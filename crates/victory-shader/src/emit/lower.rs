@@ -6221,8 +6221,18 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
+                // An old value with none of its own (`Val::Missing`: a first
+                // interpolation half, which the second half recomputes) keeps
+                // zero, as in `write_half`; any other failure stands.
                 let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
+                    Some(o) => {
+                        let missing = matches!(self.vals.get(&o), Some(Val::Missing(_)));
+                        match self.i32_of(o) {
+                            Ok(x) => x,
+                            Err(_) if missing => self.s.m.i32(0),
+                            Err(why) => return Err(why),
+                        }
+                    }
                     None => self.s.m.i32(0),
                 };
                 let h = self
