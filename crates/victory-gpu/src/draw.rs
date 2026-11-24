@@ -1821,6 +1821,11 @@ impl State {
         }
     }
 
+    /// Whether the bound pipeline completes rectangles in a geometry stage.
+    fn rect_gs(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rect_gs)
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -2122,7 +2127,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
-        let rects = self.topology == RECTANGLES;
+        // A pipeline with a rectangle geometry stage takes the title's
+        // vertices as they are.
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
         let ran = ready && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
@@ -2218,10 +2225,13 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        if self.topology == RECTANGLES {
+        // Rectangles run only where a geometry stage completes them: it
+        // takes each three indices' vertices as the console does.
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
+        if rects {
             once!("indexed rectangles not drawn");
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -2276,8 +2286,14 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        // Rectangles run only where a geometry stage completes them: an
+        // indirect draw's vertex range is not known here to expand.
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES && !p.rect_gs {
+            why("rectangles without a geometry stage");
+            return false;
+        }
         let matches_kind = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && !p.compute && !p.mesh,
+            DRAW | INDEXED => !p.compute && !p.mesh,
             MESH => !p.compute && p.mesh,
             DISPATCH => p.compute,
             _ => false,
