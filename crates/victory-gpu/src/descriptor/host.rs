@@ -2718,6 +2718,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if address == 0 || size == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -3759,6 +3762,22 @@ mod tests {
             return;
         };
         assert_eq!(full.count + full.dynamic, lowest);
+    }
+
+    #[test]
+    fn null_cbv_does_not_allocate_shadow_at_zero() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        assert!(make(&View::Constant(0, 0), heap.cpu(0)).is_none());
+        assert!(make(&View::Constant(0, 256), heap.cpu(0)).is_none());
+        assert!(make(&View::Constant(0x1000, 0), heap.cpu(0)).is_none());
+        // Making through `make_at` falls back to `null_for` (canonical null CBV)
+        // without keeping a bogus VA-0 shadow buffer.
+        heap.make_at(0, &View::Constant(0, 0));
+        assert!(heap.kept.lock().unwrap()[0].is_none());
+        heap.constant_at(1, 0, 0);
+        assert!(heap.kept.lock().unwrap()[1].is_none());
     }
 }
 

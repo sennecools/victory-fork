@@ -903,10 +903,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => View::Constant(u64::from(lo) | u64::from(hi) << 32, size),
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1439,5 +1440,16 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn null_cbv_overwrites_previous_descriptor() {
+        let null = std::ptr::null();
+        let slot = [0u64; 4];
+        let at = slot.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 0, 256, 0], at);
+        assert_eq!(view(at), Some(View::Constant(0x1000, 256)));
+        create_cbv(null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Constant(0, 0)));
     }
 }
