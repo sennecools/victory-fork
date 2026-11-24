@@ -362,6 +362,18 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     Some(all)
 }
 
+/// A join that brings a lane mask on one path and a value that is no mask on another (a
+/// traversal that keeps its lanes' masks on one stack with its node numbers): read as a
+/// number after the join, the mask is the ballot of its lanes (`Lower::fill_phis`), which
+/// is the console's mask only on a wave of the console's size.
+pub(super) fn joins_masks_with_numbers(p: &Program, st: &Structured) -> bool {
+    let is_mask = |v: &Value| st.masks.contains_key(v) || st.highs.contains_key(v);
+    p.blocks
+        .iter()
+        .flat_map(|b| &b.phis)
+        .any(|phi| phi.reg != Reg::Scc && !is_mask(&phi.value) && phi.args.iter().any(is_mask))
+}
+
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
 fn lane_constant_masks(st: &Structured) -> bool {
@@ -401,8 +413,19 @@ fn lane_constant_masks(st: &Structured) -> bool {
 /// Off by default: it is exact but untried in a game run, and adds instructions to every
 /// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
 fn f16_nearest_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_F16_NEAREST.get() {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`f16_nearest_on`], for its thread only.
+    pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -632,7 +655,8 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || lane_constant_masks(x.st);
+            }) || lane_constant_masks(x.st)
+                || joins_masks_with_numbers(p, x.st);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
