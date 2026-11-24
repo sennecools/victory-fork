@@ -22,12 +22,12 @@ pub fn run(
     // Before any window exists: sizes in screen pixels, then the window size.
     {
         use victory_core::WindowSize;
-        use victory_hle::modules::lifecycle::{self, use_physical_pixels};
+        use victory_gpu::window::{self, use_physical_pixels};
         use_physical_pixels();
-        lifecycle::set_window(match cfg.window {
-            WindowSize::Title => lifecycle::WindowSize::Title,
-            WindowSize::Pixels { width, height } => lifecycle::WindowSize::Pixels { width, height },
-            WindowSize::Fullscreen => lifecycle::WindowSize::Fullscreen,
+        window::set_window(match cfg.window {
+            WindowSize::Title => window::WindowSize::Title,
+            WindowSize::Pixels { width, height } => window::WindowSize::Pixels { width, height },
+            WindowSize::Fullscreen => window::WindowSize::Fullscreen,
         });
     }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;

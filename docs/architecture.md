@@ -33,7 +33,7 @@ Converting them ahead of time from files is only a warm-up.
 | `victory-pe` | read-only PE32+ and import-library analysis |
 | `victory-loader` | prepare, map, bind and start the title image |
 | `victory-hle` | console API implementations, host pass-through policy |
-| `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
+| `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12; the window's size, place and closing |
 | `victory-shader` | Xbox shader containers → host shaders |
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
 | `victory-pipeline` | converter trait, content-addressed cache |

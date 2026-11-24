@@ -22,19 +22,21 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
-    /// How big the title's window is on the host screen.
+    /// How big the window the title is shown in is on the host screen.
     pub window: WindowSize,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
 
-/// How big the title's window is on the primary screen, in screen pixels
-/// (`[window].size`, `VICTORY_WINDOW_SIZE`). Only the window: the title
-/// renders at the size it chooses either way, and its frame is stretched to
-/// the window.
+/// How big the window the title is shown in is on the primary screen, in
+/// screen pixels (`[window].size`, `VICTORY_WINDOW_SIZE`): the window
+/// `victory` presents in. A window the title shows itself is only shrunk
+/// to fit the screen. Only the window: the title renders at the size it
+/// chooses either way, and its frame is stretched to the window.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum WindowSize {
-    /// `"title"`: the size the title asks for, shrunk to the screen if larger.
+    /// `"title"`: the title's size (its frame), shrunk to the screen if
+    /// larger, and centred.
     #[default]
     Title,
     /// `"<width>x<height>"`: a client area of that many pixels, centred, and

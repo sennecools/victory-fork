@@ -5980,6 +5980,12 @@ impl Host {
         }
     }
 
+    /// A swap chain for `width` x `height` frames in `format`, on the
+    /// title's visible window or, without one, a window of ours
+    /// ([`make_window`]).
+    ///
+    /// shortcut: DXGI's Alt+Enter (exclusive fullscreen) is left on: the
+    /// window association is not made with `DXGI_MWA_NO_ALT_ENTER`.
     fn presenter(
         &self,
         width: u32,
@@ -6282,7 +6288,8 @@ pub(crate) fn transition(
     }
 }
 
-/// A window of the given client size, owned by its own message thread.
+/// A window for a frame of the given size ([`make_window`]), owned by its
+/// own message thread.
 fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -6308,14 +6315,27 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    use crate::window::{Handling, close, presenting_message};
+    match presenting_message(message, wparam.0) {
+        // Ends the title as closing its own window does; the window stays
+        // until the process ends.
+        Handling::Close if close() => return LRESULT(0),
+        Handling::Ignore => return LRESULT(0),
+        Handling::Close | Handling::Default => {}
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+/// The window a `width` x `height` frame is presented in when the title
+/// shows none, sized and placed as [`crate::window::set_window`] says and
+/// closed as [`crate::window::on_close`] says; the swap chain keeps the
+/// frame's size and is stretched to it.
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
+    let at = crate::window::place_presenting(width, height);
     // SAFETY: registers our class once and creates a window of it.
-    unsafe {
+    let hwnd = unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -6326,28 +6346,26 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&class);
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: width as i32,
-            bottom: height as i32,
-        };
-        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WINDOW_EX_STYLE(at.ex_style),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            WINDOW_STYLE(at.style),
+            at.x,
+            at.y,
+            at.width,
+            at.height,
             None,
             None,
             Some(instance.into()),
             None,
-        )
-    }
+        )?
+    };
+    // Shown only once placed, so it does not jump.
+    crate::window::keep_client(hwnd.0, at.client);
+    // SAFETY: the window this thread just created.
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+    Ok(hwnd)
 }
 
 fn pump() {

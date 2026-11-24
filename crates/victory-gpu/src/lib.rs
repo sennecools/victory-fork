@@ -12,7 +12,8 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
+//! share, [`console`] which console model the title sees, [`window`] the
+//! size, place and closing of the window the title is shown in. Planned:
 //! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -55,6 +56,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+pub mod window;
 
 #[cfg(windows)]
 pub use host::on_failure;
