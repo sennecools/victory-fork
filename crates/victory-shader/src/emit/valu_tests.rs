@@ -1891,3 +1891,58 @@ fn scalar_lshl_add_and_minmax_set_scc() {
         });
     }
 }
+
+#[test]
+fn v_ldexp_f32_scales_and_handles_edge_cases() {
+    // v_ldexp_f32 v0, v1, v2 (VOP3 opcode 0x362)
+    let plain = build_valu_cs(&vop3(0x362, 0, vgpr(1), vgpr(2), 0));
+    let cases: &[([u32; 4], u32)] = &[
+        ([1.5f32.to_bits(), 3, 0, 0], 12.0f32.to_bits()),
+        ([(-1.5f32).to_bits(), (-2i32) as u32, 0, 0], (-0.375f32).to_bits()),
+        ([1.0f32.to_bits(), 127, 0, 0], 0x7F00_0000),
+        ([1.0f32.to_bits(), 128, 0, 0], f32::INFINITY.to_bits()),
+        ([(-1.0f32).to_bits(), i32::MAX as u32, 0, 0], f32::NEG_INFINITY.to_bits()),
+        ([1.0f32.to_bits(), (-126i32) as u32, 0, 0], 0x0080_0000),
+        ([(-1.0f32).to_bits(), (-127i32) as u32, 0, 0], (-0.0f32).to_bits()),
+        ([1.0f32.to_bits(), i32::MIN as u32, 0, 0], 0.0f32.to_bits()),
+        ([0.0f32.to_bits(), 100, 0, 0], 0.0f32.to_bits()),
+        ([(-0.0f32).to_bits(), 100, 0, 0], (-0.0f32).to_bits()),
+        ([0x8000_0001, 50, 0, 0], (-0.0f32).to_bits()), // subnormal flushed under f32 FTZ
+        ([f32::INFINITY.to_bits(), (-100i32) as u32, 0, 0], f32::INFINITY.to_bits()),
+        ([f32::NEG_INFINITY.to_bits(), (-100i32) as u32, 0, 0], f32::NEG_INFINITY.to_bits()),
+        ([0x7FC0_0000, 5, 0, 0], 0x7FC0_0000),
+        ([0x7F80_0001, 5, 0, 0], 0x7FC0_0001), // sNaN quieted
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&plain, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        if want & 0x7FFF_FFFF > 0x7F80_0000 {
+            assert!(
+                got & 0x7FFF_FFFF > 0x7F80_0000 && got & 0x0040_0000 != 0,
+                "{backend}: v_ldexp_f32 case {i} expected qNaN, got {got:#010x}",
+            );
+        } else {
+            assert_eq!(
+                got, want,
+                "{backend}: v_ldexp_f32({:#010x}, {}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1] as i32,
+            );
+        }
+    });
+
+    // Source neg + output clamp: -(-0.75) * 2^1 = 1.5 -> clamped to 1.0; -(0.25) * 2^1 = -0.5 -> 0.0.
+    let neg_clamp = build_valu_cs(&vop3_mod(0x362, 0, vgpr(1), vgpr(2), 0, 0, 1, 0, true));
+    let mod_cases: &[([u32; 4], u32)] = &[
+        ([(-0.75f32).to_bits(), 1, 0, 0], 1.0f32.to_bits()),
+        ([0.25f32.to_bits(), 1, 0, 0], 0.0f32.to_bits()),
+        ([(-0.25f32).to_bits(), 1, 0, 0], 0.5f32.to_bits()),
+    ];
+    let mod_in: Vec<[u32; 4]> = mod_cases.iter().map(|c| c.0).collect();
+    run_cases(&neg_clamp, &mod_in, |backend, i, _, got| {
+        assert_eq!(
+            got, mod_cases[i].1,
+            "{backend}: v_ldexp_f32(-v1, v2) clamp case {i} = {got:#010x}, want {:#010x}",
+            mod_cases[i].1,
+        );
+    });
+}
