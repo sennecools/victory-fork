@@ -1083,6 +1083,11 @@ fn lds_min_max_ref(old: u32, data: u32, max: bool) -> u32 {
 
 #[test]
 fn ds_min_max_f32_order_floats_and_return_the_old_value() {
+    // Hardware only (see below): `VICTORY_WARP=1` makes the hardware device WARP too.
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("skipped on WARP: it runs no fixed wave size of 32 for one thread");
+        return;
+    }
     let values = [
         0.0f32,
         -0.0,
