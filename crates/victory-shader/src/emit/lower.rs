@@ -8876,13 +8876,34 @@ impl<'a> Lower<'a> {
                 *o = zero;
             }
             if offset_word && offsets > 0 {
-                let w = addr_val(self, 0)?;
-                for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
-                    // Bits at..at+5 sign-extended: shift up, then down.
-                    let left = self.s.m.i32(at);
-                    let t = self.s.m.bin(c, Bin::Shl, w, left);
-                    let k26 = self.s.m.i32(26);
-                    os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                // The offset word is always 32-bit (6-bit signed X/Y/Z in bits
+                // 0..5, 8..13, 16..21), even under `a16`. DXIL `sample*` ops
+                // require immediate constant offsets in -8..=7; fold constant
+                // words in range directly, and keep dynamic extraction for
+                // programmable gathers / out-of-range offsets.
+                let w = addr_u32(self, 0)?;
+                let folded = self.s.m.int_value(w).and_then(|w| {
+                    let w = w as u32;
+                    let fields: Vec<i32> = (0..offsets)
+                        .map(|k| {
+                            let x = (w >> (8 * k) & 0x3F) as i32;
+                            if x >= 32 { x - 64 } else { x }
+                        })
+                        .collect();
+                    fields.iter().all(|&f| (-8..=7).contains(&f)).then_some(fields)
+                });
+                if let Some(fields) = folded {
+                    for (o, f) in os.iter_mut().zip(fields) {
+                        *o = self.s.m.i32(f as u32);
+                    }
+                } else {
+                    for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
+                        // Bits at..at+5 sign-extended: shift up, then down.
+                        let left = self.s.m.i32(at);
+                        let t = self.s.m.bin(c, Bin::Shl, w, left);
+                        let k26 = self.s.m.i32(26);
+                        os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                    }
                 }
             }
             let mut args = vec![h, sh];
@@ -8916,27 +8937,6 @@ impl<'a> Lower<'a> {
                     )
                 }
                 60 => {
-                    if offset_word {
-                        // DXIL wants immediate offsets in -8..=7 here; the
-                        // console's are 6-bit and may be computed. A
-                        // constant word in range becomes immediates
-                        // (upstream PR #634); anything else keeps the
-                        // offsets computed above (upstream refuses those).
-                        let w = addr_val(self, 0)?;
-                        if let Some(w) = self.s.m.int_value(w) {
-                            let w = w as u32;
-                            let field = |k: usize| {
-                                let x = (w >> (8 * k) & 0x3F) as i32;
-                                if x >= 32 { x - 64 } else { x }
-                            };
-                            let n = offsets.min(2);
-                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
-                                for (k, o) in os.iter_mut().enumerate().take(n) {
-                                    *o = self.s.m.i32(field(k) as u32);
-                                }
-                            }
-                        }
-                    }
                     args.extend(&os);
                     args.push(clamp);
                     self.s
@@ -9006,11 +9006,10 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    // DXIL unary opcode 23 (`Log`) is base-2 log (`log2`); a
+                    // length of 0 gives minus infinity, which the sampler
+                    // clamps to level 0.
+                    let lod = self.unary(23, texels);
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

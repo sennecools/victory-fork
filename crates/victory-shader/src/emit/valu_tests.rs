@@ -2521,3 +2521,295 @@ fn tbuffer_load_format_d16_packs_float_and_int_channels() {
         }
     }
 }
+
+/// MIMG sampled instruction encoding (`r128 = 0`, `nsa = 0`).
+#[allow(clippy::too_many_arguments)]
+const fn mimg_sample(
+    op: u8,
+    dim: u8,
+    dmask: u8,
+    a16: bool,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    ssamp: u8,
+) -> [u32; 2] {
+    [
+        0x3C << 26
+            | (op as u32 & 0x7F) << 18
+            | (dmask as u32 & 0xF) << 8
+            | (dim as u32 & 7) << 3
+            | (op as u32 >> 7 & 1),
+        (a16 as u32) << 30
+            | ((ssamp as u32 >> 2) & 0x1F) << 21
+            | ((srsrc as u32 >> 2) & 0x1F) << 16
+            | (vdata as u32) << 8
+            | vaddr as u32,
+    ]
+}
+
+fn build_sampled_cs(body: &[u32], vgprs: u16) -> HostShader {
+    let mut words = Vec::new();
+    // s[4:5] = view table (SRV at 0, UAV at 8 dwords); s[6:7] = sampler table (offset 0).
+    words.push(s_mov_b32(5, 0x80));
+    words.push(s_mov_b32(7, 0x80));
+    // s_load_dwordx8 s[8:15], s[4:5], 0x0
+    words.extend_from_slice(&[0xF40C_0202, 0xFA00_0000]);
+    // s_load_dwordx4 s[16:19], s[6:7], 0x0
+    words.extend_from_slice(&s_load_dwordx4(16, 6));
+    // s_load_dwordx4 s[20:23], s[4:5], 0x20
+    words.extend_from_slice(&[0xF408_0502, 0xFA00_0020]);
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 20, 0));
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Sampler,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 7 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .unwrap();
+    let mut dxil = l.dxil;
+    #[cfg(windows)]
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut dxil).unwrap();
+    }
+    HostShader {
+        stage: HwStage::Cs,
+        dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: Vec::new(),
+    }
+}
+
+#[test]
+fn mimg_3d_sample_offset_preserves_z_and_a16() {
+    // 4x4x4 3D texture: texel (x, y, z) stores R = z*100 + y*10 + x.
+    let mut texels = Vec::with_capacity(64);
+    for z in 0..4u32 {
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                texels.push([(z * 100 + y * 10 + x) as f32, 0.0, 0.0, 1.0]);
+            }
+        }
+    }
+    // Base coordinate = texel (1, 1, 2) -> (u, v, w) = (0.375, 0.375, 0.625).
+    // Exact in both f32 and f16: 0.375 = 0x3600, 0.625 = 0x3900.
+    // Test offsets: (+1, +2, -1) -> (2, 3, 1) = 132; (-1, +1, +1) -> (0, 2, 3) = 320.
+    let offset_cases: &[(u32, f32, &str)] = &[
+        (0x003F_0201, 132.0, "(+1, +2, -1)"),
+        (0x0001_013F, 320.0, "(-1, +1, +1)"),
+    ];
+    for &(off_word, want, label) in offset_cases {
+        for a16 in [false, true] {
+            let mut body = Vec::new();
+            // v2 = constant 32-bit offset word (always 32-bit even under a16).
+            body.extend_from_slice(&[vop1(0x001, 2, 0xFF), off_word]);
+            if a16 {
+                // v3 = (v=0.375_f16 << 16) | u=0.375_f16; v4 = w=0.625_f16.
+                body.extend_from_slice(&[vop1(0x001, 3, 0xFF), 0x3600_3600]);
+                body.extend_from_slice(&[vop1(0x001, 4, 0xFF), 0x0000_3900]);
+            } else {
+                body.extend_from_slice(&[vop1(0x001, 3, 0xFF), 0.375f32.to_bits()]);
+                body.extend_from_slice(&[vop1(0x001, 4, 0xFF), 0.375f32.to_bits()]);
+                body.extend_from_slice(&[vop1(0x001, 5, 0xFF), 0.625f32.to_bits()]);
+            }
+            // image_sample_lz_o (0x37), dim=2 (3D), dmask=1, v0, v[2..], s[8:15], s[16:19].
+            body.extend_from_slice(&mimg_sample(0x37, 2, 1, a16, 0, 2, 8, 16));
+            let shader = build_sampled_cs(&body, 8);
+
+            #[cfg(windows)]
+            {
+                use windows::Win32::Graphics::Direct3D12::*;
+                let sampler = [D3D12_SAMPLER_DESC {
+                    Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+                    AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    MaxAnisotropy: 1,
+                    MaxLOD: f32::MAX,
+                    ..Default::default()
+                }];
+                let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+                for (backend, warp) in [("hardware", false), ("WARP", true)] {
+                    let Ok(host) = Host::new(warp) else {
+                        continue;
+                    };
+                    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(vec![0; 7]))],
+                                views: &[View::Texture3D(4, 4, 4, &texels), View::RawUav(16)],
+                                samplers: &sampler,
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap();
+                    let got = f32::from_bits(out[0][0]);
+                    assert_eq!(
+                        got, want,
+                        "{backend}: 3D image_sample_lz_o a16={a16} offset {label} got {got}, want {want}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mimg_cube_sample_d_selects_exact_log2_mip() {
+    // 8x8 mipmapped cubemap (4 mips: 8, 4, 2, 1); every texel in mip m has R = m as f32.
+    let m0 = vec![[0.0f32, 0.0, 0.0, 1.0]; 6 * 8 * 8];
+    let m1 = vec![[1.0f32, 0.0, 0.0, 1.0]; 6 * 4 * 4];
+    let m2 = vec![[2.0f32, 0.0, 0.0, 1.0]; 6 * 2 * 2];
+    let m3 = vec![[3.0f32, 0.0, 0.0, 1.0]; 6];
+    let mips: [&[[f32; 4]]; 4] = [&m0, &m1, &m2, &m3];
+
+    // image_sample_d (0x22), dim=3 (cube), dmask=1, a16=false:
+    // v1=ddx_s (from s0), v2=ddx_t=0, v3=ddy_s=0, v4=ddy_t=0, v5=s=1.5, v6=t=1.5, v7=face=0.0 (+X).
+    let mut body = Vec::new();
+    body.push(vop1(0x001, 1, sgpr(0)));
+    for r in 2..=4u8 {
+        body.push(vop1(0x001, r, 0x80)); // 0.0
+    }
+    body.extend_from_slice(&[vop1(0x001, 5, 0xFF), 1.5f32.to_bits()]);
+    body.extend_from_slice(&[vop1(0x001, 6, 0xFF), 1.5f32.to_bits()]);
+    body.push(vop1(0x001, 7, 0x80)); // face 0 (+X)
+    body.extend_from_slice(&mimg_sample(0x22, 3, 1, false, 0, 1, 8, 16));
+    let shader = build_sampled_cs(&body, 8);
+
+    // With trilinear filtering and mip m filled with m.0, sampleLevel returns the exact LOD.
+    // Face width = 8 -> texels = g * 8 -> expected LOD = log2(g * 8).
+    let cases: &[(f32, f32)] = &[
+        (0.125, 0.0),          // texels = 1 -> log2(1) = 0.0
+        (0.25, 1.0),           // texels = 2 -> log2(2) = 1.0 (before fix: 1.443)
+        (0.353_553_4, 1.5),    // texels = 2*sqrt(2) -> log2 = 1.5 (before fix: 2.164)
+        (0.5, 2.0),            // texels = 4 -> log2(4) = 2.0 (before fix: 2.885)
+    ];
+
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let sampler = [D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        }];
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            for &(g, want) in cases {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![g.to_bits(), 0, 0, 0, 0, 0, 0]))],
+                            views: &[View::CubeMips(8, &mips), View::RawUav(16)],
+                            samplers: &sampler,
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                let got = f32::from_bits(out[0][0]);
+                assert!(
+                    (got - want).abs() < 0.05,
+                    "{backend}: cube image_sample_d g={g} returned LOD {got}, want {want}",
+                );
+            }
+        }
+    }
+}

@@ -966,6 +966,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F 3D texture SRV (width, height, depth, texels slice-by-slice).
+    Texture3D(u32, u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
     /// An RGBA32F 2D texture array SRV (width, height, layers, texels of
@@ -974,6 +976,8 @@ pub enum View<'a> {
     /// An RGBA32F 3D texture SRV (width, height, depth, texels of each
     /// depth in turn).
     Volume(u32, u32, u32, &'a [[f32; 4]]),
+    /// A mipmapped RGBA32F cube SRV (base face size, per-mip 6-face texels).
+    CubeMips(u32, &'a [&'a [[f32; 4]]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1414,6 +1418,116 @@ impl Host {
                             _ => None,
                         };
                         dev.CreateShaderResourceView(&tex, view, at);
+                        keep.push(tex);
+                    }
+                    View::Texture3D(w, h, depth, texels) => {
+                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
+                        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                        desc.DepthOrArraySize = depth as u16;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let pitch = (w as usize * 16).next_multiple_of(256);
+                        for z in 0..depth as usize {
+                            let upload = make(
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                            )?;
+                            let mut p = std::ptr::null_mut();
+                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                            let slice = &texels[z * (w * h) as usize..];
+                            for y in 0..h as usize {
+                                let row = &slice[y * w as usize..(y + 1) * w as usize];
+                                std::ptr::copy_nonoverlapping(
+                                    row.as_ptr().cast::<u8>(),
+                                    p.cast::<u8>().add(y * pitch),
+                                    row.len() * 16,
+                                );
+                            }
+                            upload.Unmap(0, None);
+                            list.CopyTextureRegion(
+                                &subresource(&tex),
+                                0,
+                                0,
+                                z as u32,
+                                &footprint(&upload, w, h),
+                                None,
+                            );
+                            keep.push(upload);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
+                    }
+                    View::CubeMips(n, mips) => {
+                        let levels = mips.len() as u16;
+                        let mut desc = texture(n, n, D3D12_RESOURCE_FLAG_NONE);
+                        desc.DepthOrArraySize = 6;
+                        desc.MipLevels = levels;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        for (mip, data) in mips.iter().enumerate() {
+                            let s = (n >> mip).max(1);
+                            let pitch = (s as usize * 16).next_multiple_of(256);
+                            for face in 0..6usize {
+                                let upload = make(
+                                    D3D12_HEAP_TYPE_UPLOAD,
+                                    &buffer((pitch * s as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                                )?;
+                                let mut p = std::ptr::null_mut();
+                                upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                                let texels = &data[face * (s * s) as usize..];
+                                for y in 0..s as usize {
+                                    let row = &texels[y * s as usize..(y + 1) * s as usize];
+                                    std::ptr::copy_nonoverlapping(
+                                        row.as_ptr().cast::<u8>(),
+                                        p.cast::<u8>().add(y * pitch),
+                                        row.len() * 16,
+                                    );
+                                }
+                                upload.Unmap(0, None);
+                                let mut at_sub = subresource(&tex);
+                                at_sub.Anonymous.SubresourceIndex =
+                                    (mip + face * mips.len()) as u32;
+                                list.CopyTextureRegion(
+                                    &at_sub,
+                                    0,
+                                    0,
+                                    0,
+                                    &footprint(&upload, s, s),
+                                    None,
+                                );
+                                keep.push(upload);
+                            }
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                TextureCube: D3D12_TEXCUBE_SRV {
+                                    MipLevels: u32::from(levels),
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(&tex, Some(&cube), at);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {
