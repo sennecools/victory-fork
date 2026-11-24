@@ -653,7 +653,7 @@ impl HostPipeline {
                 BytecodeLength: b.len(),
             }
         });
-        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
@@ -680,6 +680,7 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
+        zero_padding(&mut desc.BlendState, &mut desc.DepthStencilState);
         // The geometry stage is named only where there is one, so that the
         // pipelines without one keep their names in the library.
         let (vs_bytes, ps_bytes) = (code_bytes(&code(0)), code_bytes(&code(1)));
@@ -892,7 +893,31 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
-    let build = |depth: Sub<_>| {
+    // The gaps between a subobject's type and its description, and after it.
+    fn zero_gaps<T>(sub: &mut Sub<T>) {
+        let at = std::mem::offset_of!(Sub<T>, 1);
+        let end = at + size_of::<T>();
+        let bytes = (&raw mut *sub).cast::<u8>();
+        // SAFETY: padding bytes of `sub`, inside it.
+        unsafe {
+            bytes.add(4).write_bytes(0, at - 4);
+            bytes.add(end).write_bytes(0, size_of::<Sub<T>>() - end);
+        }
+    }
+    fn zero_stream_gaps<D>(stream: &mut Stream<D>) {
+        zero_gaps(&mut stream.root);
+        zero_gaps(&mut stream.ms);
+        zero_gaps(&mut stream.ps);
+        zero_gaps(&mut stream.blend);
+        zero_gaps(&mut stream.mask);
+        zero_gaps(&mut stream.raster);
+        zero_gaps(&mut stream.depth);
+        zero_gaps(&mut stream.targets);
+        zero_gaps(&mut stream.dsv);
+        zero_gaps(&mut stream.samples);
+        zero_gaps(&mut stream.topology);
+    }
+    let build = |depth: Sub<D3D12_DEPTH_STENCIL_DESC>| {
         let mut stream = Stream {
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
@@ -909,6 +934,8 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
+        zero_padding(&mut stream.blend.1, &mut stream.depth.1);
+        zero_stream_gaps(&mut stream);
         stream_pipeline(device, &mut stream, name)
     };
     if depth_bounds {
@@ -928,6 +955,9 @@ fn mesh_pipeline(
                 D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             ),
         };
+        zero_blend_padding(&mut stream.blend.1);
+        zero_depth1_padding(&mut stream.depth.1);
+        zero_stream_gaps(&mut stream);
         stream_pipeline(device, &mut stream, name)
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
@@ -989,6 +1019,50 @@ fn mesh_refusal(
         return "the pixel shader or how it links to the mesh shader";
     }
     "the mesh shader or the root signature"
+}
+
+/// Zeroes the padding in a blend and a depth-stencil description: the
+/// title's (copied whole by [`GraphicsState::read`]) holds whatever its
+/// memory held, and the library compares a loaded pipeline's description
+/// with the stored one byte for byte, so a pipeline whose padding changed
+/// between runs was refused, made again and its store refused too, every
+/// run (upstream Marvisak/VIctory#1690). Done on the description handed to
+/// the host, after which nothing moves it.
+fn zero_padding(blend: &mut D3D12_BLEND_DESC, depth: &mut D3D12_DEPTH_STENCIL_DESC) {
+    use std::mem::offset_of;
+    zero_blend_padding(blend);
+    let (write, front) = (
+        offset_of!(D3D12_DEPTH_STENCIL_DESC, StencilWriteMask) + 1,
+        offset_of!(D3D12_DEPTH_STENCIL_DESC, FrontFace),
+    );
+    let bytes = (&raw mut *depth).cast::<u8>();
+    // SAFETY: the padding between two fields, inside `depth`.
+    unsafe { bytes.add(write).write_bytes(0, front - write) };
+}
+
+/// The blend part of [`zero_padding`].
+fn zero_blend_padding(blend: &mut D3D12_BLEND_DESC) {
+    use std::mem::offset_of;
+    let mask = offset_of!(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1;
+    let tail = size_of::<D3D12_RENDER_TARGET_BLEND_DESC>() - mask;
+    for target in &mut blend.RenderTarget {
+        let bytes = (&raw mut *target).cast::<u8>();
+        // SAFETY: the padding after the last field, inside `target`.
+        unsafe { bytes.add(mask).write_bytes(0, tail) };
+    }
+}
+
+/// The depth part of [`zero_padding`], for the description with the depth
+/// bounds test.
+fn zero_depth1_padding(depth: &mut D3D12_DEPTH_STENCIL_DESC1) {
+    use std::mem::offset_of;
+    let (write, front) = (
+        offset_of!(D3D12_DEPTH_STENCIL_DESC1, StencilWriteMask) + 1,
+        offset_of!(D3D12_DEPTH_STENCIL_DESC1, FrontFace),
+    );
+    let bytes = (&raw mut *depth).cast::<u8>();
+    // SAFETY: the padding between two fields, inside `depth`.
+    unsafe { bytes.add(write).write_bytes(0, front - write) };
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -1729,6 +1803,47 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn a_description_s_padding_is_zero_whatever_the_title_left_in_it() {
+        fn bytes<T>(v: &T) -> &[u8] {
+            // SAFETY: the bytes of a plain description.
+            unsafe { std::slice::from_raw_parts((&raw const *v).cast::<u8>(), size_of::<T>()) }
+        }
+        fn fill<T>(v: &mut T, byte: u8) {
+            let at = (&raw mut *v).cast::<u8>();
+            // SAFETY: plain data, every byte of it (padding too) `byte`.
+            unsafe { at.write_bytes(byte, size_of::<T>()) };
+        }
+        let states = |byte: u8| {
+            let mut blend = D3D12_BLEND_DESC::default();
+            let mut depth = D3D12_DEPTH_STENCIL_DESC::default();
+            fill(&mut blend, byte);
+            fill(&mut depth, byte);
+            // The fields written one by one, the padding left as it was.
+            let base = GraphicsState::default();
+            let (a, d) = (&base.blend, &base.depth);
+            blend.AlphaToCoverageEnable = a.AlphaToCoverageEnable;
+            blend.IndependentBlendEnable = a.IndependentBlendEnable;
+            for (t, b) in blend.RenderTarget.iter_mut().zip(&a.RenderTarget) {
+                (t.BlendEnable, t.LogicOpEnable) = (b.BlendEnable, b.LogicOpEnable);
+                (t.SrcBlend, t.DestBlend, t.BlendOp) = (b.SrcBlend, b.DestBlend, b.BlendOp);
+                (t.SrcBlendAlpha, t.DestBlendAlpha, t.BlendOpAlpha, t.LogicOp) =
+                    (b.SrcBlendAlpha, b.DestBlendAlpha, b.BlendOpAlpha, b.LogicOp);
+                t.RenderTargetWriteMask = b.RenderTargetWriteMask;
+            }
+            (depth.DepthEnable, depth.DepthWriteMask, depth.DepthFunc) =
+                (d.DepthEnable, d.DepthWriteMask, d.DepthFunc);
+            depth.StencilEnable = d.StencilEnable;
+            depth.StencilReadMask = d.StencilReadMask;
+            depth.StencilWriteMask = d.StencilWriteMask;
+            (depth.FrontFace, depth.BackFace) = (d.FrontFace, d.BackFace);
+            zero_padding(&mut blend, &mut depth);
+            (bytes(&blend).to_vec(), bytes(&depth).to_vec())
+        };
+        assert_eq!(states(0x00), states(0xab));
+        assert_eq!(states(0x00), states(0xff));
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
