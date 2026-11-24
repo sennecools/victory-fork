@@ -296,20 +296,21 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Moves a container of the old layout (blob files named by encoded name,
-/// a `.display` file) into a committed version, then removes it.
+/// a `.display` file) into a committed version, then removes it. A blob
+/// that cannot be read stops it, the old container left for a later try.
 fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let dir = container_dir(root, name);
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in std::fs::read_dir(old).ok()? {
+            let entry = entry.ok()?;
+            let Some(blob) = entry.file_name().to_str().and_then(decode) else {
+                continue; // not a blob
+            };
+            blobs.push((blob, std::fs::read(entry.path()).ok()?));
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -1141,6 +1142,30 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    /// A blob of the old layout that cannot be read (here a folder by a
+    /// blob's name) stops the move: nothing is committed and the old
+    /// container stays whole, to be moved once it can be read.
+    #[test]
+    fn an_unreadable_old_blob_is_not_dropped() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(old.join("Header")).unwrap();
+        std::fs::write(old.join("Data"), b"data").unwrap();
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(old.join("Data").is_file() && old.join("Header").is_dir());
+        let c = p.container("Player");
+        assert!(current_named(&c.dir, "Player").unwrap().is_none() && !c.dir.exists());
+
+        std::fs::remove_dir(old.join("Header")).unwrap();
+        std::fs::write(old.join("Header"), b"header").unwrap();
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists());
+        let blobs = read(&p.container("Player"), None).unwrap();
+        let expected = [("Data".into(), b"data".to_vec()), ("Header".into(), b"header".to_vec())];
+        assert_eq!(blobs, expected);
     }
 
     /// An empty configuration id names none. As a folder name it would be
