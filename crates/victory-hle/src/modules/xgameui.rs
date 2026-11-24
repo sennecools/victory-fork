@@ -61,6 +61,7 @@ extern "system" fn text_entry_async(
     max_length: u32,
 ) -> HRESULT {
     let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
+    let max_length = if max_length == 0 { 1024 } else { max_length };
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
         match ask(&title, &description, &default, max_length) {
@@ -102,12 +103,9 @@ extern "system" fn text_entry_result(
     put(used, written as u32)
 }
 
-/// At most `max` characters (0: no limit).
+/// At most `max` characters.
 fn limit(typed: &str, max: u32) -> String {
-    match max {
-        0 => typed.to_owned(),
-        max => typed.chars().take(max as usize).collect(),
-    }
+    typed.chars().take(max as usize).collect()
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
@@ -317,5 +315,27 @@ mod tests {
         assert_eq!(result(this, &mut b, 7, out.as_mut_ptr(), &mut used), S_OK);
         assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyp"), 7));
         assert_eq!(limit("\u{e9}t\u{e9}s", 3), "\u{e9}t\u{e9}");
+    }
+
+    #[test]
+    fn text_entry_defaults_to_1024_characters() {
+        let default = std::ffi::CString::new("a".repeat(1025)).unwrap();
+        let mut b = block();
+        assert_eq!(
+            text_entry_async(
+                &OBJECT,
+                &mut b,
+                c"Type".as_ptr(),
+                std::ptr::null(),
+                default.as_ptr(),
+                0,
+                0,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        let mut size = 0;
+        assert_eq!(text_entry_size(&OBJECT, &mut b, &mut size), S_OK);
+        assert_eq!(size, 1025); // 1024 ASCII characters plus the NUL.
     }
 }
