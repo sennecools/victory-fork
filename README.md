@@ -112,6 +112,15 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+Host drivers that crash compiling a shader: with `VICTORY_PIPELINE_JOURNAL=1`
+a pipeline whose creation ends the process is refused from the next run on
+(its draws dropped, as for any refused pipeline) and listed in
+`pipeline-journal\crashed.txt` under the cache folder. Each such pipeline
+costs one crash; delete its line to try it again. Pipelines are still created
+in parallel; when a crash leaves several in creation, they are listed in
+`pipeline-journal\suspects.txt` and each is created alone until it succeeds,
+so a repeat crash names only the pipeline that caused it.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with

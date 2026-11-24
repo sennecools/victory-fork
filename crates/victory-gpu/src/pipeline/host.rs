@@ -380,6 +380,14 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        // A pipeline whose creation ended an earlier run is not tried again
+        // (`VICTORY_PIPELINE_JOURNAL`); the note lives until this returns.
+        let key = stages
+            .iter()
+            .map(|(s, _)| s.hash.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
+        let _pending = super::journal::enter(&key)?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
