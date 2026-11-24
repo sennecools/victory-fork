@@ -2846,15 +2846,37 @@ fn keep_views() -> bool {
 }
 
 /// Whether both are shader views of one texture the title placed in
-/// memory: the same address and the same resource description, whatever
-/// part of it each shows.
+/// memory, the same address and the same resource description, that
+/// differ in their mips at most. The old view shows a sharper or blurrier
+/// picture of the same thing; one of another array slice, plane or format
+/// (a video's ring of pictures) would show an older picture instead.
 fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
-            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
+            resource[0] != 1
+                && resource == other
+                && desc[10..12] == other_desc[10..12]
+                && (0..10).all(|i| desc[i] == other_desc[i] || mip_word(desc[1], i))
         }
         _ => false,
     }
+}
+
+/// Whether word `i` of a shader view's description (the host's layout) is
+/// one of its mip range or its least detail clamp, for view dimension
+/// `dimension`. Word 3 is padding; the union starts at word 4.
+fn mip_word(dimension: u32, i: usize) -> bool {
+    let clamp = match D3D12_SRV_DIMENSION(dimension as i32) {
+        D3D12_SRV_DIMENSION_TEXTURE1D
+        | D3D12_SRV_DIMENSION_TEXTURE3D
+        | D3D12_SRV_DIMENSION_TEXTURECUBE => 6,
+        D3D12_SRV_DIMENSION_TEXTURE2D => 7,
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY | D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => 8,
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => 9,
+        // Multisampled views have no mips.
+        _ => return i == 3,
+    };
+    matches!(i, 3..=5) || i == clamp
 }
 
 /// A shader view of a texture the title placed in memory itself, as a view
@@ -3111,6 +3133,27 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+        // Of the same texture, but not only its mips: another plane or
+        // format; a clamp of the least detail is a mip range still.
+        let with = |word: usize, value: u32| {
+            let mut other = desc;
+            other[word] = value;
+            View::Placed(false, resource, other)
+        };
+        assert!(!same_placed_texture(&low, &with(6, 1)), "plane");
+        assert!(!same_placed_texture(&low, &with(0, 99)), "format");
+        assert!(
+            same_placed_texture(&low, &with(7, 2.0f32.to_bits())),
+            "clamp"
+        );
+        // Array slices of one texture (a ring of video pictures).
+        let slice = |first: u32| {
+            let mut array = desc;
+            (array[1], array[6], array[7]) = (5, first, 1);
+            View::Placed(false, resource, array)
+        };
+        assert!(same_placed_texture(&slice(2), &slice(2)));
+        assert!(!same_placed_texture(&slice(2), &slice(3)));
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
