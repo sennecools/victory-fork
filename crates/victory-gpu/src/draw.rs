@@ -1686,11 +1686,10 @@ impl State {
         }
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
-        // textures (a scene's first minutes) then drains in fewer frames.
-        static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
-        }) << 20;
+        // textures (a scene's first minutes) then drains in fewer frames. Under
+        // `VICTORY_FLIP` a pair of values compares two ([`crate::flip`]).
+        static PER_FRAME_MB: crate::flip::Pair = crate::flip::Pair::new("VICTORY_TEXTURE_STAGE_MB");
+        let per_frame: u64 = PER_FRAME_MB.parsed().unwrap_or(192u64).saturating_mul(1 << 20);
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1765,10 +1764,9 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        // `VICTORY_TEXTURE_STAGE_MS` (a pair under `VICTORY_FLIP`, as above).
+        static SPAN_MS: crate::flip::Pair = crate::flip::Pair::new("VICTORY_TEXTURE_STAGE_MS");
+        let span = std::time::Duration::from_millis(SPAN_MS.parsed().unwrap_or(250));
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
         // surfaces at 192 MB a frame) gets three times the bytes and the time until it
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
