@@ -54,6 +54,9 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// The fence of the last late submission that actually reads this
+    /// staging buffer. Checked only when new contents will be written.
+    last_upload: std::sync::atomic::AtomicU64,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
@@ -623,7 +626,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging);
+        list.defer_texture(staging, false);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -680,15 +683,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     // When the list is submitted, its copy takes what the staging buffer
-    // holds by then: noted before the check below, which sets `dirty`
-    // again if it detiles (the next list then uploads once more).
-    {
-        let staging = staging.clone();
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
-        });
-    }
+    // holds by then: noted by the texture step (`uploads`) before its check,
+    // which sets `dirty` again if it detiles (the next list then uploads once
+    // more), and the submission's fence noted so that a later detiling waits
+    // for the copy to have run (`Staging::detile`).
     // Levels on demand (`crate::tiles`): after the check below, in the
     // order of this list's steps, and before the list is executed, the
     // levels the staging buffer holds as the title's are given the card's
@@ -698,10 +696,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
-        list.defer_texture(staging);
+        list.defer_texture(staging, true);
         return;
     };
-    list.defer_texture(staging.clone());
+    list.defer_texture(staging.clone(), true);
     list.defer_host(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
@@ -828,6 +826,18 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// Note an upload before checking for changed contents. The check sets
+    /// dirty again if the next list needs to upload newer contents.
+    pub(crate) fn note_upload(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.uploaded.store(true, Relaxed);
+        self.dirty.store(false, Relaxed);
+    }
+
+    pub(crate) fn note_upload_fence(&self, fence: u64) {
+        self.last_upload.store(fence, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
     /// of the texture shows (0 without a view that says): the title's own
@@ -1070,6 +1080,11 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        // A submission sent ahead may still copy from the staging buffer.
+        let fence = self.last_upload.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if fence != 0 {
+            host().expect("an upload has a host").wait_for_staging(fence);
+        }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1454,6 +1469,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        last_upload: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
