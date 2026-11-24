@@ -517,8 +517,23 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
-            return;
+        let mut empty_steps = 0u32;
+        while voice.pcm.len() < SAMPLES_PER_BLOCK {
+            let before = voice.pcm.len();
+            if !decode(context, voice) {
+                if voice.pcm.is_empty() {
+                    return;
+                }
+                break;
+            }
+            if voice.pcm.len() == before {
+                empty_steps += 1;
+                if empty_steps > 16 {
+                    return;
+                }
+            } else {
+                empty_steps = 0;
+            }
         }
         let write = context.field(0, 27, 5);
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
@@ -608,11 +623,12 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let ends_loop = loop_end != 0
         && (frame.start == loop_end
             || (frame.start < loop_end && frame.next.is_none_or(|n| loop_end < n)));
+    let mut next_skip = None;
     if loops > 0 && ends_loop {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
         pcm.truncate(keep);
         next = context.field(3, 0, 26) as usize;
-        voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
+        next_skip = Some(context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES);
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
         }
@@ -620,6 +636,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let skip = (voice.skip * channels).min(pcm.len());
     voice.skip -= skip / channels;
     voice.pcm.extend(&pcm[skip..]);
+    if let Some(skip) = next_skip {
+        voice.skip = skip;
+    }
     if next == 0 {
         context.set_field(0, 20 + current, 1, 0);
     }
@@ -1167,6 +1186,120 @@ mod tests {
         assert_eq!((m.disconnect)(acp), S_OK);
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    fn test_voice(skip: usize) -> Voice {
+        Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        }
+    }
+
+    #[test]
+    fn loop_end_keeps_current_samples_and_defers_loop_start_skip() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 2, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>());
+
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+
+        // 2 packets, loops = 1 (bits 12..20), input 0 valid (bit 20), ring size 4.
+        context.set(0, 2 | (1 << 12) | (1 << 20) | (4 << 22));
+        // loop_end_subframe = 1 (keep 2 subframes = 256 samples, bits 12..14),
+        // loop_start_subframe skip = 2 (256 samples for next iteration, bits 17..20),
+        // 48 kHz mono, writable.
+        context.set(1, (1 << 12) | (2 << 17) | (3 << 27) | (1 << 31));
+        context.set(2, 32); // read offset at first frame
+        context.set(3, 32); // loop_start = bit 32
+        context.set(4, 32); // loop_end = bit 32
+        context.set(5, input_apu);
+
+        let mut voice = test_voice(0);
+        assert!(decode(context, &mut voice));
+        // Current loop_end frame keeps 256 samples; loop_start skip of 256 is
+        // deferred to the next frame rather than eating the current frame.
+        assert_eq!(voice.pcm.len(), 2 * xma::SUBFRAME_SAMPLES);
+        assert_eq!(voice.skip, 2 * xma::SUBFRAME_SAMPLES);
+        assert_eq!(context.field(0, 12, 8), 0);
+        assert_eq!(context.field(2, 0, 26), 32);
+
+        ApuFree(input);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn pump_keeps_decoding_across_empty_steps_without_injecting_silence() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 2, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>());
+
+        // Buffer 0 has an empty/exhausted packet (all 0xFF -> read_frame returns None),
+        // buffer 1 has a valid stream with 6 frames.
+        let (mut input0, mut input0_apu) = (std::ptr::null_mut(), 0);
+        let (mut input1, mut input1_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input0, &mut input0_apu, 0x800, 0x800, 1), S_OK);
+        assert_eq!(ApuAlloc(&mut input1, &mut input1_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: buffers were allocated above.
+        unsafe {
+            input0.cast::<u8>().write_bytes(0xff, 0x800);
+            std::ptr::copy_nonoverlapping(stream.as_ptr(), input1.cast(), stream.len());
+        }
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2), S_OK);
+
+        // Input 0 (1 packet) and input 1 (2 packets) both valid; ring of 4 blocks, writable.
+        context.set(0, 1 | (0b11 << 20) | (4 << 22));
+        context.set(1, 2 | (3 << 27) | (1 << 31));
+        context.set(2, 32);
+        context.set(5, input0_apu);
+        context.set(6, input1_apu);
+        context.set(7, output_apu);
+
+        // Start with skip = 512 (4 subframes): frame 0 of buffer 1 is also skipped whole.
+        let mut voice = test_voice(xma::FRAME_SAMPLES);
+        pump(context, &mut voice);
+
+        // Buffer 0 became invalid, switched to buffer 1, skipped frame 0 whole,
+        // and decoded frame 1 (512 samples = 4 blocks) without injecting any
+        // spurious silence block during the buffer switch or full-frame skip.
+        assert_eq!(context.field(0, 20, 1), 0, "input 0 consumed");
+        assert_eq!(context.field(4, 31, 1), 1, "switched to input 1");
+        assert_eq!(voice.skip, 0);
+        assert_eq!(voice.trace.frames, 2, "frame 0 skipped + frame 1 filled the 4-block ring");
+        assert_eq!(voice.trace.produced, 4 * SAMPLES_PER_BLOCK);
+
+        ApuFree(input0);
+        ApuFree(input1);
+        ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 }
