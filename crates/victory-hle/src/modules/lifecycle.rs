@@ -84,7 +84,14 @@ pub extern "system" fn CreateWindowExW(
     } else {
         asked
     };
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let wide = parent
+        .is_null()
+        .then(caption)
+        .flatten()
+        .map(|c| c.encode_utf16().chain([0]).collect::<Vec<u16>>());
+    let name = wide.as_ref().map_or(name, |c| c.as_ptr());
+    // SAFETY: the title's own arguments, forwarded (the size fitted, the
+    // caption replaced by `wide`, which outlives the call).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             at.ex_style,
@@ -126,7 +133,15 @@ pub extern "system" fn CreateWindowExA(
     } else {
         asked
     };
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let narrow = parent.is_null().then(caption).flatten().map(|c| {
+        c.bytes()
+            .filter(|&b| b != 0)
+            .chain([0])
+            .collect::<Vec<u8>>()
+    });
+    let name = narrow.as_ref().map_or(name, |c| c.as_ptr());
+    // SAFETY: the title's own arguments, forwarded (the size fitted, the
+    // caption replaced by `narrow`, which outlives the call).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             at.ex_style,
@@ -145,6 +160,12 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// `VICTORY_CAPTION`, which replaces the caption of the title's top-level
+/// windows as it does that of the window `victory-gpu` presents in.
+fn caption() -> Option<String> {
+    std::env::var("VICTORY_CAPTION").ok()
 }
 
 /// Puts our procedure in front of the title's.

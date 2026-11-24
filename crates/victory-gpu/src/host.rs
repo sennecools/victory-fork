@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -6793,7 +6793,7 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -7474,6 +7474,10 @@ extern "system" fn window_proc(
 /// frame's size and is stretched to it.
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
+    // `VICTORY_CAPTION` replaces the window's caption, e.g. with a neutral
+    // one while the screen is shared.
+    let caption =
+        HSTRING::from(std::env::var("VICTORY_CAPTION").unwrap_or_else(|_| "VIctory".into()));
     let at = crate::window::place_presenting(width, height);
     // SAFETY: registers our class once and creates a window of it.
     let hwnd = unsafe {
@@ -7490,7 +7494,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(at.ex_style),
             CLASS,
-            w!("VIctory"),
+            &caption,
             WINDOW_STYLE(at.style),
             at.x,
             at.y,
