@@ -1097,8 +1097,9 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.bytes);
+            // SAFETY: the subresource's part of the mapped staging buffer, cut
+            // to its end ([`subresource_len`]).
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -1116,6 +1117,19 @@ impl Staging {
             }
         }
     }
+}
+
+/// The bytes of the staging buffer (`total` long) a subresource at `offset`
+/// may use: `pitch * rows * depth`, or what is left of the buffer if that is
+/// less. `GetCopyableFootprints` leaves out the row pitch's padding after
+/// the last row of the last subresource, so the product can run past the
+/// buffer's end (a 4-row texture: 896 bytes of staging, 1,024 of rows).
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+    let padded = pitch
+        .saturating_mul(rows as usize)
+        .saturating_mul(depth as usize);
+    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(remaining)
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -1235,7 +1249,10 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const KERNEL_PAGE: usize = 4096;
-    let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
+    let Some(end_incl) = at.checked_add(len - 1) else {
+        return (0, 1);
+    };
+    let (first, last) = (at / KERNEL_PAGE, end_incl / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
     // SAFETY: plain data.
@@ -1270,19 +1287,35 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     (there, of)
 }
 
+/// Whether a region `VirtualQuery` described is committed memory that may be
+/// read: not no-access (the host's form of the console's GPU-only memory)
+/// and no guard page, as [`readable`] counts them.
+fn is_readable_commit(info: &windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+    info.State == MEM_COMMIT
+        && info.Protect != 0
+        && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
+}
+
 fn committed_by_query(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 || !is_readable_commit(&info) {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
     }
     true
 }
@@ -1294,12 +1327,14 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
-    let end = start.saturating_add(len);
+    let Some(end) = start.checked_add(len) else {
+        return 0;
+    };
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
@@ -1340,7 +1375,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if is_readable_commit(&info) {
             there += (next - p) as u64;
         }
         p = next;
@@ -1537,5 +1572,51 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    /// A subresource's slice of the staging buffer ends with the buffer.
+    #[test]
+    fn subresource_len_stays_inside_staging_bytes() {
+        // 4 rows of pitch 256, the last 128 long: 896 bytes staged, 1,024 of rows.
+        assert_eq!(super::subresource_len(0, 256, 4, 1, 896), 896);
+        assert_eq!(super::subresource_len(512, 256, 4, 1, 896), 384);
+        assert_eq!(super::subresource_len(0, 256, 4, 1, 2048), 1024);
+        assert_eq!(super::subresource_len(1024, 256, 4, 1, 896), 0);
+    }
+
+    /// A range past the address space's end, a no-access page and a guard
+    /// page are not there to read; a read-write page is.
+    #[test]
+    fn overflowing_ranges_and_unreadable_pages_are_not_there() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+        assert!(!super::committed(usize::MAX as *const u8, 64));
+        assert!(!super::committed_by_query(usize::MAX as *const u8, 64));
+        assert_eq!(super::readable(usize::MAX - 8, 64, true), (0, 1));
+        assert_eq!(super::mapped_bytes(usize::MAX as *const u8, 64), 0);
+        let page = |protect| {
+            // SAFETY: a page of our own, freed below.
+            let at =
+                unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, protect) };
+            assert!(!at.is_null());
+            at
+        };
+        // SAFETY: a page `page` made.
+        let free = |at| assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
+        let none = page(PAGE_NOACCESS);
+        assert!(!super::committed(none.cast(), 4096));
+        assert!(!super::committed_by_query(none.cast(), 4096));
+        assert_eq!(super::mapped_bytes(none.cast(), 4096), 0);
+        free(none);
+        let guard = page(PAGE_READWRITE | PAGE_GUARD);
+        assert!(!super::committed_by_query(guard.cast(), 4096));
+        free(guard);
+        let rw = page(PAGE_READWRITE);
+        assert!(super::committed(rw.cast(), 4096));
+        assert!(super::committed_by_query(rw.cast(), 4096));
+        assert_eq!(super::mapped_bytes(rw.cast(), 4096), 4096);
+        free(rw);
     }
 }
