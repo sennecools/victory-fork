@@ -10,10 +10,16 @@
 //! A first use queues the pipeline and waits for it within a budget per
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
 //! bake) are there at once as before; past the budget a draw or dispatch
-//! whose pipeline is not ready is dropped, as an untranslated one is.
+//! whose pipeline is not ready is dropped, as an untranslated one is. One
+//! pipeline's uses wait for it one frame's budget in all, not in every
+//! frame: one the host driver takes minutes to compile, or never finishes,
+//! is used in every frame meanwhile and would spend each frame's whole
+//! budget.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! The default budget is half a second per title frame, and as much in all
+//! for one pipeline. A pass the title runs only once and whose pipeline
+//! takes longer is lost, and a pass it runs in every frame is dropped until
+//! its pipeline is made.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -33,6 +39,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// How long its uses have waited for it, in microseconds.
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,7 +64,30 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
+    }
+
+    /// What is left of the waiting its uses are given: one frame's budget
+    /// in all.
+    fn wait_left(&self) -> Duration {
+        let waited = Duration::from_micros(self.waited_us.load(Ordering::Relaxed));
+        wait_budget().saturating_sub(waited)
+    }
+
+    /// Counts a use's wait; whether it was the one that used up the
+    /// pipeline's waiting (true at most once, so it is named once).
+    fn count_wait(&self, waited: Duration) -> bool {
+        // Relaxed: the count guards no other data (the host pipeline is
+        // published through `made`). Uses that wait at once each saw some
+        // left, so together they may wait a little over the budget. A wait
+        // is at most the budget and is only counted while some was left,
+        // so the sum stays far below u64::MAX.
+        let budget = wait_budget();
+        let waited = waited.min(budget).as_micros() as u64;
+        let budget = budget.as_micros() as u64;
+        let before = self.waited_us.fetch_add(waited, Ordering::Relaxed);
+        before < budget && before + waited >= budget
     }
 
     fn make(&self) {
@@ -125,7 +156,26 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        // Only what a use really waited counts: one that got nothing
+        // because the frame's budget was taken by others leaves the
+        // pipeline's own waiting for a later frame. One that could not be
+        // made counts as made (with no host pipeline): it is neither
+        // waited for nor named.
+        let left = p.wait_left();
+        if !left.is_zero()
+            && p.count_wait(wait(p, crate::frame::current(), left))
+            && p.made.get().is_none()
+        {
+            let shaders: Vec<String> = p
+                .shaders
+                .iter()
+                .map(|s| format!("{} {}", s.stage, s.hash))
+                .collect();
+            tracing::info!(
+                shaders = %shaders.join(" + "),
+                "a pipeline is still being made after a frame's budget of waiting; its uses no longer wait"
+            );
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -159,11 +209,12 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+/// Waits for `p` while frame `frame` has budget left, at most `most`; how
+/// long it waited.
+fn wait(p: &Pending, frame: u64, most: Duration) -> Duration {
     let budget = wait_budget();
     if budget.is_zero() {
-        return;
+        return Duration::ZERO;
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
@@ -174,14 +225,14 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(most);
         if shared {
             spent.1 += left;
         }
         left
     };
     if left.is_zero() {
-        return;
+        return Duration::ZERO;
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -211,6 +262,7 @@ fn wait(p: &Pending, frame: u64) {
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
+    waited
 }
 
 const NOT_QUEUED: u8 = 0;
@@ -361,6 +413,28 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline's uses wait one frame's budget in all: a use that got no
+    /// waiting does not count, and the wait that uses it up is told so once.
+    #[test]
+    fn a_pipeline_is_waited_for_one_budget_in_all() {
+        let budget = wait_budget();
+        if budget.is_zero() {
+            // VICTORY_PIPELINE_WAIT_MS=0 turns waiting off; nothing to count.
+            return;
+        }
+        let p = Pending::new(Vec::new(), None);
+        assert_eq!(p.wait_left(), budget);
+        assert!(!p.count_wait(Duration::ZERO));
+        assert_eq!(p.wait_left(), budget);
+        assert!(!p.count_wait(budget / 2));
+        assert_eq!(p.wait_left(), budget / 2);
+        assert!(p.count_wait(budget / 2));
+        assert!(p.wait_left().is_zero());
+        // A use that was waiting at the same time: counted, not named again.
+        assert!(!p.count_wait(budget));
+        assert!(p.wait_left().is_zero());
     }
 
     #[test]
