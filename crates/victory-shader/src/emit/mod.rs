@@ -213,6 +213,16 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
 }
 
+/// `VICTORY_REUSE_ALL` set: compute programs get the one-instruction-for-
+/// one-value pass (`bitcode::opt::REUSE`) too, which they otherwise skip
+/// (`Shader::finish`).
+///
+/// Part of the translation: the shader cache keys on it.
+pub fn reuse_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REUSE_ALL").is_some())
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
