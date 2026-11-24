@@ -579,9 +579,12 @@ fn create() -> windows::core::Result<Host> {
                 tracing::info!("GPU-based validation on");
             }
         }
-        // Diagnostics: device-removed data (the command that faulted, the
-        // faulting address), read when the device is removed.
-        if dred_on() {
+        // Device-removed data (the command that faulted, the faulting
+        // address), read when the device is removed: the driver keeps it,
+        // with no debug layer.
+        let mode = dred();
+        tracing::info!("dred mode: {}", mode.name());
+        if mode != Dred::Off {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
@@ -795,6 +798,11 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Names the list in the device-removed report's [`SENT_OPS`].
+    id: u32,
+    /// Its draws and dispatches in recorded order ([`HostList::op`]),
+    /// unless device-removed data is off.
+    ops: Mutex<Vec<Op>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1069,11 +1077,8 @@ impl PlanePass {
 /// heap, graphics root signature, pipeline, depth target, viewport,
 /// scissor and topology and puts none of them back: it is for a list that
 /// records nothing of the title's after it.
-fn record_plane_pass(
-    list: &ID3D12GraphicsCommandList,
-    depth: &ID3D12Resource,
-    plane: &ID3D12Resource,
-) {
+fn record_plane_pass(host_list: &HostList, depth: &ID3D12Resource, plane: &ID3D12Resource) {
+    let list = &host_list.list;
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return;
     };
@@ -1155,6 +1160,7 @@ fn record_plane_pass(
                 list.IASetPrimitiveTopology(
                     windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4),
                 );
+                host_list.op(OpKind::Plane, 0);
                 list.DrawInstanced(3, 1, 0, 0);
             }
             crate::resource::PLANES[0].fetch_add(1, Ordering::Relaxed);
@@ -1255,14 +1261,161 @@ fn record_twin_copy(
     }
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
-pub(crate) fn dred_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+/// What device-removed data is kept (`VICTORY_D3D12_DRED`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Dred {
+    /// None (`0` or `off`).
+    Off,
+    /// The default, in every build (or `lite`): the driver's breadcrumbs
+    /// and page-fault data, and per list one [`Op`] per draw or dispatch:
+    /// no text, no marker, no names. The full markers cost 450 to
+    /// 1,000 ms a frame in the title (the views a draw reads were looked
+    /// up and written out for every command).
+    Lite,
+    /// Any other value (diagnostics builds; a build without them keeps
+    /// [`Dred::Lite`]): also a marker with the text of every command, and
+    /// host objects named after what they hold.
+    Full,
+}
+
+impl Dred {
+    fn name(self) -> &'static str {
+        match self {
+            Dred::Off => "off",
+            Dred::Lite => "lite",
+            Dred::Full => "full",
+        }
+    }
+}
+
+/// The device-removed data kept in this run ([`Dred`]).
+pub(crate) fn dred() -> Dred {
+    static MODE: OnceLock<Dred> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var("VICTORY_D3D12_DRED").ok();
+        dred_mode(value.as_deref(), cfg!(feature = "diagnostics"))
     })
 }
+
+/// `VICTORY_D3D12_DRED`'s value as a mode, in a build with or without
+/// diagnostics. Pure, for testing.
+fn dred_mode(value: Option<&str>, diagnostics: bool) -> Dred {
+    match value.map(str::trim) {
+        None | Some("lite") => Dred::Lite,
+        Some("0" | "off") => Dred::Off,
+        Some(_) if diagnostics => Dred::Full,
+        Some(_) => Dred::Lite,
+    }
+}
+
+/// What a draw or dispatch recorded on a host list is ([`Op`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub(crate) enum OpKind {
+    Draw,
+    Indexed,
+    Mesh,
+    Dispatch,
+    Indirect,
+    /// Ours: the compute pass that clamps an indirect execution's records.
+    Clamp,
+    /// Ours: the pass that draws a depth plane's twin into the plane.
+    Plane,
+}
+
+impl OpKind {
+    fn name(self) -> &'static str {
+        match self {
+            OpKind::Draw => "draw",
+            OpKind::Indexed => "indexed draw",
+            OpKind::Mesh => "mesh dispatch",
+            OpKind::Dispatch => "dispatch",
+            OpKind::Indirect => "indirect execution",
+            OpKind::Clamp => "indirect clamp (ours)",
+            OpKind::Plane => "depth plane pass (ours)",
+        }
+    }
+
+    /// The breadcrumb the driver keeps for it.
+    fn breadcrumb(self) -> D3D12_AUTO_BREADCRUMB_OP {
+        match self {
+            OpKind::Draw | OpKind::Plane => D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED,
+            OpKind::Indexed => D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED,
+            OpKind::Mesh => D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH,
+            OpKind::Dispatch | OpKind::Clamp => D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
+            OpKind::Indirect => D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT,
+        }
+    }
+}
+
+/// Whether a breadcrumb is one [`OpKind::breadcrumb`] gives: the k-th of
+/// those in a list is its k-th [`Op`].
+fn is_op_breadcrumb(op: D3D12_AUTO_BREADCRUMB_OP) -> bool {
+    [
+        D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED,
+        D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED,
+        D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH,
+        D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
+        D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT,
+    ]
+    .contains(&op)
+}
+
+/// A draw or dispatch recorded on a host list, for the device-removed
+/// report: what it is and its pipeline's key ([`pipeline_key`]; 0 for
+/// ours).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Op {
+    kind: OpKind,
+    pipeline: u64,
+}
+
+/// The ops a host list reserves room for when it is made.
+const OPS_RESERVED: usize = 512;
+
+/// The last [`Op`]s sent to the card, oldest first, with the id of their
+/// list ([`HostList::id`]): what ran just before a removal when no list
+/// of the failed submission names it.
+static SENT_OPS: Mutex<std::collections::VecDeque<(u32, Op)>> =
+    Mutex::new(std::collections::VecDeque::new());
+/// The ops [`SENT_OPS`] keeps.
+const SENT_OPS_KEPT: usize = 64;
+
+/// Pipelines by key ([`pipeline_key`]), for the device-removed report.
+static PIPELINE_NAMES: Mutex<Option<std::collections::HashMap<u64, String>>> = Mutex::new(None);
+
+/// The key the draws and dispatches of the pipeline `name` (its shaders)
+/// are recorded with: the first 8 bytes of the name's BLAKE3. Kept with
+/// the name for the report, unless device-removed data is off.
+pub(crate) fn pipeline_key(name: &str) -> u64 {
+    let hash = blake3::hash(name.as_bytes());
+    let key = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap_or_default());
+    if dred() != Dred::Off {
+        PIPELINE_NAMES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(std::collections::HashMap::new)
+            .entry(key)
+            .or_insert_with(|| name.to_owned());
+    }
+    key
+}
+
+/// A pipeline key and its name, for the report.
+fn pipeline_named(key: u64) -> String {
+    if key == 0 {
+        return "ours".to_owned();
+    }
+    let names = PIPELINE_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let name = names
+        .as_ref()
+        .and_then(|n| n.get(&key))
+        .map_or("unknown", String::as_str);
+    format!("{key:016x} {name}")
+}
+
+/// Ids for host lists ([`HostList::id`]).
+static LIST_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Indirect mesh dispatches since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
@@ -1276,7 +1429,7 @@ static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::a
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// builds; the commands are noted with `VICTORY_D3D12_DRED=1`).
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -1284,9 +1437,9 @@ fn timing() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with the full device-removed data).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
-    if dred_on()
+    if dred() == Dred::Full
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
         // SAFETY: a plain call on a live object.
@@ -3217,6 +3370,12 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
+                id: LIST_IDS.fetch_add(1, Ordering::Relaxed),
+                ops: Mutex::new(Vec::with_capacity(if dred() == Dred::Off {
+                    0
+                } else {
+                    OPS_RESERVED
+                })),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4635,6 +4794,7 @@ impl Host {
         }
         for list in runs {
             list.run_deferred(&mut batch);
+            list.sent_ops();
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -4838,12 +4998,22 @@ impl Host {
         None
     }
 
-    /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
-    /// it lies in (by the names we give them) or the title memory copy just
-    /// below it; for each list that did not finish, the command it stopped
-    /// at and what the draws and dispatches in flight there run (or, in
-    /// lists that never started, the pipelines they bind).
+    /// For the report of a removed device: the driver's device-removed
+    /// data ([`Host::driver_removal_data`]), then the last ops sent, the
+    /// view clamp, the loop limit, the build and the mode.
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        let mut text = self.driver_removal_data(runs);
+        text.push_str(&removal_state());
+        text
+    }
+
+    /// Unless device-removed data is off: the faulting address, its class,
+    /// and the allocations it lies in (by the names we give them, with the
+    /// full data) or the title memory copy just below it; for each list
+    /// that did not finish, the command it stopped at, what the draws and
+    /// dispatches in flight there run (or, in lists that never started,
+    /// the pipelines they bind) and its last op finished and first not.
+    fn driver_removal_data(&self, runs: &[&HostList]) -> String {
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
             return String::new();
         };
@@ -4881,6 +5051,7 @@ impl Host {
                 }
                 text.push_str(&crate::shadow::near(va));
                 text.push_str(&crate::descriptor::host::near_heaps(va));
+                text.push_str(&crate::descriptor::host::fault_class(va));
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
@@ -4938,6 +5109,9 @@ impl Host {
                     } else if let Some(r) = run {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
+                    }
+                    if let Some(r) = run {
+                        text.push_str(&r.stopped_ops(history, done as usize));
                     }
                 }
                 plain = p.pNext;
@@ -5121,6 +5295,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.ops.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -5293,7 +5468,7 @@ impl HostList {
         let Some(plane) = &twin.plane else { return };
         self.settle(depth, DEPTH_WRITE);
         self.settle(plane, PIXEL_SHADER_RESOURCE);
-        record_plane_pass(&self.list, &depth.texture, &plane.texture);
+        record_plane_pass(self, &depth.texture, &plane.texture);
         self.settle(plane, UNORDERED_ACCESS);
     }
 
@@ -5463,8 +5638,8 @@ impl HostList {
     }
 
     /// Notes what the command about to be recorded does, as a marker
-    /// command whose text the list keeps (diagnostics, with device-removed
-    /// data on): the report pairs the breadcrumbs' marker commands with the
+    /// command whose text the list keeps (diagnostics, with the full
+    /// device-removed data, [`Dred::Full`]): the report pairs the breadcrumbs' marker commands with the
     /// texts in order and names the commands a fault stopped among.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_op(&self, what: impl FnOnce() -> String) {
@@ -5480,7 +5655,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        if dred() != Dred::Full {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -5505,6 +5680,48 @@ impl HostList {
                 .push((what, range));
             crate::copystat::add(crate::copystat::C::NoteNs, started.elapsed().as_nanos() as u64);
         }
+    }
+
+    /// Notes a draw or dispatch about to be recorded on the list, unless
+    /// device-removed data is off: called just before the host call, by
+    /// every one recorded on the list (the report pairs the k-th such
+    /// breadcrumb with the k-th op).
+    pub(crate) fn op(&self, kind: OpKind, pipeline: u64) {
+        if dred() != Dred::Off {
+            self.ops
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Op { kind, pipeline });
+        }
+    }
+
+    /// The list goes to the card: its last ops go into [`SENT_OPS`].
+    fn sent_ops(&self) {
+        if dred() == Dred::Off {
+            return;
+        }
+        let ops = self.ops.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sent = SENT_OPS.lock().unwrap_or_else(|e| e.into_inner());
+        for &op in &ops[ops.len().saturating_sub(SENT_OPS_KEPT)..] {
+            if sent.len() == SENT_OPS_KEPT {
+                sent.pop_front();
+            }
+            sent.push_back((self.id, op));
+        }
+    }
+
+    /// For the device-removed report, where the list stopped at command
+    /// `done` of `history` (its breadcrumbs): its last draw or dispatch
+    /// that finished and the first that did not, by its [`Op`]s.
+    fn stopped_ops(&self, history: &[D3D12_AUTO_BREADCRUMB_OP], done: usize) -> String {
+        if dred() == Dred::Off {
+            return String::new();
+        }
+        stopped_ops(
+            &self.ops.lock().unwrap_or_else(|e| e.into_inner()),
+            history,
+            done,
+        )
     }
 
     /// Whether nothing recorded since the list was opened does any work:
@@ -7003,9 +7220,81 @@ impl Host {
     }
 }
 
+/// For the report of a removed device: the last ops sent to the card
+/// ([`SENT_OPS`], repeats joined) and their pipelines, whether view indices
+/// are clamped, the loop limit, our executable's BLAKE3 and the
+/// device-removed data's mode.
+fn removal_state() -> String {
+    use std::fmt::Write;
+    let mut text = String::new();
+    {
+        let sent = SENT_OPS.lock().unwrap_or_else(|e| e.into_inner());
+        if !sent.is_empty() {
+            let _ = write!(
+                text,
+                "; the last {} draws and dispatches sent, oldest first:",
+                sent.len()
+            );
+            let mut pipelines = Vec::new();
+            let mut i = 0;
+            while i < sent.len() {
+                let same = sent.iter().skip(i).take_while(|&&s| s == sent[i]).count();
+                let (list, op) = sent[i];
+                let _ = write!(text, " list {list} {} {:016x}", op.kind.name(), op.pipeline);
+                if same > 1 {
+                    let _ = write!(text, " x{same}");
+                }
+                text.push(',');
+                if op.pipeline != 0 && !pipelines.contains(&op.pipeline) {
+                    pipelines.push(op.pipeline);
+                }
+                i += same;
+            }
+            text.pop();
+            for key in pipelines {
+                let _ = write!(text, "; pipeline {}", pipeline_named(key));
+            }
+        }
+    }
+    match victory_shader::emit::view_heap_limit() {
+        0 => text.push_str("; view indices not clamped"),
+        slot => {
+            let _ = write!(text, "; view indices clamped to null slot {slot}");
+        }
+    }
+    match victory_shader::emit::loop_limit() {
+        victory_shader::emit::DEFAULT_LOOP_LIMIT => {
+            text.push_str("; loop limit the default per stage")
+        }
+        limit => {
+            let _ = write!(text, "; loop limit {limit} (VICTORY_SHADER_LOOP_LIMIT)");
+        }
+    }
+    let _ = write!(
+        text,
+        "; build {}; dred mode {}",
+        build_hash(),
+        dred().name()
+    );
+    text
+}
+
+/// The first 8 bytes of our executable's BLAKE3, as hex.
+fn build_hash() -> String {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| match std::env::current_exe().and_then(std::fs::read) {
+        Ok(bytes) => blake3::hash(&bytes).as_bytes()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+        Err(e) => format!("unknown ({e})"),
+    })
+    .clone()
+}
+
 /// For adapters without device-removed data (the software one): the last
 /// commands each list of the failed submission noted (diagnostics, with
-/// `VICTORY_D3D12_DRED`).
+/// `VICTORY_D3D12_DRED=1`).
 fn last_notes(runs: &[&HostList]) -> String {
     #[cfg(feature = "diagnostics")]
     {
@@ -7037,6 +7326,44 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
     } else {
         format!(" (fault {:#x} past its source's end)", va - end)
     }
+}
+
+/// [`HostList::stopped_ops`]: `ops` paired with the draw and dispatch
+/// breadcrumbs of `history` in order (if they match one for one), the
+/// last of them before command `done` and the first from it on.
+fn stopped_ops(ops: &[Op], history: &[D3D12_AUTO_BREADCRUMB_OP], done: usize) -> String {
+    let crumbs: Vec<usize> = (0..history.len())
+        .filter(|&at| is_op_breadcrumb(history[at]))
+        .collect();
+    if crumbs.len() != ops.len()
+        || crumbs
+            .iter()
+            .zip(ops)
+            .any(|(&at, op)| history[at] != op.kind.breadcrumb())
+    {
+        return format!(
+            "; its {} draw and dispatch commands do not match its {} ops",
+            crumbs.len(),
+            ops.len()
+        );
+    }
+    let say = |what: &str, k: Option<usize>| match k {
+        Some(k) => format!(
+            "; {what}: op {k} of {} (command {}), {} of pipeline {}",
+            ops.len(),
+            crumbs[k],
+            ops[k].kind.name(),
+            pipeline_named(ops[k].pipeline)
+        ),
+        None => format!("; {what}: none"),
+    };
+    let last = crumbs.iter().rposition(|&at| at < done);
+    let first = crumbs.iter().position(|&at| at >= done);
+    format!(
+        "{}{}",
+        say("last draw or dispatch finished", last),
+        say("first not finished", first)
+    )
 }
 
 /// The commands that may have been running where a list stopped at
@@ -7198,6 +7525,77 @@ mod trail {
         assert!(text.contains("pipeline library: no call running"));
         assert!(text.contains(&format!("thing {} done", super::TRAIL_MOST + 4)));
         assert!(!text.contains("thing 4 done"), "the oldest entries are dropped");
+    }
+}
+
+#[cfg(test)]
+mod dred {
+    use super::*;
+
+    /// Lite unless set: `0` or `off` turn it off, any other value asks for
+    /// the full data, which only a diagnostics build has.
+    #[test]
+    fn the_dred_switch_has_three_modes() {
+        for diagnostics in [false, true] {
+            assert_eq!(dred_mode(None, diagnostics), Dred::Lite);
+            assert_eq!(dred_mode(Some("lite"), diagnostics), Dred::Lite);
+            assert_eq!(dred_mode(Some("0"), diagnostics), Dred::Off);
+            assert_eq!(dred_mode(Some(" off "), diagnostics), Dred::Off);
+        }
+        assert_eq!(dred_mode(Some("1"), true), Dred::Full);
+        assert_eq!(dred_mode(Some("full"), true), Dred::Full);
+        assert_eq!(dred_mode(Some("1"), false), Dred::Lite);
+    }
+
+    /// The k-th draw or dispatch breadcrumb is the k-th op: the report
+    /// names the last one before the stop and the first from it on.
+    #[test]
+    fn a_stopped_list_names_its_ops_around_the_stop() {
+        let (barrier, marker) = (
+            D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER,
+            D3D12_AUTO_BREADCRUMB_OP_SETMARKER,
+        );
+        let history = [
+            barrier,
+            D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
+            marker,
+            D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED,
+            barrier,
+            D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT,
+        ];
+        let ops = [
+            Op {
+                kind: OpKind::Clamp,
+                pipeline: 0,
+            },
+            Op {
+                kind: OpKind::Indexed,
+                pipeline: 0x1234,
+            },
+            Op {
+                kind: OpKind::Indirect,
+                pipeline: 0x5678,
+            },
+        ];
+        let text = stopped_ops(&ops, &history, 4);
+        assert!(text.contains("last draw or dispatch finished: op 1 of 3 (command 3), indexed draw of pipeline 0000000000001234"), "{text}");
+        assert!(text.contains("first not finished: op 2 of 3 (command 5), indirect execution of pipeline 0000000000005678"), "{text}");
+        assert!(stopped_ops(&ops, &history, 0).contains("last draw or dispatch finished: none"));
+        // Out of step: nothing is paired.
+        let text = stopped_ops(&ops[..2], &history, 4);
+        assert_eq!(
+            text,
+            "; its 3 draw and dispatch commands do not match its 2 ops"
+        );
+        let wrong = [
+            ops[0],
+            Op {
+                kind: OpKind::Draw,
+                pipeline: 0,
+            },
+            ops[2],
+        ];
+        assert!(stopped_ops(&wrong, &history, 4).contains("do not match"));
     }
 }
 

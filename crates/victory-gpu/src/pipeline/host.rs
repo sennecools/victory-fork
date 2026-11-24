@@ -314,6 +314,9 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// The key its draws and dispatches are recorded with, for the
+    /// device-removed report (`crate::host::pipeline_key`).
+    pub(crate) key: u64,
     /// A rectangle-list pipeline whose geometry stage (ours) completes each
     /// rectangle from its three vertices: its draws run as triangle lists
     /// with the title's own vertex counts.
@@ -550,6 +553,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                key: crate::host::pipeline_key(&format!("{shaders:?}")),
                 slots: 0,
                 inputs: Vec::new(),
                 rect_gs: false,
@@ -616,6 +620,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                key: crate::host::pipeline_key(&format!("{shaders:?}")),
                 slots: 0,
                 inputs: Vec::new(),
                 rect_gs: false,
@@ -712,6 +717,7 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
+            key: crate::host::pipeline_key(&format!("{shaders:?}")),
             slots: g.slots(),
             inputs: g.elements(),
             rect_gs: gs.is_some(),

@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, OpKind, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -265,7 +265,16 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let clamped = record_clamp(c, &list.list, &dst, budget, src, count, spec);
+    clamped.then(|| noted(list, spec, dst))
+}
+
+/// A clamp just recorded on `list`: noted as its op if it dispatched.
+fn noted(list: &HostList, (_, _, records): (u32, u32, u32), dst: ID3D12Resource) -> ID3D12Resource {
+    if records > 0 {
+        list.op(OpKind::Clamp, 0);
+    }
+    dst
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -285,7 +294,8 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let clamped = record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true);
+    clamped.then(|| noted(list, spec, dst))
 }
 
 fn record_clamp(

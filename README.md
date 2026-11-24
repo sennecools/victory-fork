@@ -131,7 +131,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, also the text of the commands in flight and the names of the allocations hit (slow) |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
@@ -140,7 +140,10 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+title's data folder. For a removed host device it writes the driver's
+device-removed data: the faulting address and its class, the draw or
+dispatch each list stopped at with its pipeline, and the last ones sent
+(`VICTORY_D3D12_DRED=lite`, the default; `0` turns it off).
 
 ## License
 

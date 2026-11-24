@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{HostList, OpKind};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -219,6 +219,9 @@ pub(crate) struct State {
     window: Option<Window>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
+    /// The key of the pipeline bound last ([`HostPipeline::key`]), for the
+    /// list's ops ([`HostList::op`]).
+    host_key: u64,
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
@@ -978,6 +981,7 @@ impl State {
             }
             self.host_roots[usize::from(compute)] = root;
         }
+        self.host_key = p.key;
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
         if self.host_pipeline != p.pso.as_raw() as usize {
@@ -2072,6 +2076,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.op(OpKind::Dispatch, self.host_key);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2342,6 +2347,7 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    list.op(OpKind::Mesh, self.host_key);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
@@ -2744,6 +2750,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.op(OpKind::Draw, self.host_key);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2839,6 +2846,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.op(OpKind::Indexed, self.host_key);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3034,6 +3042,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        list.op(OpKind::Indirect, self.host_key);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {

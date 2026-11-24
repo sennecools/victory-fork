@@ -790,6 +790,42 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
+/// For device-removed reports: the class of a faulting host GPU address
+/// `va`. Low: below 4 GiB (no host heap or buffer of ours lies there; a
+/// null view read as another kind gave such addresses). Mid: within 4 GiB
+/// of a host descriptor heap (a view index past the heap's end: the 24-bit
+/// "no descriptor" index is 512 MiB of views past the start). Wild:
+/// anywhere else. With the heap nearest to it.
+pub(crate) fn fault_class(va: u64) -> String {
+    fault_class_in(va, &GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// [`fault_class`] against the heaps `ranges` ([`GPU_RANGES`]). Pure, for
+/// testing.
+fn fault_class_in(va: u64, ranges: &[(u64, u64, u64, bool)]) -> String {
+    const FOUR_GIB: u64 = 1 << 32;
+    let distance = |&&(start, bytes, _, _): &&(u64, u64, u64, bool)| {
+        if va < start {
+            start - va
+        } else {
+            va.saturating_sub(start.saturating_add(bytes))
+        }
+    };
+    let nearest = ranges.iter().min_by_key(distance);
+    let class = match nearest {
+        _ if va < FOUR_GIB => "low",
+        Some(heap) if distance(&heap) < FOUR_GIB => "mid",
+        _ => "wild",
+    };
+    match nearest {
+        Some(&(start, bytes, _, sampler)) => format!(
+            "; fault class {class}, nearest the {} heap {start:#x}+{bytes:#x}",
+            if sampler { "sampler" } else { "view" }
+        ),
+        None => format!("; fault class {class}, no host heap"),
+    }
+}
+
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
@@ -3154,6 +3190,40 @@ mod tests {
         };
         assert!(same_placed_texture(&slice(2), &slice(2)));
         assert!(!same_placed_texture(&slice(2), &slice(3)));
+    }
+
+    /// A faulting address is low below 4 GiB, mid within 4 GiB of a host
+    /// heap and wild elsewhere, with the heap nearest to it.
+    #[test]
+    fn a_fault_is_classed_by_its_distance_from_the_heaps() {
+        const GIB: u64 = 1 << 30;
+        let heaps = [(16 * GIB, GIB, 32, false), (40 * GIB, GIB, 32, true)];
+        assert!(
+            fault_class_in(37 << 20, &heaps)
+                .starts_with("; fault class low, nearest the view heap")
+        );
+        // The 24-bit "no descriptor" index read as a view past the heap's end.
+        let past = 16 * GIB + 0x00FF_FFFF * 32;
+        assert_eq!(
+            fault_class_in(past, &heaps),
+            format!(
+                "; fault class mid, nearest the view heap {:#x}+{GIB:#x}",
+                16 * GIB
+            )
+        );
+        assert!(
+            fault_class_in(15 * GIB, &heaps)
+                .starts_with("; fault class mid, nearest the view heap")
+        );
+        assert!(
+            fault_class_in(42 * GIB, &heaps)
+                .starts_with("; fault class mid, nearest the sampler heap")
+        );
+        assert!(fault_class_in(28 * GIB, &heaps).starts_with("; fault class wild"));
+        assert_eq!(
+            fault_class_in(28 * GIB, &[]),
+            "; fault class wild, no host heap"
+        );
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
