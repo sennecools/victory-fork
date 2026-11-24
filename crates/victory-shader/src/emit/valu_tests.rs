@@ -2311,3 +2311,213 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
         }
     }
 }
+
+/// MTBUF instruction encoding (`tbuffer_load_format_*`, soffset = inline 0).
+const fn mtbuf(op: u8, format: u8, vdata: u8, vaddr: u8, srsrc: u8, offset: u16) -> [u32; 2] {
+    [
+        0x3A << 26
+            | (format as u32 & 0x7F) << 19
+            | (op as u32 & 0x7) << 16
+            | (offset as u32 & 0xFFF),
+        0x80 << 24
+            | ((op as u32 >> 3) & 1) << 21
+            | ((srsrc as u32 >> 2) & 0x1F) << 16
+            | (vdata as u32) << 8
+            | vaddr as u32,
+    ]
+}
+
+#[test]
+fn tbuffer_load_format_d16_packs_float_and_int_channels() {
+    // MTBUF opcodes: tbuffer_load_format_d16_xyz = 0x0a, tbuffer_load_format_d16_xyzw = 0x0b.
+    // Input raw SRV at table offset 0 dwords (heap index 0); output raw UAV at 8 dwords (index 1).
+    let cases: &[(u8, u8, &[u32], [u32; 2], &str)] = &[
+        // 16_16_16_16_FLOAT (71), xyzw: [1.0, -2.0, 0.5, 4.0]
+        (
+            0x0B,
+            71,
+            &[0xC000_3C00, 0x4400_3800],
+            [0xC000_3C00, 0x4400_3800],
+            "16_16_16_16_FLOAT xyzw",
+        ),
+        // 16_16_FLOAT (29), xyzw: missing z=0.0 (0x0000), w=1.0 (0x3C00)
+        (
+            0x0B,
+            29,
+            &[0xBC00_3800, 0],
+            [0xBC00_3800, 0x3C00_0000],
+            "16_16_FLOAT xyzw defaults",
+        ),
+        // 16_16_16_16_FLOAT (71), xyz: odd 3rd channel leaves high half of v2 zero
+        (
+            0x0A,
+            71,
+            &[0xC000_3C00, 0x4400_3800],
+            [0xC000_3C00, 0x0000_3800],
+            "16_16_16_16_FLOAT xyz",
+        ),
+        // 8_8_8_8_UINT (60), xyzw: [0x01, 0x12, 0x80, 0xFF]
+        (
+            0x0B,
+            60,
+            &[0xFF80_1201],
+            [0x0012_0001, 0x00FF_0080],
+            "8_8_8_8_UINT xyzw",
+        ),
+        // 8_8_8_8_SINT (61), xyzw: [-1, -128, 127, 0]
+        (
+            0x0B,
+            61,
+            &[0x007F_80FF],
+            [0xFF80_FFFF, 0x0000_007F],
+            "8_8_8_8_SINT xyzw",
+        ),
+        // 32_32_32_32_UINT (75), xyzw: clamps values > 0xFFFF to 0xFFFF
+        (
+            0x0B,
+            75,
+            &[0, 65535, 70000, u32::MAX],
+            [0xFFFF_0000, 0xFFFF_FFFF],
+            "32_32_32_32_UINT xyzw clamp",
+        ),
+        // 32_32_32_32_SINT (76), xyzw: clamps to [-32768, 32767]
+        (
+            0x0B,
+            76,
+            &[(-40000i32) as u32, (-1i32) as u32, 32767, 50000],
+            [0xFFFF_8000, 0x7FFF_7FFF],
+            "32_32_32_32_SINT xyzw clamp",
+        ),
+    ];
+
+    for &(op, fmt, input, want, label) in cases {
+        let mut words = Vec::new();
+        words.push(s_mov_b32(5, 0x80)); // s5 = 0
+        words.extend_from_slice(&s_load_dwordx4(8, 4)); // s[8:11] = SRV (offset 0)
+        // s_load_dwordx4 s[12:15], s[4:5], 0x20 (UAV at table offset 8 dwords)
+        words.extend_from_slice(&[0xF408_0302, 0xFA00_0020]);
+        words.push(vop1(0x001, 0, 0x80)); // v0 = 0
+        words.extend_from_slice(&mtbuf(op, fmt, 1, 0, 8, 0)); // load into v[1:2]
+        words.extend_from_slice(&buffer_store_dword(1, 12, 0));
+        words.extend_from_slice(&buffer_store_dword(2, 12, 4));
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let l = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        #[cfg(windows)]
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        views: &[
+                            View::Buffer {
+                                data: input,
+                                stride: super::host::Stride::Raw,
+                            },
+                            View::RawUav(16),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                [out[0][0], out[0][1]],
+                want,
+                "{backend}: {label}: got [{:#010x}, {:#010x}], want [{:#010x}, {:#010x}]",
+                out[0][0],
+                out[0][1],
+                want[0],
+                want[1],
+            );
+        }
+    }
+}
