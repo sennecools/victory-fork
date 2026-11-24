@@ -557,10 +557,23 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, Some(&name)) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    // Without the debug layer the driver gives no reason:
+                    // which part of the description it refuses is found by
+                    // trying again with parts of it made neutral.
+                    let refused = mesh_refusal(&host.device, &root, code(0), code(1), g);
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        root_parameters = params.len(),
+                        static_samplers = samplers.len(),
+                        refused,
+                        state,
+                        "host mesh pipeline refused"
+                    );
+                    // The debug layer's messages, if any, of every attempt.
                     host.log_messages();
                     return None;
                 }
@@ -710,13 +723,16 @@ impl HostPipeline {
 /// "already exists"). The translation makes triangle mesh shaders only
 /// (`mesh_prologue` refuses others), and the debug layer wants the two to
 /// agree (1323).
+///
+/// With a `name`, the pipeline is loaded from the library or stored there;
+/// without one it is only made.
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
-    name: &str,
+    name: Option<&str>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     /// A stream subobject: its type, then its description, pointer-aligned.
@@ -757,13 +773,74 @@ fn mesh_pipeline(
         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
     };
     let device = device.cast::<ID3D12Device2>()?;
-    super::library::pipeline(
-        name,
-        // SAFETY: the stream holds whole subobjects pointing at live data.
-        |library, name| unsafe { library.LoadPipeline(name, &desc) },
-        // SAFETY: as above.
-        || unsafe { device.CreatePipelineState(&desc) },
-    )
+    // SAFETY: the stream holds whole subobjects pointing at live data.
+    let create = || unsafe { device.CreatePipelineState(&desc) };
+    match name {
+        Some(name) => super::library::pipeline(
+            name,
+            // SAFETY: as above.
+            |library, name| unsafe { library.LoadPipeline(name, &desc) },
+            create,
+        ),
+        None => create(),
+    }
+}
+
+/// Which part of a refused mesh pipeline's description the driver refuses:
+/// it is made again (outside the library) with one part after another made
+/// neutral, and the part whose neutral form is first accepted is named.
+/// Each step keeps the ones before it, so the part named is one the
+/// pipeline needs changed once those before it are neutral too.
+fn mesh_refusal(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+    ms: D3D12_SHADER_BYTECODE,
+    ps: D3D12_SHADER_BYTECODE,
+    g: &GraphicsState,
+) -> &'static str {
+    let neutral = GraphicsState::default();
+    let mut s = GraphicsState {
+        blend: g.blend,
+        sample_mask: g.sample_mask,
+        rasterizer: g.rasterizer,
+        depth: g.depth,
+        targets: g.targets,
+        depth_format: g.depth_format,
+        samples: g.samples,
+        ..GraphicsState::default()
+    };
+    let accepted = |s: &GraphicsState, ps| mesh_pipeline(device, root, ms, ps, s, None).is_ok();
+    s.blend = neutral.blend;
+    s.sample_mask = neutral.sample_mask;
+    if accepted(&s, ps) {
+        return "the blend state or sample mask";
+    }
+    s.rasterizer = neutral.rasterizer;
+    if accepted(&s, ps) {
+        return "the rasterizer state";
+    }
+    // Off rather than D3D12's default, which tests depth: valid with any
+    // depth format, and with none (the next step).
+    s.depth = D3D12_DEPTH_STENCIL_DESC {
+        DepthEnable: false.into(),
+        ..neutral.depth
+    };
+    if accepted(&s, ps) {
+        return "the depth and stencil state";
+    }
+    s.targets = D3D12_RT_FORMAT_ARRAY::default();
+    s.targets.NumRenderTargets = 1;
+    s.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    s.depth_format = DXGI_FORMAT_UNKNOWN;
+    s.samples = neutral.samples;
+    if accepted(&s, ps) {
+        return "the target formats, depth format or sample count";
+    }
+    // A mesh pipeline may leave the pixel stage out.
+    if accepted(&s, D3D12_SHADER_BYTECODE::default()) {
+        return "the pixel shader or how it links to the mesh shader";
+    }
+    "the mesh shader or the root signature"
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -1575,12 +1652,81 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, Some(&name)).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, Some(&name))
+            .expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
+        );
+    }
+
+    /// A refused mesh pipeline names the part of its state the driver
+    /// refuses: each case breaks one part, which the steps before its own
+    /// leave as it is.
+    #[test]
+    fn a_refused_mesh_pipeline_names_the_part_refused() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        let title = || {
+            let mut g = GraphicsState::default();
+            g.targets.NumRenderTargets = 1;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            g.depth_format = DXGI_FORMAT_D32_FLOAT;
+            g
+        };
+        type Breaks = fn(&mut GraphicsState);
+        let cases: [(&str, Breaks); 4] = [
+            ("the blend state or sample mask", |g| {
+                // Logic operations are for integer targets only.
+                g.blend.RenderTarget[0].LogicOpEnable = true.into();
+                g.blend.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_CLEAR;
+            }),
+            ("the rasterizer state", |g| {
+                g.rasterizer.FillMode = D3D12_FILL_MODE(0)
+            }),
+            ("the depth and stencil state", |g| {
+                g.depth.DepthFunc = D3D12_COMPARISON_FUNC(0)
+            }),
+            ("the target formats, depth format or sample count", |g| {
+                g.samples.Count = 0
+            }),
+        ];
+        for (part, breaks) in cases {
+            let mut g = title();
+            mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, None)
+                .expect("the unbroken state is accepted");
+            breaks(&mut g);
+            assert!(
+                mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, None).is_err(),
+                "{part}: the broken state was accepted"
+            );
+            assert_eq!(
+                mesh_refusal(&host.device, &root, code(&ms), code(&ps), &g),
+                part
+            );
+        }
+        // Accepted only without its pixel shader: one that reads an input
+        // the mesh shader does not write.
+        let reads = compile(
+            &dxc,
+            dir.path(),
+            "float4 main(float4 c : COLOR) : SV_Target { return c; }",
+            "ps_6_5",
+        );
+        assert_eq!(
+            mesh_refusal(&host.device, &root, code(&ms), code(&reads), &title()),
+            "the pixel shader or how it links to the mesh shader"
         );
     }
 }
