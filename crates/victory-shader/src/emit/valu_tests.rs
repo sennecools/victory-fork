@@ -1323,12 +1323,24 @@ const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
     ]
 }
 
+/// DS `op vdst, addr, data0, data1` at offset 0.
+const fn ds2(op: u8, vdst: u8, addr: u8, data0: u8, data1: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18,
+        (vdst as u32) << 24 | (data1 as u32) << 16 | (data0 as u32) << 8 | addr as u32,
+    ]
+}
+
 const DS_WRITE_B32: u8 = 0x0D;
+const DS_CMPST_F32: u8 = 0x11;
 const DS_MIN_F32: u8 = 0x12;
 const DS_MAX_F32: u8 = 0x13;
+const DS_ADD_F32: u8 = 0x15;
+const DS_CMPST_RTN_F32: u8 = 0x31;
 const DS_MIN_RTN_F32: u8 = 0x32;
 const DS_MAX_RTN_F32: u8 = 0x33;
 const DS_READ_B32: u8 = 0x36;
+const DS_ADD_RTN_F32: u8 = 0x55;
 
 /// What RDNA2 writes for `ds_max_f32` / `ds_min_f32` over a dword holding
 /// `old` with `data` (bits), as measured on gfx1036 with f32 denormals kept:
@@ -2018,6 +2030,103 @@ fn v_ldexp_f32_scales_and_handles_edge_cases() {
             got, mod_cases[i].1,
             "{backend}: v_ldexp_f32(-v1, v2) clamp case {i} = {got:#010x}, want {:#010x}",
             mod_cases[i].1,
+        );
+    });
+}
+
+#[test]
+fn ds_add_f32_accumulates_atomically_across_waves() {
+    // 64 threads: LDS[0] = v1, every thread adds (thread_id + 1) as f32 -> +2080.0.
+    let mut body = vec![vop1(0x001, 5, 0x80)]; // v5 = 0
+    body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    body.push(S_BARRIER);
+    body.push(vop2(0x25, 6, 0x81, 0)); // v_add_nc_u32 v6, 1, v0
+    body.push(vop1(0x005, 6, vgpr(6))); // v_cvt_f32_i32 v6, v6
+    body.extend(ds(DS_ADD_F32, 0, 5, 6));
+    body.push(S_BARRIER);
+    body.extend(ds(DS_READ_B32, 0, 5, 0));
+    let shader = build_cs(&body, 64, 512);
+    for (init, want) in [(0.0f32, 2080.0f32), (-100.5, 1979.5), (1024.0, 3104.0)] {
+        run_cases(&shader, &[[init.to_bits(), 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(
+                f32::from_bits(got),
+                want,
+                "{backend}: ds_add_f32 from {init} over 64 threads",
+            );
+        });
+    }
+
+    // Per-lane isolated slot (v5 = v0 << 2): check ds_add_rtn_f32 old value and updated value.
+    let mut ret_old = vec![vop2(0x1A, 5, 0x82, 0)]; // v_lshlrev_b32 v5, 2, v0
+    ret_old.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    ret_old.extend(ds(DS_ADD_RTN_F32, 0, 5, 2));
+    let mut ret_new = vec![vop2(0x1A, 5, 0x82, 0)];
+    ret_new.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    ret_new.extend(ds(DS_ADD_RTN_F32, 6, 5, 2));
+    ret_new.extend(ds(DS_READ_B32, 0, 5, 0));
+    let s_old = build_cs(&ret_old, 64, 512);
+    let s_new = build_cs(&ret_new, 64, 512);
+    let add_cases: &[(f32, f32, f32)] = &[
+        (1.5, 2.25, 3.75),
+        (-3.5, 3.5, 0.0),
+        (f32::INFINITY, -1.0, f32::INFINITY),
+    ];
+    let inputs: Vec<[u32; 4]> = add_cases
+        .iter()
+        .map(|&(a, b, _)| [a.to_bits(), b.to_bits(), 0, 0])
+        .collect();
+    run_cases(&s_old, &inputs, |backend, i, _, got| {
+        assert_eq!(
+            got,
+            add_cases[i].0.to_bits(),
+            "{backend}: ds_add_rtn_f32 old value case {i}",
+        );
+    });
+    run_cases(&s_new, &inputs, |backend, i, _, got| {
+        assert_eq!(
+            got,
+            add_cases[i].2.to_bits(),
+            "{backend}: ds_add_rtn_f32 new value case {i}",
+        );
+    });
+}
+
+#[test]
+fn ds_cmpst_f32_compares_as_ieee_floats() {
+    // Per-lane isolated slot (v5 = v0 << 2): LDS[v5] = v1; cmpst(cmp=v2, new=v3).
+    let mut ret_old = vec![vop2(0x1A, 5, 0x82, 0)]; // v_lshlrev_b32 v5, 2, v0
+    ret_old.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    ret_old.extend(ds2(DS_CMPST_RTN_F32, 0, 5, 2, 3));
+    let mut ret_new = vec![vop2(0x1A, 5, 0x82, 0)];
+    ret_new.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    ret_new.extend(ds2(DS_CMPST_F32, 0, 5, 2, 3));
+    ret_new.extend(ds(DS_READ_B32, 0, 5, 0));
+    let s_old = build_cs(&ret_old, 64, 512);
+    let s_new = build_cs(&ret_new, 64, 512);
+
+    // (init, cmp, new, want_after)
+    let cases: &[(u32, u32, u32, u32)] = &[
+        (1.5f32.to_bits(), 1.5f32.to_bits(), 4.25f32.to_bits(), 4.25f32.to_bits()),
+        (1.5f32.to_bits(), 2.5f32.to_bits(), 4.25f32.to_bits(), 1.5f32.to_bits()),
+        // -0.0 == +0.0 under IEEE-754 float comparison: swap succeeds!
+        (0x8000_0000, 0x0000_0000, 3.0f32.to_bits(), 3.0f32.to_bits()),
+        (0x0000_0000, 0x8000_0000, (-3.0f32).to_bits(), (-3.0f32).to_bits()),
+        // Identical qNaN bit patterns must NOT match under IEEE-754 float equality.
+        (0x7FC0_0000, 0x7FC0_0000, 1.0f32.to_bits(), 0x7FC0_0000),
+        (f32::INFINITY.to_bits(), f32::INFINITY.to_bits(), 7.0f32.to_bits(), 7.0f32.to_bits()),
+        (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 7.0f32.to_bits(), f32::INFINITY.to_bits()),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, c, _)| [a, b, c, 0]).collect();
+    run_cases(&s_old, &inputs, |backend, i, _, got| {
+        assert_eq!(
+            got, cases[i].0,
+            "{backend}: ds_cmpst_rtn_f32 old value case {i}",
+        );
+    });
+    run_cases(&s_new, &inputs, |backend, i, _, got| {
+        assert_eq!(
+            got, cases[i].3,
+            "{backend}: ds_cmpst_f32 new value case {i}",
         );
     });
 }

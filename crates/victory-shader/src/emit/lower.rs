@@ -3528,7 +3528,7 @@ impl<'a> Lower<'a> {
             "min_u32" => Some(Rmw::UMin),
             "max_u32" => Some(Rmw::UMax),
             "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" | "max_f32" | "min_f32" => None,
+            "cmpst_b32" | "cmpst_f32" | "add_f32" | "max_f32" | "min_f32" => None,
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
@@ -3542,13 +3542,15 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let p = dword(self, offset);
-        if let Some(max) = match op.as_str() {
-            "max_f32" => Some(true),
-            "min_f32" => Some(false),
-            _ => None,
-        } {
+        if matches!(op.as_str(), "max_f32" | "min_f32" | "add_f32" | "cmpst_f32") {
             let at = self.begin_guarded(guard);
-            let r = self.lds_float_min_max(p, v0, max);
+            let r = match op.as_str() {
+                "max_f32" => self.lds_float_min_max(p, v0, true),
+                "min_f32" => self.lds_float_min_max(p, v0, false),
+                "add_f32" => self.lds_float_add(p, v0),
+                "cmpst_f32" => self.lds_float_cmpst(p, v0, v1.ok_or("an LDS compare")?),
+                _ => unreachable!(),
+            };
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
                 self.write(inst, Reg::V(reg), r, None);
@@ -3595,6 +3597,56 @@ impl<'a> Lower<'a> {
         let done = self.s.m.cmp(lp, pred::EQ, prev, old);
         self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
         self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+        self.cur = exit;
+        old
+    }
+
+    /// `ds_add_f32` / `ds_add_rtn_f32` on the LDS dword at `p` with the float
+    /// bits `data`; the old bits return.
+    fn lds_float_add(&mut self, p: V, data: V) -> V {
+        let pre = self.cur;
+        let init = self.s.m.load(pre, p);
+        let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(pre, Term::Br(lp));
+        let i32t = self.s.t.i32;
+        let old = self.s.m.phi(lp, i32t);
+        self.cur = lp;
+        let old_f = self.as_float(old);
+        let data_f = self.as_float(data);
+        let sum = self.s.m.bin(lp, Bin::Add, old_f, data_f);
+        let new = self.as_int(sum);
+        let prev = self.s.m.cmpxchg(lp, p, old, new);
+        let done = self.s.m.cmp(lp, pred::EQ, prev, old);
+        self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
+        self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+        self.cur = exit;
+        old
+    }
+
+    /// `ds_cmpst_f32` / `ds_cmpst_rtn_f32` on the LDS dword at `p`: compares
+    /// `*p` against `cmp` using IEEE-754 float equality (`+0.0 == -0.0`,
+    /// `NaN != NaN`) and, if equal, stores `data`; the old bits return.
+    fn lds_float_cmpst(&mut self, p: V, cmp: V, data: V) -> V {
+        let pre = self.cur;
+        let init = self.s.m.load(pre, p);
+        let (lp, swap, exit) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(pre, Term::Br(lp));
+        let i32t = self.s.t.i32;
+        let old = self.s.m.phi(lp, i32t);
+        self.cur = lp;
+        let old_f = self.as_float(old);
+        let cmp_f = self.as_float(cmp);
+        let eq = self.s.m.cmp(lp, pred::OEQ, old_f, cmp_f);
+        self.s.m.terminate(lp, Term::CondBr(eq, swap, exit));
+        self.cur = swap;
+        let prev = self.s.m.cmpxchg(swap, p, old, data);
+        let done = self.s.m.cmp(swap, pred::EQ, prev, old);
+        self.s.m.set_phi(old, vec![(init, pre), (prev, swap)]);
+        self.s.m.terminate(swap, Term::CondBr(done, exit, lp));
         self.cur = exit;
         old
     }
