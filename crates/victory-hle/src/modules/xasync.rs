@@ -69,6 +69,9 @@ impl Mode {
 struct Task {
     context: usize,
     callback: usize,
+    /// The `Queue::id` it was submitted through (0 until delivered): queues
+    /// can share a port, and terminating one cancels only its own.
+    owner: u64,
 }
 
 impl Task {
@@ -76,6 +79,7 @@ impl Task {
         Task {
             context: context as usize,
             callback: callback as usize,
+            owner: 0,
         }
     }
 
@@ -193,6 +197,9 @@ impl Pool {
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
 pub struct Queue {
+    /// Unique for the process (an address can be reused once a queue is
+    /// gone): marks the tasks this queue put on a shared port.
+    id: u64,
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
     terminated: AtomicBool,
@@ -200,7 +207,9 @@ pub struct Queue {
 
 impl Queue {
     fn new(ports: [Arc<Port>; 2]) -> Arc<Queue> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Arc::new(Queue {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             ports,
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
@@ -227,7 +236,10 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
+        self.ports[port as usize].submit(Task {
+            owner: self.id,
+            ..task
+        });
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
@@ -369,8 +381,10 @@ pub fn XTaskQueueSubmitDelayedCallback(
     }
 }
 
-/// Cancels what is still queued (callbacks see `canceled`), refuses new
-/// work, then calls `callback`.
+/// Cancels what this queue still has queued (callbacks see `canceled`),
+/// refuses new work, then calls `callback`. Work other queues put on the
+/// same ports (a composite queue shares its ports) stays queued, in order:
+/// each queue's lifetime is its own.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
     _wait: bool,
@@ -382,7 +396,12 @@ pub fn XTaskQueueTerminate(
     };
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
+        let pending: VecDeque<Task> = {
+            let mut tasks = lock(&port.tasks);
+            let (mine, others) = tasks.drain(..).partition(|t: &Task| t.owner == queue.id);
+            *tasks = others;
+            mine
+        };
         // Dispatches waiting on this queue end: nothing more will come.
         // (Those of other queues on the port see theirs is open and wait
         // on.) After the lock above, so none misses both flag and wake.
@@ -1303,6 +1322,51 @@ mod tests {
         assert!(!XTaskQueueDispatch(a, WORK, INFINITE));
         XTaskQueueCloseHandle(a);
         XTaskQueueCloseHandle(b);
+    }
+
+    /// A composite queue shares its ports with the queue they came from;
+    /// terminating it cancels its own queued callbacks, not the other's.
+    #[test]
+    fn terminating_a_composite_queue_leaves_the_base_queues_callbacks() {
+        /// 0: not run; 1: ran; 2: ran as canceled.
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            // SAFETY: the test passes a pointer to its slot.
+            unsafe { *context.cast::<u8>() = 1 + u8::from(canceled) };
+        }
+        let none = std::ptr::null_mut();
+        let (mut base, mut composite) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut base), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(base, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(base, COMPLETION, &mut completion), S_OK);
+        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut composite), S_OK);
+
+        // base, composite, base: the base's two must keep their order.
+        let mut slots = [0u8; 3];
+        let [b1, c, b2] = slots.each_mut().map(|s| (s as *mut u8).cast());
+        for (queue, slot) in [(base, b1), (composite, c), (base, b2)] {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(queue, WORK, 0, slot, Some(note)),
+                S_OK
+            );
+        }
+        assert_eq!(XTaskQueueTerminate(composite, false, none, None), S_OK);
+        assert_eq!(slots, [0, 2, 0], "only the composite's callback is canceled");
+
+        assert!(XTaskQueueDispatch(base, WORK, 0));
+        assert_eq!(slots, [1, 2, 0], "the base's first runs first, not canceled");
+        assert!(XTaskQueueDispatch(base, WORK, 0));
+        assert_eq!(slots, [1, 2, 1]);
+        assert!(!XTaskQueueDispatch(base, WORK, 0), "nothing left");
+        // The base is still open.
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(base, WORK, 0, b1, Some(note)),
+            S_OK
+        );
+        assert_eq!(XTaskQueueTerminate(base, false, none, None), S_OK);
+        assert_eq!(slots[0], 2);
+        XTaskQueueCloseHandle(composite);
+        XTaskQueueCloseHandle(base);
     }
 
     #[test]
