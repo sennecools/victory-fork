@@ -82,6 +82,44 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame a hash last found the texture's memory changed in (see
+    /// [`guard_skips`]).
+    changed: Option<u64>,
+}
+
+impl Last {
+    /// Takes `hash` as the hash of the texture's memory; true when it
+    /// differs from the last one, and then the frame is noted.
+    fn rehash(&mut self, hash: blake3::Hash) -> bool {
+        if self.hash == Some(hash) {
+            return false;
+        }
+        self.hash = Some(hash);
+        self.changed = Some(crate::frame::current());
+        true
+    }
+}
+
+/// A guarded texture in view memory is hashed every eighth frame only, by
+/// its address so that textures take turns.
+const HASH_EVERY: u64 = 8;
+/// For this many frames after a hash found a guarded texture changed, it is
+/// hashed at every check. A texture the title rewrites through another
+/// view (startup screens, video frames) changes where the guard cannot see
+/// it; hashed every eighth frame only, it showed repeated and stale frames
+/// and flickered (#269). Two turns, so a texture that keeps changing never
+/// leaves this state while one that stops goes back to taking turns.
+const RECENTLY_CHANGED: u64 = 2 * HASH_EVERY;
+
+/// Whether a guarded texture in view memory is passed over at a check in
+/// `frame`: the guard saw no write to it (`unwritten`), it is not its turn
+/// to be hashed, and no hash found it changed lately.
+fn guard_skips(unwritten: bool, frame: u64, start: usize, changed: Option<u64>) -> bool {
+    let turn = frame
+        .wrapping_add((start >> 16) as u64)
+        .is_multiple_of(HASH_EVERY);
+    let recent = changed.is_some_and(|at| frame.wrapping_sub(at) < RECENTLY_CHANGED);
+    unwritten && !turn && !recent
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -952,17 +990,16 @@ impl Staging {
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // texture's address, so the textures take turns; and at every check
+        // for a while once it found the texture changed ([`guard_skips`]).
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if guard_skips(unwritten, crate::frame::current(), start, last.changed) {
                 return 0;
             }
         }
@@ -1001,10 +1038,9 @@ impl Staging {
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
-                if last.hash == Some(hash) {
+                if !last.rehash(hash) {
                     return false;
                 }
-                last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -1023,10 +1059,9 @@ impl Staging {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if !last.rehash(hash) {
                     return size;
                 }
-                last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1039,10 +1074,9 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !last.rehash(hash) {
             return size;
         }
-        last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1061,9 +1095,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
+            if last.rehash(blake3::hash(read)) {
                 self.detile(read);
             }
             true
@@ -1478,6 +1510,50 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::{HASH_EVERY, RECENTLY_CHANGED, guard_skips};
+
+    /// Of `frames`, the ones a guarded texture at `start` is hashed in.
+    fn hashed(
+        frames: std::ops::Range<u64>,
+        unwritten: bool,
+        start: usize,
+        changed: Option<u64>,
+    ) -> Vec<u64> {
+        frames
+            .filter(|&f| !guard_skips(unwritten, f, start, changed))
+            .collect()
+    }
+
+    /// Unwritten and unchanged, a texture is hashed on its turn only, one
+    /// frame in eight; a write the guard saw has it hashed at once.
+    #[test]
+    fn a_still_texture_takes_its_turn() {
+        assert_eq!(hashed(100..132, true, 0x3_0000, None), [101, 109, 117, 125]);
+        assert_eq!(hashed(100..132, true, 0x4_0000, None), [100, 108, 116, 124]);
+        assert_eq!(hashed(100..108, false, 0x3_0000, None).len(), 8);
+    }
+
+    /// A texture a hash found changed is hashed at every check for the
+    /// next 16 frames, so one rewritten every frame through another view
+    /// (where the guard cannot see the writes) is never shown stale; after
+    /// that it goes back to taking turns (#269).
+    #[test]
+    fn a_changing_texture_is_hashed_at_every_frame() {
+        let changed = Some(101);
+        let after = 101 + RECENTLY_CHANGED;
+        assert_eq!(
+            hashed(101..after, true, 0x3_0000, changed),
+            (101..after).collect::<Vec<_>>()
+        );
+        let later = hashed(after..after + 2 * HASH_EVERY, true, 0x3_0000, changed);
+        assert_eq!(later, [117, 125]);
+        // A change noted in the frame counter's last values still counts.
+        assert!(!guard_skips(true, 3, 0x3_0000, Some(u64::MAX - 2)));
+    }
 }
 
 #[cfg(test)]
