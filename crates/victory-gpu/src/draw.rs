@@ -139,6 +139,10 @@ struct Window {
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
 
+/// The sampler heap we bind when the title binds none (a value no title heap
+/// address takes).
+const SAMPLERS_OURS: usize = usize::MAX;
+
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
 /// by default).
@@ -930,6 +934,21 @@ impl State {
         true
     }
 
+    /// The heaps a list must have bound before one of our root signatures
+    /// is set: the title's, and our sampler heap when it binds none. Every
+    /// signature we make indexes its sampler heap directly, and D3D12
+    /// requires one to be bound before such a signature (the debug layer's
+    /// id 1419; NVIDIA removes the device for it). Compute lists that only
+    /// read views are the case.
+    fn wanted(title: [usize; 2]) -> [usize; 2] {
+        let sampler = if title[1] != 0 {
+            title[1]
+        } else {
+            SAMPLERS_OURS
+        };
+        [title[0], sampler]
+    }
+
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
@@ -946,18 +965,25 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+        let want = Self::wanted(self.heaps);
+        if self.host_heaps != want {
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            if want[1] == SAMPLERS_OURS {
+                match crate::descriptor::host::fallback_samplers() {
+                    Some(h) => heaps.push(Some(h.heap.clone())),
+                    None => once!("no sampler heap of ours to bind"),
+                }
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = want;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
@@ -3402,5 +3428,25 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One of our root signatures needs a sampler heap bound before it is
+    /// set: ours stands in for a title that binds none, which a compute list
+    /// that only reads views does.
+    #[test]
+    fn a_list_without_a_sampler_heap_gets_ours() {
+        // The title binds both: nothing of ours.
+        assert_eq!(State::wanted([0x10, 0x20]), [0x10, 0x20]);
+        // Views only: our sampler heap after them.
+        assert_eq!(State::wanted([0x10, 0]), [0x10, SAMPLERS_OURS]);
+        // Neither: our sampler heap alone.
+        assert_eq!(State::wanted([0, 0]), [0, SAMPLERS_OURS]);
+        // A title sampler heap stays without views.
+        assert_eq!(State::wanted([0, 0x20]), [0, 0x20]);
     }
 }

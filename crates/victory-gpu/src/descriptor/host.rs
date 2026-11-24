@@ -1128,6 +1128,15 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// A sampler heap of our own, for lists that set one of our root signatures
+/// (`SAMPLER_HEAP_DIRECTLY_INDEXED`) while the title binds no sampler heap.
+/// Its one slot starts as a point sampler (`HostHeap::new`), so an indexed
+/// read of it returns something defined.
+pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
+    static HEAP: std::sync::OnceLock<Option<HostHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| HostHeap::new(true, 1)).as_ref()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
