@@ -19,6 +19,17 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // Before any window exists: sizes in screen pixels, then the window size.
+    {
+        use victory_core::WindowSize;
+        use victory_hle::modules::lifecycle::{self, use_physical_pixels};
+        use_physical_pixels();
+        lifecycle::set_window(match cfg.window {
+            WindowSize::Title => lifecycle::WindowSize::Title,
+            WindowSize::Pixels { width, height } => lifecycle::WindowSize::Pixels { width, height },
+            WindowSize::Fullscreen => lifecycle::WindowSize::Fullscreen,
+        });
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -71,6 +82,7 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    println!("window         {}", cfg.window);
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());

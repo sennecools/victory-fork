@@ -17,3 +17,14 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[window]
+# How big the title's window is on the primary screen, in screen pixels
+# (Windows display scaling does not apply).   env: VICTORY_WINDOW_SIZE
+# "title" (default): the size the title asks for, shrunk to the screen.
+# "1920x1080" (each side 64 to 16384): a client area of that size, centred,
+#   shrunk to the screen if it does not fit.
+# "fullscreen": borderless over the whole screen; Alt+F4 closes it.
+# Only the window changes: the title renders at its own size and its frame
+# is stretched to the window, so another aspect ratio distorts the picture.
+# size = "1920x1080"

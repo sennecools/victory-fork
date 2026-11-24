@@ -9,7 +9,7 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -73,13 +73,30 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let asked = Placement::asked(ex_style, style, x, y, width, height);
+    let at = if parent.is_null() {
+        place(asked, menu)
+    } else {
+        asked
+    };
+    // SAFETY: the title's own arguments, forwarded (placed on the host screen).
     let hwnd = unsafe {
         wm::CreateWindowExW(
-            ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
+            at.ex_style,
+            class,
+            name,
+            at.style,
+            at.x,
+            at.y,
+            at.width,
+            at.height,
+            parent,
+            menu,
+            instance,
+            param,
         )
     };
+    keep_client(hwnd, at.client);
     hook(hwnd);
     hwnd
 }
@@ -99,36 +116,321 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let asked = Placement::asked(ex_style, style, x, y, width, height);
+    let at = if parent.is_null() {
+        place(asked, menu)
+    } else {
+        asked
+    };
+    // SAFETY: the title's own arguments, forwarded (placed on the host screen).
     let hwnd = unsafe {
         wm::CreateWindowExA(
-            ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
+            at.ex_style,
+            class,
+            name,
+            at.style,
+            at.x,
+            at.y,
+            at.width,
+            at.height,
+            parent,
+            menu,
+            instance,
+            param,
         )
     };
+    keep_client(hwnd, at.client);
     hook(hwnd);
     hwnd
 }
 
-/// A console title sizes its window to its render target (
-/// the title: 3840x2160 on a Series X), which can exceed the host's screen.
-/// A top-level window larger than the work area is shrunk to fit, keeping
-/// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches).
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
-    let mut area = RECT::default();
-    // SAFETY: `area` receives the primary monitor's work area.
-    let known =
-        unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
-    let fitted = fit_into(&area, width, height);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+/// How the title's top-level window is sized on the host screen, in screen
+/// pixels. Only the window: the title renders at the size it chooses, and
+/// the swap chain stretches its frame to the window.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WindowSize {
+    /// The title's own size (its render size), shrunk to the primary
+    /// screen's work area if larger.
+    #[default]
+    Title,
+    /// A client area of `width` x `height`, centred in the primary screen's
+    /// work area (shrunk to it, keeping proportions, if it would not fit).
+    Pixels { width: u32, height: u32 },
+    /// Borderless over the whole primary screen.
+    Fullscreen,
+}
+
+static WINDOW: OnceLock<WindowSize> = OnceLock::new();
+
+/// Sets how the title's window is sized; call before the title runs. Later
+/// calls do nothing.
+pub fn set_window(size: WindowSize) {
+    if WINDOW.set(size).is_err() {
+        tracing::debug!(?size, "window size already set");
     }
-    tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
-    let (w, h) = fitted;
+}
+
+/// Makes window sizes physical pixels: the process becomes per-monitor DPI
+/// aware, so on a screen scaled to 150 % a 1920x1080 window is 1920x1080
+/// pixels and its frame is drawn sharp, not scaled up by Windows. Call
+/// before any window exists.
+///
+/// shortcut: a window moved to a screen with another scale keeps its size
+/// in pixels (`WM_DPICHANGED` is passed on, not acted on).
+pub fn use_physical_pixels() {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::UI::HiDpi::{
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_AWARENESS_PER_MONITOR_AWARE,
+        GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+        SetProcessDpiAwarenessContext,
+    };
+    // SAFETY: a predefined awareness context.
+    if unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } != 0 {
+        return;
+    }
+    // SAFETY: plain queries of this thread's state.
+    let (error, aware) = unsafe {
+        (
+            GetLastError(),
+            GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()),
+        )
+    };
+    // Already aware (a manifest, or a second call) is fine.
+    if aware != DPI_AWARENESS_PER_MONITOR_AWARE {
+        tracing::warn!(
+            error,
+            "not DPI aware: Windows scales the window with the display scale"
+        );
+    }
+}
+
+/// A window's styles and rectangle, and for a sized window the client area
+/// it must end up with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    ex_style: u32,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    client: Option<(i32, i32)>,
+}
+
+impl Placement {
+    fn asked(ex_style: u32, style: u32, x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self {
+            ex_style,
+            style,
+            x,
+            y,
+            width,
+            height,
+            client: None,
+        }
+    }
+}
+
+/// What the host screen offers the title's top-level window.
+struct Screen {
+    /// The primary screen's work area (without the taskbar), if known.
+    area: Option<RECT>,
+    /// The primary screen's size, if known.
+    size: Option<(i32, i32)>,
+    /// How much wider and taller a window of the title's style is than its
+    /// client area.
+    frame: (i32, i32),
+}
+
+/// The title's top-level window, placed as [`set_window`] says.
+fn place(asked: Placement, menu: HMENU) -> Placement {
+    let size = WINDOW.get().copied().unwrap_or_default();
+    let mut area = RECT::default();
+    // SAFETY: `area` receives the primary screen's work area; plain metric
+    // queries of the primary screen.
+    let (known, screen) = unsafe {
+        (
+            wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) != 0,
+            (
+                wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                wm::GetSystemMetrics(wm::SM_CYSCREEN),
+            ),
+        )
+    };
+    let screen = Screen {
+        area: known.then_some(area),
+        size: (screen.0 > 0 && screen.1 > 0).then_some(screen),
+        frame: frame(asked.style, asked.ex_style, !menu.is_null()),
+    };
+    let placed = plan(size, &screen, asked);
+    if placed != asked {
+        tracing::info!(
+            ?size,
+            asked = ?(asked.width, asked.height),
+            window = ?(placed.width, placed.height),
+            client = ?placed.client,
+            "title window placed"
+        );
+    }
+    placed
+}
+
+/// Where the title's top-level window goes; falls back to the title's own
+/// size (shrunk to the work area) when the screen is not known.
+fn plan(size: WindowSize, screen: &Screen, asked: Placement) -> Placement {
+    match size {
+        WindowSize::Fullscreen => {
+            if let Some((width, height)) = screen.size {
+                return Placement {
+                    ex_style: borderless_ex(asked.ex_style),
+                    style: borderless(asked.style),
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                    client: None,
+                };
+            }
+        }
+        WindowSize::Pixels { width, height } => {
+            if let Some(area) = &screen.area {
+                let (fw, fh) = screen.frame;
+                // The client area fits what the work area leaves inside a frame.
+                let inside = RECT {
+                    right: area.right - fw,
+                    bottom: area.bottom - fh,
+                    ..*area
+                };
+                let wanted = (
+                    i32::try_from(width).unwrap_or(i32::MAX),
+                    i32::try_from(height).unwrap_or(i32::MAX),
+                );
+                let (cw, ch) = fit_into(&inside, wanted.0, wanted.1);
+                let (x, y, width, height) = centred(area, cw + fw, ch + fh);
+                return Placement {
+                    x,
+                    y,
+                    width,
+                    height,
+                    client: Some((cw, ch)),
+                    ..asked
+                };
+            }
+        }
+        WindowSize::Title => {}
+    }
+    // A console title sizes its window to its render target (the title:
+    // 3840x2160 on a Series X), which can exceed the host's
+    // screen: then it is shrunk to fit, keeping its proportions, and
+    // centred.
+    let Some(area) = &screen.area else {
+        return asked;
+    };
+    if fit_into(area, asked.width, asked.height) == (asked.width, asked.height) {
+        return asked;
+    }
+    let (x, y, width, height) = centred(area, asked.width, asked.height);
+    Placement {
+        x,
+        y,
+        width,
+        height,
+        ..asked
+    }
+}
+
+/// How much wider and taller than its client area a top-level window of
+/// these styles is, at the system DPI (an estimate: [`keep_client`]
+/// measures the real one).
+fn frame(style: u32, ex_style: u32, menu: bool) -> (i32, i32) {
+    use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
+    // Windows gives a top-level window that is not a popup a caption.
+    let style = if style & (wm::WS_POPUP | wm::WS_CHILD) == 0 {
+        style | wm::WS_CAPTION
+    } else {
+        style
+    };
+    let mut rect = RECT::default();
+    // SAFETY: `rect` is ours.
+    let known = unsafe {
+        AdjustWindowRectExForDpi(
+            &mut rect,
+            style,
+            i32::from(menu),
+            ex_style,
+            GetDpiForSystem(),
+        )
+    } != 0;
+    if known {
+        (rect.right - rect.left, rect.bottom - rect.top)
+    } else {
+        (0, 0)
+    }
+}
+
+/// A sized window whose client area came out other than planned (its frame
+/// differs from the estimate, as on a screen whose scale changed since sign
+/// in) is resized by the difference and centred again.
+fn keep_client(hwnd: HWND, client: Option<(i32, i32)>) {
+    let Some((cw, ch)) = client else {
+        return;
+    };
+    if hwnd.is_null() {
+        return;
+    }
+    let (mut got, mut outer, mut area) = (RECT::default(), RECT::default(), RECT::default());
+    // SAFETY: a window this thread just created; the rectangles are ours.
+    let known = unsafe {
+        wm::GetClientRect(hwnd, &mut got) != 0
+            && wm::GetWindowRect(hwnd, &mut outer) != 0
+            && wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) != 0
+    };
+    let (gw, gh) = (got.right - got.left, got.bottom - got.top);
+    if !known || (gw, gh) == (cw, ch) {
+        return;
+    }
+    let width = outer.right - outer.left + cw - gw;
+    let height = outer.bottom - outer.top + ch - gh;
+    let (x, y, width, height) = centred(&area, width, height);
+    tracing::debug!(got = ?(gw, gh), want = ?(cw, ch), "title window client area corrected");
+    // SAFETY: a window this thread just created.
+    unsafe {
+        wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            width,
+            height,
+            wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// `width` x `height` shrunk to fit `area` if needed, and centred in it:
+/// left, top, width, height.
+fn centred(area: &RECT, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    let (w, h) = fit_into(area, width, height);
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// `style` without a frame: no caption, border or sizing edge, a popup.
+/// The system menu and minimize box stay, so Alt+F4 and the taskbar can
+/// still close and minimise it.
+fn borderless(style: u32) -> u32 {
+    let frame = wm::WS_CAPTION | wm::WS_THICKFRAME | wm::WS_MAXIMIZEBOX;
+    (style & !frame) | wm::WS_POPUP
+}
+
+/// `ex_style` without the extended frame edges.
+fn borderless_ex(ex_style: u32) -> u32 {
+    ex_style
+        & !(wm::WS_EX_DLGMODALFRAME
+            | wm::WS_EX_WINDOWEDGE
+            | wm::WS_EX_CLIENTEDGE
+            | wm::WS_EX_STATICEDGE)
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
@@ -177,8 +479,8 @@ extern "system" fn window_proc(
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
     // title then stops (no frames, no input) until a key ends the loop, and
-    // nothing shows it, since the window has no menu bar;
-    // the title aborts itself about half a minute later. A console has no window
+    // nothing shows it, since the window has no menu bar; the title
+    // aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
@@ -345,6 +647,148 @@ mod tests {
             fit_into(&area, wm::CW_USEDEFAULT, 0),
             (wm::CW_USEDEFAULT, 0)
         );
+    }
+
+    #[test]
+    fn sized_windows_are_centred_and_shrink_only_when_too_big() {
+        // A 4K screen with a 60-pixel taskbar.
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2100,
+        };
+        assert_eq!(centred(&area, 1920, 1080), (960, 510, 1920, 1080));
+        assert_eq!(centred(&area, 3840, 2160), (53, 0, 3733, 2100));
+        // A work area that does not start at the origin (taskbar on the left).
+        let left_bar = RECT {
+            left: 100,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert_eq!(centred(&left_bar, 1280, 720), (370, 180, 1280, 720));
+    }
+
+    #[test]
+    fn borderless_drops_the_frame_and_keeps_the_rest() {
+        let style = wm::WS_OVERLAPPEDWINDOW | wm::WS_VISIBLE | wm::WS_CLIPCHILDREN;
+        let plain = borderless(style);
+        assert_eq!(
+            plain & (wm::WS_CAPTION | wm::WS_THICKFRAME | wm::WS_MAXIMIZEBOX),
+            0
+        );
+        assert_ne!(plain & wm::WS_POPUP, 0);
+        // Alt+F4 and the taskbar still close and minimise it.
+        assert_ne!(plain & wm::WS_SYSMENU, 0);
+        assert_ne!(plain & wm::WS_MINIMIZEBOX, 0);
+        assert_ne!(plain & wm::WS_VISIBLE, 0);
+        assert_ne!(plain & wm::WS_CLIPCHILDREN, 0);
+        let ex = borderless_ex(wm::WS_EX_OVERLAPPEDWINDOW | wm::WS_EX_APPWINDOW);
+        assert_eq!(ex & (wm::WS_EX_WINDOWEDGE | wm::WS_EX_CLIENTEDGE), 0);
+        assert_ne!(ex & wm::WS_EX_APPWINDOW, 0);
+    }
+
+    /// A 4K primary screen with a 60-pixel taskbar, and a frame 16 wider
+    /// and 39 taller than the client area.
+    fn screen() -> Screen {
+        Screen {
+            area: Some(RECT {
+                left: 0,
+                top: 0,
+                right: 3840,
+                bottom: 2100,
+            }),
+            size: Some((3840, 2160)),
+            frame: (16, 39),
+        }
+    }
+
+    fn asked(width: i32, height: i32) -> Placement {
+        Placement::asked(0, wm::WS_OVERLAPPEDWINDOW, 7, 8, width, height)
+    }
+
+    #[test]
+    fn a_pixel_size_is_a_client_area_centred_in_the_work_area() {
+        let placed = plan(
+            WindowSize::Pixels {
+                width: 1920,
+                height: 1080,
+            },
+            &screen(),
+            asked(3840, 2160),
+        );
+        assert_eq!(placed.client, Some((1920, 1080)));
+        assert_eq!((placed.width, placed.height), (1936, 1119));
+        assert_eq!((placed.x, placed.y), (952, 490));
+        assert_eq!(placed.style, wm::WS_OVERLAPPEDWINDOW);
+    }
+
+    #[test]
+    fn a_pixel_size_too_big_for_the_screen_keeps_its_proportions() {
+        let placed = plan(
+            WindowSize::Pixels {
+                width: 7680,
+                height: 4320,
+            },
+            &screen(),
+            asked(3840, 2160),
+        );
+        let (cw, ch) = placed.client.unwrap();
+        // The client fits what the work area leaves inside the frame.
+        assert!(cw + 16 <= 3840 && ch + 39 <= 2100, "{cw}x{ch}");
+        // As tall as the work area allows (less a rounding pixel).
+        assert!(ch >= 2060, "{ch}");
+        assert!((f64::from(cw) / f64::from(ch) - 16.0 / 9.0).abs() < 0.01);
+        assert_eq!((placed.width, placed.height), (cw + 16, ch + 39));
+    }
+
+    #[test]
+    fn fullscreen_covers_the_screen_without_a_frame() {
+        let placed = plan(WindowSize::Fullscreen, &screen(), asked(3840, 2160));
+        assert_eq!(
+            (placed.x, placed.y, placed.width, placed.height),
+            (0, 0, 3840, 2160)
+        );
+        assert_eq!(placed.style & wm::WS_CAPTION, 0);
+        assert_ne!(placed.style & wm::WS_POPUP, 0);
+        assert_eq!(placed.client, None);
+    }
+
+    #[test]
+    fn the_title_size_is_kept_when_it_fits_and_fitted_when_not() {
+        assert_eq!(
+            plan(WindowSize::Title, &screen(), asked(1280, 720)),
+            asked(1280, 720)
+        );
+        let placed = plan(WindowSize::Title, &screen(), asked(3840, 2160));
+        assert_eq!(
+            (placed.x, placed.y, placed.width, placed.height),
+            (53, 0, 3733, 2100)
+        );
+    }
+
+    #[test]
+    fn an_unknown_screen_falls_back_to_what_the_title_asked() {
+        let unknown = Screen {
+            area: None,
+            size: None,
+            frame: (0, 0),
+        };
+        for size in [
+            WindowSize::Title,
+            WindowSize::Fullscreen,
+            WindowSize::Pixels {
+                width: 1920,
+                height: 1080,
+            },
+        ] {
+            assert_eq!(
+                plan(size, &unknown, asked(3840, 2160)),
+                asked(3840, 2160),
+                "{size:?}"
+            );
+        }
     }
 
     #[test]

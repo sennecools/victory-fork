@@ -69,6 +69,15 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+The title's window takes the size the title asks for, shrunk to the primary
+screen. Set `[window] size` in `victory.toml` (or `VICTORY_WINDOW_SIZE`) to
+`"1920x1080"` or any other client size, or to `"fullscreen"` for a
+borderless window over the whole screen (Alt+F4 closes it). Sizes are screen
+pixels: `victory` is DPI aware, so Windows display scaling does not enlarge
+the window. This sizes only the window: the title renders at its own size
+and its frame is stretched to the window, so a size with another aspect
+ratio distorts the picture.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
