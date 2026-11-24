@@ -577,25 +577,33 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let Some(_one_save) = one_save(now) else {
+        return;
+    };
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| remove_stale_tmps(dir, STALE_TMP));
+    let tmp = tmp_beside(&dir.join(LIBRARY_FILE));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    // The pipelines in it are taken off `added` once it is renamed in place:
+    // a save that fails leaves them for the next one.
+    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+    let (bytes, added) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        if !used_changed && added == 0 {
             return;
         }
         if added == 0 {
-            0
+            (0, 0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -603,16 +611,17 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
+                USED_CHANGED.fetch_or(used_changed, Ordering::Relaxed);
                 return;
             }
-            library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            (size, added)
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
+        library.added.fetch_sub(added, Ordering::Relaxed);
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -626,8 +635,18 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    // The early list only when it changed: a pipeline made again from the
+    // library leaves it as it was.
+    let written = library_written.and_then(|()| {
+        if used_changed {
+            write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes())
+        } else {
+            Ok(())
+        }
+    });
+    if written.is_err() {
+        USED_CHANGED.fetch_or(used_changed, Ordering::Relaxed);
+    }
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -638,6 +657,27 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    }
+}
+
+/// Held for a whole save: this run's saves share the temporary files beside
+/// the library and the early list ([`tmp_beside`]), so a second one would truncate the file the first
+/// is about to rename over the library (the end-of-run save against a
+/// worker's periodic one; upstream Marvisak/VIctory#1660). A periodic save
+/// (`now` false) that finds one running is skipped; `now` waits for it.
+fn one_save(now: bool) -> Option<MutexGuard<'static, ()>> {
+    static SAVING: Mutex<()> = Mutex::new(());
+    alone(&SAVING, now)
+}
+
+fn alone(lock: &Mutex<()>, wait: bool) -> Option<MutexGuard<'_, ()>> {
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) if wait => {
+            Some(lock.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
 
@@ -667,15 +707,60 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    std::fs::rename(tmp, dir.join(LIBRARY_FILE))
+        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(tmp);
+        })
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let tmp = tmp_beside(path);
+    std::fs::write(&tmp, bytes)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+}
+
+/// The temporary file a save writes before renaming it over `path`: named
+/// for this process, as nothing keeps two runs off one cache folder
+/// ([`one_save`] keeps this run's saves apart).
+fn tmp_beside(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension(format!("tmp-{}", std::process::id()))
+}
+
+/// How old a temporary file in the cache folder must be before a save takes
+/// it for one that never finished: a save writes and renames its own within
+/// seconds, so another run's that is younger may still be in use.
+const STALE_TMP: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Removes the temporary files in `dir` of saves that never finished (a run
+/// that ended during one), older than `stale`: each can hold the library's
+/// whole size, and no later save writes the same name again.
+fn remove_stale_tmps(dir: &std::path::Path, stale: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let numbered = |pid: &str| pid.parse::<u32>().is_ok();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let tmp = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "tmp" || e.strip_prefix("tmp-").is_some_and(numbered));
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= stale);
+        if tmp && old {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -727,6 +812,70 @@ mod tests {
     }
 
     #[test]
+    fn a_periodic_save_skips_a_running_one_and_an_end_of_run_save_waits() {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let held = alone(&LOCK, false).expect("free");
+        assert!(alone(&LOCK, false).is_none());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _g = alone(&LOCK, true).expect("waits");
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("ran after release");
+        waiter.join().unwrap();
+        assert!(alone(&LOCK, false).is_some());
+    }
+
+    #[test]
+    fn a_save_leaves_a_whole_file_and_no_temporary_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EARLY_FILE);
+        let tmp = tmp_beside(&path);
+        assert_ne!(tmp, path);
+        assert!(
+            tmp.to_string_lossy()
+                .ends_with(&format!(".tmp-{}", std::process::id()))
+        );
+        write_atomically(&path, b"first").unwrap();
+        write_atomically(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        // A rename that cannot land (a folder in the way) leaves no tmp.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("x"), b"").unwrap();
+        assert!(write_atomically(&blocked, b"bytes").is_err());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.iter().any(|n| n.contains(".tmp")), "{names:?}");
+    }
+
+    #[test]
+    fn only_stale_temporary_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - 2 * STALE_TMP;
+        for name in ["a.tmp-17", "b.tmp", "c.tmp-x", "d.bin"] {
+            let file = std::fs::File::create(dir.path().join(name)).unwrap();
+            file.set_modified(old).unwrap();
+        }
+        std::fs::write(dir.path().join("e.tmp-18"), b"").unwrap();
+        remove_stale_tmps(dir.path(), STALE_TMP);
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["c.tmp-x", "d.bin", "e.tmp-18"]);
+    }
+
+    #[test]
     fn a_rejected_blob_gives_an_empty_library() {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
@@ -753,7 +902,7 @@ mod tests {
         assert!(matches!(blob, Blob::Mapped(_)) || !mapped());
         assert_eq!(blob.bytes(), &old[..]);
         // A save while the old file is mapped.
-        let tmp = path.with_extension("tmp");
+        let tmp = tmp_beside(&path);
         let new: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
         {
             let mut file = Mapped::create(&tmp, new.len()).expect("a new file, mapped");
@@ -825,7 +974,7 @@ mod tests {
         }
         let mapped = Mapped::open_holding(&path, true).expect("the file, mapped");
         // A save: the new library, renamed over the mapped one.
-        let tmp = path.with_extension("tmp");
+        let tmp = tmp_beside(&path);
         {
             let mut file = Mapped::create(&tmp, LEN).expect("a new file, mapped");
             file.bytes_mut().fill(0xEE);
