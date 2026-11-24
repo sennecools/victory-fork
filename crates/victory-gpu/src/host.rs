@@ -5639,8 +5639,9 @@ impl HostList {
 
     /// Notes what the command about to be recorded does, as a marker
     /// command whose text the list keeps (diagnostics, with the full
-    /// device-removed data, [`Dred::Full`]): the report pairs the breadcrumbs' marker commands with the
-    /// texts in order and names the commands a fault stopped among.
+    /// device-removed data, [`Dred::Full`]): the report pairs the
+    /// breadcrumbs' marker commands with the texts in order and names the
+    /// commands a fault stopped among.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_op(&self, what: impl FnOnce() -> String) {
         self.note(what, None);

@@ -3197,17 +3197,21 @@ mod tests {
     #[test]
     fn a_fault_is_classed_by_its_distance_from_the_heaps() {
         const GIB: u64 = 1 << 30;
-        let heaps = [(16 * GIB, GIB, 32, false), (40 * GIB, GIB, 32, true)];
+        // Heaps of 2^21 views of 32 bytes (64 MiB): the "no descriptor"
+        // index lies past their end, not inside them.
+        const HEAP: u64 = (1 << 21) * 32;
+        let heaps = [(16 * GIB, HEAP, 32, false), (40 * GIB, HEAP, 32, true)];
         assert!(
             fault_class_in(37 << 20, &heaps)
                 .starts_with("; fault class low, nearest the view heap")
         );
         // The 24-bit "no descriptor" index read as a view past the heap's end.
         let past = 16 * GIB + 0x00FF_FFFF * 32;
+        assert!(past > 16 * GIB + HEAP);
         assert_eq!(
             fault_class_in(past, &heaps),
             format!(
-                "; fault class mid, nearest the view heap {:#x}+{GIB:#x}",
+                "; fault class mid, nearest the view heap {:#x}+{HEAP:#x}",
                 16 * GIB
             )
         );
