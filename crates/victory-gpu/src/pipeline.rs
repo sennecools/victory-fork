@@ -175,7 +175,7 @@ impl Shader {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
-    // The translation depends on it (a view index past a capped heap).
+    // The translation depends on it (view indices are clamped to the heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL) {

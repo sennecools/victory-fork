@@ -161,7 +161,7 @@ fn main() -> Result<()> {
             jobs,
             warm,
         } => {
-            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
+            // `VICTORY_VIEW_LIMIT=<last slot>`: translate as on a host whose view heaps end there
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }

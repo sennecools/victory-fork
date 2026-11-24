@@ -19,6 +19,19 @@
 //!   the host heaps keep the title's descriptor order. The root signature
 //!   needs `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and
 //!   `SAMPLER_HEAP_DIRECTLY_INDEXED`.
+//! * **Heap indices** (changed 2026-11-25) are clamped on every host. A
+//!   view index at or past the null view of the handle's kind and texture
+//!   dimension at the view heap's end ([`GuardView`], from slot
+//!   [`view_heap_limit`] down: [`HEAP_VIEWS`] − 1 where the host takes
+//!   that many views) reads that null view, so an index the program
+//!   computes from data the host has not got reads zeros instead of
+//!   memory past the heap (a page fault on AMD, a hang on NVIDIA). The
+//!   host's view heaps end with those null views and hold nothing else
+//!   past the title's and the dynamic slots. A sampler index is clamped
+//!   to 2,047. A buffer the program picks from the view heap itself
+//!   (`ResourceHeap`) at a slot that holds no buffer view ([`SLOT_STRIDES`]
+//!   says 0) reads the null buffer view of its kind instead: a texture
+//!   view read as a buffer is a wild address on AMD.
 //! * **Immediate samplers** as static samplers `s<n>, space 0`, `n` the
 //!   position in [`HostShader::samplers`] (the console sampler words) and
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
@@ -83,6 +96,8 @@ mod diff_tests;
 #[cfg(all(test, windows))]
 mod f16_wave_tests;
 #[cfg(all(test, windows))]
+mod heap_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -105,9 +120,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    HEAP_VIEWS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
+    SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -289,6 +304,105 @@ pub struct UserData {
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,
+}
+
+/// The null views a host view heap ends with (module notes, "Heap
+/// indices"), one per kind and texture dimension the translator declares:
+/// a view index past the heap reads the one of its handle's kind, never a
+/// null view of another kind or dimension. Mismatches are undefined in
+/// D3D12; on AMD a texture view read as a buffer gives a wild address, and
+/// the device is removed.
+// shortcut: typed and structured buffer accesses read the raw buffer view,
+// and the texture kinds the translator makes none of (multisampled, cube
+// arrays) the 2D one: a null view of the same class but not of the same
+// shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardView {
+    /// A null 2D texture SRV: 2D texture reads and samples, and every slot
+    /// of a kind the host does not know. The heap's last slot.
+    Texture2D = 0,
+    /// A null constant buffer view: constant buffer reads.
+    Constant = 1,
+    /// A null raw buffer SRV: raw, structured and typed buffer reads.
+    Buffer = 2,
+    /// A null raw buffer UAV: buffer reads, stores and atomics through an
+    /// unordered view.
+    UnorderedBuffer = 3,
+    /// A null 2D texture UAV (`R32_UINT`): 2D texture reads, stores and
+    /// atomics through an unordered view.
+    UnorderedTexture2D = 4,
+    /// A null 1D texture SRV.
+    Texture1D = 5,
+    /// A null 1D texture array SRV.
+    Texture1DArray = 6,
+    /// A null 2D texture array SRV.
+    Texture2DArray = 7,
+    /// A null 3D texture SRV.
+    Texture3D = 8,
+    /// A null cube texture SRV: cube samples, gathers and sizes.
+    TextureCube = 9,
+    /// A null 1D texture UAV (`R32_UINT`).
+    UnorderedTexture1D = 10,
+    /// A null 1D texture array UAV (`R32_UINT`).
+    UnorderedTexture1DArray = 11,
+    /// A null 2D texture array UAV (`R32_UINT`), also for cubes (an
+    /// unordered view sees a cube's faces as a 2D array).
+    UnorderedTexture2DArray = 12,
+    /// A null 3D texture UAV (`R32_UINT`).
+    UnorderedTexture3D = 13,
+}
+
+impl GuardView {
+    /// Every null view, from the heap's last slot down.
+    pub const ALL: [GuardView; 14] = [
+        GuardView::Texture2D,
+        GuardView::Constant,
+        GuardView::Buffer,
+        GuardView::UnorderedBuffer,
+        GuardView::UnorderedTexture2D,
+        GuardView::Texture1D,
+        GuardView::Texture1DArray,
+        GuardView::Texture2DArray,
+        GuardView::Texture3D,
+        GuardView::TextureCube,
+        GuardView::UnorderedTexture1D,
+        GuardView::UnorderedTexture1DArray,
+        GuardView::UnorderedTexture2DArray,
+        GuardView::UnorderedTexture3D,
+    ];
+
+    /// The null view an access through a handle annotated with DXIL
+    /// resource properties `props` (first dword: kind in bits 0-7, UAV at
+    /// bit 12) reads.
+    pub fn of(props: u32) -> Self {
+        const UAV: u32 = 0x1000;
+        // DXIL resource kinds: 1 1D, 2 2D, 3 2D multisampled, 4 3D, 5 cube,
+        // 6 1D array, 7 2D array, 8 2D multisampled array, 9 cube array,
+        // 10 typed buffer, 11 raw buffer, 12 structured buffer, 13 constant
+        // buffer.
+        match (props & 0xFF, props & UAV != 0) {
+            (13, _) => GuardView::Constant,
+            (10..=12, false) => GuardView::Buffer,
+            (10..=12, true) => GuardView::UnorderedBuffer,
+            (1, false) => GuardView::Texture1D,
+            (4, false) => GuardView::Texture3D,
+            (5, false) => GuardView::TextureCube,
+            (6, false) => GuardView::Texture1DArray,
+            (7, false) => GuardView::Texture2DArray,
+            (1, true) => GuardView::UnorderedTexture1D,
+            (4, true) => GuardView::UnorderedTexture3D,
+            (5 | 7, true) => GuardView::UnorderedTexture2DArray,
+            (6, true) => GuardView::UnorderedTexture1DArray,
+            (_, true) => GuardView::UnorderedTexture2D,
+            (_, false) => GuardView::Texture2D,
+        }
+    }
+
+    /// This null view's slot in a view heap whose last slot is `last`
+    /// ([`view_heap_limit`]).
+    pub fn slot(self, last: u32) -> u32 {
+        last - self as u32
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -581,6 +695,47 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    /// The null views sit in [`GuardView::ALL`] order from the heap's last
+    /// slot down, and each handle kind reads the one of its own kind and
+    /// texture dimension.
+    #[test]
+    fn guard_views_follow_their_kinds() {
+        use super::GuardView as G;
+        for (k, view) in (0..).zip(G::ALL) {
+            assert_eq!(view.slot(100), 100 - k);
+        }
+        // Every null view a handle reads is listed (else the host does not
+        // make it).
+        for props in (0..=0xFF).flat_map(|kind| [kind, kind | 0x1000]) {
+            assert!(G::ALL.contains(&G::of(props)), "{props:#x}");
+        }
+        let of = G::of;
+        assert_eq!(of(13), G::Constant);
+        assert_eq!(of(11), G::Buffer);
+        assert_eq!(of(12), G::Buffer);
+        assert_eq!(of(10), G::Buffer);
+        assert_eq!(of(11 | 0x1000), G::UnorderedBuffer);
+        assert_eq!(of(10 | 0x1000), G::UnorderedBuffer);
+        // Each texture kind the translator makes (`Lower::image`), as a
+        // shader view and an unordered one.
+        let textures = [
+            (1, G::Texture1D, G::UnorderedTexture1D),
+            (2, G::Texture2D, G::UnorderedTexture2D),
+            (4, G::Texture3D, G::UnorderedTexture3D),
+            (5, G::TextureCube, G::UnorderedTexture2DArray),
+            (6, G::Texture1DArray, G::UnorderedTexture1DArray),
+            (7, G::Texture2DArray, G::UnorderedTexture2DArray),
+        ];
+        for (kind, shader, unordered) in textures {
+            assert_eq!(of(kind), shader, "kind {kind}");
+            assert_eq!(of(kind | 0x1000), unordered, "kind {kind}");
+        }
+        // Kinds it makes none of read the 2D views; samplers, the 2D view.
+        assert_eq!(of(3), G::Texture2D);
+        assert_eq!(of(9 | 0x1000), G::UnorderedTexture2D);
+        assert_eq!(of(14 | 0x8000), G::Texture2D);
     }
     use super::container::SigElement;
     use super::shader::Shader;

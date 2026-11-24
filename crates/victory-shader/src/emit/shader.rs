@@ -24,8 +24,16 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
-/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
-pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Dwords of the [`SLOT_STRIDES`] buffer, one per slot a view index can
+/// reach: heap indices are clamped to it.
+pub const SLOT_STRIDES_COUNT: u32 = HEAP_VIEWS;
+
+/// The slots of a host view heap where the host takes that many (AMD; the
+/// title's heap is a little over 1,000,000 views, and `victory-gpu`'s
+/// dynamic slots fit after it with room to spare): the last
+/// ([`view_heap_limit`]) and those below it are the null views every view
+/// index at or past them reads (module notes, "Heap indices").
+pub const HEAP_VIEWS: u32 = 1 << 21;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -106,19 +114,23 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
-/// The null slot every host view heap keeps at its end (0: no limit). Shaders translated while
-/// it is set read that slot for any view index at or past it. A read past a heap's end is
-/// undefined: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
-/// larger) hung its GPU (GPU-based validation: "descriptor heap index out of bounds"), and AMD
-/// RDNA3 took a page fault and removed the device.
-static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The last slot of every host view heap, where its null views end ([`super::GuardView`]):
+/// [`HEAP_VIEWS`] − 1, or less on a host that caps its view heaps lower (NVIDIA at 1,000,000
+/// views). Shaders translated while it is set clamp every view index to the null view of its
+/// kind there. A read past a heap's end is undefined: the capped host hung its GPU (GPU-based
+/// validation: "descriptor heap index out of bounds"), and AMD (RDNA3, RDNA4) took a page
+/// fault and removed the device.
+static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(HEAP_VIEWS - 1);
 
-/// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
-pub fn set_view_heap_limit(null_slot: u32) {
-    VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+/// See [`VIEW_LIMIT`]: `last` is the last slot of the host's view heaps; set before the first
+/// shader is translated. A heap holds at least its null views.
+pub fn set_view_heap_limit(last: u32) {
+    let least = super::GuardView::ALL.len() as u32 - 1;
+    VIEW_LIMIT.store(last.max(least), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
+/// See [`VIEW_LIMIT`]: the last slot of the host's view heaps, which shaders translated now
+/// clamp view indices against.
 pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -392,29 +404,34 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
-        // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
-        // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
-        let index = if !sampler && limit != 0 {
-            let null = self.m.i32(limit);
-            let i32t = self.t.i32;
-            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
-            self.m.tag(v, super::bitcode::Tag::Clamp);
-            v
-        } else if sampler {
+        // A view index at or past the null view of the handle's kind at the
+        // host heap's end reads that view (module notes, "Heap indices"):
+        // one UMin (a compare and select emitted here made the bitcode
+        // invalid).
+        // shortcut: an index among the null views below that one (at most
+        // 13 slots) reads a null view of another kind.
+        let last = if sampler {
             // A sampler heap has at most 2,048 samplers on any host: an
             // index past that (a number read from memory the host has not
             // got yet) stays inside the largest heap there is.
             // shortcut: not the bound heap's own count, which a title
             // heap smaller than 2,048 would need.
-            let last = self.m.i32(2047);
-            let i32t = self.t.i32;
-            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
-            self.m.tag(v, super::bitcode::Tag::Clamp);
-            v
+            2047
         } else {
-            index
+            super::GuardView::of(props.0)
+                .slot(VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed))
         };
+        let last = self.m.i32(last);
+        let i32t = self.t.i32;
+        let index = self.op(
+            block,
+            "binary.i32",
+            Attr::ReadNone,
+            i32t,
+            40,
+            &[index, last],
+        );
+        self.m.tag(index, super::bitcode::Tag::Clamp);
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {

@@ -7,6 +7,7 @@
 
 use std::sync::Mutex;
 
+use victory_shader::emit::GuardView;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -17,7 +18,8 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have `dynamic` more.
+    /// Slots mirroring the title's; view heaps have `dynamic` more, then
+    /// null slots up to the null views they end with ([`GuardView`]).
     count: u32,
     /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
@@ -830,50 +832,45 @@ fn fault_class_in(va: u64, ranges: &[(u64, u64, u64, bool)]) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
-/// The size of every host view heap on a host that takes more than
-/// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
-/// views in the retail game) plus [`DYNAMIC`] fits with room to spare, and
-/// the last slot is the null slot every view index at or past it reads.
-const UNCAPPED_VIEWS: u32 = 1 << 21;
+/// The null views every view heap ends with ([`GuardView`]).
+const GUARDS: u32 = GuardView::ALL.len() as u32;
 
-/// Picks, once, the null slot at the end of every host view heap and tells
-/// the translator now (`set_view_heap_limit`) instead of when the title's
+/// Picks, once, the size of every host view heap and tells the translator
+/// its last slot now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
 /// title makes 25 pipelines (their shaders translated at once) before it
-/// makes its view heap. Called before a shader is translated and before a
-/// view heap is made.
+/// makes its view heap. [`HEAP_VIEWS`] where the host takes that many
+/// (AMD), else [`PORTABLE_VIEWS`] (NVIDIA). Called before a shader is
+/// translated and before a view heap is made.
 ///
-/// Every host clamps. A host that caps view heaps at [`PORTABLE_VIEWS`]
-/// (NVIDIA) hung on a view index past the heap; one that does not (AMD
-/// RDNA3, RX 7900 XT) took a page fault and removed the device on entering
-/// the world: a compute program read view slot 16,777,088 (0xffff80) of a
-/// heap of 1,507,328, past its end. Unclamped, that index is undefined on
-/// any host.
+/// Every host clamps: a view index past the heap hung the capped host's
+/// GPU, and on AMD a compute program of the title's world that reads the
+/// 24-bit "no descriptor" marker as a view index took a page fault past
+/// the heap's end and removed the device (RDNA3 and RDNA4).
+///
+/// [`HEAP_VIEWS`]: victory_shader::emit::HEAP_VIEWS
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        let fits = |count: u32| {
-            // SAFETY: plain heap creation; the heap is released at once.
-            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            };
-            made.is_ok()
+        // SAFETY: plain heap creation; the heap is released at once.
+        let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: victory_shader::emit::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
         };
-        let views = if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
+        let views = if made.is_ok() {
+            victory_shader::emit::HEAP_VIEWS
         } else {
             PORTABLE_VIEWS
         };
         tracing::info!(
             views,
-            "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
+            "host view heaps hold {views} views; view indices are clamped to the null views at their end"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
     });
@@ -913,34 +910,32 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        // A view heap ends at the null slot shaders clamp view indices to
-        // (`probe_view_limit`), whatever the title's own count: the title's
-        // slots, then the dynamic ones, then null up to and with that slot.
-        if !sampler {
-            probe_view_limit();
-        }
-        let null = if sampler {
-            0
-        } else {
-            victory_shader::emit::view_heap_limit()
-        };
-        let (heap, count, size) = if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
+        let (heap, count, size) = if sampler {
+            match make(count) {
+                Ok(heap) => (heap, count, count),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
                 }
             }
         } else {
-            let size = null + 1;
-            let fitted = if count + extra <= null {
+            // A view heap ends at the slot shaders clamp view indices to
+            // (`probe_view_limit`), whatever the title's own count: the
+            // title's slots, the dynamic ones, null slots, and the null
+            // views of every kind (`make_guards`).
+            probe_view_limit();
+            let size = victory_shader::emit::view_heap_limit() + 1;
+            let room = size - GUARDS - extra;
+            let fitted = if count <= room {
                 count
             } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                // shortcut: descriptors past the host's limit are left out; a title that
+                // reaches them needs remapping. They read the null views instead.
+                tracing::warn!(
+                    count,
+                    "host view heap capped at {size}; views past it read a null view"
+                );
+                room
             };
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
@@ -1018,8 +1013,58 @@ impl HostHeap {
         if let Err(e) = h.fill_null(kind, size) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
+        if !sampler {
+            h.make_guards(size - 1);
+        }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
+    }
+
+    /// Makes the null views a view heap whose last slot is `last` ends with
+    /// ([`GuardView`]), each of the kind and texture dimension of the
+    /// accesses that read it: none reads a null view of another kind (on
+    /// AMD a null texture view read as a buffer gives a wild address) or
+    /// dimension (as [`null_like`] and [`null_uav_desc`] avoid for the
+    /// title's slots).
+    fn make_guards(&self, last: u32) {
+        let Some(host) = host() else { return };
+        for view in GuardView::ALL {
+            let at = self.cpu(view.slot(last));
+            // Null views as for a title's description of that dimension.
+            let texture = |dimension: D3D12_SRV_DIMENSION| {
+                let mut words = [0; 10];
+                words[1] = dimension.0 as u32;
+                null_like(&words, at);
+            };
+            let unordered = |dimension: D3D12_UAV_DIMENSION| {
+                null_uav(&null_uav_desc(Some(dimension.0 as u32)), at);
+            };
+            match view {
+                GuardView::Texture2D => texture(D3D12_SRV_DIMENSION_TEXTURE2D),
+                GuardView::Constant => {
+                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                    // SAFETY: a slot of our heap; a zero location makes a
+                    // null view.
+                    unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+                }
+                GuardView::Buffer => null_buffer_view(at),
+                GuardView::UnorderedBuffer => null_uav(&null_raw_uav_desc(), at),
+                GuardView::UnorderedTexture2D => unordered(D3D12_UAV_DIMENSION_TEXTURE2D),
+                GuardView::Texture1D => texture(D3D12_SRV_DIMENSION_TEXTURE1D),
+                GuardView::Texture1DArray => texture(D3D12_SRV_DIMENSION_TEXTURE1DARRAY),
+                GuardView::Texture2DArray => texture(D3D12_SRV_DIMENSION_TEXTURE2DARRAY),
+                GuardView::Texture3D => texture(D3D12_SRV_DIMENSION_TEXTURE3D),
+                GuardView::TextureCube => texture(D3D12_SRV_DIMENSION_TEXTURECUBE),
+                GuardView::UnorderedTexture1D => unordered(D3D12_UAV_DIMENSION_TEXTURE1D),
+                GuardView::UnorderedTexture1DArray => {
+                    unordered(D3D12_UAV_DIMENSION_TEXTURE1DARRAY);
+                }
+                GuardView::UnorderedTexture2DArray => {
+                    unordered(D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+                }
+                GuardView::UnorderedTexture3D => unordered(D3D12_UAV_DIMENSION_TEXTURE3D),
+            }
+        }
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
@@ -1776,27 +1821,7 @@ impl HostHeap {
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
         self.keep(index, None);
-        let Some(host) = host() else { return };
-        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_UAV {
-                    NumElements: 1,
-                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                    ..Default::default()
-                },
-            },
-        };
-        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-        unsafe {
-            host.device.CreateUnorderedAccessView(
-                None::<&ID3D12Resource>,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.cpu(index),
-            )
-        };
+        null_uav(&null_raw_uav_desc(), self.cpu(index));
     }
 
     /// The shader-visible handle of slot `index`.
@@ -2981,15 +3006,37 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     } else {
         null_uav_desc(dimension)
     };
+    null_uav(&desc, at);
+}
+
+/// A null unordered access view described by `desc` at `at`: reads give
+/// zeros, writes are dropped.
+fn null_uav(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device.CreateUnorderedAccessView(
             None::<&ID3D12Resource>,
             None::<&ID3D12Resource>,
-            Some(&desc),
+            Some(desc),
             at,
         )
     };
+}
+
+/// A raw buffer UAV of one dword, as null views of raw buffers are made.
+fn null_raw_uav_desc() -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    }
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -3671,6 +3718,38 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A view heap ends at the slot shaders clamp view indices to, however
+    /// few slots the title asks for, and its null views of every kind and
+    /// dimension there come after every slot it hands out and leave the
+    /// device alive (with `VICTORY_D3D12_DEBUG` in a diagnostics build, the
+    /// debug layer finds no error in them; run it alone then, as other tests
+    /// share the device).
+    #[test]
+    fn view_heaps_end_with_the_null_views_shaders_clamp_to() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let _ = host.log_messages();
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        let last = victory_shader::emit::view_heap_limit();
+        // SAFETY: a live heap.
+        let size = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        assert_eq!(size, last + 1);
+        let lowest = GuardView::ALL.iter().map(|v| v.slot(last)).min().unwrap();
+        assert_eq!(lowest, last + 1 - GUARDS);
+        assert!(heap.count + heap.dynamic <= lowest);
+        // A heap the title fills to the end leaves the null views out.
+        let Some(full) = HostHeap::new(false, last) else {
+            return;
+        };
+        assert_eq!(full.count + full.dynamic, lowest);
     }
 }
 

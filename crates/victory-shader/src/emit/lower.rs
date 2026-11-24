@@ -5153,6 +5153,7 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
+                let index = self.buffer_guard(src, index, props)?;
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -5219,7 +5220,8 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                let index = self.buffer_guard(src, phi, props)?;
+                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -5237,6 +5239,7 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
+                let index = self.buffer_guard(src, index, props)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -5244,6 +5247,7 @@ impl<'a> Lower<'a> {
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
+                let index = self.buffer_guard(src, index, props)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
@@ -5310,8 +5314,17 @@ impl<'a> Lower<'a> {
         if let Some(&v) = self.strides.get(&key) {
             return Ok(Some(v));
         }
-        let c = self.cur;
         let slot = self.heap_index(*load, *first, false)?;
+        let v = self.stride_at(slot);
+        self.strides.insert(key, v);
+        Ok(Some(v))
+    }
+
+    /// The bytes per element of the buffer view at view heap slot `slot`
+    /// (0: none, or not a buffer), from the host's table
+    /// ([`super::shader::SLOT_STRIDES`]), read in the current block.
+    fn stride_at(&mut self, slot: V) -> V {
+        let c = self.cur;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -5333,9 +5346,53 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
-        self.strides.insert(key, v);
-        Ok(Some(v))
+        self.as_int(f)
+    }
+
+    /// Whether the descriptor `src` comes from the view heap itself (root
+    /// type `ResourceHeap`, not a table) on some path.
+    fn is_heap_direct(&self, src: &Source) -> bool {
+        match src {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap),
+            Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } => {
+                args.iter().any(|a| self.is_heap_direct(a))
+            }
+            Source::LanePhi { args, .. } => args.iter().flatten().any(|a| self.is_heap_direct(a)),
+            Source::Constant(_) | Source::Built { .. } => false,
+        }
+    }
+
+    /// The heap index to read a buffer at, for the descriptor `src` at heap
+    /// index `index` with `props`: `index`, or the null buffer view of the
+    /// handle's kind ([`super::GuardView`]) where the program picks the
+    /// buffer from the view heap itself and the host's table of strides
+    /// says the slot holds no buffer view (module notes, "Heap indices").
+    /// Such an index comes from data, and a texture view read as a buffer
+    /// gives a wild address on AMD (the texture's address shifted 8 bits
+    /// down: GPU faults at low addresses).
+    fn buffer_guard(&mut self, src: &Source, index: V, props: (u32, u32)) -> Result<V, Why> {
+        let view = super::GuardView::of(props.0);
+        let buffer = matches!(
+            view,
+            super::GuardView::Buffer | super::GuardView::UnorderedBuffer
+        );
+        if !buffer || !self.is_heap_direct(src) {
+            return Ok(index);
+        }
+        // A descriptor loaded in this block has its stride read once.
+        let stride = match self.slot_stride(src)? {
+            Some(stride) => stride,
+            None => self.stride_at(index),
+        };
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let none = self.s.m.cmp(c, pred::EQ, stride, zero);
+        let null = self.s.m.i32(view.slot(super::view_heap_limit()));
+        Ok(self.s.m.select(c, none, null, index))
     }
 
     /// The heap index of a descriptor that may differ between lanes,

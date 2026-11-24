@@ -968,18 +968,35 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F 2D texture array SRV (width, height, layers, texels of
+    /// each layer in turn).
+    Array(u32, u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F 3D texture SRV (width, height, depth, texels of each
+    /// depth in turn).
+    Volume(u32, u32, u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// [`View::UintTextureUav`] as a 2D array of one layer.
+    UintArrayUav(u32, u32),
+    /// [`View::UintTextureUav`] as a 3D texture of depth 1.
+    UintVolumeUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// Last in the heap only: the heap then has the host's slots up to its
+    /// last ([`super::view_heap_limit`]) and ends with the null views
+    /// translated shaders clamp view indices to ([`super::GuardView`]), as
+    /// the host's do; these views take the places of the first of them, in
+    /// [`super::GuardView::ALL`] order (to show which one an access reads).
+    /// Slots between the views before and the null views are left unmade.
+    Guards(&'a [View<'a>]),
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -995,6 +1012,156 @@ pub enum Stride {
     Format(DXGI_FORMAT, u32),
 }
 
+/// Makes the null views at the end of view heap `heap`, whose last slot is
+/// `last` ([`super::GuardView`]), as the host makes its own.
+#[cfg(test)]
+fn null_guards(dev: &ID3D12Device, heap: &ID3D12DescriptorHeap, last: u32) {
+    use super::GuardView;
+    // A null texture view of `dimension`: one mip, one slice.
+    let texture = |dimension| {
+        let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: dimension,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        desc.Anonymous = match dimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+            D3D12_SRV_DIMENSION_TEXTURE3D => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+            D3D12_SRV_DIMENSION_TEXTURECUBE => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+            _ => D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        desc
+    };
+    // A null `R32_UINT` texture UAV of `dimension`: one slice, every depth.
+    let unordered_texture = |dimension| {
+        let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: dimension,
+            ..Default::default()
+        };
+        match dimension {
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                    ArraySize: 1,
+                    ..Default::default()
+                };
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: 1,
+                    ..Default::default()
+                };
+            }
+            D3D12_UAV_DIMENSION_TEXTURE3D => {
+                desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                    WSize: u32::MAX,
+                    ..Default::default()
+                };
+            }
+            _ => {}
+        }
+        desc
+    };
+    let buffer = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    let unordered_buffer = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    // A zero location makes a null view.
+    let constant = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+    // SAFETY: slots inside a live heap; null resources with descriptions.
+    unsafe {
+        let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let start = heap.GetCPUDescriptorHandleForHeapStart();
+        for view in GuardView::ALL {
+            let slot = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: start.ptr + view.slot(last) as usize * step as usize,
+            };
+            let srv = |desc| dev.CreateShaderResourceView(None, Some(&desc), slot);
+            let uav = |desc| dev.CreateUnorderedAccessView(None, None, Some(&desc), slot);
+            match view {
+                GuardView::Texture2D => srv(texture(D3D12_SRV_DIMENSION_TEXTURE2D)),
+                GuardView::Constant => dev.CreateConstantBufferView(Some(&constant), slot),
+                GuardView::Buffer => srv(buffer),
+                GuardView::UnorderedBuffer => uav(unordered_buffer),
+                GuardView::UnorderedTexture2D => {
+                    uav(unordered_texture(D3D12_UAV_DIMENSION_TEXTURE2D));
+                }
+                GuardView::Texture1D => srv(texture(D3D12_SRV_DIMENSION_TEXTURE1D)),
+                GuardView::Texture1DArray => srv(texture(D3D12_SRV_DIMENSION_TEXTURE1DARRAY)),
+                GuardView::Texture2DArray => srv(texture(D3D12_SRV_DIMENSION_TEXTURE2DARRAY)),
+                GuardView::Texture3D => srv(texture(D3D12_SRV_DIMENSION_TEXTURE3D)),
+                GuardView::TextureCube => srv(texture(D3D12_SRV_DIMENSION_TEXTURECUBE)),
+                GuardView::UnorderedTexture1D => {
+                    uav(unordered_texture(D3D12_UAV_DIMENSION_TEXTURE1D));
+                }
+                GuardView::UnorderedTexture1DArray => {
+                    uav(unordered_texture(D3D12_UAV_DIMENSION_TEXTURE1DARRAY));
+                }
+                GuardView::UnorderedTexture2DArray => {
+                    uav(unordered_texture(D3D12_UAV_DIMENSION_TEXTURE2DARRAY));
+                }
+                GuardView::UnorderedTexture3D => {
+                    uav(unordered_texture(D3D12_UAV_DIMENSION_TEXTURE3D));
+                }
+            }
+        }
+    }
+}
+
 /// Bindings for [`Host::dispatch`]: root arguments, the view heap in order,
 /// the sampler heap, and the group counts.
 #[cfg(test)]
@@ -1007,8 +1174,9 @@ pub struct Dispatch<'a> {
 
 #[cfg(test)]
 impl Host {
-    /// Runs a compute pipeline and returns each UAV's contents in heap
-    /// order (texels as float bits, row by row).
+    /// Runs a compute pipeline and returns each UAV's contents in the order
+    /// of the views (those of [`View::Guards`] last; texels as float bits,
+    /// row by row).
     pub fn dispatch(
         &self,
         root: &ID3D12RootSignature,
@@ -1127,28 +1295,52 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
+            // The views from slot 0 on; with `View::Guards` last, the null
+            // views at the heap's end, some of them replaced.
+            let (listed, guards) = match d.views.split_last() {
+                Some((View::Guards(marked), rest)) => (rest, Some(*marked)),
+                _ => (d.views, None),
+            };
+            let last = super::view_heap_limit();
+            let slots = if guards.is_some() {
+                last as usize + 1
+            } else {
+                listed.len()
+            };
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                 as usize;
             let sampler_size =
                 dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
+            let mut placed: Vec<(usize, &View)> = listed.iter().enumerate().collect();
+            if let Some(marked) = guards {
+                null_guards(dev, &views, last);
+                let at = super::GuardView::ALL.iter().map(|g| g.slot(last) as usize);
+                placed.extend(at.zip(marked));
+            }
             let mut keep = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
-            for (i, v) in d.views.iter().enumerate() {
+            for (i, v) in placed {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
+                    View::Texture(..) | View::Cube(..) | View::Array(..) | View::Volume(..) => {
+                        // Faces, layers or depths, each its own upload.
                         let (w, h, texels, faces) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1),
                             View::Cube(n, t) => (n, n, t, 6),
+                            View::Array(w, h, n, t) | View::Volume(w, h, n, t) => (w, h, t, n),
                             _ => unreachable!(),
                         };
+                        let volume = matches!(v, View::Volume(..));
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        if volume {
+                            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                        }
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
@@ -1173,13 +1365,15 @@ impl Host {
                                 );
                             }
                             upload.Unmap(0, None);
+                            // A 3D texture's depths are all subresource 0.
+                            let (index, z) = if volume { (0, face) } else { (face, 0) };
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
+                            at_face.Anonymous.SubresourceIndex = index as u32;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
                                 0,
-                                0,
+                                z as u32,
                                 &footprint(&upload, w, h),
                                 None,
                             );
@@ -1201,11 +1395,25 @@ impl Host {
                                 },
                             },
                         };
-                        dev.CreateShaderResourceView(
-                            &tex,
-                            (faces == 6).then_some(&cube as *const _),
-                            at,
-                        );
+                        // An array of one layer too (its default view is 2D).
+                        let array = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                                    MipLevels: 1,
+                                    ArraySize: faces,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let view = match v {
+                            View::Cube(..) => Some(&cube as *const _),
+                            View::Array(..) => Some(&array as *const _),
+                            _ => None,
+                        };
+                        dev.CreateShaderResourceView(&tex, view, at);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {
@@ -1262,18 +1470,40 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) => {
+                    View::UintTextureUav(w, h)
+                    | View::UintArrayUav(w, h)
+                    | View::UintVolumeUav(w, h) => {
+                        let mut desc = texture_as(
+                            w,
+                            h,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            DXGI_FORMAT_R32_UINT,
+                        );
+                        if matches!(v, View::UintVolumeUav(..)) {
+                            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                        }
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(
-                                w,
-                                h,
-                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                DXGI_FORMAT_R32_UINT,
-                            ),
+                            &desc,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
-                        dev.CreateUnorderedAccessView(&t, None, None, at);
+                        // One layer's default view is 2D, not an array.
+                        let array = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_UINT,
+                            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                                    ArraySize: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(
+                            &t,
+                            None,
+                            matches!(v, View::UintArrayUav(..)).then_some(&array as *const _),
+                            at,
+                        );
                         let pitch = (w * 4).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1337,6 +1567,7 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
+                    View::Guards(_) => return Err("View::Guards is only last".to_string()),
                 }
             }
             for (i, s) in d.samplers.iter().enumerate() {
