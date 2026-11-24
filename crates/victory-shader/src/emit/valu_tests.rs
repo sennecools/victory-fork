@@ -1811,3 +1811,83 @@ fn movrel_masks_m0_to_8_bits_and_allows_non_vgpr_src0() {
         );
     });
 }
+
+#[test]
+fn scalar_lshl_add_and_minmax_set_scc() {
+    // SOP2 opcodes: s_addc_u32 = 0x04, s_cselect_b32 = 0x0a,
+    // s_lshl{1,2,3,4}_add_u32 = 0x2e..=0x31.
+    for (shift, op) in [(1u32, 0x2Eu8), (2, 0x2F), (3, 0x30), (4, 0x31)] {
+        // s6 = (s0 << shift) + s1, SCC = 32-bit unsigned carry-out;
+        // s7 = s2 + 0 + SCC (64-bit address/pointer high-word carry propagation);
+        // v0 = s7.
+        let shader = build_valu_cs(&[
+            sop2(op, 6, 0, 1),
+            sop2(0x04, 7, 2, 0x80),
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        let cases: &[([u32; 4], u32)] = &[
+            // Non-zero sum, no carry -> SCC must be 0 (not `r != 0`).
+            ([3, 4, 10, 0], 10),
+            // Exact zero result with carry shifted out of s0 -> SCC must be 1.
+            ([1u32 << (32 - shift), 0, 10, 0], 11),
+            // Carry from addition wrap only (shift does not overflow).
+            ([1, 0xFFFF_FFFF, 10, 0], 11),
+            // Carry from shift overflow only (addition does not wrap).
+            ([0x8000_0000, 5, 10, 0], 11),
+            // Carry from both shift and addition.
+            ([0xFFFF_FFFF, 0xFFFF_FFFF, 10, 0], 11),
+            // Zero + zero -> no carry.
+            ([0, 0, 10, 0], 10),
+        ];
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            let expected_carry = u32::from((((u64::from(inp[0]) << shift) + u64::from(inp[1])) >> 32) != 0);
+            assert_eq!(want, inp[2] + expected_carry);
+            assert_eq!(
+                got, want,
+                "{backend}: s_lshl{shift}_add_u32({:#010x}, {:#010x}) + s_addc_u32({}) = {got}, want {want}",
+                inp[0], inp[1], inp[2],
+            );
+        });
+    }
+
+    // s_min_i32 (0x06), s_min_u32 (0x07), s_max_i32 (0x08), s_max_u32 (0x09):
+    // SCC = 1 iff src0 won the comparison (`src0 < src1` or `src0 > src1`).
+    let minmax_ops: &[(u8, &str, fn(u32, u32) -> bool)] = &[
+        (0x06, "s_min_i32", |a, b| (a as i32) < (b as i32)),
+        (0x07, "s_min_u32", |a, b| a < b),
+        (0x08, "s_max_i32", |a, b| (a as i32) > (b as i32)),
+        (0x09, "s_max_u32", |a, b| a > b),
+    ];
+    let pairs: &[(u32, u32)] = &[
+        (0, 5),
+        (5, 0),
+        (5, 3),
+        (3, 5),
+        (5, 5),
+        (0, 0),
+        (0, (-5i32) as u32),
+        ((-5i32) as u32, 0),
+        ((-5i32) as u32, (-5i32) as u32),
+        (0x8000_0000, 1),
+        (1, 0x8000_0000),
+    ];
+    let inputs: Vec<[u32; 4]> = pairs.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
+    for &(op, name, pred_fn) in minmax_ops {
+        // s6 = op(s0, s1), SCC = src0 won; s7 = SCC ? 1 : 0; v0 = s7.
+        let shader = build_valu_cs(&[
+            sop2(op, 6, 0, 1),
+            sop2(0x0A, 7, 0x81, 0x80),
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = u32::from(pred_fn(inp[0], inp[1]));
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) SCC = {got}, want {want} (case {i})",
+                inp[0], inp[1],
+            );
+        });
+    }
+}
