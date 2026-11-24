@@ -5564,7 +5564,6 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -5644,25 +5643,30 @@ impl<'a> Lower<'a> {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
+            // What the host views at the load's own place.
+            let src = Source::Loaded {
+                load: site,
+                first: 0,
+            };
+            let used = self.used_kind(&src);
+            let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
             // A buffer view the code only takes the address of, to walk
-            // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // the memory behind it (a ray-tracing structure), or only asks
+            // whether it holds records (the record count against 0): the
+            // address from the host, the record count from the host view,
+            // dword 3 has no value.
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
-                for k in 0..count {
-                    let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
-                        _ => {
-                            if let Some(v) = inst.write(reg) {
-                                self.vals.insert(v, Val::Missing(OTHER));
-                                self.stale.insert(v);
-                            }
-                        }
-                    }
+                let mut words = vec![(0, lo), (1, hi)];
+                // Without a handle the count has no value either.
+                if count > 2
+                    && let Ok(d) = self.view_dimensions(site, &src, (11 | u, 0), false)
+                {
+                    words.push((2, self.record_count(d, 11, used)));
                 }
+                self.write_fields(inst, code, count, 0, &words);
                 return Ok(());
             }
             if std::env::var_os("VICTORY_DESC_WHY").is_some() {
@@ -5726,18 +5730,8 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        let d = self.view_dimensions(site, &src, props, image.is_some() && !uav)?;
         let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
-        } else {
-            self.s.m.undef(i32t)
-        };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
         let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
         let words: Vec<(u32, V)> = match image {
             Some(kind) => {
@@ -5777,16 +5771,7 @@ impl<'a> Lower<'a> {
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
             None => {
-                // A raw view counts bytes; the descriptor's record count is in elements.
-                let n = field(self, 0);
-                let stride = used.map_or(0, |u| u.stride);
-                let n = if props.0 & 0xFF == 11 && stride > 1 {
-                    let k = self.s.m.i32(stride);
-                    self.s.m.bin(c, Bin::UDiv, n, k)
-                } else {
-                    n
-                };
-                let mut words = vec![(2, n)];
+                let mut words = vec![(2, self.record_count(d, props.0, used))];
                 // Its address too, where the code computes with it and the
                 // host can tell it.
                 let computed = (0..2u8).any(|k| {
@@ -5802,6 +5787,55 @@ impl<'a> Lower<'a> {
                 words
             }
         };
+        self.write_fields(inst, code, count, first, &words);
+        Ok(())
+    }
+
+    /// The host view's dimensions (`getDimensions`, at level 0 with
+    /// `level0`) through a handle with `props` of the descriptor `src`
+    /// loaded at `site`.
+    fn view_dimensions(
+        &mut self,
+        site: Site,
+        src: &Source,
+        props: (u32, u32),
+        level0: bool,
+    ) -> Result<V, Why> {
+        let h = self.handle(site, src, false, props)?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = if level0 {
+            self.s.m.i32(0)
+        } else {
+            self.s.m.undef(i32t)
+        };
+        Ok(self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]))
+    }
+
+    /// A buffer descriptor's record count (dword 2) from the host view's
+    /// dimensions `d`, the view's kind in the low byte of `kind`: a raw
+    /// view counts bytes, the descriptor elements of the used entry's
+    /// stride.
+    fn record_count(&mut self, d: V, kind: u32, used: Option<&UsedResource>) -> V {
+        let c = self.cur;
+        let n = self.s.m.extract(c, d, 0);
+        let stride = used.map_or(0, |u| u.stride);
+        if kind & 0xFF == 11 && stride > 1 {
+            let k = self.s.m.i32(stride);
+            self.s.m.bin(c, Bin::UDiv, n, k)
+        } else {
+            n
+        }
+    }
+
+    /// Writes the `count` dwords from SGPR `code` of the descriptor load
+    /// `inst`: `words` by place from the descriptor's dword `first` on; the
+    /// others (addresses, formats, tiling) have no host value.
+    fn write_fields(&mut self, inst: &Inst, code: u8, count: u32, first: u8, words: &[(u32, V)]) {
+        const OTHER: Why = "a descriptor's address or format read as data";
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
@@ -5814,7 +5848,6 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Ok(())
     }
 
     /// `s_load_dword*` from the program's constant table.
