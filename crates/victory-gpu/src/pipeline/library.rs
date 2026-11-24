@@ -661,10 +661,11 @@ pub(crate) fn save(now: bool) {
 }
 
 /// Held for a whole save: this run's saves share the temporary files beside
-/// the library and the early list ([`tmp_beside`]), so a second one would truncate the file the first
-/// is about to rename over the library (the end-of-run save against a
-/// worker's periodic one; upstream Marvisak/VIctory#1660). A periodic save
-/// (`now` false) that finds one running is skipped; `now` waits for it.
+/// the library and the early list ([`tmp_beside`]), so a second one would
+/// truncate the file the first is about to rename over the library (the
+/// end-of-run save against a worker's periodic one; upstream
+/// Marvisak/VIctory#1660). A periodic save (`now` false) that finds one
+/// running is skipped; `now` waits for it.
 fn one_save(now: bool) -> Option<MutexGuard<'static, ()>> {
     static SAVING: Mutex<()> = Mutex::new(());
     alone(&SAVING, now)
