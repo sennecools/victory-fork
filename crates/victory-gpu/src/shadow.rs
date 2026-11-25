@@ -295,8 +295,11 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    match &buffer {
+        Some(buffer) => crate::host::label(buffer, "title buffer card copy", size),
+        None => {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        }
     }
     buffer
 }
@@ -350,8 +353,11 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    match &buffer {
+        Some(buffer) => crate::host::label(buffer, "window card copy", size),
+        None => {
+            WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        }
     }
     buffer
 }
@@ -3900,6 +3906,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
+        crate::host::label(&buffer, "title buffer host copy", size);
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
@@ -4121,6 +4128,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
+    crate::host::label(&buffer, "window host copy", len);
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
@@ -4207,6 +4215,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         });
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::label(&buffer, "view host copy", len.next_multiple_of(256));
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

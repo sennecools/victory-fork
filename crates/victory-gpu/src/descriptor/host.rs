@@ -1215,6 +1215,7 @@ impl HostHeap {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
+                crate::host::label(&buffer, "stride table", bytes);
                 crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
                 Some((buffer, gpu, data as usize))
             })
@@ -3579,6 +3580,7 @@ fn magenta() -> Option<&'static ID3D12Resource> {
                     )
                     .ok()?;
                 let texture = texture?;
+                crate::host::label(&texture, "magenta texel", 4);
                 texture.Map(0, None, None).ok()?;
                 let texel = [255u8, 0, 255, 255];
                 texture

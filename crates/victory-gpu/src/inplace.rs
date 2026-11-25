@@ -380,13 +380,17 @@ pub(crate) enum From {
 pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<ID3D12Heap> {
     // SAFETY: the calls take an address or a handle and check both
     // themselves; a refusal is an error code.
-    unsafe {
+    let heap: ID3D12Heap = unsafe {
         match from {
             From::Region(at) => device.cast::<ID3D12Device3>()?.OpenExistingHeapFromAddress(at as *const c_void),
             From::Part(at, bytes) => device.cast::<ID3D12Device13>()?.OpenExistingHeapFromAddress1(at as *const c_void, bytes),
             From::Section(handle) => device.cast::<ID3D12Device3>()?.OpenExistingHeapFromFileMapping(HANDLE(handle as *mut c_void)),
         }
-    }
+    }?;
+    // SAFETY: a plain query on a live heap.
+    let bytes = unsafe { heap.GetDesc() }.SizeInBytes;
+    crate::host::label(&heap, "in-place heap", bytes);
+    Ok(heap)
 }
 
 fn buffer_desc(size: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
@@ -411,7 +415,9 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
     let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     // SAFETY: plain creation in a live heap.
     unsafe { device.CreatePlacedResource(heap, offset, &buffer_desc(size, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut placed)? };
-    placed.ok_or_else(windows::core::Error::empty)
+    let placed = placed.ok_or_else(windows::core::Error::empty)?;
+    crate::host::label(&placed, "in-place buffer", size);
+    Ok(placed)
 }
 
 // The title's views of its physical pages, as the runtime maps them: the
@@ -678,7 +684,9 @@ impl Rig {
             self.device
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc(size, D3D12_RESOURCE_FLAG_NONE), state, None, &mut buffer)?
         };
-        buffer.ok_or_else(windows::core::Error::empty)
+        let buffer = buffer.ok_or_else(windows::core::Error::empty)?;
+        crate::host::label(&buffer, "in-place probe buffer", size);
+        Ok(buffer)
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
@@ -748,6 +756,7 @@ impl Rig {
             self.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc(bytes, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COMMON, None, &mut to)?
         };
         let to = to.ok_or_else(windows::core::Error::empty)?;
+        crate::host::label(&to, "in-place probe copy", bytes);
         let mut best = f64::MAX;
         for _ in 0..3 {
             let started = std::time::Instant::now();

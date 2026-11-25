@@ -495,6 +495,7 @@ fn twin_texture(
         TWINS[1].fetch_add(1, Relaxed);
         return None;
     };
+    crate::host::label_texture(&texture, "depth twin");
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -523,6 +524,7 @@ fn twin_texture(
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
+        crate::host::label(&buffer, "depth twin stencil copy", bytes);
         Some(buffer)
     } else {
         None
@@ -555,6 +557,7 @@ fn twin_texture(
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
+            crate::host::label_texture(&texture, "depth plane twin");
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -2255,6 +2258,14 @@ fn host_texture_as(
         return Err(Some(e.code().0));
     }
     let texture = texture.ok_or(None)?;
+    let kind = if reserved {
+        "host reserved texture"
+    } else if d.flags & (TARGET | UNORDERED) != 0 {
+        "host target texture"
+    } else {
+        "host texture"
+    };
+    crate::host::label_texture(&texture, kind);
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
     });

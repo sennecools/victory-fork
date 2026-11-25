@@ -252,6 +252,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let Some(buffer) = host.uav_buffer(bytes[0]) else {
                     return false;
                 };
+                crate::host::label(&buffer, "texture alias copy", bytes[0]);
                 crate::host::name(&buffer, || {
                     format!(
                         "alias copy {}x{} f{} to f{}",
@@ -1518,6 +1519,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         );
     }
     let (buffer, data) = host.upload_buffer(total)?;
+    crate::host::label(&buffer, "texture staging", total);
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",

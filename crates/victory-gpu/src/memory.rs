@@ -96,6 +96,7 @@ impl Memory {
         let host = host()?;
         let make = |dwords: u64, what: &str| {
             let (buffer, data) = host.shared_buffer(dwords * 4)?;
+            crate::host::label(&buffer, "title memory by address", dwords * 4);
             crate::host::name(&buffer, || format!("title memory by address: {what}"));
             // SAFETY: a fresh mapping of at least that many bytes.
             unsafe { std::ptr::write_bytes(data, 0, (dwords * 4) as usize) };

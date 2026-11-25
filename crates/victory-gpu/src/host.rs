@@ -1527,8 +1527,134 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// Gives a resource or heap we make the name of its kind and its size in
+/// bytes (`"list scratch 0x10000"`), in every build and mode, so that the
+/// device-removed report's lists of allocations a page fault hit (alive or
+/// freed) say what each one was. The name is put together on the stack;
+/// [`name`] gives a fuller one with the full device-removed data. Takes
+/// the object as an `ID3D12Object` (resources and heaps deref to one), so
+/// labelling costs one `SetName` and no interface query.
+pub(crate) fn label(object: &ID3D12Object, kind: &'static str, bytes: u64) {
+    let mut text = [0u16; 96];
+    let used = label_text(&mut text, kind, bytes);
+    // SAFETY: a plain call on a live object; the text ends in a zero within
+    // the array.
+    let _ = unsafe { object.SetName(windows::core::PCWSTR(text[..=used].as_ptr())) };
+}
+
+/// [`label`] for a texture (or any resource): the bytes are what the
+/// device says the resource takes.
+pub(crate) fn label_texture(resource: &ID3D12Resource, kind: &'static str) {
+    // SAFETY: plain queries on a live resource and device.
+    let bytes = unsafe {
+        let desc = resource.GetDesc();
+        let info = |h: &Host| h.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes;
+        host().map_or(0, info)
+    };
+    label(resource, kind, bytes);
+}
+
+/// Writes `"<kind> 0x<bytes>"` into `out` as UTF-16 (the kind cut to fit)
+/// and a zero after it; returns where the zero is.
+fn label_text(out: &mut [u16], kind: &str, bytes: u64) -> usize {
+    // Room for " 0x" and 16 digits and the zero.
+    let room = out.len() - 20;
+    let mut at = 0;
+    for unit in kind.encode_utf16().take(room) {
+        out[at] = unit;
+        at += 1;
+    }
+    for unit in " 0x".encode_utf16() {
+        out[at] = unit;
+        at += 1;
+    }
+    let digits = (64 - bytes.leading_zeros()).div_ceil(4).max(1);
+    for i in (0..digits).rev() {
+        let digit = ((bytes >> (i * 4)) & 0xf) as u8;
+        out[at] = u16::from(if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        });
+        at += 1;
+    }
+    out[at] = 0;
+    at
+}
+
+/// How many allocation nodes the device-removed report walks per list.
+const ALLOCATION_WALK: usize = 100_000;
+
+/// How many kinds the device-removed report counts allocations of by name.
+const ALLOCATION_KINDS: usize = 24;
+
+/// One list of allocations a page fault hit, on one line: how many, the
+/// first few names as they came, and how many of each kind, most first;
+/// says when the kinds or the walk ([`ALLOCATION_WALK`], `cut`) stopped
+/// short.
+fn allocation_summary(
+    what: &str,
+    names: &[String],
+    mut counts: Vec<(String, usize)>,
+    walked: usize,
+    cut: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!("; {what}: {walked} allocations");
+    if cut {
+        let _ = write!(text, " (walk stopped at {ALLOCATION_WALK})");
+    }
+    let _ = write!(text, " (first {}: [{}])", names.len(), names.join(", "));
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+    let more = counts.len().saturating_sub(ALLOCATION_KINDS);
+    counts.truncate(ALLOCATION_KINDS);
+    let kinds: Vec<String> = counts
+        .iter()
+        .map(|(kind, n)| format!("{kind} x{n}"))
+        .collect();
+    let _ = write!(text, "; by kind: {}", kinds.join(", "));
+    if more > 0 {
+        let _ = write!(text, " and {more} more kinds");
+    }
+    text
+}
+
+/// An allocation's name in the device-removed report without its sizes
+/// and addresses (the words that start with `0x`), to count them by kind.
+fn kind_of(name: &str) -> String {
+    name.split_whitespace()
+        .filter(|word| !word.starts_with("0x"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The name D3D12 keeps for an object ([`label`], [`name`]), if any.
+#[cfg(test)]
+pub(crate) fn object_name(object: &impl Interface) -> Option<String> {
+    use windows::Win32::Graphics::Direct3D::WKPDID_D3DDebugObjectNameW;
+    let object = object.cast::<ID3D12Object>().ok()?;
+    let mut size = 0u32;
+    // SAFETY: a size query, then a read into a buffer of that size.
+    unsafe {
+        object
+            .GetPrivateData(&WKPDID_D3DDebugObjectNameW, &mut size, None)
+            .ok()?;
+        let mut units = vec![0u16; (size as usize).div_ceil(2)];
+        object
+            .GetPrivateData(
+                &WKPDID_D3DDebugObjectNameW,
+                &mut size,
+                Some(units.as_mut_ptr().cast()),
+            )
+            .ok()?;
+        let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+        Some(String::from_utf16_lossy(&units[..end]))
+    }
+}
+
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with the full device-removed data).
+/// allocations a page fault hit (only with the full device-removed data;
+/// otherwise the name [`label`] gave stays).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     if dred() == Dred::Full
         && let Ok(object) = object.cast::<ID3D12Object>()
@@ -1665,6 +1791,12 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         return Some(chunk);
     }
     let (buffer, data) = host.upload_buffer(size)?;
+    let kind = match (scratch_pool(), size == SCRATCH_FIRST) {
+        (true, true) => "list scratch pooled first chunk",
+        (true, false) => "list scratch pooled chunk",
+        (false, _) => "list scratch chunk",
+    };
+    label(&buffer, kind, size);
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -3905,9 +4037,11 @@ impl Host {
             let code = code.ok_or_else(windows::core::Error::empty)?;
             let slots = inflight_slots(inflight_fetch_bytes());
             let (table, table_data) = self.shared_buffer(4 + results).ok_or_else(windows::core::Error::empty)?;
+            label(&table, "card fetch tickets", 4 + results);
             name(&table, || "card fetch in flight: tickets".into());
             let fetched_bytes = u64::from(slots) * INFLIGHT_SLOT;
             let (fetched, fetched_data) = self.shared_buffer(fetched_bytes).ok_or_else(windows::core::Error::empty)?;
+            label(&fetched, "card fetch pieces", fetched_bytes);
             name(&fetched, || "card fetch in flight: pieces".into());
             // SAFETY: the mapping holds the counter; nothing of ours ran
             // on the card with it yet.
@@ -4005,7 +4139,9 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for (shadow, _) in &declared {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                let bytes = crate::shadow::card_hash_bytes(size);
+                let before = self.uav_buffer(bytes)?;
+                label(&before, "card copy piece hashes", bytes);
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -4396,7 +4532,10 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.shared_buffer(size).map(|(buffer, data)| {
+                label(&buffer, "relay fetch buffer", size);
+                (buffer, data as usize, size)
+            });
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -4785,7 +4924,10 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.shared_buffer(size).map(|(buffer, data)| {
+                    label(&buffer, "card fetch buffer", size);
+                    (buffer, data as usize, size)
+                });
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -5624,21 +5766,35 @@ impl Host {
                     ("inside", fault.pHeadExistingAllocationNode),
                     ("inside freed", fault.pHeadRecentFreedAllocationNode),
                 ] {
+                    // The first few as they come, then how many of each
+                    // name and type in the whole list.
                     let mut names = Vec::new();
+                    let mut counts: Vec<(String, usize)> = Vec::new();
+                    let mut walked = 0usize;
                     let mut node = head;
                     while let Some(n) = node.as_ref()
-                        && names.len() < 8
+                        && walked < ALLOCATION_WALK
                     {
                         let name = if n.ObjectNameW.is_null() {
                             "unnamed".to_owned()
                         } else {
                             n.ObjectNameW.to_string().unwrap_or_default()
                         };
-                        names.push(format!("{name} (type {})", n.AllocationType.0));
+                        let name = format!("{name} (type {})", n.AllocationType.0);
+                        if names.len() < 8 {
+                            names.push(name.clone());
+                        }
+                        let kind = kind_of(&name);
+                        match counts.iter_mut().find(|(k, _)| *k == kind) {
+                            Some((_, count)) => *count += 1,
+                            None => counts.push((kind, 1)),
+                        }
+                        walked += 1;
                         node = n.pNext;
                     }
                     if !names.is_empty() {
-                        text.push_str(&format!("; {what} {names:?}"));
+                        let cut = !node.is_null();
+                        text.push_str(&allocation_summary(what, &names, counts, walked, cut));
                     }
                 }
                 text.push_str(&crate::shadow::near(va));
@@ -5823,7 +5979,9 @@ impl HostList {
                         )
                         .ok()?;
                 }
-                Some((heap?, back?))
+                let back = back?;
+                label(&back, "timestamp read-back", u64::from(STAMPS) * 8);
+                Some((heap?, back))
             })
             .as_ref()
     }
@@ -6494,6 +6652,7 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
+        label(&buffer, "list upload", size);
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -6507,6 +6666,7 @@ impl HostList {
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
+            label(&buffer, "list scratch big", len);
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -6550,6 +6710,7 @@ impl HostList {
             .budget
             .get_or_init(|| {
                 let (b, d) = host()?.shared_buffer(256)?;
+                label(&b, "indirect budget", 256);
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -6717,6 +6878,7 @@ impl HostList {
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
+        label(&buffer, "indirect scratch", alloc);
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -7427,7 +7589,11 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                let buffer = buffer?;
+                label(&buffer, "read-back buffer", size);
+                Some(buffer)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -7474,7 +7640,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                label(&buffer, "upload buffer", size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -8248,7 +8418,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                label(&buffer, "shared buffer", size);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -8292,7 +8466,11 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                let buffer = buffer?;
+                label(&buffer, "uav buffer", size);
+                Some(buffer)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None
@@ -8630,6 +8808,100 @@ mod dred {
         assert_eq!(dred_mode(Some("1"), true), Dred::Full);
         assert_eq!(dred_mode(Some("full"), true), Dred::Full);
         assert_eq!(dred_mode(Some("1"), false), Dred::Lite);
+    }
+
+    /// A label is its kind and its bytes in hex, a long kind cut to fit,
+    /// and the report counts names by kind, sizes left out.
+    #[test]
+    fn labels_are_kind_and_bytes() {
+        use super::{kind_of, label_text};
+        let text = |kind: &str, bytes: u64| {
+            let mut out = [0u16; 96];
+            let end = label_text(&mut out, kind, bytes);
+            assert_eq!(out[end], 0);
+            String::from_utf16(&out[..end]).unwrap()
+        };
+        assert_eq!(
+            text("list scratch chunk", 4 << 20),
+            "list scratch chunk 0x400000"
+        );
+        assert_eq!(text("upload buffer", 0), "upload buffer 0x0");
+        assert_eq!(text("x", u64::MAX), "x 0xffffffffffffffff");
+        let long = "k".repeat(200);
+        assert_eq!(text(&long, 1).len(), 76 + " 0x1".len());
+        assert_eq!(
+            kind_of("list scratch chunk 0x400000 (type 34)"),
+            "list scratch chunk (type 34)"
+        );
+        assert_eq!(kind_of("unnamed (type 34)"), "unnamed (type 34)");
+    }
+
+    /// The report's allocation line counts kinds most first and says when
+    /// the kinds or the walk were cut.
+    #[test]
+    fn allocation_summary_says_what_it_cut() {
+        use super::{ALLOCATION_KINDS, ALLOCATION_WALK, allocation_summary};
+        let names = vec!["a 0x10 (type 34)".to_owned(), "b 0x20 (type 34)".to_owned()];
+        let counts = vec![("a (type 34)".to_owned(), 1), ("b (type 34)".to_owned(), 3)];
+        assert_eq!(
+            allocation_summary("inside freed", &names, counts, 4, false),
+            "; inside freed: 4 allocations (first 2: [a 0x10 (type 34), b 0x20 (type 34)]); \
+             by kind: b (type 34) x3, a (type 34) x1"
+        );
+        let counts = (0..ALLOCATION_KINDS + 2)
+            .map(|i| (format!("k{i}"), 1))
+            .collect();
+        let text = allocation_summary("inside", &names, counts, ALLOCATION_WALK, true);
+        assert!(
+            text.contains(&format!("(walk stopped at {ALLOCATION_WALK})")),
+            "{text}"
+        );
+        assert!(text.ends_with(" and 2 more kinds"), "{text}");
+    }
+
+    /// A labelled buffer and heap report their names back (WARP).
+    #[cfg(windows)]
+    #[test]
+    fn warp_a_labelled_buffer_reports_its_name() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_DESC, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, ID3D12Heap,
+        };
+        let Some(host) = super::host() else {
+            return;
+        };
+        let (buffer, _) = host.upload_buffer(0x1234).unwrap();
+        assert_eq!(
+            super::object_name(&buffer).as_deref(),
+            Some("upload buffer 0x1234")
+        );
+        super::label(&buffer, "list scratch chunk", 0x10000);
+        assert_eq!(
+            super::object_name(&buffer).as_deref(),
+            Some("list scratch chunk 0x10000")
+        );
+        let uav = host.uav_buffer(0x2000).unwrap();
+        assert_eq!(
+            super::object_name(&uav).as_deref(),
+            Some("uav buffer 0x2000")
+        );
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: 64 << 10,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation; the out pointer is ours.
+        unsafe { host.device.CreateHeap(&raw const desc, &raw mut heap) }.unwrap();
+        let heap = heap.unwrap();
+        super::label(&heap, "tile heap", 64 << 10);
+        assert_eq!(
+            super::object_name(&heap).as_deref(),
+            Some("tile heap 0x10000")
+        );
     }
 
     /// The k-th draw or dispatch breadcrumb is the k-th op: the report

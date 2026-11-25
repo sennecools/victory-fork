@@ -291,6 +291,7 @@ fn read_back_of(
             )
             .ok()?;
         let buffer = buffer?;
+        crate::host::label(&buffer, "capture read-back", desc.Width);
         let to = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(&buffer),
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -757,6 +758,7 @@ pub(crate) fn probe(
             )
             .ok()?;
         let buffer = buffer?;
+        crate::host::label(&buffer, "capture sample read-back", desc.Width);
         for i in 0..GRID * GRID {
             let (x, y) = (
                 (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),

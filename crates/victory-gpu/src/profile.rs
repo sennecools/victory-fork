@@ -814,6 +814,9 @@ pub(crate) mod gpu {
                     None,
                     &mut back,
                 )?;
+                if let Some(back) = &back {
+                    crate::host::label(back, "profile timestamp read-back", desc.Width);
+                }
                 let allocator: ID3D12CommandAllocator =
                     device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
                 let frequency = queue.GetTimestampFrequency()?;
