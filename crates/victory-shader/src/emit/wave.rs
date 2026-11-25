@@ -414,6 +414,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 _ => one(Sym::Unknown),
             }
         };
+        // On `v_permlanex16_b32` op_sel[1:0] are FI and BOUND_CTRL, and
+        // op_sel[3] (the destination's half) means nothing for its 32-bit
+        // result; the console compiler sets it.
         let modifiers = v.abs != 0
             || v.neg != 0
             || v.neg_hi != 0
@@ -422,7 +425,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             || v.opsel_hi != 0
             || v.sdwa.is_some()
             || (name != "v_permlanex16_b32" && v.opsel != 0)
-            || (name == "v_permlanex16_b32" && v.opsel & !3 != 0);
+            || (name == "v_permlanex16_b32" && v.opsel & 4 != 0);
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
@@ -1377,6 +1380,7 @@ mod tests {
         assert_eq!(perm_lane16(0), Some(Shape::K(5))); // FI=0, BOUND_CTRL=0 -> keeps old v2 (5)
         assert_eq!(perm_lane16(2), Some(Shape::K(0))); // FI=0, BOUND_CTRL=1 -> returns 0
         assert_eq!(perm_lane16(1), Some(Shape::K(7))); // FI=1 -> fetches inactive lane 0 (7)
+        assert_eq!(perm_lane16(1 | 8), Some(Shape::K(7))); // op_sel[3] (dst half) -> ignored
         assert_eq!(perm_lane16(4), None); // invalid op_sel bit -> unknown
     }
 }
