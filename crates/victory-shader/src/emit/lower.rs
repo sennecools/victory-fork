@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Attribute, Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
@@ -212,6 +212,8 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Rows read by isolated P10, with the offset of the first such read.
+    isolated_p10_rows: BTreeMap<u8, usize>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
@@ -818,6 +820,7 @@ impl<'a> Lower<'a> {
                 }
                 m
             },
+            isolated_p10_rows: BTreeMap::new(),
             handles: HashMap::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
@@ -1422,6 +1425,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.finish_isolated_p10_rows()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -8251,6 +8255,7 @@ impl<'a> Lower<'a> {
         // What the result adds to the evaluated channel (a second half's
         // first half, when the halves evaluate on their own).
         let mut add = None;
+        let mut isolated_p10 = false;
         let (attribute, eval) = match *interp {
             Interp::Interpolated {
                 attribute,
@@ -8286,9 +8291,14 @@ impl<'a> Lower<'a> {
                 vertex: 2,
             } => (attribute, Eval::Mode(1)),
             // P10 and P20: what the first and second halves weigh, P1 - P0
-            // and P2 - P0, which is what the hardware holds for an
-            // attribute the program also interpolates.
-            Interp::Vertex { attribute, vertex } if self.interpolated(attribute.row) => {
+            // and P2 - P0.
+            Interp::Vertex { attribute, vertex } => {
+                if !self.interpolated(attribute.row) {
+                    if !self.isolated_p10(attribute, vertex) {
+                        return Err("a non-provoking vertex value");
+                    }
+                    isolated_p10 = true;
+                }
                 let one = Some(self.s.m.f32(1f32.to_bits()));
                 let (i, j) = if vertex == 0 {
                     (one, None)
@@ -8297,7 +8307,6 @@ impl<'a> Lower<'a> {
                 };
                 (attribute, Eval::Weights { p0: false, i, j })
             }
-            Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
             // A half of an interpolation with computed i or j: P0 + i P10,
             // or the old dst (f16: the third operand) + j P20.
             Interp::Weighted { attribute } if name.starts_with("v_interp_p1") => {
@@ -8408,6 +8417,11 @@ impl<'a> Lower<'a> {
         };
         // A pixel interpolates in every lane; guards only hide inactive ones.
         self.write(inst, Reg::V(reg), x, None);
+        if isolated_p10 {
+            self.isolated_p10_rows
+                .entry(attribute.row)
+                .or_insert(inst.machine.offset);
+        }
         Ok(())
     }
 
@@ -8424,8 +8438,7 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// Whether the program interpolates attribute row `row` (so the
-    /// hardware holds P1 - P0 and P2 - P0 for it).
+    /// Whether the program interpolates the attribute row.
     fn interpolated(&self, row: u8) -> bool {
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Interpolated { attribute, .. } | Interp::Weighted { attribute } => {
@@ -8433,6 +8446,51 @@ impl<'a> Lower<'a> {
             }
             Interp::Vertex { .. } => false,
         })
+    }
+
+    /// An isolated P10 also reads P1 - P0 for a float32 interpolant.
+    fn isolated_p10(&self, attribute: Attribute, vertex: u8) -> bool {
+        if vertex != 0 || attribute.usage != Usage::Generic {
+            return false;
+        }
+        let StageIo::Ps { inputs, .. } = &self.x.native.io else {
+            return false;
+        };
+        inputs.iter().any(|input| {
+            input.row == attribute.row
+                && input.usage == attribute.usage
+                && input.mask & (1 << attribute.channel) != 0
+                && !input.flat
+                && !input.fp16
+        }) && self
+            .find_input(attribute.row, attribute.channel)
+            .is_some_and(|(id, _)| {
+                let e = &self.s.inputs[id];
+                e.kind == 0 && e.comp == 9 && !e.half
+            })
+    }
+
+    /// DXIL requires one interpolation mode for every element of a row.
+    /// Match the mode of isolated P10 only for unread user inputs, after
+    /// all reads are known, so the linkage and any live interpolation stay intact.
+    fn finish_isolated_p10_rows(&mut self) -> Result<(), Stop> {
+        for (&row, &offset) in &self.isolated_p10_rows {
+            for input in self
+                .s
+                .inputs
+                .iter_mut()
+                .filter(|e| e.row == Some(u32::from(row)) && e.interp != 1)
+            {
+                if input.kind != 0 || input.usage != 0 {
+                    return Err(unsupported(
+                        offset,
+                        "isolated P10 sharing an input row with a different interpolation mode",
+                    ));
+                }
+                input.interp = 1;
+            }
+        }
+        Ok(())
     }
 
     /// Channel `ch` of input row `row` evaluated as `eval` says, as raw bits.

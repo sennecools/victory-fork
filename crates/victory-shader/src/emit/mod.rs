@@ -1686,6 +1686,24 @@ mod barycentric_tests {
     }
 
     fn pixel_with_input(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
+        pixel_from(words, input_addr, fp16, &[element("TEXCOORD", 0, 0)])
+    }
+
+    /// `pixel`, with the `ISG1` rows `inputs` in place of TEXCOORD0.
+    fn pixel_with_inputs(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
+        pixel_from(words, input_addr, false, inputs)
+    }
+
+    fn pixel_from(
+        words: &[u32],
+        input_addr: u32,
+        fp16: bool,
+        inputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1711,7 +1729,7 @@ mod barycentric_tests {
         };
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let isg1 = container::signature(inputs, true);
         let osg1 = container::signature(&[target], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
@@ -1732,14 +1750,16 @@ mod barycentric_tests {
         )
     }
 
-    fn validate(shader: &HostShader) {
+    fn validate(shader: &HostShader) -> bool {
         #[cfg(windows)]
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {
             v.validate(&mut shader.dxil.clone()).unwrap();
+            return true;
         }
         let _ = shader;
+        false
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
@@ -1872,9 +1892,14 @@ mod barycentric_tests {
     }
     /// The `PSV0` interpolation mode of TEXCOORD0 (row 0, x-w, float).
     fn texcoord_mode(shader: &HostShader) -> u8 {
+        input_mode(shader, 0, 4)
+    }
+
+    /// The `PSV0` interpolation mode of a user float input in row 0.
+    fn input_mode(shader: &HostShader, col: u8, cols: u8) -> u8 {
         let c = Container::parse(&shader.dxil).unwrap();
         let psv = c.part(FourCC::PSV0).unwrap().data;
-        let row = [1, 0, 0x44, 0, 3];
+        let row = [1, 0, 0x40 | (col << 4) | cols, 0, 3];
         let at = psv.windows(5).position(|w| w == row).unwrap();
         psv[at + 5]
     }
@@ -1963,9 +1988,138 @@ mod barycentric_tests {
         let shader = pixel(&words, PERSP_CENTER).unwrap();
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
-        // Alone, what the hardware holds is not known.
+    }
+
+    #[test]
+    fn isolated_p10_reads_two_vertices() {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
-        assert!(pixel(&words, PERSP_CENTER).is_err());
+        let shader = pixel(&words, 0).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0);
+        assert_eq!(inputs.len(), 1, "{inputs:?}");
+        assert_eq!(texcoord_mode(&shader), 1);
+
+        #[cfg(windows)]
+        if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+            draw_isolated_p10(shader);
+            return;
+        }
+        validate(&shader);
+    }
+
+    #[test]
+    fn isolated_p10_in_a_packed_input_row() {
+        let inputs = [
+            SigElement {
+                cols: 1,
+                ..element("TEXCOORD", 0, 0)
+            },
+            SigElement {
+                col: 1,
+                cols: 3,
+                ..element("COLOR", 0, 0)
+            },
+        ];
+        let [e0, e1] = exp_mrt0(4);
+        let p10 = [0xC812_0000, e0, e1, S_ENDPGM];
+        let [e0, e1] = exp_mrt0(2);
+        let texcoord_pair = [0xC808_0000, 0xC809_0001, e0, e1, S_ENDPGM];
+        let color_pair = [0xC808_0100, 0xC809_0101, e0, e1, S_ENDPGM];
+        for (name, words, input_addr, mode, read_masks) in [
+            ("P10", &p10[..], 0, 1, [1, 0]),
+            ("TEXCOORD p1/p2", &texcoord_pair[..], PERSP_CENTER, 2, [1, 0]),
+            ("COLOR p1/p2", &color_pair[..], PERSP_CENTER, 2, [0, 2]),
+        ] {
+            let shader = pixel_with_inputs(words, input_addr, &inputs).unwrap();
+            let (_, emitted_inputs) = parts(&shader);
+            assert_eq!(emitted_inputs, inputs, "{name}: input layout");
+            assert_eq!(input_mode(&shader, 0, 1), mode, "{name}: TEXCOORD");
+            assert_eq!(input_mode(&shader, 1, 3), mode, "{name}: COLOR");
+            let c = Container::parse(&shader.dxil).unwrap();
+            let isg1 = c.part(FourCC::ISG1).unwrap().data;
+            assert_eq!([isg1[8 + 25], isg1[8 + 32 + 25]], read_masks, "{name}");
+            if validate(&shader) {
+                eprintln!("packed {name}: DXIL validated");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn draw_isolated_p10(mut shader: HostShader) {
+        use super::diff_tests::{compile, pc_dxc};
+        use super::host::{Draw, Host};
+        use windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        let path = validator::Validator::default_path();
+        let mut validator = validator::Validator::load(path.as_deref()).unwrap();
+        validator.validate(&mut shader.dxil).unwrap();
+        let host = Host::new(true).unwrap();
+        // SAFETY: both calls return owned DXGI interfaces.
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByLuid(host.device.GetAdapterLuid())
+                .unwrap();
+            adapter.GetDesc1().unwrap()
+        };
+        let name = String::from_utf16_lossy(&adapter.Description);
+        eprintln!(
+            "DXIL validated; {} {:04x}:{:04x}",
+            name.trim_end_matches('\0'),
+            adapter.VendorId,
+            adapter.DeviceId,
+        );
+
+        let dxc = pc_dxc().expect("WARP draw requires PC DXC");
+        let dir = std::env::temp_dir().join(format!("victory-p10-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let vs = compile(
+            &dxc,
+            &dir,
+            r#"
+            struct P10Vertex { float4 attr : TEXCOORD0; float4 pos : SV_Position; };
+            P10Vertex vs_p10(float4 pos : POSITION, float4 attr : TEXCOORD0) {
+                P10Vertex result;
+                result.attr = attr;
+                result.pos = pos;
+                return result;
+            }
+            "#,
+            "vs_p10",
+            "vs_6_6",
+        );
+        std::fs::remove_file(dir.join("t.hlsl")).unwrap();
+        std::fs::remove_file(dir.join("vs_p10.bin")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        let root = host
+            .root_signature_for(&[(&shader, D3D12_SHADER_VISIBILITY_PIXEL)])
+            .unwrap();
+        let pso = host.pipeline_with(&root, &vs, &shader.dxil).unwrap();
+        // POSITION.xyzw followed by TEXCOORD0.xyzw. The sole pixel is
+        // inside the triangle; all three vertices are inside the clip volume.
+        let vertices = [
+            [-1.0, -1.0, 0.5, 1.0, 0.25, 0.0, 0.0, 0.0],
+            [1.0, -1.0, 0.5, 1.0, 0.75, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.5, 1.0, 0.125, 0.0, 0.0, 0.0],
+        ];
+        let texels = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: Vec::new(),
+                    textures: &[],
+                    samplers: &[],
+                    vertices: vertices.as_flattened(),
+                    stride: 32,
+                    size: (1, 1),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap();
+        eprintln!("SV_Target0 = {:?}", texels[0]);
+        assert_eq!(texels[0][0], 0.5);
     }
 }

@@ -653,14 +653,18 @@ const MS_CASES: &[(&str, u32, &str)] = &[
 
 fn tools() -> Option<(PathBuf, PathBuf)> {
     let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
-    let pc = match std::env::var_os("VICTORY_PC_DXC") {
-        Some(p) => PathBuf::from(p),
-        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
-    };
+    let pc = pc_dxc()?;
     (console.exists() && pc.exists()).then_some((console, pc))
 }
 
-fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
+pub(super) fn pc_dxc() -> Option<PathBuf> {
+    match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => Some(PathBuf::from(p)),
+        None => Some(super::validator::Validator::default_path()?.with_file_name("dxc.exe")),
+    }
+}
+
+pub(super) fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
     let input = dir.join("t.hlsl");
     let output = dir.join(format!("{entry}.bin"));
     let text = if entry == "cs" {
