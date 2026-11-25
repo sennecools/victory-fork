@@ -63,6 +63,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The wave size the shader requires of the host, if any.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -81,14 +84,18 @@ pub(crate) struct Parts<'a> {
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
+    /// A scalar join materialized a Wave32 mask after choosing the lane layout.
+    NeedsWave32,
     Fail(ShaderError),
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut needs_wave32 = false;
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, needs_wave32).run() {
             Ok(l) => return Ok(l),
+            Err(Stop::NeedsWave32) => needs_wave32 = true,
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -96,6 +103,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                         what: "a phi that does not settle",
                     });
                 }
+                needs_wave32 = false;
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
@@ -644,7 +652,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, needs_wave32: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -667,7 +675,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            console_lanes = needs_wave32 || insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -1429,6 +1437,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -10391,10 +10401,17 @@ impl<'a> Lower<'a> {
                             && self.mask_data == MaskData::Console
                             && (st.masks.contains_key(&arg) || st.highs.contains_key(&arg)) =>
                     {
-                        match self.mask_dword(arg) {
-                            Ok(x) => x,
-                            Err(why) => return Err(Stop::Retry(phi.value, why)),
+                        let x = self
+                            .mask_dword(arg)
+                            .map_err(|why| Stop::Retry(phi.value, why))?;
+                        // Thread IDs must follow the same lane order as the ballot.
+                        if !self.console_lanes
+                            && !self.x.native.wave64
+                            && matches!(self.x.native.io, StageIo::Cs(_))
+                        {
+                            return Err(Stop::NeedsWave32);
                         }
+                        x
                     }
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
@@ -10657,6 +10674,77 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    #[test]
+    fn a_mask_joined_with_a_number_requires_the_console_wave_layout() {
+        let mut words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE94_036A, // s_mov_b32 s20, vcc_lo
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0001, // skip the overwrite
+            0xBE94_0385, // s_mov_b32 s20, 5
+            0x7E00_0214, // v_mov_b32 v0, s20
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            S_ENDPGM,
+        ];
+        let emit = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 16,
+                layout: vec![
+                    RootParam {
+                        sgprs: 4,
+                        ..root(RootType::Constants, 0, 0)
+                    },
+                    root(RootType::Table, 4, 1),
+                ],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                }],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 5 << 1,
+                    threads: [32, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap()
+        };
+        let wave32 = emit(&words);
+        assert!(wave32.wave_ops);
+        assert_eq!(wave32.wave_size, Some(32));
+
+        words[4] = 0xBE94_0387; // join two ordinary numbers
+        let scalars = emit(&words);
+        assert!(!scalars.wave_ops);
+        assert_eq!(scalars.wave_size, None);
     }
 
     #[test]
