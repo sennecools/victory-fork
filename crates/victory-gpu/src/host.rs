@@ -2380,6 +2380,9 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// Title memory ranges that texture-to-buffer read-backs (`HostList::defer_read_back`)
+    /// will write once the submission lands.
+    read_backs: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -2395,6 +2398,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    read_backs: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3143,6 +3147,31 @@ pub(crate) fn walls_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2"))
 }
 
+/// The half-open title memory span `[at, end)` touched by a texture-to-buffer
+/// read-back of `rows` rows of `row` bytes pitched `pitch`.
+fn read_back_span(at: usize, [row, rows, pitch]: [usize; 3]) -> Option<(usize, usize)> {
+    if rows == 0 || row == 0 {
+        return None;
+    }
+    let span = (rows - 1).checked_mul(pitch)?.checked_add(row)?;
+    let end = at.checked_add(span)?;
+    Some((at, end))
+}
+
+/// All title memory ranges that `runs`' deferred texture-to-buffer read-backs
+/// will write once the submission lands.
+fn read_back_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    runs.iter()
+        .flat_map(|l| {
+            l.deferred()
+                .backs
+                .iter()
+                .filter_map(|&(_, at, shape)| read_back_span(at, shape))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// After `list` has run: the texels its read-backs copied into host
 /// buffers of ours go to the title's memory (`HostList::defer_read_back`).
 ///
@@ -3152,15 +3181,26 @@ pub(crate) fn walls_trace() -> bool {
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+        if *rows == 0 || *row == 0 {
+            continue;
+        }
         let mut data = std::ptr::null_mut();
-        // SAFETY: a read-back buffer of ours, written by the list that has
-        // run; the title's destination holds every row (checked when the
-        // copy was recorded).
+        // SAFETY: a read-back buffer of ours, written by the list that has run.
+        // Title memory is written via `write_mapped` after opening watch guards
+        // so unmapped/freed title pages are skipped instead of faulting.
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                let src_pitch = row.next_multiple_of(256);
+                if let Some((start, end)) = read_back_span(*at, [*row, *rows, *pitch]) {
+                    crate::watch::writing(start, end - start);
+                }
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    let Some(dst) = line.checked_mul(*pitch).and_then(|off| at.checked_add(off))
+                    else {
+                        break;
+                    };
+                    write_mapped(dst as *mut u8, from.add(line * src_pitch), *row);
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
@@ -4307,6 +4347,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.read_backs.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -4485,7 +4526,13 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.read_backs.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4495,6 +4542,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                read_backs: sent.read_backs,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -4529,7 +4577,13 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.read_backs.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4539,6 +4593,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                read_backs: sent.read_backs,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -4883,6 +4938,7 @@ impl Host {
                 }
             }
             let back = declared_writes(runs);
+            let read_backs = read_back_ranges(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -4892,6 +4948,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                read_backs,
                 writes,
             };
             working(was_working);
@@ -7817,5 +7874,73 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_backs_tracks_spans_copies_mapped_rows_and_skips_unmapped_memory() {
+        use super::{read_back_ranges, read_back_span, read_backs};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        assert_eq!(read_back_span(0x1000, [16, 3, 64]), Some((0x1000, 0x1090)));
+        assert_eq!(read_back_span(0x1000, [0, 3, 64]), None);
+        assert_eq!(read_back_span(0x1000, [16, 0, 64]), None);
+        assert_eq!(read_back_span(usize::MAX - 8, [16, 1, 16]), None);
+
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let rb_mapped = host.read_back_buffer(512).unwrap();
+        let rb_unmapped = host.read_back_buffer(256).unwrap();
+
+        // Populate two 256-byte-pitched rows in `rb_mapped`.
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: mapping our own readback buffer.
+        unsafe {
+            rb_mapped.Map(0, None, Some(&mut ptr)).unwrap();
+            let buf = std::slice::from_raw_parts_mut(ptr.cast::<u8>(), 512);
+            buf[0..16].fill(0xA5);
+            buf[256..272].fill(0x5A);
+            rb_mapped.Unmap(0, None);
+        }
+
+        let mut dst = vec![0xCCu8; 64];
+        // Obtain an address that is guaranteed unmapped at read-back landing time.
+        // SAFETY: reserving and immediately releasing a private page.
+        let freed = unsafe {
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            );
+            assert!(!p.is_null());
+            assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
+            p.cast::<u8>()
+        };
+
+        list.defer_read_back(rb_mapped, dst.as_mut_ptr(), [16, 2, 32]);
+        list.defer_read_back(rb_unmapped, freed, [16, 1, 16]);
+
+        let ranges = read_back_ranges(&[&list]);
+        let dst_start = dst.as_ptr() as usize;
+        let freed_start = freed as usize;
+        assert_eq!(
+            ranges,
+            vec![
+                (dst_start, dst_start + 32 + 16),
+                (freed_start, freed_start + 16),
+            ]
+        );
+
+        // Copies live rows cleanly and skips the unmapped destination without faulting.
+        read_backs(&list);
+        assert_eq!(&dst[0..16], &[0xA5u8; 16]);
+        assert_eq!(&dst[16..32], &[0xCCu8; 16]);
+        assert_eq!(&dst[32..48], &[0x5Au8; 16]);
+        assert_eq!(&dst[48..64], &[0xCCu8; 16]);
     }
 }
