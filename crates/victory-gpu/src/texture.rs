@@ -122,6 +122,23 @@ fn guard_skips(unwritten: bool, frame: u64, start: usize, changed: Option<u64>) 
     unwritten && !turn && !recent
 }
 
+impl Last {
+    /// Sparse view blocks can be reported as written on every guard query
+    /// even when unchanged. Keep their expensive reads bounded regardless.
+    fn partial_due(&self, frame: u64) -> bool {
+        self.partial.is_none_or(|at| frame.saturating_sub(at) >= 30)
+    }
+
+    /// All-zero reads from partially mapped memory are not uploaded.
+    /// Do not record their hash as if they had replaced the staging data.
+    fn accept_partial(&mut self, bytes: &[u8]) -> bool {
+        if bytes.iter().all(|&b| b == 0) {
+            return false;
+        }
+        self.rehash(blake3::hash(bytes))
+    }
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -1025,11 +1042,10 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
+            // Poll at most every 30 frames: the guard conservatively reports
+            // unprotectable sparse blocks even without an actual write.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if !last.partial_due(frame) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1037,11 +1053,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
-                if !last.rehash(hash) {
-                    return false;
-                }
-                if read.iter().all(|&b| b == 0) {
+                if !last.accept_partial(read) {
                     return false;
                 }
                 self.detile(read);
@@ -1054,6 +1066,8 @@ impl Staging {
             let _ = changed;
             return size;
         }
+        // Fully mapped again: a later partial mapping starts a new poll.
+        last.partial = None;
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
@@ -1583,7 +1597,45 @@ mod guard_tests {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{Last, with_title};
+
+    #[test]
+    fn repeated_sparse_guard_reports_do_not_bypass_partial_throttle() {
+        let mut last = Last::default();
+        let mut reads = Vec::new();
+        // Simulate every submission reaching the sparse read path due to
+        // a conservative guard report (including repeated queries per frame).
+        for frame in 100..191 {
+            for _ in 0..32 {
+                if last.partial_due(frame) {
+                    reads.push(frame);
+                    last.partial = Some(frame);
+                }
+            }
+        }
+        assert_eq!(reads, [100, 130, 160, 190]);
+        // A fully mapped path clears the partial polling state.
+        last.partial = None;
+        assert!(last.partial_due(191));
+    }
+
+    #[test]
+    fn skipped_zero_partial_read_does_not_replace_staged_hash() {
+        let mut last = Last::default();
+        let data = [0x51; 64];
+        let zero = [0; 64];
+        assert!(!last.accept_partial(&zero));
+        assert_eq!(last.hash, None);
+        assert!(last.accept_partial(&data));
+        assert_eq!(last.hash, Some(blake3::hash(&data)));
+        assert!(!last.accept_partial(&zero));
+        assert_eq!(last.hash, Some(blake3::hash(&data)));
+        // A later fully mapped zero texture must not be skipped as equal
+        // to the nonzero contents still in staging.
+        assert_ne!(last.hash, Some(blake3::hash(&zero)));
+        assert!(!last.accept_partial(&data));
+        assert!(last.accept_partial(&[0xa2; 64]));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
