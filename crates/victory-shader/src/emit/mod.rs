@@ -30,8 +30,11 @@
 //!   past the title's and the dynamic slots. A sampler index is clamped
 //!   to 2,047. A buffer the program picks from the view heap itself
 //!   (`ResourceHeap`) at a slot that holds no buffer view ([`SLOT_STRIDES`]
-//!   says 0) reads the null buffer view of its kind instead: a texture
-//!   view read as a buffer is a wild address on AMD.
+//!   says 0 or [`SLOT_CONSTANT`]) reads the null buffer view of its kind
+//!   instead, and a constant buffer read there at a slot that holds
+//!   neither a buffer nor a constant buffer view ([`SLOT_STRIDES`] says 0)
+//!   reads the null constant buffer view: a texture view read as a buffer
+//!   is a wild address on AMD.
 //! * **Immediate samplers** as static samplers `s<n>, space 0`, `n` the
 //!   position in [`HostShader::samplers`] (the console sampler words) and
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
@@ -120,8 +123,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_VIEWS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
-    SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE,
+    HEAP_VIEWS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_CONSTANT,
+    SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE,
     USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 

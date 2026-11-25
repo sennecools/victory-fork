@@ -17,7 +17,9 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i` (0: none or not a buffer;
+/// [`SLOT_CONSTANT`]: a constant buffer view, or a buffer view of no known
+/// element size).
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -27,6 +29,14 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer, one per slot a view index can
 /// reach: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = HEAP_VIEWS;
+/// The [`SLOT_STRIDES`] dword of a slot that holds a constant buffer view,
+/// or a buffer view of no element size the host knows: no stride (a buffer
+/// read there reads the null buffer view, as at 0), but a constant buffer
+/// read there reads the slot. At 0 (a texture view, a null slot) a constant
+/// buffer read reads the null constant buffer view: on AMD a texture view
+/// read as a constant buffer is the texture's address shifted 8 bits down,
+/// a GPU page fault.
+pub const SLOT_CONSTANT: u32 = u32::MAX;
 
 /// The slots of a host view heap where the host takes that many (AMD; the
 /// title's heap is a little over 1,000,000 views, and `victory-gpu`'s

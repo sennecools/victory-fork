@@ -215,7 +215,7 @@ struct Lower<'a> {
     /// Rows read by isolated P10, with the offset of the first such read.
     isolated_p10_rows: BTreeMap<u8, usize>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
-    /// Element strides read from the host's table by heap slot
+    /// Dwords read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
     /// Blocks splitting the edge from one IR block to another.
@@ -4507,7 +4507,11 @@ impl<'a> Lower<'a> {
         // it passed no meshlet and every indirect mesh draw ran empty.
         // The host's table of strides by heap slot tells a buffer view
         // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // buffer; only the load that fits the slot runs. That read finds
+        // the null constant buffer view at a slot that holds no constant
+        // buffer view either (`buffer_guard`): a texture view read as one
+        // removed the device on AMD (a page fault at the texture's address
+        // shifted 8 bits down, in the first frame of the world).
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
@@ -5511,6 +5515,14 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let word = self.slot_word(src)?;
+        Ok(word.map(|w| self.stride_of(w)))
+    }
+
+    /// The dword of the host's table by heap slot
+    /// ([`super::shader::SLOT_STRIDES`]) for the view `src` names, as
+    /// [`Self::slot_stride`] reads it.
+    fn slot_word(&mut self, src: &Source) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -5527,15 +5539,25 @@ impl<'a> Lower<'a> {
             return Ok(Some(v));
         }
         let slot = self.heap_index(*load, *first, false)?;
-        let v = self.stride_at(slot);
+        let v = self.word_at(slot);
         self.strides.insert(key, v);
         Ok(Some(v))
     }
 
-    /// The bytes per element of the buffer view at view heap slot `slot`
-    /// (0: none, or not a buffer), from the host's table
-    /// ([`super::shader::SLOT_STRIDES`]), read in the current block.
-    fn stride_at(&mut self, slot: V) -> V {
+    /// The bytes per element a dword of the host's table by heap slot
+    /// says: 0 for [`super::shader::SLOT_CONSTANT`] (no buffer view).
+    fn stride_of(&mut self, word: V) -> V {
+        let c = self.cur;
+        let constant = self.s.m.i32(super::shader::SLOT_CONSTANT);
+        let is_constant = self.s.m.cmp(c, pred::EQ, word, constant);
+        let zero = self.s.m.i32(0);
+        self.s.m.select(c, is_constant, zero, word)
+    }
+
+    /// The dword of the host's table by heap slot
+    /// ([`super::shader::SLOT_STRIDES`]) at view heap slot `slot`, read in
+    /// the current block.
+    fn word_at(&mut self, slot: V) -> V {
         let c = self.cur;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
@@ -5582,27 +5604,42 @@ impl<'a> Lower<'a> {
     /// index `index` with `props`: `index`, or the null buffer view of the
     /// handle's kind ([`super::GuardView`]) where the program picks the
     /// buffer from the view heap itself and the host's table of strides
-    /// says the slot holds no buffer view (module notes, "Heap indices").
+    /// says the slot holds no buffer view (module notes, "Heap indices");
+    /// for a constant buffer, the null constant buffer view where it says
+    /// the slot holds neither a buffer nor a constant buffer view.
     /// Such an index comes from data, and a texture view read as a buffer
     /// gives a wild address on AMD (the texture's address shifted 8 bits
     /// down: GPU faults at low addresses).
     fn buffer_guard(&mut self, src: &Source, index: V, props: (u32, u32)) -> Result<V, Why> {
-        let view = super::GuardView::of(props.0);
-        let buffer = matches!(
-            view,
-            super::GuardView::Buffer | super::GuardView::UnorderedBuffer
-        );
-        if !buffer || !self.is_heap_direct(src) {
+        use super::GuardView;
+        let view = GuardView::of(props.0);
+        // Constant buffers only from a single heap load (`Source::Loaded`),
+        // as `smem` reads them: a descriptor that may also come from a table
+        // may be a per-draw constant buffer in a dynamic slot, which the
+        // table has no word for.
+        let guarded = match view {
+            GuardView::Buffer | GuardView::UnorderedBuffer => true,
+            GuardView::Constant => matches!(src, Source::Loaded { .. }),
+            _ => false,
+        };
+        if !guarded || !self.is_heap_direct(src) {
             return Ok(index);
         }
-        // A descriptor loaded in this block has its stride read once.
-        let stride = match self.slot_stride(src)? {
-            Some(stride) => stride,
-            None => self.stride_at(index),
+        // A descriptor loaded in this block has its word read once.
+        let word = match self.slot_word(src)? {
+            Some(word) => word,
+            None => self.word_at(index),
+        };
+        // A buffer view's stride, or for a constant buffer read the word
+        // itself: a buffer view or a constant buffer view (not 0) is a
+        // buffer descriptor either way on AMD.
+        let kind = match view {
+            GuardView::Constant => word,
+            _ => self.stride_of(word),
         };
         let c = self.cur;
         let zero = self.s.m.i32(0);
-        let none = self.s.m.cmp(c, pred::EQ, stride, zero);
+        let none = self.s.m.cmp(c, pred::EQ, kind, zero);
         let null = self.s.m.i32(view.slot(super::view_heap_limit()));
         Ok(self.s.m.select(c, none, null, index))
     }

@@ -715,3 +715,80 @@ fn a_buffer_picked_from_the_heap_at_a_texture_slot_reads_the_null_buffer_view() 
     assert_eq!(out[1], [0; 4], "the UAV at slot 3 untouched");
     assert_eq!(out[2], [0, 0, 7, 0], "the store in the null UAV's place");
 }
+
+/// A scalar buffer load (`s_buffer_load_dword`) through a descriptor the
+/// program picks from the view heap itself at an index it computes: raw at
+/// a buffer view's slot, as a constant buffer at a constant buffer view's
+/// ([`super::SLOT_CONSTANT`]), and at a texture view's slot (the table
+/// says 0) through the null constant buffer view, not the texture view read
+/// as a constant buffer: on AMD that is the texture's address shifted 8
+/// bits down, the page fault that removed the device in the first frame of
+/// the world. With a constant buffer view in the null view's place, the
+/// load at the texture's slot finds it.
+#[test]
+fn a_constant_buffer_picked_from_the_heap_at_a_texture_slot_reads_the_null_view() {
+    let mut words = vec![
+        s_mov_b32(5, 0x80),     // s5 = 0: the table's high half
+        s_mov_b32(7, 0x80),     // s7 = 0: the heap's high half
+        sop2(0x1E, 8, 0, 0x85), // s_lshl_b32 s8, s0, 5: the index from data
+    ];
+    words.extend(smem(0x02, 12, 4, 125, 0)); // the output UAV, table entry 0
+    words.extend(smem(0x02, 16, 6, 8, 0)); // heap slot s0
+    words.extend(smem(0x08, 20, 16, 125, 4)); // s_buffer_load_dword s20, its dword 1
+    words.push(v_mov(1, 20)); // v_mov_b32 v1, s20
+    words.extend(buffer_store_dword(1, 12, 0));
+    words.push(S_ENDPGM);
+    let shader = lower_cs(&words, vec![used(ResourceType::Uav, 0, 0, 4)], true);
+    assert_eq!(
+        shader.root_srvs,
+        [super::SLOT_STRIDES],
+        "the table of strides"
+    );
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(warp) = Warp::new(&shader) else {
+        return;
+    };
+    // Slots: 0 the output, 1 a texture, 2 a constant buffer, 3 a raw buffer.
+    let mut strides = vec![0u32; super::SLOT_STRIDES_COUNT as usize];
+    (strides[0], strides[2], strides[3]) = (1, super::SLOT_CONSTANT, 1);
+    let roots = [strides];
+    let (constants, data) = ([0xC000, 0xC001, 0, 0], [0xB000, 0xB001]);
+    let texel = [[0.5; 4]];
+    let listed = || {
+        vec![
+            View::RawUav(4),
+            View::Texture(1, 1, &texel),
+            View::Cbv(&constants),
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+        ]
+    };
+    let run = |s0: u32, views: &[View]| warp.run(&shader, [s0, 0, 0, 0], views, &[], &roots)[0][0];
+    let mut views = listed();
+    views.push(View::Guards(&[]));
+    for (s0, loaded) in [(3, 0xB001), (2, 0xC001), (1, 0), (1 << 25, 0)] {
+        assert_eq!(run(s0, &views), loaded, "slot {s0:#x}");
+    }
+
+    // A constant buffer view in the null one's place: the load at the
+    // texture's slot reads it.
+    let marked = [0xA000, 0xA001, 0, 0];
+    let guards = [
+        View::Texture(1, 1, &texel),
+        View::Cbv(&marked),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(4),
+    ];
+    let mut views = listed();
+    views.push(View::Guards(&guards));
+    assert_eq!(
+        run(1, &views),
+        0xA001,
+        "the load in the null constant buffer view's place"
+    );
+}
