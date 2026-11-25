@@ -142,8 +142,8 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1,024;
+/// 16 and 512 before). Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
@@ -632,7 +632,8 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
+/// (`VICTORY_RELAY=1` or `2`; on by default, `VICTORY_RELAY=0` turns it
+/// off; not with kept snapshots,
 /// [`keeps`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
@@ -1285,7 +1286,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on by default; `VICTORY_WIDE_BACK=0` turns it off).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -1570,7 +1571,7 @@ pub(crate) fn back_line(frames: f64) {
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of 1 MiB or more (the card looks in those it has a copy of, VICTORY_CARD_BUFFERS_MB)",
         mb(c[2]),
         c[5],
         mb(c[0]),

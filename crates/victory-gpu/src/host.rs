@@ -2125,8 +2125,9 @@ pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
 
-/// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
-/// [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
+/// The relay's first stage (`VICTORY_RELAY=1`; without it the relay runs
+/// at its second stage, [`relay_exact`], and `VICTORY_RELAY=0` turns it
+/// off; it turns [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
 /// and is off with it, in the timing run and with kept snapshots).
 ///
 /// With [`late`] alone every settle does three things on the thread that
@@ -2162,8 +2163,8 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
 }
 
-/// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
-/// title memory a flight's shaders may write (a title buffer copy, a fill
+/// The relay's second stage (`VICTORY_RELAY=2`, the default): a submission
+/// that reads title memory a flight's shaders may write (a title buffer copy, a fill
 /// of upload memory, a texture) waits only until the flights that declared
 /// that memory have landed, not for everything in the air; and at
 /// [`late_most`] lists in the air it waits until there are fewer. At `1`
