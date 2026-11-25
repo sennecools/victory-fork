@@ -153,7 +153,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_TEXTURE_ROOM_PERCENT=90` | share of the card's memory budget up to which textures picked by index get host copies (50 to 97) |
 | `VICTORY_PLACED_FILLER=1` | placed textures keyed with the filler words of their description too, as before (two views that differ only there get two host copies) |
 | `VICTORY_RELAY=1` / `VICTORY_RELAY=2` | what shaders wrote is copied back by a thread of its own, beside the submitting thread, at its first or second stage (off by default: with the second stage on by default an RX 9070 XT lost the device in a run while a submission was sent ahead) |
-| `VICTORY_FRAMETIME_DUMP=1` | writes `<cache>rametime.csv`, one row per summary interval with the frame buckets and the worst and mean frame (any other value is a path; off by default) |
+| `VICTORY_FRAMETIME_DUMP=1` | writes `<cache>\frametime.csv`, one row per summary interval with the frame buckets and the worst and mean frame (any other value is a path; off by default) |
 | `VICTORY_WIDE_BACK=0`, `VICTORY_CARD_BUFFERS_MIN_MB=16`, `VICTORY_CARD_BUFFERS_MB=512`, `VICTORY_LATE_WAIT_LISTS=128` | the earlier defaults: without the wide copy, card copies of title buffers from 16 MiB and up to 512 MB, 128 lists in the air (with `VICTORY_LATE_WAIT` or the relay) |
 | `VICTORY_NULL_MAGENTA=1` | diagnostics build: a 2D colour texture view with nothing to show yet reads magenta instead of black |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
