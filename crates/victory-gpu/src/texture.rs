@@ -1196,37 +1196,39 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     Some((at as u64, len as u64))
 }
 
-/// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
-/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
-/// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
+/// A fingerprint of the title memory `[at, at + len)`, never 0: of all of it up to
+/// 48 KiB, else of twelve pieces of 4 KiB spread evenly over it, the first
+/// and the last included. Read through the kernel, so pages not there count
+/// as zeros. (A texture whose change falls between the pieces is missed.)
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
-    const WINDOW: usize = 16 << 10;
+    const PIECE: usize = 4 << 10;
+    const PIECES: usize = 12;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let len = len as usize;
-    let mut hasher = blake3::Hasher::new();
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(3 * WINDOW, 0);
+        read.resize(PIECES * PIECE, 0);
+        let mut hasher = blake3::Hasher::new();
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
             hasher.update(&read[..bytes]);
         };
-        if len <= 3 * WINDOW {
+        if len <= PIECES * PIECE {
             take(0, len);
         } else {
-            take(0, WINDOW);
-            take((len / 2) & !0xfff, WINDOW);
-            take(len - WINDOW, WINDOW);
+            for n in 0..PIECES - 1 {
+                take(((len - PIECE) / (PIECES - 1) * n) & !0xfff, PIECE);
+            }
+            take(len - PIECE, PIECE);
         }
-    });
-    let hash = hasher.finalize();
-    let mut first = [0u8; 8];
-    first.copy_from_slice(&hash.as_bytes()[..8]);
-    u64::from_le_bytes(first) | 1
+        let hash = hasher.finalize();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&hash.as_bytes()[..8]);
+        u64::from_le_bytes(first) | 1
+    })
 }
 
 /// Has the next list that uploads a title texture with a staging buffer
