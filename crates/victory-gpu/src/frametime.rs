@@ -5,7 +5,9 @@
 //! frame over the interval, measured at every present.
 //!
 //! `VICTORY_FRAMETIME_DUMP=<path>` writes it there; `=1` writes
-//! `%TEMP%\victory-frametime.csv`. The file is truncated at the first row.
+//! `<cache>\frametime.csv` (the app points this at Victory's cache folder;
+//! `%TEMP%\victory-frametime.csv` if it did not). The file is truncated at
+//! the first row.
 //! This is deliberately release-buildable (no `diagnostics` feature): the
 //! frames it is meant to explain are the slow ones.
 
@@ -17,7 +19,15 @@ use std::time::Instant;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// Where `=1` writes; the app points this at Victory's cache folder.
+static DEFAULT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+/// Points `VICTORY_FRAMETIME_DUMP=1` at `path` (the app passes
+/// `<cache>\frametime.csv`). Call before the first presented frame.
+pub fn use_dump_path(path: PathBuf) {
+    let _ = DEFAULT_PATH.set(Some(path));
+}
 
 /// When the previous present happened and how long the frames since the
 /// last summary took (microseconds, and a count).
@@ -35,7 +45,11 @@ fn enabled() -> bool {
             return false;
         }
         let path = if value.to_str() == Some("1") {
-            std::env::temp_dir().join("victory-frametime.csv")
+            DEFAULT_PATH
+                .get()
+                .and_then(Option::as_ref)
+                .cloned()
+                .unwrap_or_else(|| std::env::temp_dir().join("victory-frametime.csv"))
         } else {
             PathBuf::from(value)
         };

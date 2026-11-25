@@ -30,7 +30,7 @@ pub mod fence;
 #[cfg(windows)]
 mod flip;
 pub mod frame;
-mod frametime;
+pub mod frametime;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
