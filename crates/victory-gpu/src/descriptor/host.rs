@@ -1416,6 +1416,8 @@ pub(crate) mod hold {
     pub(crate) const GONE: u64 = 9;
     /// The texture pass asking whether a slot is made (`texture_slot_made_from`).
     pub(crate) const MADE_FROM: u64 = 10;
+    /// The profile's sample of the made slots (`made_keys`).
+    pub(crate) const SAMPLE: u64 = 11;
 }
 
 /// A hold of a heap's `made` lock while the profiler records, from just
@@ -1508,6 +1510,14 @@ impl HostHeap {
         };
         let hold = self.hold(site);
         (made, hold)
+    }
+
+    /// For the profile's sample (`VICTORY_PROFILE_SAMPLES`): the keys of
+    /// the views the made slots were made from (0 for a slot not made), as
+    /// copied under `made`'s lock.
+    pub(crate) fn made_keys(&self) -> Vec<u64> {
+        let (made, _hold) = self.made_at(hold::SAMPLE);
+        made.clone()
     }
 }
 
@@ -2621,6 +2631,9 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            // On the profile: slots changed against the distinct records
+            // they changed to, by who mirrored them.
+            crate::profile::record_changed(site, key);
             // Nothing to shaders while the slot changes (`write_word`).
             self.write_word(index, 0);
             // Views of other textures in the memory this one describes

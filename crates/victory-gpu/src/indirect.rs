@@ -954,6 +954,12 @@ fn record_gpu_clamp(
         ),
     ];
     let skip = usize::from(!waits);
+    {
+        use crate::profile::{Count, count};
+        count(Count::Clamps, 1);
+        count(Count::UavClampFirst, u64::from(waits));
+        count(Count::UavClampSecond, u64::from(waits));
+    }
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -1113,6 +1119,7 @@ impl MeshBatch {
         let before = list.indirect_state(&bounded);
         let addresses = [src_gpu, words_gpu, dst_gpu, budget];
         record_gpu_clamp(c, &list.list, (&bounded, before), [0; 6], addresses, 1);
+        crate::profile::count(crate::profile::Count::MeshBatches, 1);
         if keep {
             list.indirect_readable(&bounded);
         }

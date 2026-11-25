@@ -22,12 +22,22 @@
 //! buffer of its own; one writer thread drains them ten times a second.
 //!
 //! The card's side ([`gpu`]): in a submission that is waited for (the default;
-//! not those sent ahead with `VICTORY_LATE_WAIT` or the relay), a timestamp
-//! before and after each host list, resolved by a list at the end of the same
-//! submission and read after the wait the submission makes anyway; put on the
-//! CPU clock with `GetClockCalibration`. They show as the process "GPU". Our
-//! other sends (the card copies' uploads in `card_before`, their fetches in
-//! `card_back`) are not stamped and show as gaps there.
+//! those sent ahead with `VICTORY_LATE_WAIT` or the relay only with
+//! `VICTORY_PROFILE_FLIGHT_STAMPS=1`, [`flight_stamps`]), a timestamp before
+//! and after each host list, resolved by a list at the end of the same
+//! submission into a read-back slot of its own and read after the wait the
+//! submission makes anyway, or when it lands; put on the CPU clock with
+//! `GetClockCalibration`. They show as the process "GPU". Our other sends
+//! (the card copies' uploads in `card_before`, their fetches in `card_back`)
+//! are not stamped and show as gaps there.
+//!
+//! Counters ([`count`], [`record_changed`]; `"ph":"C"` events): what was
+//! recorded or done between two presents, written at each present (global
+//! UAV barriers by origin, the split of copy refreshes into kernel askings,
+//! journal work and copies, host view slots changed and the distinct records
+//! they were changed to). With `VICTORY_PROFILE_SAMPLES=1` ([`samples`]) the
+//! writer thread adds each recording thread's processor time (the process
+//! "thread cpu") and the memory split.
 //!
 //! The recording of each title list (open to close) shows as the process
 //! "title lists", one line per list (lists overlap on one thread, and the
@@ -188,10 +198,16 @@ pub(crate) enum Track {
     /// can be closed on another thread than the one that opened them, so
     /// their spans would not nest on the threads' lines.
     List(u32),
+    /// A counter event (`"ph":"C"`) of the CPU process: sums since the last
+    /// present ([`count`]) and the samples of [`samples`].
+    Counter,
+    /// The processor time of one thread (by id) over a sample's interval,
+    /// on the process "thread cpu" ([`samples`]).
+    ThreadCpu(u32),
 }
 
 /// The most named numbers an event carries.
-const MOST_ARGS: usize = 6;
+const MOST_ARGS: usize = 10;
 
 /// Arguments an event carries: up to [`MOST_ARGS`] named numbers.
 type Args = [(&'static str, u64); MOST_ARGS];
@@ -236,6 +252,11 @@ struct Buffer {
     tid: u32,
     name: String,
     events: Mutex<Vec<Event>>,
+    /// A handle to the thread for its processor time ([`samples`]); 0 if
+    /// none was opened. Kept for the process's life (a handle per thread
+    /// that recorded).
+    #[cfg(windows)]
+    handle: usize,
 }
 
 static BUFFERS: Mutex<Vec<Arc<Buffer>>> = Mutex::new(Vec::new());
@@ -269,6 +290,16 @@ fn register() -> Arc<Buffer> {
         tid,
         name,
         events: Mutex::new(Vec::with_capacity(256)),
+        #[cfg(windows)]
+        handle: if samples() {
+            use windows_sys::Win32::System::Threading::{
+                OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+            };
+            // SAFETY: a plain open of this thread for queries.
+            unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid) as usize }
+        } else {
+            0
+        },
     });
     BUFFERS
         .lock()
@@ -471,6 +502,429 @@ pub(crate) fn textures_made() -> u64 {
     TEXTURES_MADE.try_with(std::cell::Cell::get).unwrap_or(0)
 }
 
+/// Whether submissions sent ahead (`VICTORY_LATE_WAIT`, the relay) are
+/// stamped on the card too (`VICTORY_PROFILE_FLIGHT_STAMPS=1`; off by
+/// default): the stamps go into the flight and are read when it lands
+/// ([`gpu`]). It adds the stamps' small lists to every flight sent while
+/// recording.
+pub(crate) fn flight_stamps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PROFILE_FLIGHT_STAMPS").is_some_and(|v| v == "1"))
+}
+
+/// Whether the writer thread samples while recording
+/// (`VICTORY_PROFILE_SAMPLES=1`; off by default): every second the
+/// processor time of each thread that recorded, and every two seconds the
+/// memory split and the distinct views the view heaps' slots were made
+/// from ([`sample_memory`]). The samples take the heaps' `made` locks for a
+/// copy of their slots and ask Windows about the page pools' pages.
+pub(crate) fn samples() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PROFILE_SAMPLES").is_some_and(|v| v == "1"))
+}
+
+/// What is counted while recording ([`count`]), summed between two
+/// presents: each present writes the sums since the one before as counter
+/// events, a group each ([`GROUPS`]). The sums themselves only grow, so a
+/// span can take the part its own work added ([`refresh_split`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Count {
+    /// Global UAV barriers recorded (waits for every earlier shader
+    /// write), by origin: a title barrier naming a buffer; a title barrier
+    /// on every resource; a title barrier group; the indirect clamp's wait
+    /// before its dispatch and the one after; the compare and the fetch of
+    /// copies in the card's memory.
+    UavTitleBuffer,
+    UavTitleGlobal,
+    UavTitleGroup,
+    UavClampFirst,
+    UavClampSecond,
+    UavCard,
+    /// Indirect argument clamps recorded, and of them those that open a
+    /// batch of mesh draws.
+    Clamps,
+    MeshBatches,
+    /// Refreshes of host copies and texture staging ([`refresh_scope`];
+    /// thread time, summed over the threads that refresh): clock ticks in
+    /// the kernel's write-watch askings and the bytes they asked about, clock
+    /// ticks in the journal's own work (its lock, its map, the copies'
+    /// page stamps), clock ticks copying title memory (`ReadProcessMemory`),
+    /// and the 4 KiB pages the askings found written with the distinct
+    /// 64 KiB pages they lie in.
+    AskTicks,
+    AskBytes,
+    JournalTicks,
+    CopyTicks,
+    Pages4k,
+    Pages64k,
+    /// Host view slots whose record changed, by who mirrored it (the
+    /// `descriptor::host::hold` sites view, table, walk, sync and upload).
+    SlotsView,
+    SlotsTable,
+    SlotsWalk,
+    SlotsSync,
+    SlotsUpload,
+}
+
+const COUNTS_N: usize = Count::SlotsUpload as usize + 1;
+static COUNTS: [AtomicU64; COUNTS_N] = [const { AtomicU64::new(0) }; COUNTS_N];
+
+/// How a counter's sum is written.
+#[derive(Clone, Copy)]
+enum Unit {
+    Plain,
+    /// Clock ticks, as microseconds.
+    Micros,
+    /// Bytes, as KiB.
+    Kib,
+    /// Times this (pages, as KiB).
+    Times(u64),
+}
+
+/// The counter events written at each present: a name and its sums.
+const GROUPS: &[(&str, &[(&str, Count, Unit)])] = &[
+    (
+        "uav barriers",
+        &[
+            ("title_buffer", Count::UavTitleBuffer, Unit::Plain),
+            ("title_global", Count::UavTitleGlobal, Unit::Plain),
+            ("title_group", Count::UavTitleGroup, Unit::Plain),
+            ("clamp_first", Count::UavClampFirst, Unit::Plain),
+            ("clamp_second", Count::UavClampSecond, Unit::Plain),
+            ("card", Count::UavCard, Unit::Plain),
+            ("clamps", Count::Clamps, Unit::Plain),
+            ("mesh_batches", Count::MeshBatches, Unit::Plain),
+        ],
+    ),
+    (
+        "refresh split",
+        &[
+            ("kernel_us", Count::AskTicks, Unit::Micros),
+            ("kernel_kb", Count::AskBytes, Unit::Kib),
+            ("journal_us", Count::JournalTicks, Unit::Micros),
+            ("copy_us", Count::CopyTicks, Unit::Micros),
+            ("written_4k_kb", Count::Pages4k, Unit::Times(4)),
+            ("written_64k_kb", Count::Pages64k, Unit::Times(64)),
+        ],
+    ),
+];
+
+/// Adds `n` to `what` while recording.
+#[inline]
+pub(crate) fn count(what: Count, n: u64) {
+    if on() {
+        COUNTS[what as usize].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// `sum` written in `unit`.
+fn in_unit(sum: u64, unit: Unit) -> u64 {
+    match unit {
+        Unit::Plain => sum,
+        Unit::Micros => micros(sum),
+        Unit::Kib => sum >> 10,
+        Unit::Times(n) => sum.saturating_mul(n),
+    }
+}
+
+/// Who mirrors a view slot, as [`record_changed`] keeps them: the
+/// `descriptor::host::hold` sites 1 to 5, with their counts of slots.
+const KEY_SITES: usize = 5;
+const SITE_SLOTS: [Count; KEY_SITES] = [
+    Count::SlotsView,
+    Count::SlotsTable,
+    Count::SlotsWalk,
+    Count::SlotsSync,
+    Count::SlotsUpload,
+];
+const KEY_SHARDS: usize = 16;
+
+/// One shard of [`KEYS`]; `None` until its first key.
+type KeyShard = Mutex<Option<std::collections::HashSet<u64>>>;
+
+/// The distinct records (by view key) host view slots were made from since
+/// the last present, by site, in shards by key.
+static KEYS: [[KeyShard; KEY_SHARDS]; KEY_SITES] =
+    [const { [const { Mutex::new(None) }; KEY_SHARDS] }; KEY_SITES];
+
+/// While recording: host view slot changed to the record `key` (a view's
+/// generation and index), mirrored by `site` (`descriptor::host::hold`).
+/// Counted, and the key kept for the count of distinct records changed to
+/// in the frame.
+#[inline]
+pub(crate) fn record_changed(site: u64, key: u64) {
+    if !on() {
+        return;
+    }
+    let Some(s) = (site as usize).checked_sub(1).filter(|&s| s < KEY_SITES) else {
+        return;
+    };
+    COUNTS[SITE_SLOTS[s] as usize].fetch_add(1, Ordering::Relaxed);
+    let shard = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60) as usize % KEY_SHARDS;
+    KEYS[s][shard]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(key);
+}
+
+/// The distinct keys [`record_changed`] kept per site since the last
+/// call, which empties them.
+fn keys_taken() -> [u64; KEY_SITES] {
+    let mut out = [0u64; KEY_SITES];
+    for (site, shards) in KEYS.iter().enumerate() {
+        for shard in shards {
+            if let Some(set) = shard.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                out[site] += set.len() as u64;
+                set.clear();
+            }
+        }
+    }
+    out
+}
+
+/// The sums at the last present, against which the next writes its own.
+static LAST_COUNTS: Mutex<[u64; COUNTS_N]> = Mutex::new([0; COUNTS_N]);
+
+/// At a present while recording: the counter events of the frame that
+/// ends `at`, the sums since the last present ([`GROUPS`], and the record
+/// keys), as one event per group with anything in it.
+fn push_counts(at: u64) {
+    let now: [u64; COUNTS_N] = std::array::from_fn(|i| COUNTS[i].load(Ordering::Relaxed));
+    let since: [u64; COUNTS_N] = {
+        let mut last = LAST_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        let since = std::array::from_fn(|i| now[i].saturating_sub(last[i]));
+        *last = now;
+        since
+    };
+    for &(name, sums) in GROUPS {
+        if sums.iter().all(|&(_, what, _)| since[what as usize] == 0) {
+            continue;
+        }
+        let args: Vec<(&'static str, u64)> = sums
+            .iter()
+            .map(|&(key, what, unit)| (key, in_unit(since[what as usize], unit)))
+            .collect();
+        push(Event::new(name, at, at, Track::Counter, &args));
+    }
+    let keys = keys_taken();
+    let slots = |s: usize| since[SITE_SLOTS[s] as usize];
+    if (0..KEY_SITES).any(|s| slots(s) > 0) {
+        const NAMES: [(&str, &str); KEY_SITES] = [
+            ("view_slots", "view_keys"),
+            ("table_slots", "table_keys"),
+            ("walk_slots", "walk_keys"),
+            ("sync_slots", "sync_keys"),
+            ("upload_slots", "upload_keys"),
+        ];
+        let args: Vec<(&'static str, u64)> = NAMES
+            .iter()
+            .enumerate()
+            .flat_map(|(s, &(a, b))| [(a, slots(s)), (b, keys[s])])
+            .collect();
+        push(Event::new("record keys", at, at, Track::Counter, &args));
+    }
+}
+
+thread_local! {
+    /// [`refresh_scope`]: whether this thread refreshes host copies now;
+    /// the clock ticks it spent asking the kernel and copying so far (the
+    /// journal's share is what its timers saw less these); whether a
+    /// journal timer runs ([`journal_timer`]).
+    static REFRESH: std::cell::Cell<(bool, u64, u64, bool)> =
+        const { std::cell::Cell::new((false, 0, 0, false)) };
+}
+
+/// While recording, the calling thread refreshes host copies (or texture
+/// staging) until the result is dropped: the kernel askings, the journal's
+/// work and the copies it does meanwhile are counted ([`Count::AskTicks`]
+/// and on). `None` (and nothing counted) while the profiler does not
+/// record.
+pub(crate) fn refresh_scope() -> Option<RefreshScope> {
+    if !on() {
+        return None;
+    }
+    let was = REFRESH
+        .try_with(|r| {
+            let (was, kernel, copy, timing) = r.get();
+            r.set((true, kernel, copy, timing));
+            was
+        })
+        .ok()?;
+    Some(RefreshScope { was })
+}
+
+/// See [`refresh_scope`].
+#[must_use = "the scope ends when it is dropped"]
+pub(crate) struct RefreshScope {
+    was: bool,
+}
+
+impl Drop for RefreshScope {
+    fn drop(&mut self) {
+        let was = self.was;
+        let _ = REFRESH.try_with(|r| {
+            let (_, kernel, copy, timing) = r.get();
+            r.set((was, kernel, copy, timing));
+        });
+    }
+}
+
+/// The start of a timed part of a refresh: 0, with no look at the clock,
+/// unless the calling thread is in a [`refresh_scope`].
+#[inline]
+pub(crate) fn refresh_stamp() -> u64 {
+    // (One load while the profiler is off: no look at the thread's state.)
+    if STATE.load(Ordering::Relaxed) == ON && REFRESH.try_with(|r| r.get().0).unwrap_or(false) {
+        now()
+    } else {
+        0
+    }
+}
+
+/// A kernel write-watch asking begun at `start` ([`refresh_stamp`]; 0:
+/// not counted) asked about `bytes` and found the 4 KiB pages at
+/// `found` (in address order, as the kernel gives them).
+pub(crate) fn kernel_asked(start: u64, bytes: u64, found: &[usize]) {
+    if start == 0 {
+        return;
+    }
+    let ticks = elapsed(start);
+    let _ = REFRESH.try_with(|r| {
+        let (on, kernel, copy, timing) = r.get();
+        r.set((on, kernel + ticks, copy, timing));
+    });
+    let (pages, blocks) = pages_and_blocks(found);
+    COUNTS[Count::AskTicks as usize].fetch_add(ticks, Ordering::Relaxed);
+    COUNTS[Count::AskBytes as usize].fetch_add(bytes, Ordering::Relaxed);
+    COUNTS[Count::Pages4k as usize].fetch_add(pages, Ordering::Relaxed);
+    COUNTS[Count::Pages64k as usize].fetch_add(blocks, Ordering::Relaxed);
+}
+
+/// Of the addresses of written 4 KiB pages in address order: how many,
+/// and how many distinct 64 KiB blocks they lie in.
+fn pages_and_blocks(found: &[usize]) -> (u64, u64) {
+    let mut blocks = 0u64;
+    let mut last = None;
+    for &at in found {
+        let block = at >> 16;
+        if last != Some(block) {
+            blocks += 1;
+            last = Some(block);
+        }
+    }
+    (found.len() as u64, blocks)
+}
+
+/// A copy of title memory begun at `start` ([`refresh_stamp`]; 0: not
+/// counted) has ended.
+pub(crate) fn copied(start: u64) {
+    if start == 0 {
+        return;
+    }
+    let ticks = elapsed(start);
+    let _ = REFRESH.try_with(|r| {
+        let (on, kernel, copy, timing) = r.get();
+        r.set((on, kernel, copy + ticks, timing));
+    });
+    COUNTS[Count::CopyTicks as usize].fetch_add(ticks, Ordering::Relaxed);
+}
+
+/// [`copied`] when dropped, of a copy begun now: nothing outside a
+/// [`refresh_scope`].
+pub(crate) fn copy_timer() -> CopyTimer {
+    CopyTimer {
+        start: refresh_stamp(),
+    }
+}
+
+/// See [`copy_timer`].
+#[must_use = "the timer ends when it is dropped"]
+pub(crate) struct CopyTimer {
+    start: u64,
+}
+
+impl Drop for CopyTimer {
+    fn drop(&mut self) {
+        copied(self.start);
+    }
+}
+
+/// Times the journal's work from now until dropped, less the kernel
+/// askings and copies made meanwhile ([`kernel_asked`], [`copied`]):
+/// `None` outside a [`refresh_scope`] and inside another timer (an outer
+/// one counts the inner's time).
+pub(crate) fn journal_timer() -> Option<JournalTimer> {
+    // (One load while the profiler is off: no look at the thread's state.)
+    if STATE.load(Ordering::Relaxed) != ON {
+        return None;
+    }
+    scoped_journal_timer()
+}
+
+/// [`journal_timer`] once the profiler is known to record: the thread's
+/// own state decides.
+fn scoped_journal_timer() -> Option<JournalTimer> {
+    let (on, kernel, copy, timing) = REFRESH.try_with(std::cell::Cell::get).ok()?;
+    if !on || timing {
+        return None;
+    }
+    let _ = REFRESH.try_with(|r| r.set((on, kernel, copy, true)));
+    Some(JournalTimer {
+        start: now(),
+        kernel,
+        copy,
+    })
+}
+
+/// See [`journal_timer`].
+#[must_use = "the timer ends when it is dropped"]
+pub(crate) struct JournalTimer {
+    start: u64,
+    kernel: u64,
+    copy: u64,
+}
+
+impl Drop for JournalTimer {
+    fn drop(&mut self) {
+        let ticks = elapsed(self.start);
+        let (kernel, copy) = REFRESH
+            .try_with(|r| {
+                let (on, kernel, copy, _) = r.get();
+                r.set((on, kernel, copy, false));
+                (kernel, copy)
+            })
+            .unwrap_or((self.kernel, self.copy));
+        let others = kernel.saturating_sub(self.kernel) + copy.saturating_sub(self.copy);
+        COUNTS[Count::JournalTicks as usize]
+            .fetch_add(ticks.saturating_sub(others), Ordering::Relaxed);
+    }
+}
+
+/// The refresh sums so far ([`Count::AskTicks`] to [`Count::Pages64k`]),
+/// for [`refresh_args`].
+pub(crate) fn refresh_split() -> [u64; 6] {
+    std::array::from_fn(|i| COUNTS[Count::AskTicks as usize + i].load(Ordering::Relaxed))
+}
+
+/// Adds to `span` what the refreshes did since `before` ([`refresh_split`]):
+/// `kernel_us`, `kernel_mb`, `journal_us`, `copy_us`, `kb_4k` and `kb_64k`
+/// (the written pages found, at 4 KiB and at 64 KiB grain). Only the
+/// calling thread's submission refreshes meanwhile (the submission lock),
+/// but the times are thread time summed over the threads that refresh for
+/// it: with `VICTORY_WIDE_REFRESH` the flush's workers refresh side by side
+/// and the parts can add up to more than the span's wall time.
+pub(crate) fn refresh_args(span: &mut Span, before: [u64; 6]) {
+    let now = refresh_split();
+    let d: [u64; 6] = std::array::from_fn(|i| now[i].saturating_sub(before[i]));
+    span.arg("kernel_us", micros(d[0]));
+    span.arg("kernel_mb", d[1] >> 20);
+    span.arg("journal_us", micros(d[2]));
+    span.arg("copy_us", micros(d[3]));
+    span.arg("kb_4k", d[4] * 4);
+    span.arg("kb_64k", d[5] * 64);
+}
+
 /// Records the recording of title list `list` from `start` ([`stamp`]; 0:
 /// nothing) until now, on the list's own line, with the closing thread.
 #[inline]
@@ -525,13 +979,16 @@ pub(crate) fn presented(recorded: u64) {
                 start(config, frame, draws);
             }
         }
-        ON if last != 0 => push(Event::new(
-            "frame",
-            last,
-            at,
-            Track::Frames,
-            &[("frame", frame), ("draws", draws)],
-        )),
+        ON if last != 0 => {
+            push(Event::new(
+                "frame",
+                last,
+                at,
+                Track::Frames,
+                &[("frame", frame), ("draws", draws)],
+            ));
+            push_counts(at);
+        }
         _ => {}
     }
 }
@@ -568,8 +1025,17 @@ fn write_out(config: &'static Config, base: u64) {
     };
     let started = std::time::Instant::now();
     let length = std::time::Duration::from_secs(config.seconds);
+    let mut sampler = Sampler::default();
+    let mut ticks = 0u64;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
+        ticks += 1;
+        if samples() && ticks.is_multiple_of(10) {
+            sampler.threads();
+            if ticks.is_multiple_of(20) {
+                sample_memory();
+            }
+        }
         let done = started.elapsed() >= length || writer.bytes() >= MOST_BYTES;
         if done {
             STATE.store(DONE, Ordering::Relaxed);
@@ -603,6 +1069,103 @@ fn write_out(config: &'static Config, base: u64) {
     );
 }
 
+/// The writer thread's samples of the threads' processor time
+/// ([`samples`]): per thread id, the time at the last sample (clock ticks)
+/// and its processor time then (100 ns units).
+#[derive(Default)]
+struct Sampler {
+    last: std::collections::HashMap<u32, (u64, u64)>,
+}
+
+impl Sampler {
+    /// One event per thread that recorded, on the process "thread cpu":
+    /// its processor time (kernel and user, `cpu_us`) from its last sample
+    /// to now.
+    #[cfg(windows)]
+    fn threads(&mut self) {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetThreadTimes;
+        let buffers: Vec<Arc<Buffer>> = BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut events = Vec::with_capacity(buffers.len());
+        for buffer in buffers {
+            if buffer.handle == 0 {
+                continue;
+            }
+            let mut times = [FILETIME::default(); 4];
+            let [created, exited, kernel, user] = &mut times;
+            // SAFETY: a handle of ours, opened for queries; four times out.
+            let ok =
+                unsafe { GetThreadTimes(buffer.handle as _, created, exited, kernel, user) } != 0;
+            if !ok {
+                continue;
+            }
+            let time =
+                |t: &FILETIME| u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime);
+            let cpu = time(&times[2]) + time(&times[3]);
+            let at = now();
+            if let Some((then, was)) = self.last.insert(buffer.tid, (at, cpu))
+                && cpu >= was
+            {
+                events.push(Event::new(
+                    "cpu",
+                    then,
+                    at,
+                    Track::ThreadCpu(buffer.tid),
+                    &[("cpu_us", (cpu - was) / 10)],
+                ));
+            }
+        }
+        push_all(events);
+    }
+
+    #[cfg(not(windows))]
+    fn threads(&mut self) {}
+}
+
+/// The memory split and the distinct views of the view heaps' slots, as
+/// two counter events ([`samples`]): `memory` in MB (the page pools the
+/// title registered and how much of them is resident, host copies of
+/// title memory, of them the windows outside buffers, snapshot buffers,
+/// copies in the card's memory (each with a CPU side as large), texture
+/// staging buffers, upload memory of the lists) and `live keys` (distinct
+/// views the made slots were made from, the made slots).
+#[cfg(windows)]
+fn sample_memory() {
+    let at = now();
+    let (pool, resident) = crate::resource::page_pools_resident();
+    let [copies, windows, snapshots, card] = crate::shadow::memory_split();
+    let staging = crate::texture::staging_bytes();
+    let upload = crate::host::upload_bytes();
+    let mb = |b: u64| b >> 20;
+    push(Event::new(
+        "memory",
+        at,
+        at,
+        Track::Counter,
+        &[
+            ("pool_mb", mb(pool)),
+            ("pool_resident_mb", mb(resident)),
+            ("copies_mb", mb(copies)),
+            ("windows_mb", mb(windows)),
+            ("snapshots_mb", mb(snapshots)),
+            ("card_mb", mb(card)),
+            ("staging_mb", mb(staging)),
+            ("upload_mb", mb(upload)),
+        ],
+    ));
+    let (keys, slots) = crate::descriptor::live_keys();
+    push(Event::new(
+        "live keys",
+        at,
+        at,
+        Track::Counter,
+        &[("live_keys", keys), ("made_slots", slots)],
+    ));
+}
+
+#[cfg(not(windows))]
+fn sample_memory() {}
+
 /// What closes the trace; written after every chunk and over by the next.
 const TRAILER: &str = "\n]}\n";
 
@@ -629,6 +1192,7 @@ impl Writer {
              {{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":2,\"tid\":0,\"args\":{{\"name\":\"GPU\"}}}},\n\
              {{\"name\":\"process_sort_index\",\"ph\":\"M\",\"pid\":2,\"tid\":0,\"args\":{{\"sort_index\":-1}}}},\n\
              {{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":3,\"tid\":0,\"args\":{{\"name\":\"title lists\"}}}},\n\
+             {{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":4,\"tid\":0,\"args\":{{\"name\":\"thread cpu\"}}}},\n\
              {{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":0,\"args\":{{\"name\":\"frames\"}}}},\n\
              {{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":2,\"tid\":1,\"args\":{{\"name\":\"host queue\"}}}}",
             env!("CARGO_PKG_VERSION")
@@ -665,9 +1229,10 @@ impl Writer {
             for event in events {
                 let (pid, tid) = match event.track {
                     Track::Thread => (1, *tid),
-                    Track::Frames => (1, 0),
+                    Track::Frames | Track::Counter => (1, 0),
                     Track::Gpu => (2, 1),
                     Track::List(list) => (3, list),
+                    Track::ThreadCpu(thread) => (4, thread),
                 };
                 if (pid == 1 && tid != 0 || pid == 3) && self.named.insert((pid, tid)) {
                     let _ = write!(
@@ -684,11 +1249,19 @@ impl Writer {
                 chunk.push_str(",\n{\"name\":");
                 json_string(&mut chunk, event.name);
                 let ts = self.micros(event.start);
-                let dur = event.end.saturating_sub(event.start) as f64 * 1e6 / self.frequency;
-                let _ = write!(
-                    chunk,
-                    ",\"ph\":\"X\",\"ts\":{ts:.3},\"dur\":{dur:.3},\"pid\":{pid},\"tid\":{tid}"
-                );
+                if event.track == Track::Counter {
+                    // (A counter has a moment, no length.)
+                    let _ = write!(
+                        chunk,
+                        ",\"ph\":\"C\",\"ts\":{ts:.3},\"pid\":{pid},\"tid\":{tid}"
+                    );
+                } else {
+                    let dur = event.end.saturating_sub(event.start) as f64 * 1e6 / self.frequency;
+                    let _ = write!(
+                        chunk,
+                        ",\"ph\":\"X\",\"ts\":{ts:.3},\"dur\":{dur:.3},\"pid\":{pid},\"tid\":{tid}"
+                    );
+                }
                 if event.args_len > 0 {
                     chunk.push_str(",\"args\":{");
                     for (i, (key, value)) in
@@ -733,7 +1306,9 @@ fn json_string(out: &mut String, text: &str) {
     out.push('"');
 }
 
-/// The card's timestamps around the host lists of a waited submission.
+/// The card's timestamps around the host lists of a submission: waited
+/// ones, and with [`super::flight_stamps`] those sent ahead too, read when
+/// they land.
 #[cfg(windows)]
 pub(crate) mod gpu {
     use super::{Event, Track};
@@ -752,6 +1327,9 @@ pub(crate) mod gpu {
 
     /// Timestamps a submission may take: two per stamped part.
     const MOST: u32 = 256;
+    /// Submissions that may be stamped and not yet read at once (flights in
+    /// the air), each with its own part of the read-back buffer.
+    const SLOTS: u32 = 128;
 
     /// A part of a submission's lists to stamp: `lists[first..end]`, shown as
     /// `name` with `arg`.
@@ -762,21 +1340,35 @@ pub(crate) mod gpu {
         pub(crate) arg: (&'static str, u64),
     }
 
-    /// What [`read`] needs of a stamped submission.
+    /// What [`read`] needs of a stamped submission: its parts, its number
+    /// and the read-back slot its stamps are resolved into (given back when
+    /// it is read, [`done`], or forgotten, [`forget`]).
     pub(crate) struct Plan {
         parts: Vec<(&'static str, (&'static str, u64))>,
         submission: u64,
+        slot: u32,
     }
 
     pub(crate) struct Stamps {
+        /// Two banks of [`MOST`] queries: a slot uses bank `slot % 2`.
         heap: ID3D12QueryHeap,
+        /// [`MOST`] values for each of the slots.
         back: ID3D12Resource,
-        /// Backs every list below; none is ever reset.
+        /// Backs every mark list; none is ever reset.
         allocator: ID3D12CommandAllocator,
-        /// Closed lists that each end one timestamp query, by index.
-        marks: Vec<ID3D12GraphicsCommandList>,
-        /// Closed lists that resolve the first `n` queries, by `n`.
-        resolves: Vec<Option<ID3D12GraphicsCommandList>>,
+        /// Closed lists that each end one timestamp query, by index, made
+        /// when first needed.
+        marks: Vec<Option<ID3D12GraphicsCommandList>>,
+        /// Per slot, an allocator and a list that resolves the slot's
+        /// queries into its part of `back`, recorded again for each
+        /// submission stamped in the slot (the one before it has been read
+        /// by then).
+        resolves: Vec<Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>>,
+        /// Slots whose submission has not been read yet.
+        busy: Vec<bool>,
+        /// The slot to try first: slots are taken in turn, so submissions
+        /// one after another use the two banks by turns.
+        next: u32,
         /// Card ticks per second, and a pair of card and CPU ticks taken at
         /// the same moment.
         frequency: u64,
@@ -795,6 +1387,16 @@ pub(crate) mod gpu {
             device: &ID3D12Device,
             queue: &ID3D12CommandQueue,
         ) -> windows::core::Result<Stamps> {
+            Self::with_slots(device, queue, SLOTS)
+        }
+
+        /// [`Stamps::new`] with `slots` read-back slots.
+        pub(crate) fn with_slots(
+            device: &ID3D12Device,
+            queue: &ID3D12CommandQueue,
+            slots: u32,
+        ) -> windows::core::Result<Stamps> {
+            let slots = slots.max(1);
             let mut heap: Option<ID3D12QueryHeap> = None;
             let mut back: Option<ID3D12Resource> = None;
             let readback = D3D12_HEAP_PROPERTIES {
@@ -803,7 +1405,7 @@ pub(crate) mod gpu {
             };
             let desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: u64::from(MOST) * 8,
+                Width: u64::from(slots) * u64::from(MOST) * 8,
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
@@ -819,7 +1421,7 @@ pub(crate) mod gpu {
                 device.CreateQueryHeap(
                     &D3D12_QUERY_HEAP_DESC {
                         Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
-                        Count: MOST,
+                        Count: 2 * MOST,
                         NodeMask: 0,
                     },
                     &mut heap,
@@ -845,32 +1447,13 @@ pub(crate) mod gpu {
                     back: back.ok_or_else(windows::core::Error::empty)?,
                     allocator,
                     marks: Vec::new(),
-                    resolves: vec![None; MOST as usize + 1],
+                    resolves: (0..slots).map(|_| None).collect(),
+                    busy: vec![false; slots as usize],
+                    next: 0,
                     frequency: frequency.max(1),
                     calibration,
                     calibrated: std::time::Instant::now(),
                 })
-            }
-        }
-
-        /// A closed list of `record`'s commands, on the shared allocator.
-        fn closed(
-            &self,
-            device: &ID3D12Device,
-            record: impl FnOnce(&ID3D12GraphicsCommandList),
-        ) -> windows::core::Result<ID3D12GraphicsCommandList> {
-            // SAFETY: a new list on our allocator, which records nothing
-            // else meanwhile (the caller holds `STAMPS`' lock).
-            unsafe {
-                let list: ID3D12GraphicsCommandList = device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &self.allocator,
-                    None,
-                )?;
-                record(&list);
-                list.Close()?;
-                Ok(list)
             }
         }
 
@@ -879,44 +1462,91 @@ pub(crate) mod gpu {
             device: &ID3D12Device,
             index: u32,
         ) -> windows::core::Result<ID3D12CommandList> {
-            while self.marks.len() <= index as usize {
-                let at = self.marks.len() as u32;
-                // SAFETY: an open list and our heap.
-                let list = self.closed(device, |list| unsafe {
-                    list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, at)
-                })?;
-                self.marks.push(list);
+            if self.marks.len() <= index as usize {
+                self.marks.resize(index as usize + 1, None);
             }
-            self.marks[index as usize].cast()
+            if let Some(list) = &self.marks[index as usize] {
+                return list.cast();
+            }
+            // SAFETY: a new list on our allocator, which records nothing
+            // else meanwhile (the caller holds `STAMPS`' lock); our heap.
+            let list = unsafe {
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &self.allocator,
+                    None,
+                )?;
+                list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
+                list.Close()?;
+                list
+            };
+            let cast = list.cast();
+            self.marks[index as usize] = Some(list);
+            cast
         }
 
+        /// The list that resolves `count` queries of `slot`'s bank into the
+        /// slot's part of the read-back buffer, recorded now.
         fn resolve(
             &mut self,
             device: &ID3D12Device,
+            slot: u32,
             count: u32,
         ) -> windows::core::Result<ID3D12CommandList> {
-            if self.resolves[count as usize].is_none() {
-                // SAFETY: an open list, our heap and read-back buffer.
-                let list = self.closed(device, |list| unsafe {
-                    list.ResolveQueryData(
-                        &self.heap,
-                        D3D12_QUERY_TYPE_TIMESTAMP,
+            let held = &mut self.resolves[slot as usize];
+            if held.is_none() {
+                // SAFETY: plain object creation.
+                unsafe {
+                    let allocator: ID3D12CommandAllocator =
+                        device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = device.CreateCommandList(
                         0,
-                        count,
-                        &self.back,
-                        0,
-                    )
-                })?;
-                self.resolves[count as usize] = Some(list);
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?;
+                    list.Close()?;
+                    *held = Some((allocator, list));
+                }
             }
-            match &self.resolves[count as usize] {
-                Some(list) => list.cast(),
-                None => Err(windows::core::Error::empty()),
+            let Some((allocator, list)) = held else {
+                return Err(windows::core::Error::empty());
+            };
+            // SAFETY: the slot was free, so the card has run its last
+            // resolve (it was read after its submission ran); our heap and
+            // read-back buffer, `count` queries of the slot's bank.
+            unsafe {
+                allocator.Reset()?;
+                list.Reset(&*allocator, None)?;
+                list.ResolveQueryData(
+                    &self.heap,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    bank(slot),
+                    count,
+                    &self.back,
+                    u64::from(slot) * u64::from(MOST) * 8,
+                );
+                list.Close()?;
             }
+            list.cast()
+        }
+
+        /// A free slot, taken; `None` if every slot's submission is still
+        /// to be read.
+        fn take_slot(&mut self) -> Option<u32> {
+            let n = self.busy.len() as u32;
+            let slot = (0..n)
+                .map(|k| (self.next + k) % n)
+                .find(|&s| !self.busy[s as usize])?;
+            self.busy[slot as usize] = true;
+            self.next = (slot + 1) % n;
+            Some(slot)
         }
 
         /// `lists` with a timestamp before and after each part and a resolve
-        /// at the end; `None` if there are too many parts.
+        /// at the end; `None` if there are too many parts or no slot is
+        /// free.
         pub(crate) fn around(
             &mut self,
             device: &ID3D12Device,
@@ -928,6 +1558,34 @@ pub(crate) mod gpu {
             if count == 0 || count > MOST {
                 return Ok(None);
             }
+            let Some(slot) = self.take_slot() else {
+                return Ok(None);
+            };
+            match self.around_in(device, lists, parts, slot) {
+                Ok(out) => {
+                    let plan = Plan {
+                        parts: parts.iter().map(|p| (p.name, p.arg)).collect(),
+                        submission,
+                        slot,
+                    };
+                    Ok(Some((out, plan)))
+                }
+                Err(error) => {
+                    self.busy[slot as usize] = false;
+                    Err(error)
+                }
+            }
+        }
+
+        fn around_in(
+            &mut self,
+            device: &ID3D12Device,
+            lists: &[Option<ID3D12CommandList>],
+            parts: &[Part],
+            slot: u32,
+        ) -> windows::core::Result<Vec<Option<ID3D12CommandList>>> {
+            let count = parts.len() as u32 * 2;
+            let base = bank(slot);
             let mut out = Vec::with_capacity(lists.len() + count as usize + 1);
             let mut next = 0;
             for (k, part) in parts.iter().enumerate() {
@@ -936,18 +1594,14 @@ pub(crate) mod gpu {
                     part.end.min(lists.len()),
                 );
                 out.extend_from_slice(&lists[next..first]);
-                out.push(Some(self.mark(device, 2 * k as u32)?));
+                out.push(Some(self.mark(device, base + 2 * k as u32)?));
                 out.extend_from_slice(&lists[first..end.max(first)]);
-                out.push(Some(self.mark(device, 2 * k as u32 + 1)?));
+                out.push(Some(self.mark(device, base + 2 * k as u32 + 1)?));
                 next = end.max(first);
             }
             out.extend_from_slice(&lists[next..]);
-            out.push(Some(self.resolve(device, count)?));
-            let plan = Plan {
-                parts: parts.iter().map(|p| (p.name, p.arg)).collect(),
-                submission,
-            };
-            Ok(Some((out, plan)))
+            out.push(Some(self.resolve(device, slot, count)?));
+            Ok(out)
         }
 
         /// Card ticks on the CPU clock (`QueryPerformanceCounter`).
@@ -959,24 +1613,53 @@ pub(crate) mod gpu {
             cpu.max(1) as u64
         }
 
+        /// The slot of a plan whose submission will not be read is free
+        /// (tests: a submission not waited for keeps its slot, which the
+        /// card may still resolve into).
+        #[cfg(test)]
+        pub(crate) fn forget(&mut self, plan: Plan) {
+            self.free(plan.slot);
+        }
+
+        fn free(&mut self, slot: u32) {
+            if let Some(busy) = self.busy.get_mut(slot as usize) {
+                *busy = false;
+            }
+        }
+
         /// After the stamped submission ran: the card's events, a part each
-        /// and one for the whole submission.
+        /// and one for the whole submission. Its slot is free again.
         pub(crate) fn read(&mut self, queue: &ID3D12CommandQueue, plan: Plan) -> Vec<Event> {
             let count = plan.parts.len() * 2;
             let mut ticks = vec![0u64; count];
-            // SAFETY: the read-back buffer, which the resolve (it has run)
-            // wrote; `count` values fit in it.
+            let offset = plan.slot as usize * MOST as usize * 8;
+            // SAFETY: the read-back buffer's slot, which the resolve (it has
+            // run) wrote; `count` values fit in it.
             unsafe {
                 let range = D3D12_RANGE {
-                    Begin: 0,
-                    End: count * 8,
+                    Begin: offset,
+                    End: offset + count * 8,
                 };
                 let mut data = std::ptr::null_mut();
-                if self.back.Map(0, Some(&range), Some(&mut data)).is_err() || data.is_null() {
-                    return Vec::new();
+                if self.back.Map(0, Some(&range), Some(&mut data)).is_ok() && !data.is_null() {
+                    std::ptr::copy_nonoverlapping(
+                        data.cast::<u8>().add(offset).cast::<u64>(),
+                        ticks.as_mut_ptr(),
+                        count,
+                    );
+                    self.back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                } else {
+                    ticks.clear();
                 }
-                std::ptr::copy_nonoverlapping(data.cast::<u64>(), ticks.as_mut_ptr(), count);
-                self.back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            }
+            let Plan {
+                parts,
+                submission,
+                slot,
+            } = plan;
+            self.free(slot);
+            if ticks.is_empty() {
+                return Vec::new();
             }
             // The two clocks drift apart slowly: matched again every second.
             if self.calibrated.elapsed() > std::time::Duration::from_secs(1) {
@@ -989,9 +1672,9 @@ pub(crate) mod gpu {
                     self.calibrated = std::time::Instant::now();
                 }
             }
-            let mut events = Vec::with_capacity(plan.parts.len() + 1);
+            let mut events = Vec::with_capacity(parts.len() + 1);
             let mut whole: Option<(u64, u64)> = None;
-            for (k, (name, arg)) in plan.parts.iter().enumerate() {
+            for (k, (name, arg)) in parts.iter().enumerate() {
                 let (begin, end) = (ticks[2 * k], ticks[2 * k + 1]);
                 if begin == 0 || end < begin {
                     continue;
@@ -1003,7 +1686,7 @@ pub(crate) mod gpu {
                     begin,
                     end,
                     Track::Gpu,
-                    &[("submission", plan.submission), *arg],
+                    &[("submission", submission), *arg],
                 ));
             }
             if let Some((begin, end)) = whole {
@@ -1012,18 +1695,21 @@ pub(crate) mod gpu {
                     begin,
                     end,
                     Track::Gpu,
-                    &[
-                        ("submission", plan.submission),
-                        ("parts", plan.parts.len() as u64),
-                    ],
+                    &[("submission", submission), ("parts", parts.len() as u64)],
                 ));
             }
             events
         }
     }
 
+    /// The first query of `slot`'s bank.
+    fn bank(slot: u32) -> u32 {
+        slot % 2 * MOST
+    }
+
     /// [`Stamps::around`] on the shared stamps, made at the first call;
-    /// `None` when they could not be made or the parts are too many.
+    /// `None` when they could not be made, the parts are too many or no
+    /// slot is free.
     pub(crate) fn around(
         device: &ID3D12Device,
         queue: &ID3D12CommandQueue,
@@ -1050,8 +1736,8 @@ pub(crate) mod gpu {
         }
     }
 
-    /// After the submission [`around`] planned ran: its events go to the
-    /// trace.
+    /// After the submission [`around`] planned ran (waited for, or landed
+    /// with the relay): its events go to the trace.
     pub(crate) fn done(queue: &ID3D12CommandQueue, plan: Plan) {
         let events = match STAMPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             Some(Some(stamps)) => stamps.read(queue, plan),
@@ -1333,7 +2019,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_keeps_six_args_and_drops_the_rest() {
+    fn an_event_keeps_ten_args_and_drops_the_rest() {
         let args = [
             ("a", 1),
             ("b", 2),
@@ -1342,6 +2028,10 @@ mod tests {
             ("e", 5),
             ("f", 6),
             ("g", 7),
+            ("h", 8),
+            ("i", 9),
+            ("j", 10),
+            ("k", 11),
         ];
         let event = Event::new("walk", 1, 2, Track::Thread, &args);
         assert_eq!(usize::from(event.args_len), MOST_ARGS);
@@ -1352,7 +2042,185 @@ mod tests {
         writer.write(&[(3, "thread 3", vec![event])]).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(valid(&text), Ok(()), "{text}");
-        assert!(text.contains("\"args\":{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6}}"));
+        assert!(text.contains(
+            "\"args\":{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8,\"i\":9,\
+             \"j\":10}}"
+        ));
+    }
+
+    /// Counter events have a moment and no length, on the CPU process;
+    /// a thread's processor time goes to the process "thread cpu" under
+    /// the thread's id, and names no line after the writing thread.
+    #[test]
+    fn counters_and_thread_samples_are_written_apart_from_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.json");
+        let mut writer = Writer::create(&path, 0, 1_000_000).unwrap();
+        writer
+            .write(&[(
+                5,
+                "victory-profile",
+                vec![
+                    Event::new("uav barriers", 30, 30, Track::Counter, &[("card", 2)]),
+                    Event::new("cpu", 10, 40, Track::ThreadCpu(77), &[("cpu_us", 25)]),
+                ],
+            )])
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(valid(&text), Ok(()), "{text}");
+        assert!(text.contains(
+            "{\"name\":\"uav barriers\",\"ph\":\"C\",\"ts\":30.000,\"pid\":1,\"tid\":0,\
+             \"args\":{\"card\":2}}"
+        ));
+        assert!(text.contains(
+            "{\"name\":\"cpu\",\"ph\":\"X\",\"ts\":10.000,\"dur\":30.000,\"pid\":4,\"tid\":77,\
+             \"args\":{\"cpu_us\":25}}"
+        ));
+        assert!(!text.contains("victory-profile"), "{text}");
+    }
+
+    /// The 4 KiB pages a write-watch asking found, and the 64 KiB blocks
+    /// they lie in (the kernel gives them in address order).
+    #[test]
+    fn written_pages_are_counted_at_both_grains() {
+        assert_eq!(pages_and_blocks(&[]), (0, 0));
+        let found = [0x1_0000, 0x1_1000, 0x1_f000, 0x2_0000, 0x5_0000, 0x5_3000];
+        assert_eq!(pages_and_blocks(&found), (6, 3));
+        assert_eq!(pages_and_blocks(&[0x7_0000]), (1, 1));
+    }
+
+    /// Counts and the refresh split stay untouched while the profiler does
+    /// not record: no scope, no stamp, no timer.
+    #[test]
+    fn counters_count_nothing_while_off() {
+        assert!(!on());
+        let before = COUNTS[Count::UavCard as usize].load(Ordering::Relaxed);
+        count(Count::UavCard, 3);
+        record_changed(4, 99);
+        assert_eq!(
+            COUNTS[Count::UavCard as usize].load(Ordering::Relaxed),
+            before
+        );
+        assert!(refresh_scope().is_none());
+        assert_eq!(refresh_stamp(), 0);
+        assert!(journal_timer().is_none());
+        let split = refresh_split();
+        kernel_asked(0, 1 << 20, &[0x1000]);
+        copied(0);
+        assert_eq!(refresh_split(), split);
+    }
+
+    /// Inside a refresh scope a journal timer counts its time less the
+    /// kernel askings and copies made under it; a timer inside another
+    /// counts nothing of its own; out of the scope nothing is timed.
+    #[test]
+    fn the_journal_share_leaves_out_kernel_and_copy_time() {
+        // (Set by hand, and the timer taken past the profiler's own check:
+        // `refresh_scope` and `journal_timer` need the profiler recording.)
+        REFRESH.with(|r| r.set((true, 0, 0, false)));
+        // The profiler off: not even a scope's thread times its journal.
+        assert!(journal_timer().is_none());
+        let before = refresh_split();
+        {
+            let timer = scoped_journal_timer().expect("in a scope");
+            assert!(scoped_journal_timer().is_none(), "one timer at a time");
+            // (Starts from the clock itself: `refresh_stamp` gives one only
+            // while recording.)
+            let asking = now();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            kernel_asked(asking, 8 << 20, &[0x1_0000, 0x1_1000]);
+            let copying = now();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            copied(copying);
+            drop(timer);
+        }
+        let after = refresh_split();
+        let d: Vec<u64> = (0..6).map(|i| after[i] - before[i]).collect();
+        // (Other tests may count meanwhile on their threads: at least.)
+        assert!(micros(d[0]) >= 3_000, "kernel {d:?}");
+        assert!(d[1] >= 8 << 20);
+        assert!(micros(d[3]) >= 3_000, "copy {d:?}");
+        assert!(d[4] >= 2 && d[5] >= 1);
+        // The journal's share: its whole time less those two, so well under
+        // the 6 ms slept.
+        let journal = micros(d[2]);
+        assert!(journal < 3_000, "journal {journal} us");
+        REFRESH.with(|r| r.set((false, 0, 0, false)));
+        assert!(scoped_journal_timer().is_none());
+    }
+
+    /// A present writes what was counted since the one before, a counter
+    /// event per group with anything in it, and the record keys' slots
+    /// against the distinct keys, which start again from nothing.
+    #[test]
+    fn a_present_writes_the_counts_since_the_last() {
+        let taken = |at: u64| -> Vec<Event> {
+            LOCAL.with(|l| {
+                let buffer = l.get_or_init(register);
+                let mut events = buffer.events.lock().unwrap();
+                let mine: Vec<Event> = events.iter().filter(|e| e.start == at).copied().collect();
+                events.retain(|e| e.start != at);
+                mine
+            })
+        };
+        let arg = |e: &Event, key: &str| {
+            e.args[..usize::from(e.args_len)]
+                .iter()
+                .find(|a| a.0 == key)
+                .map(|a| a.1)
+        };
+        // Whatever came before is written first.
+        push_counts(1);
+        let _ = taken(1);
+        let _ = keys_taken();
+        COUNTS[Count::UavTitleGroup as usize].fetch_add(5, Ordering::Relaxed);
+        COUNTS[Count::SlotsSync as usize].fetch_add(3, Ordering::Relaxed);
+        for key in [11u64, 12, 11] {
+            let shard = key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 60;
+            KEYS[3][shard as usize % KEY_SHARDS]
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Default::default)
+                .insert(key);
+        }
+        push_counts(2);
+        let events = taken(2);
+        let barriers = events
+            .iter()
+            .find(|e| e.name == "uav barriers")
+            .expect("barriers");
+        assert_eq!(barriers.track, Track::Counter);
+        assert_eq!(arg(barriers, "title_group"), Some(5));
+        assert_eq!(arg(barriers, "card"), Some(0));
+        let keys = events
+            .iter()
+            .find(|e| e.name == "record keys")
+            .expect("keys");
+        assert_eq!(arg(keys, "sync_slots"), Some(3));
+        assert_eq!(arg(keys, "sync_keys"), Some(2));
+        assert_eq!(usize::from(keys.args_len), 2 * KEY_SITES);
+        // Nothing new: nothing written.
+        push_counts(3);
+        assert!(taken(3).iter().all(|e| e.name != "record keys"));
+        assert_eq!(keys_taken(), [0; KEY_SITES]);
+    }
+
+    /// A unit turns a sum into what its counter shows.
+    #[test]
+    fn counter_units_scale_their_sums() {
+        assert_eq!(in_unit(7, Unit::Plain), 7);
+        assert_eq!(in_unit(3 * frequency(), Unit::Micros), 3_000_000);
+        assert_eq!(in_unit(5 << 10, Unit::Kib), 5);
+        assert_eq!(in_unit(6, Unit::Times(64)), 384);
+        // Every count is in at most one group, and no group holds more
+        // than an event carries.
+        let mut seen = std::collections::HashSet::new();
+        for &(_, sums) in GROUPS {
+            assert!(sums.len() <= MOST_ARGS);
+            for &(_, what, _) in sums {
+                assert!(seen.insert(what as usize), "{what:?} twice");
+            }
+        }
     }
 
     /// On the software adapter: stamps around two parts of a submission come
@@ -1444,6 +2312,107 @@ mod tests {
                 events[2].start
             );
             assert!(events[2].end <= after + slack, "{} {after}", events[2].end);
+        }
+    }
+
+    /// On the software adapter: submissions stamped one after another and
+    /// sent before any is read (flights in the air) each read back their own
+    /// stamps, in the order they ran; with every slot taken a submission is
+    /// not stamped, and a read or a forgotten plan frees its slot.
+    #[cfg(windows)]
+    #[test]
+    fn flights_in_the_air_read_their_own_stamps_on_warp() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4,
+        };
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::Interface;
+
+        let factory: IDXGIFactory4 =
+            unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.unwrap();
+        let adapter: IDXGIAdapter = unsafe { factory.EnumWarpAdapter() }.unwrap();
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) }.unwrap();
+        let device = device.unwrap();
+        let queue: ID3D12CommandQueue = unsafe {
+            device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        let allocator: ID3D12CommandAllocator =
+            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+        let empty = || -> Option<ID3D12CommandList> {
+            let list: ID3D12GraphicsCommandList = unsafe {
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+            }
+            .unwrap();
+            unsafe { list.Close() }.unwrap();
+            Some(list.cast().unwrap())
+        };
+        let lists = vec![empty(), empty()];
+        let parts = |list: u64| {
+            [0, 1].map(|i| gpu::Part {
+                first: i,
+                end: i + 1,
+                name: "host list",
+                arg: ("list", list + i as u64),
+            })
+        };
+        let mut stamps = gpu::Stamps::with_slots(&device, &queue, 3).unwrap();
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let event = unsafe { CreateEventW(None, false, false, None) }.unwrap();
+        // Three flights sent, none read: every slot is taken.
+        let mut plans = Vec::new();
+        for submission in 1..=3u64 {
+            let (all, plan) = stamps
+                .around(&device, &lists, &parts(10 * submission), submission)
+                .unwrap()
+                .unwrap();
+            unsafe {
+                queue.ExecuteCommandLists(&all);
+                queue.Signal(&fence, submission).unwrap();
+            }
+            plans.push(plan);
+        }
+        assert!(
+            stamps
+                .around(&device, &lists, &parts(40), 4)
+                .unwrap()
+                .is_none(),
+            "no slot free"
+        );
+        unsafe {
+            fence.SetEventOnCompletion(3, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+        }
+        let mut last_end = 0;
+        let mut third = None;
+        for (k, plan) in plans.into_iter().enumerate() {
+            if k == 2 {
+                third = Some(plan);
+                continue;
+            }
+            let events = stamps.read(&queue, plan);
+            assert_eq!(events.len(), 3, "{events:?}");
+            let submission = k as u64 + 1;
+            assert_eq!(events[0].args[1], ("list", 10 * submission));
+            assert_eq!(events[1].args[1], ("list", 10 * submission + 1));
+            assert_eq!(events[2].args[0], ("submission", submission));
+            assert!(events[0].end <= events[1].start);
+            assert!(events[2].start >= last_end, "flights ran in order");
+            last_end = events[2].end;
+        }
+        // The two read slots are free again; the forgotten one too.
+        stamps.forget(third.unwrap());
+        for submission in 5..=7u64 {
+            let planned = stamps
+                .around(&device, &lists, &parts(0), submission)
+                .unwrap();
+            assert!(planned.is_some(), "slot for {submission}");
         }
     }
 }

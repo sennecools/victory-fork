@@ -2603,6 +2603,53 @@ fn page_pools() -> std::sync::MutexGuard<'static, Vec<Option<(u64, u32)>>> {
     PAGE_POOLS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// For the profile's memory sample (`VICTORY_PROFILE_SAMPLES`): the bytes
+/// of the page pools the title registered, and how many of them are in
+/// the process's physical memory, asking about the first 4 KiB of each
+/// 64 KiB page (`QueryWorkingSetEx`, in batches; no walk of the pages).
+#[cfg(windows)]
+pub(crate) fn page_pools_resident() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const BATCH: usize = 16 << 10;
+    let pools: Vec<(u64, u32)> = page_pools().iter().flatten().copied().collect();
+    let total: u64 = pools
+        .iter()
+        .map(|&(_, pages)| u64::from(pages) * KIB_64)
+        .sum();
+    let mut resident = 0u64;
+    // (Address, answer) pairs, as the call fills them in.
+    let mut asked: Vec<[usize; 2]> = Vec::with_capacity(BATCH);
+    let mut ask = |asked: &mut Vec<[usize; 2]>| {
+        // SAFETY: our own process; `asked` holds that many entries of two
+        // words each.
+        let ok = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                asked.as_mut_ptr().cast(),
+                (asked.len() * size_of::<[usize; 2]>()) as u32,
+            )
+        } != 0;
+        if ok {
+            // Bit 0 of the answer: the page is in the working set.
+            resident += asked.iter().filter(|a| a[1] & 1 != 0).count() as u64 * KIB_64;
+        }
+        asked.clear();
+    };
+    for (address, pages) in pools {
+        for page in 0..u64::from(pages) {
+            asked.push([(address + page * KIB_64) as usize, 0]);
+            if asked.len() == BATCH {
+                ask(&mut asked);
+            }
+        }
+    }
+    if !asked.is_empty() {
+        ask(&mut asked);
+    }
+    (total, resident)
+}
+
 /// Device method 0x250: `(address, page count, handle out)`.
 pub(crate) extern "system" fn register_page_pool(
     _: This,
@@ -2980,6 +3027,48 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// The profile's memory sample counts a registered pool's bytes, and
+    /// as resident only its 64 KiB pages that were touched.
+    #[cfg(windows)]
+    #[test]
+    fn a_page_pool_is_resident_where_it_was_touched() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGES: u32 = 4;
+        let len = PAGES as usize * KIB_64 as usize;
+        // SAFETY: a fresh committed region of our own, freed below.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!at.is_null());
+        // SAFETY: inside the region; pages 0 and 2 are touched.
+        unsafe {
+            at.write_volatile(1);
+            at.add(2 * KIB_64 as usize).write_volatile(1);
+        }
+        let (total, resident) = page_pools_resident();
+        let mut handle = 0usize;
+        let registered = register_page_pool(std::ptr::null_mut(), at as u64, PAGES, &mut handle);
+        assert_eq!(registered, S_OK);
+        let (with_total, with_resident) = page_pools_resident();
+        assert_eq!(unregister_page_pool(std::ptr::null_mut(), handle), S_OK);
+        // SAFETY: the region allocated above, no longer registered.
+        unsafe { VirtualFree(at.cast(), 0, MEM_RELEASE) };
+        assert_eq!(with_total - total, u64::from(PAGES) * KIB_64);
+        let touched = with_resident - resident;
+        assert!(
+            (2 * KIB_64..=u64::from(PAGES) * KIB_64).contains(&touched),
+            "{touched} bytes resident"
+        );
+    }
 
     #[test]
     fn manual_texture_limit_respects_adapter_video_memory_budget() {

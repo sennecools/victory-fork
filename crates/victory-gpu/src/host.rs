@@ -507,6 +507,13 @@ pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::
 /// their bytes.
 pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// For the profile's memory sample (`VICTORY_PROFILE_SAMPLES`): the bytes
+/// of the lists' upload memory alive ([`ALIVE`]: scratch chunks, kept ones
+/// among them, and the other upload buffers).
+pub(crate) fn upload_bytes() -> u64 {
+    ALIVE[2].load(Ordering::Relaxed) + ALIVE[7].load(Ordering::Relaxed)
+}
+
 /// About host lists, for the memory line: lists made by the host since the
 /// start; preludes made (a list's second allocator and list, made when it
 /// first needs one, [`lazy_prelude`]); and, in diagnostics builds, the
@@ -1199,6 +1206,12 @@ pub(crate) struct HostList {
     /// When the title opened it for recording ([`crate::profile::stamp`]; 0:
     /// not timed), for the profiler's span of its recording.
     opened: std::sync::atomic::AtomicU64,
+    /// When the title last closed it while the profiler timed its recording
+    /// (0: not timed), and the closing thread: which list of a submission
+    /// closed last, and how long before the submission ([`Host::submit`]'s
+    /// `gate_` args).
+    closed: std::sync::atomic::AtomicU64,
+    closed_by: std::sync::atomic::AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -3508,6 +3521,9 @@ struct Sent {
     read_backs: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// The profiler's stamps in it (`VICTORY_PROFILE_FLIGHT_STAMPS`), read
+    /// when it lands.
+    stamps: Option<crate::profile::gpu::Plan>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -3522,6 +3538,19 @@ struct Flight {
     card: Option<CardPlan>,
     back: Vec<Declared>,
     read_backs: Vec<(usize, usize)>,
+    /// The profiler's stamps in it ([`Sent::stamps`]; boxed, as a flight
+    /// rarely has them).
+    stamps: Option<Box<crate::profile::gpu::Plan>>,
+}
+
+impl Flight {
+    /// Once the card has run it: the profiler's stamps in it go to the
+    /// trace.
+    fn stamps_landed(&mut self, queue: &ID3D12CommandQueue) {
+        if let Some(plan) = self.stamps.take() {
+            crate::profile::gpu::done(queue, *plan);
+        }
+    }
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -4405,6 +4434,131 @@ fn wait_for_walks(runs: &[&HostList]) {
             // Ended or given up: the submission goes on either way.
             let _ = gate.wait(mark, true);
         }
+    }
+}
+
+/// The profiler's critical-path args of a submission ([`Host::submit`]):
+/// of its lists, the one the title closed last (`gate_list`, closed on
+/// thread `gate_thread`) and how long before the submission began
+/// (`gate_us`); then its waits before preparing: for heap walks
+/// (`walk_us`), for the submission lock (`lock_us`), the planning after it
+/// (`plan_us`: lifted steps put back on the CPU, whether flights block it,
+/// reads lifted onto the card) and for flights in the air (`behind_us`: a
+/// settle, or the relay's wait). `marks`: when the submission began, when
+/// each of the first two waits ended and when the wait for flights began
+/// ([`crate::profile::stamp`]; the last 0 if there was none).
+fn gate_args(span: &mut crate::profile::Span, runs: &[&HostList], marks: [u64; 4]) {
+    let closes: Vec<(u64, u32, u32)> = runs
+        .iter()
+        .map(|l| {
+            (
+                l.closed.load(Ordering::Relaxed),
+                l.id,
+                l.closed_by.load(Ordering::Relaxed),
+            )
+        })
+        .collect();
+    for (key, value) in gate(&closes, marks, crate::profile::stamp()) {
+        span.arg(key, value);
+    }
+}
+
+/// The parts of a submission the profiler stamps on the card
+/// ([`crate::profile::gpu`]): each title list with its prelude (`firsts`:
+/// where each of `runs` starts in the submission's `all` lists, which
+/// hold the title's up to `runs_end`), and the card compare after them.
+fn stamp_parts(
+    runs: &[&HostList],
+    firsts: &[usize],
+    runs_end: usize,
+    all: usize,
+) -> Vec<crate::profile::gpu::Part> {
+    use crate::profile::gpu::Part;
+    let mut parts: Vec<Part> = firsts
+        .iter()
+        .enumerate()
+        .map(|(r, &first)| Part {
+            first,
+            end: firsts.get(r + 1).copied().unwrap_or(runs_end),
+            name: "host list",
+            arg: ("list", u64::from(runs[r].id)),
+        })
+        .collect();
+    if all > runs_end {
+        parts.push(Part {
+            first: runs_end,
+            end: all,
+            name: "card compare",
+            arg: ("lists", (all - runs_end) as u64),
+        });
+    }
+    parts
+}
+
+/// [`gate_args`]' numbers from the lists' closes (stamp, list, thread;
+/// stamp 0: not timed), the marks and the moment now; nothing if the
+/// submission's start was not timed.
+fn gate(
+    closes: &[(u64, u32, u32)],
+    [entered, walked, locked, waiting]: [u64; 4],
+    now: u64,
+) -> Vec<(&'static str, u64)> {
+    let mut out = Vec::new();
+    if entered == 0 {
+        return out;
+    }
+    let us = |from: u64, to: u64| crate::profile::micros(to.saturating_sub(from));
+    if let Some(&(closed, list, thread)) = closes.iter().filter(|c| c.0 != 0).max_by_key(|c| c.0) {
+        out.push(("gate_list", u64::from(list)));
+        out.push(("gate_thread", u64::from(thread)));
+        out.push(("gate_us", us(closed, entered)));
+    }
+    out.push(("walk_us", us(entered, walked)));
+    out.push(("lock_us", us(walked, locked)));
+    // No wait for flights: all of it was planning.
+    let planned = if waiting == 0 { now } else { waiting };
+    out.push(("plan_us", us(locked, planned)));
+    out.push(("behind_us", us(planned, now)));
+    out
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::gate;
+
+    /// The list closed last gates the submission; the waits are what lies
+    /// between the marks; an untimed close is passed over, and with the
+    /// start untimed nothing is said.
+    #[test]
+    fn the_list_closed_last_gates_a_submission() {
+        let us = crate::profile::micros;
+        let closes = [(100, 7, 70), (0, 8, 80), (400, 9, 90), (250, 10, 100)];
+        let args = gate(&closes, [1_000, 1_500, 1_600, 1_800], 2_600);
+        assert_eq!(
+            args,
+            [
+                ("gate_list", 9),
+                ("gate_thread", 90),
+                ("gate_us", us(600)),
+                ("walk_us", us(500)),
+                ("lock_us", us(100)),
+                ("plan_us", us(200)),
+                ("behind_us", us(800)),
+            ]
+        );
+        // No timed close: only the waits; no wait for flights: all of the
+        // time after the lock is planning.
+        let args = gate(&[(0, 1, 2)], [10, 20, 30, 0], 40);
+        assert_eq!(
+            args,
+            [
+                ("walk_us", us(10)),
+                ("lock_us", us(10)),
+                ("plan_us", us(10)),
+                ("behind_us", 0),
+            ]
+        );
+        assert!(gate(&closes, [0, 5, 6, 0], 7).is_empty());
     }
 }
 
@@ -5297,6 +5451,8 @@ impl Host {
                 })),
                 // A new list is open: the title records into it from here.
                 opened: std::sync::atomic::AtomicU64::new(crate::profile::stamp()),
+                closed: std::sync::atomic::AtomicU64::new(0),
+                closed_by: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -5733,6 +5889,7 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     // What the submission's shaders wrote, first.
+                    crate::profile::count(crate::profile::Count::UavCard, 1);
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -5775,6 +5932,7 @@ impl Host {
                     // every compare of the list, the pieces they flagged go
                     // to slots in the PC's memory.
                     if flown && let Some(inflight) = &work.inflight {
+                        crate::profile::count(crate::profile::Count::UavCard, 1);
                         list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                             Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -6271,8 +6429,9 @@ impl Host {
         let mut landed = Vec::new();
         for item in items {
             match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
+                    flight.stamps_landed(&self.queue);
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -6519,6 +6678,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 read_backs: sent.read_backs,
+                stamps: sent.stamps.map(Box::new),
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -6571,6 +6731,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 read_backs: sent.read_backs,
+                stamps: sent.stamps.map(Box::new),
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -6708,8 +6869,9 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
+                        flight.stamps_landed(&self.queue);
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
@@ -6780,13 +6942,17 @@ impl Host {
     ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
-        let _submit = crate::profile::span_args(
+        let mut submit = crate::profile::span_args(
             "submit",
             &[("lists", runs.len() as u64), ("late", u64::from(late))],
         );
+        // For the critical path on the profile: when each wait before
+        // preparing ended (`gate_args`).
+        let entered = crate::profile::stamp();
         // Lists whose binds lost the heap buffer pass's claim: not before
         // its walk has ended, and before the submission lock.
         wait_for_walks(runs);
+        let walked = crate::profile::stamp();
         // Taken after that wait: the figure `lock` below is the wait for the
         // submission lock and what comes before preparing, not for a walk.
         #[cfg(feature = "diagnostics")]
@@ -6796,6 +6962,7 @@ impl Host {
         let lock_wait = crate::profile::span("submission lock wait");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         drop(lock_wait);
+        let locked = crate::profile::stamp();
         let was_working = working(true);
         submitting(1, runs.len());
         // Steps an earlier submission of a list lifted: on the CPU again,
@@ -6806,8 +6973,11 @@ impl Host {
         }
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
-        // what they write.
+        // what they write. (`waiting`: when the wait for them began, for
+        // `gate_args`; 0: no wait.)
+        let mut waiting = 0;
         if !late {
+            waiting = crate::profile::stamp();
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
             if relay_exact() && why == WHY_READ {
@@ -6816,11 +6986,16 @@ impl Host {
                 // that may write what is read have landed: their
                 // copy-back's end, not the card's other work.
                 if !lift_reads(runs) {
+                    waiting = crate::profile::stamp();
                     relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
                 }
             } else {
+                waiting = crate::profile::stamp();
                 self.settle(&mut submitted, why);
             }
+        }
+        if let Some(submit) = submit.as_mut() {
+            gate_args(submit, runs, [entered, walked, locked, waiting]);
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted. (Its span,
@@ -6885,11 +7060,18 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
-            crate::watch::ask_once(&ranges);
+            let split = asking.as_ref().map(|_| crate::profile::refresh_split());
+            {
+                let _refresh = crate::profile::refresh_scope();
+                crate::watch::ask_once(&ranges);
+            }
             if let Some(asking) = asking.as_mut() {
                 asking.arg("ranges", ranges.len() as u64);
                 let bytes: u64 = ranges.iter().map(|(from, to)| (to - from) as u64).sum();
                 asking.arg("mb", bytes >> 20);
+                if let Some(split) = split {
+                    crate::profile::refresh_args(asking, split);
+                }
             }
             drop(asking);
             // Behind flights: the title wrote memory that a flight's shaders
@@ -6904,6 +7086,7 @@ impl Host {
                     "ask once",
                     &[("ranges", ranges.len() as u64), ("again", 1)],
                 );
+                let _refresh = crate::profile::refresh_scope();
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
@@ -6950,15 +7133,21 @@ impl Host {
         }
         let mut flush = crate::profile::span("batch flush");
         let before = batch.done;
+        let split = flush.as_ref().map(|_| crate::profile::refresh_split());
         batch.flush();
         if let Some(flush) = flush.as_mut() {
             // The flush's own refreshes; `textures`: the staging buffers the
-            // submission's lists checked.
+            // submission's lists checked; then its time in kernel askings,
+            // journal work and copies, and the written pages found at both
+            // grains.
             let done = batch.done;
             flush.arg("refreshes", done.refreshes - before.refreshes);
             flush.arg("textures", done.textures);
             flush.arg("mb_asked", (done.asked - before.asked) >> 20);
             flush.arg("mb_copied", (done.copied - before.copied) >> 20);
+            if let Some(split) = split {
+                crate::profile::refresh_args(flush, split);
+            }
         }
         drop(flush);
         crate::watch::ask_once_end();
@@ -6994,6 +7183,24 @@ impl Host {
         drop(prepare);
         if late {
             *submitted += 1;
+            // The profiler's stamps on the card in the flight too
+            // (`VICTORY_PROFILE_FLIGHT_STAMPS=1`), read when it lands.
+            let stamped = if crate::profile::on() && crate::profile::flight_stamps() {
+                let parts = stamp_parts(runs, &firsts, runs_end, lists.len());
+                crate::profile::gpu::around(
+                    &self.device,
+                    &self.queue,
+                    &lists,
+                    &parts,
+                    this_submission,
+                )
+            } else {
+                None
+            };
+            let (lists, stamps) = match stamped {
+                Some((all, plan)) => (all, Some(plan)),
+                None => (lists, None),
+            };
             let execute = crate::profile::span_args("ExecuteCommandLists", &[("lists", lists.len() as u64)]);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -7025,6 +7232,7 @@ impl Host {
                 back,
                 read_backs,
                 writes,
+                stamps,
             };
             working(was_working);
             return Some((submitted, sent));
@@ -7046,25 +7254,7 @@ impl Host {
         // around each title list (with its prelude) and the card compare,
         // when the lists go as one group.
         let stamped = if crate::profile::on() && groups.len() == 1 {
-            use crate::profile::gpu::Part;
-            let mut parts: Vec<Part> = firsts
-                .iter()
-                .enumerate()
-                .map(|(r, &first)| Part {
-                    first,
-                    end: firsts.get(r + 1).copied().unwrap_or(runs_end),
-                    name: "host list",
-                    arg: ("list", u64::from(runs[r].id)),
-                })
-                .collect();
-            if lists.len() > runs_end {
-                parts.push(Part {
-                    first: runs_end,
-                    end: lists.len(),
-                    name: "card compare",
-                    arg: ("lists", (lists.len() - runs_end) as u64),
-                });
-            }
+            let parts = stamp_parts(runs, &firsts, runs_end, lists.len());
             crate::profile::gpu::around(&self.device, &self.queue, &lists, &parts, this_submission)
         } else {
             None
@@ -7130,6 +7320,8 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        // (Not waited for: the card may still resolve into its slot, which
+        // stays taken.)
         if let Some((_, plan)) = stamped
             && !unwaited
         {
@@ -7525,6 +7717,12 @@ impl HostList {
         }
         let opened = self.opened.swap(0, Ordering::Relaxed);
         crate::profile::list_recorded(self.id, opened);
+        let closed = crate::profile::stamp();
+        if closed != 0 {
+            self.closed_by
+                .store(crate::profile::thread_id(), Ordering::Relaxed);
+            self.closed.store(closed, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -8858,6 +9056,9 @@ impl Batch {
     /// Brings each requested range of a copy up to date, timed; the bytes
     /// copied.
     fn update(shadow: &crate::shadow::Shadow, ranges: &RefreshRanges) -> u64 {
+        // On the profile: kernel askings, journal work and copies counted
+        // apart (on whichever thread refreshes the copy).
+        let _refresh = crate::profile::refresh_scope();
         let mut all = 0;
         for &(from, to) in ranges.as_slice() {
             let started = std::time::Instant::now();
@@ -8905,7 +9106,10 @@ impl Batch {
                 .filter(|(shadow, _)| !shadow.unwatched())
                 .flat_map(|(_, ranges)| ranges.as_slice().iter().copied())
                 .collect();
-            crate::watch::ask_ahead(&ranges);
+            {
+                let _refresh = crate::profile::refresh_scope();
+                crate::watch::ask_ahead(&ranges);
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         self.done.refreshes += self.refreshes.len() as u64;
@@ -8983,6 +9187,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    // On the profile, in a refresh: the copy's time, apart from the write
+    // watch's and the journal's (`crate::profile::refresh_scope`).
+    let _copy = crate::profile::copy_timer();
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is

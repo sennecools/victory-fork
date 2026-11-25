@@ -2617,21 +2617,8 @@ pub(crate) fn let_go_idle() {
 /// buffers kept for reuse and the bytes they reserve.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
-    let (windows, window_bytes) = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        // Each copy once: a window may stand under several keys.
-        let mut seen = std::collections::HashSet::new();
-        let bytes: u64 = loose
-            .values()
-            .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
-            .map(|s| s.len)
-            .sum();
-        (seen.len() as u64, bytes)
-    };
-    let (kept, kept_bytes) = {
-        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
-    };
+    let (windows, window_bytes) = windows_held();
+    let (kept, kept_bytes) = snapshots_pooled();
     [
         LIVE[0].load(Ordering::Relaxed),
         LIVE[1].load(Ordering::Relaxed),
@@ -2639,6 +2626,42 @@ pub(crate) fn memory() -> [u64; 6] {
         window_bytes,
         kept,
         kept_bytes,
+    ]
+}
+
+/// The windows of memory outside buffers and their bytes.
+fn windows_held() -> (u64, u64) {
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    // Each copy once: a window may stand under several keys.
+    let mut seen = std::collections::HashSet::new();
+    let bytes: u64 = loose
+        .values()
+        .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+        .map(|s| s.len)
+        .sum();
+    (seen.len() as u64, bytes)
+}
+
+/// The snapshot buffers kept for reuse and the bytes they reserve.
+fn snapshots_pooled() -> (u64, u64) {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    (
+        pool.len() as u64,
+        pool.iter().map(|v| v.capacity() as u64).sum::<u64>(),
+    )
+}
+
+/// For the profile's memory sample (`VICTORY_PROFILE_SAMPLES`), in bytes:
+/// the host copies of title memory alive, of them the windows outside
+/// buffers, the snapshots (buffers kept for reuse and the snapshots kept
+/// from one submission to the next), and the copies in the card's memory
+/// (each with a CPU side as large).
+pub(crate) fn memory_split() -> [u64; 4] {
+    [
+        LIVE[1].load(Ordering::Relaxed),
+        windows_held().1,
+        snapshots_pooled().1 + KEPT_BYTES.load(Ordering::Relaxed),
+        CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed),
     ]
 }
 
@@ -3588,6 +3611,9 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        // On the profile: the page stamps are the journal's work, the
+        // copies are not (`crate::profile::journal_timer`).
+        let _journal = crate::profile::journal_timer();
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();

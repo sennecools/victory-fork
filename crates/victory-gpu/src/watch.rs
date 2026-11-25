@@ -104,6 +104,9 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if pieces.len() < 2 {
         return;
     }
+    // On the profile: the journal's share of a refresh (its lock, its map),
+    // less the kernel askings made under it.
+    let _journal = crate::profile::journal_timer();
     pieces.sort_unstable();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -196,6 +199,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let _journal = crate::profile::journal_timer();
     ask_once_end();
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -282,6 +286,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let asking = crate::profile::refresh_stamp();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -293,6 +298,9 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    // (A failed asking found nothing: its time is the kernel's still.)
+    let found = if failed { &[][..] } else { &j.found[..count] };
+    crate::profile::kernel_asked(asking, ((last - first) * PAGE) as u64, found);
     if failed {
         return false;
     }
@@ -334,6 +342,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let _journal = crate::profile::journal_timer();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
@@ -355,6 +364,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
+    let asking = crate::profile::refresh_stamp();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -367,6 +377,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 &mut granularity,
             )
         } != 0;
+    if !known_view {
+        // (A failed asking found nothing: its time is the kernel's still.)
+        let found = if failed { &[][..] } else { &j.found[..count] };
+        crate::profile::kernel_asked(asking, ((last - first) * PAGE) as u64, found);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {

@@ -463,6 +463,12 @@ impl Drop for Staging {
     }
 }
 
+/// For the profile's memory sample (`VICTORY_PROFILE_SAMPLES`): the bytes
+/// of the staging buffers alive.
+pub(crate) fn staging_bytes() -> u64 {
+    STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// For the memory line: staging buffers alive, their bytes, and how many
 /// of them their texture still has (the others wait for a list's reset).
 #[cfg(feature = "diagnostics")]
@@ -966,6 +972,8 @@ impl Staging {
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
+        // Counted with the host copies' refreshes (the profiler's split).
+        let _refresh = crate::profile::refresh_scope();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);

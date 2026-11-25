@@ -284,6 +284,29 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// For the profile's sample (`VICTORY_PROFILE_SAMPLES`): over the host
+/// heaps of shader-visible heaps, the distinct views their made slots were
+/// made from (which sizes a pool of one descriptor per distinct record),
+/// and the made slots. Each heap's slots are copied under its `made` lock
+/// and counted after.
+#[cfg(windows)]
+pub(crate) fn live_keys() -> (u64, u64) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut keys: Vec<u64> = Vec::new();
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            keys.extend(host.made_keys().into_iter().filter(|&k| k != 0));
+        }
+    }
+    drop(heaps);
+    let slots = keys.len() as u64;
+    keys.sort_unstable();
+    keys.dedup();
+    (keys.len() as u64, slots)
+}
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
 /// not the one last seen (mirrored), and the microseconds it took.
