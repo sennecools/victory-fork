@@ -668,24 +668,36 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
-    let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
-    if pages.is_null() {
-        return address;
+    let pages = (!pages.is_null()).then(|| {
+        // SAFETY: the title passes `n` page numbers.
+        unsafe { std::slice::from_raw_parts(pages, n) }
+    });
+    if map_pages(&mut physical, address as usize, n, pages) {
+        address
+    } else {
+        std::ptr::null_mut()
     }
-    // SAFETY: the title passes `n` page numbers.
-    let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+}
+
+/// [`XMemMapPhysicalPages`] with the physical state and the remapping lock
+/// already held: unmaps `[base, base + n pages)`, then maps `pages` there
+/// (none: only unmaps). False if a page or the host fails.
+fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {
+    unmap(physical, base, n * PAGE);
+    let Some(pages) = pages else {
+        return true;
+    };
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
+            return false;
         };
         // One view per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
@@ -697,16 +709,23 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
-            return std::ptr::null_mut();
+        if !map(physical, base + i * PAGE, run * PAGE, first) {
+            return false;
         }
         i += run;
     }
-    address
+    true
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (the title passes 0 for addresses to clear).
+///
+/// The whole call is one change of the mapping: the physical state and the
+/// remapping lock are taken once, and addresses that follow one another
+/// (all mapped or all unmapped) are changed as one range. Page by page, each
+/// page waited for every in-place read of title memory under way, and the
+/// texture refreshes queued behind each (run amd-F: 183 of 191 s of texture
+/// preparation waiting for title memory to hold still).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -715,21 +734,27 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
-            )
-        };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+    // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+    let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
+    let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
+    let page = |i: usize| pages.map_or(0, |p| p[i]);
+    let mut physical = physical();
+    // As in `XMemMapPhysicalPages`, once for the whole call.
+    let _changing = victory_gpu::title_memory_remapping();
+    let mut i = 0;
+    while i < n {
+        let base = addresses[i] as usize;
+        let unmapping = page(i) == 0;
+        let run = 1 + (i + 1..n)
+            .take_while(|&j| {
+                addresses[j] as usize == base + (j - i) * PAGE && (page(j) == 0) == unmapping
+            })
+            .count();
+        let these = if unmapping { None } else { pages.map(|p| &p[i..i + run]) };
+        if !map_pages(&mut physical, base, run, these) {
             return 0;
         }
+        i += run;
     }
     1
 }
@@ -1224,6 +1249,54 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// One scatter call over consecutive addresses maps them as runs: pages out of
+    /// order, an unmapped address (page number 0) between mapped ones, and an address
+    /// apart from the others each show what the title asked for.
+    #[test]
+    fn a_scatter_of_many_pages_maps_each_address() {
+        let mut pages = [0usize; 4];
+        let mut n = 4;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = || {
+            XMemVirtualAlloc(std::ptr::null_mut(), 6 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE)
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        // Each page marked with its own byte, through a view of all four.
+        assert_eq!(XMemMapPhysicalPages(b, 4, pages.as_ptr()), b);
+        for k in 0..4 {
+            // SAFETY: mapped read-write.
+            unsafe { at(b, k).cast::<u8>().write(10 + k as u8) };
+        }
+        // a+0..a+2: pages 2, 0, 1 (out of order); a+3 unmapped; a+5: page 3.
+        let addresses = [at(a, 0), at(a, 1), at(a, 2), at(a, 3), at(a, 5)];
+        let scattered = [pages[2], pages[0], pages[1], 0, pages[3]];
+        assert_eq!(
+            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 5, scattered.as_ptr()),
+            1
+        );
+        // SAFETY: the mapped addresses are read-write.
+        let read = |p: *mut c_void| unsafe { p.cast::<u8>().read() };
+        assert_eq!([read(at(a, 0)), read(at(a, 1)), read(at(a, 2)), read(at(a, 5))], [12, 10, 11, 13]);
+        assert_eq!(query(at(a, 3)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(a, 4)).host.State, MEM_RESERVE);
+        // A write through the scatter's run shows at the page's other view.
+        // SAFETY: mapped read-write.
+        unsafe { at(a, 1).cast::<u8>().write(77) };
+        assert_eq!(read(b), 77);
+        // Unmapping the run in one call.
+        let zeros = [0usize; 3];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, zeros.as_ptr()), 1);
+        for k in 0..3 {
+            assert_eq!(query(at(a, k)).host.State, MEM_RESERVE);
+        }
+        assert_eq!(read(at(a, 5)), 13, "the address apart keeps its page");
+        assert_eq!(XMemMapPhysicalPages(b, 4, std::ptr::null()), b);
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses[4..].as_ptr(), 1, zeros.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a
