@@ -116,6 +116,7 @@ pub fn dump_stacks() {
 
 /// The thread's frames and its current and base scheduling priority (0-31).
 fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+    const STATUS_PENDING: i32 = 0x0000_0103;
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -125,34 +126,30 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         priority: 0,
         base_priority: 0,
     };
-    // SAFETY: writes `info`, whose layout and size are the system's.
-    let status = unsafe {
-        NtQueryInformationThread(
+    // SAFETY: zeroed is a valid CONTEXT.
+    let mut context = Aligned(unsafe { std::mem::zeroed() });
+    context.0.ContextFlags = CONTEXT_FULL_AMD64;
+    // SAFETY: suspend the thread BEFORE querying and reading its TEB so the
+    // thread cannot exit (unmapping its TEB) or grow its stack (invalidating
+    // StackLimit) between reading `info.teb` and capturing its context.
+    unsafe {
+        if SuspendThread(thread) == u32::MAX {
+            return (frames, (0, 0));
+        }
+        let status = NtQueryInformationThread(
             thread,
             ThreadBasicInformation,
             (&raw mut info).cast(),
             size_of::<BasicInfo>() as u32,
             std::ptr::null_mut(),
-        )
-    };
-    if status != 0 || info.teb.is_null() {
-        return (frames, (0, 0));
-    }
-    // SAFETY: the TEB of a live thread of this process: its NT_TIB holds
-    // the stack base at +8 and the stack limit at +0x10.
-    let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
-    // SAFETY: zeroed is a valid CONTEXT.
-    let mut context = Aligned(unsafe { std::mem::zeroed() });
-    context.0.ContextFlags = CONTEXT_FULL_AMD64;
-    // SAFETY: suspends, reads and resumes a thread that is not this one;
-    // nothing between suspend and resume allocates or takes a lock the
-    // thread could hold besides the unwinder's own.
-    unsafe {
-        if SuspendThread(thread) == u32::MAX {
-            return (frames, (info.priority, info.base_priority));
-        }
-        if GetThreadContext(thread, &mut context.0) != 0 {
-            unwind_into(context.0, low, high, &mut frames);
+        );
+        if status == 0 && info.exit_status == STATUS_PENDING && !info.teb.is_null() {
+            // SAFETY: the thread is suspended and still running (`STATUS_PENDING`),
+            // so its TEB is mapped; NT_TIB holds StackBase at +8 and StackLimit at +0x10.
+            let (high, low) = (info.teb.add(1).read(), info.teb.add(2).read());
+            if low <= high && GetThreadContext(thread, &mut context.0) != 0 {
+                unwind_into(context.0, low, high, &mut frames);
+            }
         }
         ResumeThread(thread);
     }
@@ -220,5 +217,33 @@ mod tests {
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
+    }
+
+    #[test]
+    fn frames_of_handles_exited_thread_safely() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let short = std::thread::spawn(move || {
+            // SAFETY: plain query.
+            tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+            go_rx.recv().ok();
+        });
+        let id = rx.recv().unwrap();
+        // SAFETY: opens a thread of this process; keep the handle past exit.
+        let thread = unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                0,
+                id,
+            )
+        };
+        assert!(!thread.is_null());
+        go_tx.send(()).unwrap();
+        short.join().unwrap();
+        // The thread has exited and its TEB is unmapped; `frames_of` must not fault.
+        let (frames, _) = frames_of(thread);
+        assert!(frames.is_empty());
+        // SAFETY: opened above.
+        unsafe { CloseHandle(thread) };
     }
 }
