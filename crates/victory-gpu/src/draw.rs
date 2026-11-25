@@ -1986,7 +1986,8 @@ impl State {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
             }
             if tabled {
-                // Nothing was staged here, so nothing is counted or spent,
+                // Nothing was staged here (only the staging buffer copied
+                // again, `upload_again`), so nothing is counted or spent,
                 // and the staging buffer stays: taking it away made the
                 // next draw that reads the texture through a table stage,
                 // detile and upload all of it once more.
