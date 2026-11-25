@@ -3458,12 +3458,13 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 /// Whether small title buffers inside one window cell share the cell's
-/// window as their copy (on by default; `VICTORY_FOLD_BUFFERS=0` gives each
-/// its own copy as before). Measured in the world (4090, same load):
-/// 179.2 -> 160.1 ms a frame, settles 4.5 -> 1.0 a frame.
+/// window as their copy (`VICTORY_FOLD_BUFFERS=1`; off by default: each has
+/// its own copy, as before). Measured in the world (4090, same load):
+/// 179.2 -> 160.1 ms a frame, settles 4.5 -> 1.0 a frame; but on an RX 9070
+/// XT the title stayed on the loading screen for 335 s with it on.
 fn fold_buffers() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FOLD_BUFFERS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FOLD_BUFFERS").is_some_and(|v| v == "1"))
 }
 
 /// Buffers folded into windows so far ([`fold_buffers`]).
@@ -3493,7 +3494,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
-        // Folded (`VICTORY_FOLD_BUFFERS`, on by default): a small buffer
+        // Folded (`VICTORY_FOLD_BUFFERS=1`, off by default): a small buffer
         // inside one window cell takes the cell's window as its copy, so that
         // the buffer and the memory around it, which the title also reaches by
         // address, are one copy. Two copies of the same bytes made every
