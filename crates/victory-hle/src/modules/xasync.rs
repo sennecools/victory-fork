@@ -31,6 +31,7 @@ pub const E_ABORT: HRESULT = 0x8000_4004_u32 as i32;
 pub const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 pub const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
 pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007A_u32 as i32;
+pub const E_NO_TASK_QUEUE: HRESULT = 0x8007_01AB_u32 as i32;
 pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000E_u32 as i32;
 
 const WORK: u32 = 0;
@@ -553,6 +554,12 @@ pub fn XAsyncBegin(
     };
     if block.is_null() || call(block).is_some() {
         return E_INVALIDARG;
+    }
+    // A null queue means the process queue; if the title cleared that too,
+    // the call has nowhere to run.
+    // SAFETY: checked non-null.
+    if unsafe { (*block).queue }.is_null() && process_queue().is_none() {
+        return E_NO_TASK_QUEUE;
     }
     let (status, size) = words(block);
     status.store(E_PENDING as u32 as usize, Ordering::Release);
