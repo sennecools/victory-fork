@@ -244,14 +244,15 @@ thread_local! {
     static LOCAL: std::cell::OnceCell<Arc<Buffer>> = const { std::cell::OnceCell::new() };
 }
 
+/// The calling thread's id, as the trace's `tid` names it.
 #[cfg(windows)]
-fn thread_id() -> u32 {
+pub(crate) fn thread_id() -> u32 {
     // SAFETY: a plain query.
     unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
 }
 
 #[cfg(not(windows))]
-fn thread_id() -> u32 {
+pub(crate) fn thread_id() -> u32 {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     thread_local! {
         static ID: u32 = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -451,6 +452,23 @@ pub(crate) fn part_end(start: u64) {
             parts.set(Some((sum + ticks, count + 1)));
         }
     });
+}
+
+thread_local! {
+    /// Host textures this thread made while recording ([`texture_made`]).
+    static TEXTURES_MADE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The calling thread made a host texture; counted only while recording
+/// (the caller holds a recording span), so that a span around something
+/// that may make one can say whether it did ([`textures_made`]).
+pub(crate) fn texture_made() {
+    let _ = TEXTURES_MADE.try_with(|n| n.set(n.get() + 1));
+}
+
+/// Host textures the calling thread made while recording, so far.
+pub(crate) fn textures_made() -> u64 {
+    TEXTURES_MADE.try_with(std::cell::Cell::get).unwrap_or(0)
 }
 
 /// Records the recording of title list `list` from `start` ([`stamp`]; 0:
@@ -1267,6 +1285,17 @@ mod tests {
         part_end(0);
         assert_eq!(parts_end(), (0, 0));
         assert_eq!(parts_end(), (0, 0));
+    }
+
+    /// The count of host textures made is the calling thread's own.
+    #[test]
+    fn textures_made_are_counted_per_thread() {
+        let before = textures_made();
+        texture_made();
+        texture_made();
+        assert_eq!(textures_made() - before, 2);
+        let other = std::thread::spawn(textures_made).join().unwrap();
+        assert_eq!(other, 0);
     }
 
     /// The parts timed on a thread are summed and counted from

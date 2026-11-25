@@ -29,6 +29,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// While the profiler records: who took `made` last, its site ([`hold`])
+    /// above the thread id, for the `made lock wait` of whoever finds it
+    /// held. Written only while recording ([`HostHeap::hold`]).
+    holder: std::sync::atomic::AtomicU64,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -1231,6 +1235,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            holder: std::sync::atomic::AtomicU64::new(0),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1385,6 +1390,125 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     static HEAP: std::sync::OnceLock<Option<HostHeap>> = std::sync::OnceLock::new();
     HEAP.get_or_init(|| HostHeap::new(true, 1)).as_ref()
+}
+
+/// For the profiler: where a heap's `made` lock is taken, as the `site` of
+/// `made lock wait` (the waiter's) and `holder_site` (the holder's), and
+/// of `made long hold`.
+pub(crate) mod hold {
+    /// A view the title wrote or copied (`mirror`, not for a draw).
+    pub(crate) const VIEW: u64 = 1;
+    /// A draw's bind of a table (`mirror` for a draw).
+    pub(crate) const TABLE: u64 = 2;
+    /// The walk of the heap buffer pass (`mirror_walked`).
+    pub(crate) const WALK: u64 = 3;
+    /// `sync_heaps` before a submission (`mirror_copied`).
+    pub(crate) const SYNC: u64 = 4;
+    /// The texture pass's uploads (`mirror_at`).
+    pub(crate) const UPLOAD: u64 = 5;
+    /// Slots that waited for their texture's host copy (`make_waiting`).
+    pub(crate) const WAITING: u64 = 6;
+    /// The texture pass's sweep over placed texture views.
+    pub(crate) const SWEEP: u64 = 7;
+    /// Levels on demand: views made again (`texture_views_remade`).
+    pub(crate) const REMADE: u64 = 8;
+    /// A texture's memory gone (`texture_slot_gone`).
+    pub(crate) const GONE: u64 = 9;
+    /// The texture pass asking whether a slot is made (`texture_slot_made_from`).
+    pub(crate) const MADE_FROM: u64 = 10;
+}
+
+/// A hold of a heap's `made` lock while the profiler records, from just
+/// after it is taken until this is dropped (declared after the guard, it
+/// is dropped first): a `made long hold` event if it lasted 200 µs or more,
+/// args `heap`, `site` ([`hold`]) and `created` (host textures made or tried
+/// meanwhile, `crate::resource`'s `host texture make`). Nothing while the
+/// profiler does not record.
+struct MadeHold {
+    start: u64,
+    heap: u64,
+    site: u64,
+    created: u64,
+}
+
+impl Drop for MadeHold {
+    fn drop(&mut self) {
+        if self.start != 0 {
+            crate::profile::since(
+                "made long hold",
+                self.start,
+                200,
+                &[
+                    ("heap", self.heap),
+                    ("site", self.site),
+                    (
+                        "created",
+                        crate::profile::textures_made().wrapping_sub(self.created),
+                    ),
+                ],
+            );
+        }
+    }
+}
+
+impl HostHeap {
+    /// `made` was just taken at `site` ([`hold`]): while the profiler
+    /// records, says so to waiters and times the hold.
+    #[inline]
+    fn hold(&self, site: u64) -> MadeHold {
+        let start = crate::profile::stamp();
+        let created = if start != 0 {
+            self.holder.store(
+                site << 32 | u64::from(crate::profile::thread_id()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            crate::profile::textures_made()
+        } else {
+            0
+        };
+        MadeHold {
+            start,
+            heap: self.id,
+            site,
+            created,
+        }
+    }
+
+    /// Takes `made` at `site` ([`hold`]). A wait for it is timed only when
+    /// another thread holds it and the profiler records, and on the profile
+    /// only when long (`made lock wait`, with who held it when the wait
+    /// began).
+    fn made_at(&self, site: u64) -> (std::sync::MutexGuard<'_, Vec<u64>>, MadeHold) {
+        let made = match self.made.try_lock() {
+            Ok(made) => made,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let waited = crate::profile::stamp();
+                // (Who took it last: the holder now, unless it has only
+                // just been taken and not said so yet.)
+                let holder = if waited != 0 {
+                    self.holder.load(std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    0
+                };
+                let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                crate::profile::since(
+                    "made lock wait",
+                    waited,
+                    50,
+                    &[
+                        ("heap", self.id),
+                        ("site", site),
+                        ("holder", holder & u64::from(u32::MAX)),
+                        ("holder_site", holder >> 32),
+                    ],
+                );
+                made
+            }
+        };
+        let hold = self.hold(site);
+        (made, hold)
+    }
 }
 
 impl HostHeap {
@@ -1622,6 +1746,10 @@ impl HostHeap {
         sweep.2 = now;
         let (from, mut counts) = (sweep.0.min(self.count), sweep.1);
         let to = from.saturating_add(SLOTS).min(self.count);
+        let _span = crate::profile::span_args(
+            "texture sweep",
+            &[("heap", self.id), ("slots", u64::from(to - from))],
+        );
         self.sweep_part(
             from..to,
             |index| heap.handle(index),
@@ -1659,7 +1787,7 @@ impl HostHeap {
         // The slots whose host slot does not show what the title's says.
         let mut unmade = Vec::new();
         {
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let (made, _hold) = self.made_at(hold::SWEEP);
             // The memory is the title's, and a heap may be larger than what
             // of it is there: asked once per page.
             let mut page = (u64::MAX, false);
@@ -1816,7 +1944,7 @@ impl HostHeap {
         // texture is held by no slot, may have been let go, and would be
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them.
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let (made, _hold) = self.made_at(hold::MADE_FROM);
         made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
             && self
                 .kept
@@ -1897,11 +2025,15 @@ impl HostHeap {
         if starts.is_empty() {
             return 0;
         }
+        let mut span = crate::profile::span_args("views remade", &[("heap", self.id)]);
         let slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(span) = span.as_mut() {
+            span.arg("slots", slots.len() as u64);
+        }
+        let (made, _hold) = self.made_at(hold::REMADE);
         let mut remade = 0;
         for slot in slots {
             let Some(&key) = made.get(slot as usize) else {
@@ -1918,6 +2050,9 @@ impl HostHeap {
                 remade += 1;
             }
         }
+        if let Some(span) = span.as_mut() {
+            span.arg("remade", remade as u64);
+        }
         remade
     }
 
@@ -1926,7 +2061,7 @@ impl HostHeap {
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut made, _hold) = self.made_at(hold::GONE);
         if made.get(index as usize).is_none_or(|&key| key == 0) {
             return false;
         }
@@ -2399,7 +2534,7 @@ impl HostHeap {
             }
             *last = print;
         }
-        self.mirror(index, handle, false);
+        self.mirror_marking(index, handle, false, true, hold::SYNC);
         true
     }
 
@@ -2408,7 +2543,19 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_marking(index, handle, for_draw, true)
+        let site = if for_draw { hold::TABLE } else { hold::VIEW };
+        self.mirror_marking(index, handle, for_draw, true, site)
+    }
+
+    /// [`HostHeap::mirror`] from `site` ([`hold`]), for the profiler.
+    pub(crate) fn mirror_at(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        site: u64,
+    ) -> Option<View> {
+        self.mirror_marking(index, handle, for_draw, true, site)
     }
 
     /// [`HostHeap::mirror`] for a draw, by the walk of the heap buffer
@@ -2421,12 +2568,20 @@ impl HostHeap {
     /// texture pass that make a slot from a record no write told us of.
     /// `VICTORY_HEAP_WALK_ONCE=0`: marked, as before.
     pub(crate) fn mirror_walked(&self, index: u32, handle: u64) -> Option<View> {
-        self.mirror_marking(index, handle, true, !walk_once())
+        self.mirror_marking(index, handle, true, !walk_once(), hold::WALK)
     }
 
     /// [`HostHeap::mirror`]; `mark`: a slot that is or was a buffer view
-    /// goes into the set the next heap buffer pass walks.
-    fn mirror_marking(&self, index: u32, handle: u64, for_draw: bool, mark: bool) -> Option<View> {
+    /// goes into the set the next heap buffer pass walks. `site`: who asks
+    /// ([`hold`]), for the profiler.
+    fn mirror_marking(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        mark: bool,
+        site: u64,
+    ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2445,19 +2600,10 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        // Timed only when another thread holds it, and on the profile only
-        // when the wait is long (the walk of the heap buffer pass and
+        // A wait timed only when another thread holds it, and on the
+        // profile only when long (the walk of the heap buffer pass and
         // `sync_heaps` before a submission both mirror many slots).
-        let mut made = match self.made.try_lock() {
-            Ok(made) => made,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let waited = crate::profile::stamp();
-                let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-                crate::profile::since("made lock wait", waited, 50, &[("heap", self.id)]);
-                made
-            }
-        };
+        let (mut made, _hold) = self.made_at(site);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -4256,24 +4402,24 @@ mod tests {
         assert_eq!(changes(&heap), [1, 2]);
         // The walk makes them and takes their copy: nothing for the next pass.
         let view = heap
-            .mirror_marking(1, one, true, false)
+            .mirror_marking(1, one, true, false, hold::WALK)
             .expect("a buffer view");
         assert!(
             buffer_copy(&view).is_some(),
             "the copy the walk brings up to date"
         );
-        heap.mirror_marking(2, two, true, false);
+        heap.mirror_marking(2, two, true, false, hold::WALK);
         assert!(heap.made(1) && heap.made(2));
         assert_eq!(changes(&heap), none, "made by the walk");
         // Walked once more with nothing written: still nothing.
-        heap.mirror_marking(1, one, true, false);
+        heap.mirror_marking(1, one, true, false, hold::WALK);
         assert_eq!(changes(&heap), none);
         // The title writes slot 1 again: walked again.
         super::super::record(one, buffer(20));
         heap.mirror(1, one, false);
         assert!(!heap.made(1), "left for the walk again");
         assert_eq!(changes(&heap), [1], "written by the title");
-        heap.mirror_marking(1, one, true, false);
+        heap.mirror_marking(1, one, true, false, hold::WALK);
         assert!(heap.made(1));
         assert_eq!(heap.word(1), Some(20));
         assert_eq!(changes(&heap), none);
@@ -4286,7 +4432,10 @@ mod tests {
         // empties the host slot and drops its range at once.
         // SAFETY: the record's first words, in `slots`.
         unsafe { (one as *mut [u32; 3]).write_unaligned([0; 3]) };
-        assert!(heap.mirror_marking(1, one, true, false).is_none());
+        assert!(
+            heap.mirror_marking(1, one, true, false, hold::WALK)
+                .is_none()
+        );
         assert!(!heap.made(1));
         assert_eq!(heap.word(1), Some(0));
         assert_eq!(changes(&heap), none, "emptied by the walk");
@@ -4304,8 +4453,10 @@ mod tests {
         super::super::record(one, buffer(28));
         heap.mirror(1, one, false);
         assert_eq!(changes(&heap), [1]);
-        heap.mirror_marking(1, one, true, true);
+        heap.mirror_marking(1, one, true, true, hold::TABLE);
         assert_eq!(changes(&heap), [1], "the double visit");
+        // The profiler records nothing in tests: no holder was ever said.
+        assert_eq!(heap.holder.load(std::sync::atomic::Ordering::Relaxed), 0);
         drop(heap);
         crate::shadow::unregister(memory, memory as u64);
     }

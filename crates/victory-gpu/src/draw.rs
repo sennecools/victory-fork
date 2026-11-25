@@ -2339,7 +2339,9 @@ impl State {
                     );
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = heap.handle(index).and_then(|handle| {
+                host.mirror_at(index, handle, true, crate::descriptor::host::hold::UPLOAD)
+            });
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,

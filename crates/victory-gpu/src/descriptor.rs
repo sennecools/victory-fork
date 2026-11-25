@@ -211,6 +211,11 @@ pub(crate) fn sync_heaps() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
+    // On the profile: what it did, and its time reading pages (`read_us`)
+    // and mirroring their slots (`mirror_us`, with the waits for the heaps'
+    // `made` locks), which alternate page by page.
+    let mut span = crate::profile::span("sync heaps");
+    let (mut read_ticks, mut mirror_ticks) = (0u64, 0u64);
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
@@ -236,7 +241,11 @@ pub(crate) fn sync_heaps() {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let reading = crate::profile::stamp();
+                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
+                read_ticks += crate::profile::elapsed(reading);
+                if read {
+                    let mirroring = crate::profile::stamp();
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     for index in slots {
@@ -256,12 +265,20 @@ pub(crate) fn sync_heaps() {
                             mirrored += 1;
                         }
                     }
+                    mirror_ticks += crate::profile::elapsed(mirroring);
                 }
                 page += crate::watch::PAGE;
             }
         }
     }
     drop(heaps);
+    if let Some(span) = span.as_mut() {
+        span.arg("pages", pages);
+        span.arg("looked", looked);
+        span.arg("mirrored", mirrored);
+        span.arg("read_us", crate::profile::micros(read_ticks));
+        span.arg("mirror_us", crate::profile::micros(mirror_ticks));
+    }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
@@ -855,7 +872,7 @@ pub(crate) fn make_waiting() {
                 _ => false,
             };
             if same && let Some(Some(host)) = heap.host.get() {
-                host.mirror(index, handle, true);
+                host.mirror_at(index, handle, true, crate::descriptor::host::hold::WAITING);
             }
         }
     }

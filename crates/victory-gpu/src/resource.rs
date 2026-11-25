@@ -1359,6 +1359,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || !may_make(refused, now) {
             return None;
         }
+        // Under the caller's locks, which may be a view heap's `made`
+        // (`HostHeap::mirror`): counted for its `made long hold`.
+        let mut making = crate::profile::span("host texture make");
+        if making.is_some() {
+            crate::profile::texture_made();
+        }
         let clear = r
             .host
             .clear
@@ -1455,6 +1461,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             );
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+        if let Some(making) = making.as_mut() {
+            making.arg("tiled", u64::from(tiled.is_some()));
+        }
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),

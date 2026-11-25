@@ -222,9 +222,19 @@ fn sweep() {
     {
         return;
     }
-    crate::pipeline::trim_library();
-    crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
+    {
+        let _part = crate::profile::span("sweep: library");
+        crate::pipeline::trim_library();
+    }
+    {
+        let _part = crate::profile::span("sweep: copies");
+        crate::shadow::let_go_idle();
+    }
+    {
+        let _part = crate::profile::span("sweep: staging");
+        crate::texture::let_go_idle();
+    }
+    let _part = crate::profile::span("sweep: resources");
     crate::resource::let_go_idle();
 }
 
@@ -4211,6 +4221,9 @@ unsafe fn record_lifts(list: &ID3D12GraphicsCommandList, lifts: &[LiftCopy]) {
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
+    // On the profile: host copies looked at, runs merged (`late_exact`),
+    // and whether a settle is due.
+    let mut span = crate::profile::span("stale under flights");
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
@@ -4233,10 +4246,26 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        const RUNS: usize = 512;
+        let mut runs_left = RUNS;
+        let stale = spans.iter().any(|(shadow, from, to)| {
+            shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
+        });
+        if let Some(span) = span.as_mut() {
+            span.arg("copies", spans.len() as u64);
+            span.arg("merged", RUNS.saturating_sub(runs_left) as u64);
+            span.arg("stale", u64::from(stale));
+        }
+        return stale;
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    let stale = spans
+        .iter()
+        .any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
+    if let Some(span) = span.as_mut() {
+        span.arg("copies", spans.len() as u64);
+        span.arg("stale", u64::from(stale));
+    }
+    stale
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -4497,12 +4526,15 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    // Only when it waits: a line that is done already says nothing.
+    let span = crate::profile::span_args("relay wait", &[("why", why as u64)]);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     drop(line);
+    drop(span);
     stood(waiting);
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
@@ -4578,6 +4610,7 @@ fn relay_worker() {
             Ok(items) => host.relay_land(items, &mut fetch),
             Err(target) => {
                 let waiting = std::time::Instant::now();
+                let span = crate::profile::span("relay: card wait");
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
@@ -4587,6 +4620,7 @@ fn relay_worker() {
                 if waited.is_err() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
+                drop(span);
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -5930,6 +5964,12 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        // The list recorded and sent on the host queue, behind every flight
+        // sent since the landed ones, and the wait for it.
+        let fetch_wait = crate::profile::span_args(
+            "relay fetch wait",
+            &[("bytes", total), ("pieces", pieces.len() as u64)],
+        );
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -5956,6 +5996,7 @@ impl Host {
                 Ok(after)
             })()
         };
+        drop(fetch_wait);
         let after = match ran {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
@@ -6158,6 +6199,14 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let mut span = crate::profile::span("relay: land");
+        if let Some(span) = span.as_mut() {
+            span.arg("items", items.len() as u64);
+            span.arg(
+                "flights",
+                items.iter().filter(|l| matches!(l, Late::Run(_))).count() as u64,
+            );
+        }
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -6179,7 +6228,14 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
+                {
+                    let _card_back = crate::profile::span_args(
+                        "relay: card back",
+                        &[("plans", plans.len() as u64)],
+                    );
+                    self.relay_card_back(&plans, fetch);
+                }
+                let hand_back = crate::profile::span("relay: hand back");
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -6203,12 +6259,14 @@ impl Host {
                         shadow.copy_back_done(ranges);
                     }
                 }
+                drop(hand_back);
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
         // In the order given: what tells the title the card is done.
+        let tell = crate::profile::span("relay: tell");
         let mut last = 0;
         let mut landed = Vec::new();
         for item in items {
@@ -6231,9 +6289,12 @@ impl Host {
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
+        drop(tell);
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
+            // The line's lock, and the join of what is still in the air.
+            let _line = crate::profile::span("relay: line");
             let mut line = line();
             let Line {
                 line: items,
@@ -6264,6 +6325,7 @@ impl Host {
             // by the helper thread (they take locks a waiter may hold).
             *poke = true;
         }
+        drop(span);
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
     }
@@ -6436,6 +6498,8 @@ impl Host {
         };
         let told = !sent.writes.is_empty();
         let most = {
+            // The line's lock and the join of what the flights write.
+            let _join = crate::profile::span("flight join");
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
             join_ranges(
@@ -6472,6 +6536,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        let _recycle = crate::profile::span("recycle landed");
         land();
     }
 
@@ -6533,6 +6598,8 @@ impl Host {
         if !late() {
             return;
         }
+        // (With the relay too: its wait, `relay wait`, lies inside.)
+        let _settle = crate::profile::span_args("settle", &[("why", why as u64)]);
         if relay() {
             // Nothing is settled here: the thread that lands flights does
             // it, in order, and this waits until nothing is in the air and
@@ -6543,7 +6610,6 @@ impl Host {
             return;
         }
         let was_working = working(true);
-        let _settle = crate::profile::span_args("settle", &[("why", why as u64)]);
         let mut counted = false;
         loop {
             let items = {
@@ -6757,11 +6823,9 @@ impl Host {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        {
-            let _sync = crate::profile::span("sync heaps");
-            crate::descriptor::sync_heaps();
-        }
+        // command lists that index those slots are submitted. (Its span,
+        // `sync heaps`, is its own.)
+        crate::descriptor::sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6776,6 +6840,7 @@ impl Host {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
+            let _sweep = crate::profile::span("sweep");
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
@@ -6803,6 +6868,7 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
+            let mut asking = crate::profile::span("ask once");
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
@@ -6820,6 +6886,12 @@ impl Host {
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
+            if let Some(asking) = asking.as_mut() {
+                asking.arg("ranges", ranges.len() as u64);
+                let bytes: u64 = ranges.iter().map(|(from, to)| (to - from) as u64).sum();
+                asking.arg("mb", bytes >> 20);
+            }
+            drop(asking);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -6828,6 +6900,10 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
+                let _again = crate::profile::span_args(
+                    "ask once",
+                    &[("ranges", ranges.len() as u64), ("again", 1)],
+                );
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
@@ -6851,8 +6927,13 @@ impl Host {
                 deferred.arg("heap_pass", u64::from(run.heap_pass));
             }
             drop(deferred);
+            let mut send = crate::profile::span_args("list send", &[("list", u64::from(list.id))]);
             list.sent_ops();
-            ordered.push((list.prelude(), list.list.cast().ok()));
+            let prelude = list.prelude();
+            if let Some(send) = send.as_mut() {
+                send.arg("prelude", u64::from(prelude.is_some()));
+            }
+            ordered.push((prelude, list.list.cast().ok()));
         }
         // The lifted reads of all lists (`VICTORY_LIFT_READS`) at the head,
         // as the CPU did its copies before any list: with the first run's
