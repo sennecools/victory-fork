@@ -721,11 +721,12 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
 /// (the title passes 0 for addresses to clear).
 ///
 /// The whole call is one change of the mapping: the physical state and the
-/// remapping lock are taken once, and addresses that follow one another
-/// (all mapped or all unmapped) are changed as one range. Page by page, each
-/// page waited for every in-place read of title memory under way, and the
-/// texture refreshes queued behind each (run amd-F: 183 of 191 s of texture
-/// preparation waiting for title memory to hold still).
+/// remapping lock are taken once. Taken per page, each page waited for every
+/// in-place read of title memory under way, and the texture refreshes queued
+/// behind each (run amd-F: 183 of 191 s of texture preparation waiting for
+/// title memory to hold still). Each address is still mapped on its own:
+/// addresses that follow one another can lie in different placeholders,
+/// which one view cannot span (run amd-H: error 487, and the title stopped).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -737,24 +738,14 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
     let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
-    let page = |i: usize| pages.map_or(0, |p| p[i]);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`, once for the whole call.
     let _changing = victory_gpu::title_memory_remapping();
-    let mut i = 0;
-    while i < n {
-        let base = addresses[i] as usize;
-        let unmapping = page(i) == 0;
-        let run = 1 + (i + 1..n)
-            .take_while(|&j| {
-                addresses[j] as usize == base + (j - i) * PAGE && (page(j) == 0) == unmapping
-            })
-            .count();
-        let these = if unmapping { None } else { pages.map(|p| &p[i..i + run]) };
-        if !map_pages(&mut physical, base, run, these) {
+    for (i, &address) in addresses.iter().enumerate() {
+        let page = pages.map(|p| &p[i..=i]).filter(|p| p[0] != 0);
+        if !map_pages(&mut physical, address as usize, 1, page) {
             return 0;
         }
-        i += run;
     }
     1
 }
@@ -1251,7 +1242,7 @@ mod tests {
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
 
-    /// One scatter call over consecutive addresses maps them as runs: pages out of
+    /// One scatter call over consecutive addresses: pages out of
     /// order, an unmapped address (page number 0) between mapped ones, and an address
     /// apart from the others each show what the title asked for.
     #[test]
@@ -1287,8 +1278,18 @@ mod tests {
         // SAFETY: mapped read-write.
         unsafe { at(a, 1).cast::<u8>().write(77) };
         assert_eq!(read(b), 77);
-        // Unmapping the run in one call.
         let zeros = [0usize; 3];
+        // Addresses that follow one another across two reservations (two
+        // placeholders, which one view cannot span), in one call.
+        let c = reserve();
+        let d = XMemVirtualAlloc(at(c, 6), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        if d == at(c, 6) {
+            let across = [at(c, 5), d];
+            assert_eq!(XMemMapPhysicalPagesScatter(across.as_ptr(), 2, pages[..2].as_ptr()), 1);
+            assert_eq!([read(at(c, 5)), read(d)], [77, 11]);
+            assert_eq!(XMemMapPhysicalPagesScatter(across.as_ptr(), 2, zeros.as_ptr()), 1);
+        }
+        // Unmapping in one call.
         assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, zeros.as_ptr()), 1);
         for k in 0..3 {
             assert_eq!(query(at(a, k)).host.State, MEM_RESERVE);
