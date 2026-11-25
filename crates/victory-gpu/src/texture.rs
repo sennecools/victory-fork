@@ -1385,7 +1385,9 @@ fn is_readable_commit(info: &windows_sys::Win32::System::Memory::MEMORY_BASIC_IN
         && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
 }
 
-fn committed_by_query(at: *const u8, len: usize) -> bool {
+/// Whether all of `[at, at + len)` is committed memory that may be read
+/// ([`is_readable_commit`]), by `VirtualQuery`.
+pub(crate) fn committed_by_query(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
     let Some(end) = p.checked_add(len) else {

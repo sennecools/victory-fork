@@ -815,6 +815,65 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 
+/// The title's upscale of `colour` into `output`, drawn by a pass of ours
+/// into the title's list `this` (`crate::upscale`): `render` texels of the
+/// input over `size` texels of the output. What the title had set on the
+/// list is set again after it. False if nothing was recorded.
+#[cfg(windows)]
+pub(crate) fn upscale(
+    this: This,
+    colour: This,
+    output: This,
+    render: [u32; 2],
+    size: [u32; 2],
+) -> bool {
+    const RENDER_TARGET: u32 = 0x4;
+    const PIXEL_READ: u32 = 0x80;
+    // The pointers come from fixed places in the upscaler's description:
+    // each must be readable memory (a heap address, eight-byte aligned at
+    // least) holding one of our objects of its kind, by its table, before
+    // it is taken for one. Otherwise the upscale is handed on.
+    let readable = |p: This| {
+        (p as usize) >= 0x1_0000
+            && (p as usize).is_multiple_of(8)
+            && crate::texture::committed_by_query(p.cast(), size_of::<usize>())
+    };
+    if !([this, colour, output].into_iter().all(readable)
+        && is_list(this)
+        && crate::resource::is_resource(colour)
+        && crate::resource::is_resource(output))
+    {
+        return false;
+    }
+    let Some(list) = host_list(this) else {
+        return false;
+    };
+    let (Some(to), Some(from)) = (
+        crate::resource::host_resource(output),
+        crate::resource::host_resource(colour),
+    ) else {
+        return false;
+    };
+    // (before anything is recorded: a pair the pass cannot draw is handed on)
+    if !crate::host::upscale_fits(from, to) {
+        return false;
+    }
+    ensure_state(list, output, RENDER_TARGET);
+    ensure_state(list, colour, PIXEL_READ);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!("draw 3x1 [upscale of ours] {colour:?} {render:?} over {output:?} {size:?}")
+    });
+    if !crate::host::record_upscale(list, from, to, render, size) {
+        return false;
+    }
+    crate::texture::host_written(output);
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).replay(list);
+    true
+}
+
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
@@ -2244,6 +2303,14 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
+/// Whether `this` is one of our lists (by its table). The caller makes sure
+/// a word at `this` may be read.
+#[cfg(windows)]
+fn is_list(this: This) -> bool {
+    crate::object::has_table(this, &LIST_FUNCTIONS)
+        || crate::object::has_table(this, &NEWER_LIST_FUNCTIONS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2289,6 +2356,106 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// An upscale whose description names, where a list or texture should
+    /// be, something that is no list or resource of ours (another of our
+    /// objects, plain memory, memory that may not be read) is handed on:
+    /// nothing is taken for an object it is not. With its own list and
+    /// textures it is drawn.
+    #[cfg(windows)]
+    #[test]
+    fn an_upscale_naming_no_list_or_texture_of_ours_is_handed_on() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC,
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let resource_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let make_tex = |size: u64| -> This {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: size,
+                Height: size as u32,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut out = null;
+            let hr = crate::resource::create_committed(
+                null,
+                (&raw const props).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                &mut out,
+            );
+            assert_eq!(hr, S_OK);
+            out
+        };
+        let (colour, output) = (make_tex(4), make_tex(8));
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        // Plain memory, and memory reserved but not committed.
+        let words = [0usize; 8];
+        let plain: This = std::ptr::from_ref(&words).cast();
+        // SAFETY: a plain reservation, released below.
+        let reserved =
+            unsafe { VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!reserved.is_null());
+        let reserved: This = reserved.cast_const().cast();
+
+        let (render, size) = ([2, 2], [6, 6]);
+        for not_a_list in [allocator, colour, plain, reserved] {
+            assert!(!upscale(not_a_list, colour, output, render, size));
+        }
+        for not_a_texture in [allocator, list, plain, reserved] {
+            assert!(!upscale(list, not_a_texture, output, render, size));
+            assert!(!upscale(list, colour, not_a_texture, render, size));
+        }
+        assert!(upscale(list, colour, output, render, size));
+
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(reserved.cast_mut().cast(), 0, MEM_RELEASE) };
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(close(list), S_OK);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        release(colour);
+        release(output);
     }
 
     #[cfg(windows)]

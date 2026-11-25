@@ -2109,6 +2109,13 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
+/// Whether `this` is one of our resources (by its table). The caller makes
+/// sure a word at `this` may be read.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    object::has_table(this, &RESOURCE_FUNCTIONS)
+}
+
 /// The host GPU's copy of a title resource, if it has one: made now if
 /// this is the texture's first use ([`Hosted`]). Asking is a use; what must
 /// not count as one asks `host_made`.
@@ -2149,6 +2156,27 @@ fn host_texture(
     loud: bool,
 ) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<i32>> {
     host_texture_as(desc, state, clear, false, loud)
+}
+
+/// `VICTORY_CLEAR_TARGETS_ONLY=1`: a host texture gets the title's clear
+/// value only if it is a render or depth target ([`passes_clear`]).
+#[cfg(windows)]
+fn clear_targets_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLEAR_TARGETS_ONLY").is_some_and(|v| v == "1"))
+}
+
+/// Whether a host texture with the PC flags `flags` is made with the
+/// title's clear value. The host refuses a clear value for a texture that
+/// is no render or depth target (one only shaders write, as the upscaler
+/// target in Series S mode is): with `targets_only` it is left out for
+/// such a texture, which is then made; otherwise it is always passed, as
+/// before.
+#[cfg(windows)]
+fn passes_clear(flags: u32, targets_only: bool) -> bool {
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    !targets_only || flags & (TARGET | DEPTH) != 0
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -2201,7 +2229,8 @@ fn host_texture_as(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let pass_clear = !clear.is_null() && passes_clear(d.flags, clear_targets_only());
+    let clear_value = pass_clear.then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -2968,6 +2997,89 @@ mod tests {
         assert!(!texture_room(6144 * MIB, limit, 90, || {
             panic!("should not query video memory once manual cap is reached")
         }));
+    }
+
+    /// The host refuses a clear value for a texture that is no render or
+    /// depth target (one only shaders write, as the upscaler target in
+    /// Series S mode); with
+    /// `VICTORY_CLEAR_TARGETS_ONLY=1` the value is left out for it and the
+    /// texture is made.
+    #[cfg(windows)]
+    #[test]
+    fn a_clear_value_for_a_texture_only_shaders_write_is_refused() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        const TARGET: u32 = 1;
+        const DEPTH: u32 = 2;
+        const UNORDERED: u32 = 4;
+        assert!(passes_clear(UNORDERED, false), "unset: passed as before");
+        assert!(!passes_clear(UNORDERED, true));
+        assert!(!passes_clear(0, true));
+        assert!(passes_clear(TARGET, true));
+        assert!(passes_clear(TARGET | UNORDERED, true));
+        assert!(passes_clear(DEPTH, true));
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // The host itself: a UAV-only texture with a clear value is refused,
+        // the same without one is made.
+        let pc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let value = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let create = |clear: Option<*const D3D12_CLEAR_VALUE>| {
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a plain creation from live descriptions; the out
+            // pointer is ours.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &pc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    clear,
+                    &mut texture,
+                )
+            }
+        };
+        assert!(
+            create(Some(&value)).is_err(),
+            "the host took a clear value for it"
+        );
+        assert!(create(None).is_ok());
+
+        // Ours, the same texture in the title's description (format 10:
+        // R16G16B16A16_FLOAT) with a clear value in its format: refused as
+        // before unless the switch leaves the value out.
+        let clear: [u32; 5] = [10, 0, 0, 0, 0];
+        let made =
+            |desc: &ResourceDesc, clear: *const c_void| host_texture(desc, 0, clear, false).is_ok();
+        let mut desc = texture(64, 64, 10, 1);
+        desc.flags = UNORDERED;
+        assert_eq!(made(&desc, clear.as_ptr().cast()), clear_targets_only());
+        assert!(made(&desc, std::ptr::null()));
+        // A target keeps its clear value and is made either way.
+        desc.flags = TARGET | UNORDERED;
+        assert!(made(&desc, clear.as_ptr().cast()));
     }
 
     type Release = extern "system" fn(This) -> u32;

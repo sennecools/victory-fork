@@ -153,6 +153,23 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+        // The title's upscaler, with `VICTORY_UPSCALE_STANDIN=1`: its
+        // dispatch goes through the GPU side, which stands in for it
+        // (`victory_gpu::upscaler_dispatch`).
+        if victory_gpu::upscaler_standin()
+            && (name as usize) >= 0x1_0000
+            && narrow(name) == "ffxDispatch"
+            && runtime::image_path(module as usize).is_some_and(|p| {
+                p.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("fidelityfx_upscaler")
+            })
+        {
+            let original = host::get_proc_address(module, name);
+            if !original.is_null() {
+                return victory_gpu::upscaler_dispatch(original as usize) as *mut c_void;
+            }
+        }
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.

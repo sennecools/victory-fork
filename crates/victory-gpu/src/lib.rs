@@ -61,6 +61,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod upscale;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 pub mod window;
@@ -69,6 +71,8 @@ pub mod window;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use upscale::{hook as upscaler_dispatch, standin as upscaler_standin};
 #[cfg(windows)]
 pub use watch::{
     Remapping, title_memory_reading, title_memory_reading_range, title_memory_remapped,

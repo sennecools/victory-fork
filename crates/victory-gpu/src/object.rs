@@ -71,6 +71,14 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Whether `this` is one of our objects made with `table`: its first word
+/// names the table. The caller makes sure a word at `this` may be read.
+#[cfg(windows)]
+pub(crate) fn has_table<const N: usize>(this: This, table: &'static Table<N>) -> bool {
+    // SAFETY: the caller checked that the word may be read.
+    !this.is_null() && unsafe { this.cast::<*const *const ()>().read() } == table.0.as_ptr()
+}
+
 /// Increments the reference count only if it is currently non-zero, preventing
 /// resurrection of an object whose last `Release` is already dropping it.
 /// The caller must prevent deallocation (for instance by holding the table lock

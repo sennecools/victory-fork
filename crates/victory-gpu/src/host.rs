@@ -791,6 +791,217 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// The upscale stand-in's constants: an output pixel maps into the
+    /// rendered part of the input, never past the centre of its last texel.
+    #[test]
+    fn upscale_constants_map_the_output_into_the_rendered_part() {
+        let [sx, sy, lx, ly] = upscale_constants([1280, 720], [1920, 1080], [1920, 1080]);
+        // In texels of the input: the first output pixel's centre, the last
+        // one's, and the largest coordinates read.
+        let texel = |p: f32, scale: f32, size: f32| p * scale * size;
+        assert!((texel(0.5, sx, 1920.0) - 1.0 / 3.0).abs() < 1e-3);
+        assert!((texel(1919.5, sx, 1920.0) - 1279.667).abs() < 1e-2);
+        assert!((texel(1079.5, sy, 1080.0) - 719.667).abs() < 1e-2);
+        assert!((lx * 1920.0 - 1279.5).abs() < 1e-3);
+        assert!((ly * 1080.0 - 719.5).abs() < 1e-3);
+        assert_eq!(upscale_typed(DXGI_FORMAT(27)), DXGI_FORMAT(28));
+        assert_eq!(upscale_typed(DXGI_FORMAT(10)), DXGI_FORMAT(10));
+        // The typeless families of sRGB textures shaders write.
+        assert_eq!(upscale_typed(DXGI_FORMAT(90)), DXGI_FORMAT(87));
+        assert_eq!(upscale_typed(DXGI_FORMAT(92)), DXGI_FORMAT(88));
+        // A typeless format of no known family stays typeless and is no
+        // format the pass views anything in.
+        assert!(!UPSCALE_FORMATS.contains(&upscale_typed(DXGI_FORMAT(1)).0));
+    }
+
+    /// The upscale stand-in on the host: the rendered 2x2 corner of a 4x4
+    /// input in `format` (red, the rest green, cleared through a `view` of
+    /// it) of `samples` samples, drawn over the first 6x6 texels of an 8x8
+    /// R8G8B8A8 output (blue). Whether the pass was recorded and the
+    /// output's texels after; `None` without a host GPU.
+    fn upscaled(
+        format: DXGI_FORMAT,
+        view: DXGI_FORMAT,
+        samples: u32,
+    ) -> Option<(bool, Vec<[u8; 4]>)> {
+        let host = host()?;
+        let make = |size: u64, format: DXGI_FORMAT, samples: u32| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: size,
+                Height: size as u32,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: samples,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a plain creation; the out pointer is ours.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        let colour = make(4, format, samples);
+        let output = make(8, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
+        let list = host.new_list().unwrap();
+        let from = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: view,
+            ViewDimension: if samples > 1 {
+                D3D12_RTV_DIMENSION_TEXTURE2DMS
+            } else {
+                D3D12_RTV_DIMENSION_TEXTURE2D
+            },
+            ..Default::default()
+        };
+        // SAFETY: an open list of ours and live textures.
+        unsafe {
+            let from = host.rtv(Some(&colour), Some(&from));
+            list.list
+                .ClearRenderTargetView(from, &[0.0, 1.0, 0.0, 1.0], None);
+            let corner = RECT {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 2,
+            };
+            list.list
+                .ClearRenderTargetView(from, &[1.0, 0.0, 0.0, 1.0], Some(&[corner]));
+            let to = host.rtv(Some(&output), None);
+            list.list
+                .ClearRenderTargetView(to, &[0.0, 0.0, 1.0, 1.0], None);
+            list.list.ResourceBarrier(&[transition(
+                &colour,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )]);
+        }
+        let recorded = record_upscale(&list, &colour, &output, [2, 2], [6, 6]);
+        // Eight rows of eight texels, each row at the copy's pitch.
+        let pitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize;
+        let buffer = host.read_back_buffer(8 * pitch as u64).unwrap();
+        // SAFETY: as above; the locations name live resources.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &output,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Width: 8,
+                            Height: 8,
+                            Depth: 1,
+                            RowPitch: pitch as u32,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&output),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy has run; the mapping spans the eight rows.
+        let texels = unsafe {
+            buffer.Map(0, None, Some(&mut data)).unwrap();
+            let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * 8);
+            let texels: Vec<[u8; 4]> = (0..64)
+                .map(|i| {
+                    let at = (i / 8) * pitch + (i % 8) * 4;
+                    [rows[at], rows[at + 1], rows[at + 2], rows[at + 3]]
+                })
+                .collect();
+            buffer.Unmap(0, None);
+            texels
+        };
+        Some((recorded, texels))
+    }
+
+    /// The output of [`upscaled`] when the pass drew: red over the first
+    /// 6x6 texels, the rest blue as it was.
+    fn assert_drawn(texels: &[[u8; 4]]) {
+        for (i, texel) in texels.iter().enumerate() {
+            let (x, y) = (i % 8, i / 8);
+            let wanted = if x < 6 && y < 6 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            assert_eq!(*texel, wanted, "texel {x},{y}");
+        }
+    }
+
+    #[test]
+    fn upscale_draws_the_rendered_part_over_the_output() {
+        let Some((recorded, texels)) =
+            upscaled(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, 1)
+        else {
+            return; // no host GPU here
+        };
+        assert!(recorded);
+        assert_drawn(&texels);
+    }
+
+    /// A typeless B8G8R8A8 input (an sRGB texture shaders write) is read
+    /// through a B8G8R8A8_UNORM view, not a typeless one.
+    #[test]
+    fn upscale_reads_a_typeless_bgra_input_through_its_plain_view() {
+        let Some((recorded, texels)) = upscaled(
+            DXGI_FORMAT_B8G8R8A8_TYPELESS,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            1,
+        ) else {
+            return; // no host GPU here
+        };
+        assert!(recorded);
+        assert_drawn(&texels);
+    }
+
+    /// A multisampled input is refused before anything is recorded: the
+    /// output stays as it was.
+    #[test]
+    fn upscale_refuses_a_multisampled_input() {
+        let Some((recorded, texels)) =
+            upscaled(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, 4)
+        else {
+            return; // no host GPU here
+        };
+        assert!(!recorded);
+        assert!(texels.iter().all(|&t| t == [0, 0, 255, 255]));
+    }
 }
 
 /// Per-list D3D12 state of `Shadow` buffers. Every `Shadow` buffer is created
@@ -1145,6 +1356,297 @@ impl PlanePass {
     }
 }
 
+/// The pass that stands in for the title's upscaler (`crate::upscale`): the
+/// part of the colour input the title rendered, drawn over the output with
+/// linear filtering.
+const UPSCALE: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants = 4, b0, visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_LINEAR_MIP_POINT, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D<float4> colour : register(t0);
+SamplerState smooth : register(s0);
+cbuffer sizes : register(b0) { float2 scale; float2 limit; };
+[RootSignature(RS)]
+float4 upscale(float4 p : SV_Position) : SV_Target {
+    return float4(colour.SampleLevel(smooth, min(p.xy * scale, limit), 0).rgb, 1.0);
+}
+"#;
+
+/// The upscale pass's root signature and pipeline per output format
+/// (`None`: the host refused).
+struct UpscalePipelines(Vec<(i32, Option<PlanePipeline>)>);
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for UpscalePipelines {}
+
+/// The upscale pass's root signature and pipeline for output `format`,
+/// made when first needed.
+fn upscale_pipeline(format: DXGI_FORMAT) -> Option<PlanePipeline> {
+    static MADE: Mutex<UpscalePipelines> = Mutex::new(UpscalePipelines(Vec::new()));
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, pipeline)) = made.0.iter().find(|m| m.0 == format.0) {
+        return pipeline.clone();
+    }
+    let pipeline = match make_upscale_pipeline(format) {
+        Ok(pipeline) => Some(pipeline),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                format = format.0,
+                "no pipeline to upscale with: the title's upscaler is left to it"
+            );
+            None
+        }
+    };
+    made.0.push((format.0, pipeline.clone()));
+    pipeline
+}
+
+fn make_upscale_pipeline(format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
+    use windows::core::s;
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+    let ps = compile(UPSCALE, s!("upscale"), s!("ps_5_1"))?;
+    let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+        pShaderBytecode: bytes.as_ptr().cast(),
+        BytecodeLength: bytes.len(),
+    };
+    let mut blend = D3D12_BLEND_DESC::default();
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
+    formats[0] = format;
+    // SAFETY: the root signature is inside the pixel shader; the
+    // description points at live data and never releases its pointer.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            VS: code(&vs[..]),
+            PS: code(&ps[..]),
+            BlendState: blend,
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            RTVFormats: formats,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+        Ok((root, pipeline))
+    }
+}
+
+/// The plain format of the typeless families the title's targets come in
+/// (R16G16B16A16, R10G10B10A2, R8G8B8A8, and B8G8R8A8 and B8G8R8X8 of
+/// sRGB textures shaders write, `crate::resource::SRGB`), as the upscale
+/// pass views them.
+fn upscale_typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    DXGI_FORMAT(match format.0 {
+        9 => 10,
+        23 => 24,
+        27 => 28,
+        90 => 87,
+        92 => 88,
+        f => f,
+    })
+}
+
+/// The formats the upscale pass views its input and output in (after
+/// [`upscale_typed`]): R32G32B32A32 and R16G16B16A16 float, R10G10B10A2,
+/// R11G11B10 float, R8G8B8A8, B8G8R8A8 and B8G8R8X8, plain or sRGB.
+const UPSCALE_FORMATS: [i32; 10] = [2, 10, 24, 26, 28, 29, 87, 88, 91, 93];
+
+/// Whether the upscale pass can draw `colour` over `output`: both plain
+/// 2D textures of one sample in a format of [`UPSCALE_FORMATS`] the host
+/// can sample (the input) or render to (the output), the input readable by
+/// shaders, the output a render target. Otherwise the upscale is left to
+/// the title's upscaler, with one warning.
+pub(crate) fn upscale_fits(colour: &ID3D12Resource, output: &ID3D12Resource) -> bool {
+    let Some(host) = host() else {
+        return false;
+    };
+    // SAFETY: live resources.
+    let (from, to) = unsafe { (colour.GetDesc(), output.GetDesc()) };
+    let supports = |format: DXGI_FORMAT, wanted: D3D12_FORMAT_SUPPORT1| {
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        asked.is_ok() && support.Support1.0 & wanted.0 == wanted.0
+    };
+    let plain = |d: &D3D12_RESOURCE_DESC| {
+        d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && d.SampleDesc.Count == 1
+            && UPSCALE_FORMATS.contains(&upscale_typed(d.Format).0)
+    };
+    let fits = plain(&from)
+        && plain(&to)
+        && from.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
+        && to.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0
+        && supports(
+            upscale_typed(from.Format),
+            D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE,
+        )
+        && supports(
+            upscale_typed(to.Format),
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+        );
+    if !fits {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                from = format_args!(
+                    "dimension {} samples {} format {} flags {:#x}",
+                    from.Dimension.0, from.SampleDesc.Count, from.Format.0, from.Flags.0
+                ),
+                to = format_args!(
+                    "dimension {} samples {} format {} flags {:#x}",
+                    to.Dimension.0, to.SampleDesc.Count, to.Format.0, to.Flags.0
+                ),
+                "the upscale pass cannot draw this input over this output: \
+                 the title's upscaler is left to it"
+            );
+        });
+    }
+    fits
+}
+
+/// The upscale pass's constants for `render` texels of a `from`-sized
+/// colour input drawn over `size` texels of the output: the scale from an
+/// output pixel to the input's coordinates, and the largest coordinates
+/// read (the centre of the last rendered texel, so nothing outside the
+/// rendered part is filtered in).
+fn upscale_constants(render: [u32; 2], size: [u32; 2], from: [u32; 2]) -> [f32; 4] {
+    let (w, h) = (from[0] as f32, from[1] as f32);
+    [
+        render[0] as f32 / (size[0] as f32 * w),
+        render[1] as f32 / (size[1] as f32 * h),
+        (render[0] as f32 - 0.5) / w,
+        (render[1] as f32 - 0.5) / h,
+    ]
+}
+
+/// Records into `list` the pass that draws the first `render` texels of
+/// `colour` (readable by pixel shaders) over the first `size` texels of
+/// `output` (in the render target state). As [`record_plane_pass`] it puts
+/// nothing back of what it sets (descriptor heap, graphics root signature,
+/// pipeline, target, viewport, scissor, topology): the caller has the
+/// title's state set again (`crate::draw::State::replay`). False if it
+/// recorded nothing.
+pub(crate) fn record_upscale(
+    host_list: &HostList,
+    colour: &ID3D12Resource,
+    output: &ID3D12Resource,
+    render: [u32; 2],
+    size: [u32; 2],
+) -> bool {
+    let (Some(host), Some(pass)) = (host(), plane_pass()) else {
+        return false;
+    };
+    if !upscale_fits(colour, output) {
+        return false;
+    }
+    // SAFETY: live resources.
+    let (from, to) = unsafe { (colour.GetDesc(), output.GetDesc()) };
+    let Some((root, pipeline)) = upscale_pipeline(upscale_typed(to.Format)) else {
+        return false;
+    };
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: upscale_typed(from.Format),
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    };
+    let target = D3D12_RENDER_TARGET_VIEW_DESC {
+        Format: upscale_typed(to.Format),
+        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_RTV {
+                MipSlice: 0,
+                PlaneSlice: 0,
+            },
+        },
+    };
+    let target = host.rtv(Some(output), Some(&target));
+    let (width, height) = (size[0].min(to.Width as u32), size[1].min(to.Height));
+    let sizes = upscale_constants(render, [width, height], [from.Width as u32, from.Height]);
+    let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: pass.cpu + (slot * pass.step) as usize,
+    };
+    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: pass.gpu + u64::from(slot * pass.step),
+    };
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::info!(
+            from = format_args!(
+                "{}x{} of {}x{} f{}",
+                render[0], render[1], from.Width, from.Height, from.Format.0
+            ),
+            to = format_args!(
+                "{width}x{height} of {}x{} f{}",
+                to.Width, to.Height, to.Format.0
+            ),
+            "the title's upscaler stood in for: its colour input drawn over its output"
+        );
+    });
+    let list = &host_list.list;
+    // SAFETY: an open list; a slot of our heap; live resources and objects
+    // (the pass's own live as long as the process); four constants.
+    unsafe {
+        host.device
+            .CreateShaderResourceView(colour, Some(&view), cpu);
+        list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        list.SetGraphicsRootSignature(&root);
+        list.SetPipelineState(&pipeline);
+        list.SetGraphicsRootDescriptorTable(0, gpu);
+        list.SetGraphicsRoot32BitConstants(1, 4, sizes.as_ptr().cast(), 0);
+        list.OMSetRenderTargets(1, Some(&target), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        }]);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(
+            4,
+        ));
+        host_list.op(OpKind::Upscale, 0);
+        list.DrawInstanced(3, 1, 0, 0);
+    }
+    true
+}
+
 /// Records into `list` the pass that draws `plane`, the twin of the depth
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor
@@ -1395,6 +1897,8 @@ pub(crate) enum OpKind {
     Clamp,
     /// Ours: the pass that draws a depth plane's twin into the plane.
     Plane,
+    /// Ours: the pass that stands in for the title's upscaler.
+    Upscale,
 }
 
 impl OpKind {
@@ -1407,13 +1911,16 @@ impl OpKind {
             OpKind::Indirect => "indirect execution",
             OpKind::Clamp => "indirect clamp (ours)",
             OpKind::Plane => "depth plane pass (ours)",
+            OpKind::Upscale => "upscale stand-in pass (ours)",
         }
     }
 
     /// The breadcrumb the driver keeps for it.
     fn breadcrumb(self) -> D3D12_AUTO_BREADCRUMB_OP {
         match self {
-            OpKind::Draw | OpKind::Plane => D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED,
+            OpKind::Draw | OpKind::Plane | OpKind::Upscale => {
+                D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED
+            }
             OpKind::Indexed => D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED,
             OpKind::Mesh => D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH,
             OpKind::Dispatch | OpKind::Clamp => D3D12_AUTO_BREADCRUMB_OP_DISPATCH,
