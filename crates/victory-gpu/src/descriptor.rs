@@ -136,16 +136,44 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// An owned COM reference to a shader-visible [`Heap`], keeping it (and its
+/// host heap and backing memory) alive past the [`SHADER_HEAPS`] lookup.
+#[cfg(windows)]
+struct HeapRef(*const Heap);
+
+#[cfg(windows)]
+impl std::ops::Deref for HeapRef {
+    type Target = Heap;
+
+    fn deref(&self) -> &Heap {
+        // SAFETY: `HeapRef` retains a COM reference on the boxed `Heap`.
+        unsafe { &*self.0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeapRef {
+    fn drop(&mut self) {
+        release(self.0.cast());
+    }
+}
+
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
-fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
+fn shader_slot(handle: u64) -> Option<(HeapRef, u32)> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
-    // SAFETY: registered heaps are live (removed when dropped).
-    let heap = unsafe { &*(at as *const Heap) };
-    Some((heap, heap.index(handle)?))
+    if !object::try_add_ref(at as This) {
+        return None;
+    }
+    let heap = HeapRef(at as *const Heap);
+    let index = heap.index(handle);
+    // Drop the registry lock before `index?` can drop `heap` (which acquires
+    // `SHADER_HEAPS` if it happens to release the final reference).
+    drop(heaps);
+    Some((heap, index?))
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
@@ -1451,5 +1479,43 @@ mod tests {
         assert_eq!(view(at), Some(View::Constant(0x1000, 256)));
         create_cbv(null, std::ptr::null(), at);
         assert_eq!(view(at), Some(View::Constant(0, 0)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shader_slot_retains_heap_across_title_release() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+
+        let (guard, index) = shader_slot(start + 32).expect("registered shader-visible heap");
+        assert_eq!(index, 1);
+
+        // Title drops its reference while `guard` is still held: heap must stay alive.
+        let rel = slot::<extern "system" fn(This) -> u32>(h, 0x10);
+        assert_eq!(rel(h), 1, "shader_slot guard must keep Heap alive");
+        // Backing memory remains mapped and readable/writable while `guard` is live.
+        // SAFETY: slot 1 lies inside the still-live 8-descriptor heap.
+        unsafe { ((start + 32) as *mut u32).write(0xCAFE_BABE) };
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((start + 32) as *const u32).read() }, 0xCAFE_BABE);
+
+        // Dropping the guard releases the final reference and unregisters the heap.
+        drop(guard);
+        assert!(shader_slot(start + 32).is_none());
+
+        // `try_add_ref` refuses to resurrect a zero-refcount object.
+        let dead = Object::new(&FUNCTIONS);
+        assert!(!object::try_add_ref(&raw const dead));
     }
 }

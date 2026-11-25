@@ -71,6 +71,21 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Increments the reference count only if it is currently non-zero, preventing
+/// resurrection of an object whose last `Release` is already dropping it.
+/// The caller must prevent deallocation (for instance by holding the table lock
+/// that `Drop` acquires before freeing) across this call.
+#[cfg(windows)]
+pub(crate) fn try_add_ref(this: This) -> bool {
+    // SAFETY: caller prevents deallocation of `this` while checking `refs`.
+    unsafe { &*this }
+        .refs
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n > 0).then_some(n + 1)
+        })
+        .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
