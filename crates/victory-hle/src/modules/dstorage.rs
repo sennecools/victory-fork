@@ -370,7 +370,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, QueuedRead)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -378,15 +378,15 @@ struct Lane {
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; status arrays count their
-// references atomically.
+// valid until the title has seen them complete; files and status arrays count
+// their references atomically.
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
 struct Job {
     lane: u64,
     seq: u64,
-    request: Request,
+    read: QueuedRead,
     staging: u64,
 }
 
@@ -496,10 +496,14 @@ fn work(scheduler: &'static Scheduler) {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
+        let mut job = job;
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
-        walls_request(&job.request, &result, started);
+        let result = execute(&job.read);
+        walls_request(&job.read.request, &result, started);
+        // Drop our COM reference on the file before signaling completion and
+        // outside `scheduler.lock()`.
+        job.read.release_file();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -515,10 +519,10 @@ impl Lanes {
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
-        *bytes += u64::from(job.request.destination_size);
+        *bytes += u64::from(job.read.request.destination_size);
         *busy += started.elapsed();
-        if job.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.destination_size);
+        if job.read.request.options & BCPACK != 0 {
+            self.bcpack.0 += u64::from(job.read.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
         let since = *self.since.get_or_insert(started);
@@ -555,17 +559,16 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, read) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+        let size = u64::from(read.request.destination_size.max(read.request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
@@ -573,7 +576,7 @@ impl Lanes {
         Some(Job {
             lane: id,
             seq,
-            request,
+            read,
             staging,
         })
     }
@@ -734,8 +737,48 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    Read(QueuedRead),
     Status(Status),
+}
+
+/// An enqueued read request, holding a COM reference on its file object (when
+/// not a memory source) and an owned copy of its debug name until completion
+/// or drop.
+struct QueuedRead {
+    request: Request,
+    file: Option<*mut Instance<File>>,
+    name: String,
+}
+
+impl QueuedRead {
+    fn new(mut request: Request) -> Self {
+        let name = text(request.name);
+        request.name = std::ptr::null();
+        let file = if request.options & MEMORY_SOURCE == 0 && !request.source.is_null() {
+            let file = request.source.cast::<Instance<File>>().cast_mut();
+            add_ref_instance(file);
+            Some(file)
+        } else {
+            None
+        };
+        Self {
+            request,
+            file,
+            name,
+        }
+    }
+
+    fn release_file(&mut self) {
+        if let Some(file) = self.file.take() {
+            release(file);
+        }
+    }
+}
+
+impl Drop for QueuedRead {
+    fn drop(&mut self) {
+        self.release_file();
+    }
 }
 
 
@@ -763,7 +806,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(QueuedRead::new(request)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -834,7 +877,8 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(read: &QueuedRead) -> Result<(), HRESULT> {
+    let request = &read.request;
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -844,7 +888,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             destination_size = request.destination_size,
             intermediate_size = request.intermediate_size,
             tag = request.tag,
-            name = text(request.name),
+            name = read.name.as_str(),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -1500,7 +1544,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(QueuedRead::new(r)));
     }
 
     #[test]
@@ -1824,5 +1868,59 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn enqueued_request_retains_file_and_copies_name_until_completion() {
+        let payload = b"victory-dstorage-uaf-test-payload";
+        let (_dir, file) = file_with(payload);
+        let (queue, array) = (new_queue(0), status_array(2));
+        let mut out = vec![0u8; payload.len()];
+        let mut small = [0u8; 4];
+
+        // Temporary name buffer that will be overwritten and dropped before Submit.
+        let mut name_buf = b"ephemeral-request-name\0".to_vec();
+        let mut ok_req = request(0, out.as_mut_ptr().cast(), out.len(), file, 0, payload.len());
+        ok_req.name = name_buf.as_ptr().cast();
+        let mut bad_req = request(
+            0,
+            small.as_mut_ptr().cast(),
+            small.len(),
+            file,
+            0,
+            payload.len(),
+        );
+        bad_req.name = name_buf.as_ptr().cast();
+
+        enqueue(queue, &ok_req);
+        enqueue_status(queue, array, 0);
+        enqueue(queue, &bad_req);
+        enqueue_status(queue, array, 1);
+
+        // Title drops its own reference immediately after EnqueueRequest, and
+        // clobbers + drops the request name buffer before Submit.
+        let release_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(release_fn(file), 2, "both queued reads must retain the file");
+        name_buf.fill(b'X');
+        drop(name_buf);
+
+        void(queue, 0x30); // Submit
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(wait(array, 1), E_INVALIDARG);
+        assert_eq!(out, payload);
+
+        // Also verify closing a queue drops its retained reference on unstarted reads.
+        let (_dir2, file2) = file_with(payload);
+        let queue2 = new_queue(0);
+        let add_ref_fn: extern "system" fn(*mut c_void) -> u32 = call(file2, 0x08);
+        let release_fn2: extern "system" fn(*mut c_void) -> u32 = call(file2, 0x10);
+        assert_eq!(add_ref_fn(file2), 2);
+        enqueue(
+            queue2,
+            &request(0, out.as_mut_ptr().cast(), out.len(), file2, 0, payload.len()),
+        );
+        assert_eq!(release_fn2(file2), 2); // 1 held by test + 1 held by queue2
+        void(queue2, 0x40); // Close: drops unsubmitted read and releases file2
+        assert_eq!(release_fn2(file2), 0); // last ref was the test's
     }
 }
