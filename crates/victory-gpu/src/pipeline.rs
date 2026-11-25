@@ -669,10 +669,21 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if at.checked_add(size).is_none_or(|end| end > desc.size) {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                total = desc.size,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: `at + size <= desc.size`, and a shader subobject is 24 bytes
+            // with `Bytecode` at +8.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -860,6 +871,65 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+        }
+    }
+
+    #[test]
+    fn truncated_and_unaligned_streams_do_not_read_out_of_bounds() {
+        // 1. Unaligned stream holding a complete 24-byte VS subobject (kind = 1).
+        let vs = [7u8; 6];
+        let mut backing = [0u8; 25];
+        let slice = &mut backing[1..25]; // intentionally misaligned by 1 byte
+        slice[0..4].copy_from_slice(&1u32.to_le_bytes());
+        slice[8..16].copy_from_slice(&(vs.as_ptr() as u64).to_le_bytes());
+        slice[16..24].copy_from_slice(&(vs.len() as u64).to_le_bytes());
+        let desc = StreamDesc {
+            size: slice.len(),
+            stream: slice.as_ptr(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        assert_eq!(shaders(p), [("vertex", vs.to_vec())]);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+
+        // 2. Truncated 336-byte blend subobject (kind = 8) placed flush against a
+        // PAGE_NOACCESS guard page: must not fault reading past `desc.size`.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Memory::*;
+            // SAFETY: private two-page reservation with the second page inaccessible.
+            unsafe {
+                let base = VirtualAlloc(
+                    std::ptr::null(),
+                    0x2000,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+                .cast::<u8>();
+                assert!(!base.is_null());
+                let mut old = 0;
+                assert_ne!(
+                    VirtualProtect(base.add(0x1000).cast(), 0x1000, PAGE_NOACCESS, &mut old),
+                    0
+                );
+                let tail = base.add(0x1000 - 12);
+                tail.cast::<u32>().write_unaligned(8); // D3D12_BLEND_DESC (336 bytes)
+                let trunc = StreamDesc {
+                    size: 12,
+                    stream: tail,
+                };
+                let mut q = std::ptr::null();
+                assert_eq!(
+                    create_stream(std::ptr::null(), &trunc, &PIPELINE_IIDS[0], &mut q),
+                    S_OK
+                );
+                assert!(shaders(q).is_empty());
+                assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
         }
     }
 }
