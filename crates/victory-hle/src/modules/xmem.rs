@@ -669,11 +669,6 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let mut physical = physical();
-    // Until the pages are mapped again: `unmap` takes whole views away and
-    // maps what stays of them again, and a mapped view is a reservation
-    // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
     let pages = (!pages.is_null()).then(|| {
         // SAFETY: the title passes `n` page numbers.
         unsafe { std::slice::from_raw_parts(pages, n) }
@@ -685,10 +680,18 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
 }
 
-/// [`XMemMapPhysicalPages`] with the physical state and the remapping lock
-/// already held: unmaps `[base, base + n pages)`, then maps `pages` there
-/// (none: only unmaps). False if a page or the host fails.
+/// [`XMemMapPhysicalPages`] with the physical state held: unmaps
+/// `[base, base + n pages)`, then maps `pages` there (none: only unmaps).
+/// False if a page or the host fails.
+///
+/// Until the pages are mapped again: `unmap` takes whole views away and
+/// maps what stays of them again, and a mapped view is a reservation until
+/// it is committed. A read of title memory in place must not fall into that
+/// gap: the remapping lock is held throughout, for the addresses the change
+/// touches ([`changing`]).
+#[track_caller]
 fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {
+    let _changing = changing(physical, base, n * PAGE);
     unmap(physical, base, n * PAGE);
     let Some(pages) = pages else {
         return true;
@@ -720,11 +723,12 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (the title passes 0 for addresses to clear).
 ///
-/// The whole call is one change of the mapping: the physical state and the
-/// remapping lock are taken once. Taken per page, each page waited for every
-/// in-place read of title memory under way, and the texture refreshes queued
-/// behind each (run amd-F: 183 of 191 s of texture preparation waiting for
-/// title memory to hold still). Each address is still mapped on its own:
+/// The physical state is taken once for the call; the remapping lock per
+/// address, for that address alone ([`changing`]). Taken once for the whole
+/// call it was held up to 1.95 s (run mem-W3a), and every texture refresh
+/// waited; taken per page when it covered all title memory, each page
+/// waited for every in-place read under way and the refreshes queued behind
+/// each (run amd-F). Each address is mapped on its own:
 /// addresses that follow one another can lie in different placeholders,
 /// which one view cannot span (run amd-H: error 487, and the title stopped).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
@@ -739,8 +743,6 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
     let mut physical = physical();
-    // As in `XMemMapPhysicalPages`, once for the whole call.
-    let _changing = victory_gpu::title_memory_remapping();
     for (i, &address) in addresses.iter().enumerate() {
         let page = pages.map(|p| &p[i..=i]).filter(|p| p[0] != 0);
         if !map_pages(&mut physical, address as usize, 1, page) {
@@ -758,8 +760,8 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    // As in `map_pages`: no read in place meets the gap.
+    let _changing = changing(&physical, to, len);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -783,6 +785,26 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         }
     }
     true
+}
+
+/// The remapping lock (`victory_gpu::title_memory_remapping_range`) for a
+/// change of `[base, base + len)`: those addresses and the whole of the
+/// views reaching past them, which `unmap` takes away and maps again in
+/// part. Reads of title memory elsewhere go on meanwhile.
+#[track_caller]
+fn changing(physical: &Physical, base: usize, len: usize) -> victory_gpu::Remapping {
+    let end = base.saturating_add(len);
+    let holding = |at: usize| {
+        physical
+            .views
+            .range(..=at)
+            .next_back()
+            .filter(|(start, (size, _))| at < *start + size)
+            .map(|(start, (size, _))| (*start, *start + size))
+    };
+    let lo = holding(base).map_or(base, |(start, _)| start.min(base));
+    let hi = if len == 0 { end } else { holding(end - 1).map_or(end, |(_, stop)| stop.max(end)) };
+    victory_gpu::title_memory_remapping_range(lo, (hi - lo).max(1))
 }
 
 /// Diagnostics: where the time under the remapping lock goes, since the last
