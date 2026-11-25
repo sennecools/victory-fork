@@ -498,8 +498,11 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// those of textures no longer sampled were kept for the run (2,246 of
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
-/// Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+/// Called before a submission starts, by the thread that submits. What it
+/// lets go of goes to `gone`, to be dropped as is (no list names it, so no
+/// running submission does): at once when the sweep runs whole, under the
+/// lock as before slices.
+pub(crate) fn let_go_idle(gone: &mut crate::host::LetGo) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -513,18 +516,22 @@ pub(crate) fn let_go_idle() {
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
+    let idle: Vec<usize> = map
+        .iter()
+        .filter(|(_, s)| {
+            Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+        })
+        .map(|(key, _)| *key)
+        .collect();
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
-        }
-        keep
-    });
+    for s in idle.into_iter().filter_map(|key| map.remove(&key)) {
+        LET_GO[0].fetch_add(1, Relaxed);
+        LET_GO[1].fetch_add(s.bytes, Relaxed);
+        went += 1;
+        bytes += s.bytes;
+        gone.push_dropped(s);
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }

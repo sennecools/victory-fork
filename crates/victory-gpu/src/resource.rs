@@ -1861,54 +1861,69 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// Every caller uses it at once, within the title's call.
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+///
+/// Looks at the textures after the address `from` (all with none) until
+/// `until` (to the end without one; `crate::host::sweep_walk`), and hands
+/// the host copies it lets go of to `gone` to be retired: the address it
+/// stopped after, if time ran out first.
 #[cfg(windows)]
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle(
+    from: Option<usize>,
+    until: Option<std::time::Instant>,
+    gone: &mut crate::host::LetGo,
+) -> Option<usize> {
+    use std::ops::Bound::{Excluded, Unbounded};
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
-        return;
+        return None;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
-            continue;
-        }
-        let gone = {
-            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                made.take()
-            } else {
-                None
+    let after = from.map_or(Unbounded, Excluded);
+    let stopped = crate::host::sweep_walk(
+        all.range((after, Unbounded)).map(|&at| (at, ())),
+        until,
+        |at, ()| {
+            // SAFETY: a texture leaves the table before it is freed, under the
+            // lock held here (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                return;
             }
-        };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
-            went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
+            let taken = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let idle = made.as_ref().is_some_and(|(host, _)| {
+                    crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if idle {
+                    // Under the lock: the next use must not find the staging
+                    // state of the texture let go (it says "uploaded").
+                    crate::texture::unstage(at as This);
+                    made.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((host, _)) = taken {
+                r.host.gone.store(true, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                went += 1;
+                bytes += host.bytes;
+                if first.is_none() {
+                    first = Some(at);
+                }
+                gone.push(host);
             }
-            crate::host::retire(host);
-        }
-    }
+        },
+    );
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -1918,6 +1933,7 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+    stopped
 }
 
 /// For the memory line: the host copies the sweep never lets go

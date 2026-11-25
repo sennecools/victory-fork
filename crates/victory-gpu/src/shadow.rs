@@ -2576,40 +2576,57 @@ pub(crate) fn window_use() -> [u64; 8] {
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+///
+/// Looks at the windows after the key `from` (all with none) until `until`
+/// (to the end without one; `crate::host::sweep_walk`), and hands what it
+/// lets go of to `gone` to be retired: the key it stopped after, if time
+/// ran out first.
+pub(crate) fn let_go_idle(
+    from: Option<(u64, u64)>,
+    until: Option<std::time::Instant>,
+    gone: &mut crate::host::LetGo,
+) -> Option<(u64, u64)> {
+    use std::ops::Bound::{Excluded, Unbounded};
     const IDLE_FRAMES: u64 = 4;
-    let gone: Vec<Arc<Shadow>> = {
+    let (went, stopped): (Vec<Arc<Shadow>>, _) = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
-            return;
+            return None;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
+        let mut idle: Vec<(u64, u64)> = Vec::new();
+        let after = from.map_or(Unbounded, Excluded);
+        let stopped = crate::host::sweep_walk(map.range((after, Unbounded)), until, |key, s| {
+            if Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                && crate::host::references(&s.buffer) == 1
+            {
+                idle.push(*key);
+            }
+        });
+        let stopped = stopped.copied();
+        let went = idle
+            .into_iter()
+            .filter_map(|key| map.remove(&key))
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        (went, stopped)
     };
-    if !gone.is_empty() {
-        let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
+    if !went.is_empty() {
+        let (went, bytes) = (went.len(), went.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
         });
     }
-    for shadow in gone {
+    for shadow in went {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-        // Nothing runs now and nothing names it: freed at once unless a
-        // submission is running after all.
-        crate::host::retire(shadow);
+        // Nothing runs now and nothing names it: freed when retired, at
+        // once unless a submission is running after all.
+        gone.push(shadow);
     }
+    stopped
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
