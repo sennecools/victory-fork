@@ -15,6 +15,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1030,7 +1031,9 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -1194,6 +1197,12 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
 }
 
 impl HostHeap {
+    /// Monotonic unique identifier for this host heap, used to key per-heap
+    /// caches without pointer-reuse aliasing.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -3506,6 +3515,12 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        crate::draw::forget_heap(self.id);
+    }
 }
 
 #[cfg(test)]

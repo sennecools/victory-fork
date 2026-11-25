@@ -1402,41 +1402,37 @@ impl State {
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
         // One key per list, as textures have: no title resource is there.
-        const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        // Keyed per host heap so binding a second view heap on the same list
+        // keeps its strides buffer and refreshes its views too.
+        if !list.first_use(std::ptr::from_ref(host) as usize) {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
-        // The pass itself once per frame: per list it ran up to 51 times a
-        // frame over 81,000 views and 4,100 host copies, 18 s of every
-        // frame (2026-11-24, run 11).
-        // shortcut: what the title writes into such buffers between lists
-        // of one frame is seen a frame late.
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        // Once per frame per host heap: avoids re-scanning 81,000 views on
+        // every list while never starving a second view heap bound in the same
+        // frame, and releases all cached `Arc<Shadow>` refs on `HostHeap::drop`.
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        let started = std::time::Instant::now();
+        let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = kept
+            .get_or_insert_with(Default::default)
+            .entry(host.id())
+            .or_insert_with(|| HeapRanges {
+                last_frame: u64::MAX,
+                passes: 0,
+                ranges: HeapRangeMap::new(),
+            });
+        if entry.last_frame == frame {
             return Some(gpu);
         }
-        let started = std::time::Instant::now();
-        // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+        entry.last_frame = frame;
+        let passes = &mut entry.passes;
+        let ranges = &mut entry.ranges;
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let slots = if (*passes).is_multiple_of(16) {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -2562,14 +2558,18 @@ impl State {
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
+        let mut oob: Vec<u8> = Vec::new();
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(end) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else {
+                oob.push(u.slot);
+                if !fresh.contains(&u.slot) {
+                    fresh.push(u.slot);
+                }
+                continue;
+            };
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -2577,7 +2577,10 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                oob.push(u.slot);
+                if !fresh.contains(&u.slot) {
+                    fresh.push(u.slot);
+                }
             }
         }
         fresh.sort_unstable();
@@ -2589,6 +2592,7 @@ impl State {
         }
         let mut made = Vec::new();
         for slot in fresh {
+            let must_relocate = oob.contains(&slot);
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -2598,12 +2602,21 @@ impl State {
                 .filter(|u| u.slot == slot)
                 .collect();
             let Some(heap) = self.heap_of(table) else {
+                if must_relocate {
+                    made.push((slot, u32::MAX));
+                }
                 continue;
             };
             if heap.samplers() || (table - heap.start) % 32 != 0 {
+                if must_relocate {
+                    made.push((slot, u32::MAX));
+                }
                 continue;
             }
             let Some(host) = heap.host() else {
+                if must_relocate {
+                    made.push((slot, u32::MAX));
+                }
                 continue;
             };
             let mut selected: Vec<u32> = indexed
@@ -2634,6 +2647,9 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                if must_relocate {
+                    made.push((slot, u32::MAX));
+                }
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -3051,6 +3067,7 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        let hit_window = hit.is_some();
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -3118,7 +3135,13 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            // A window hit did not run `bound`/`bound_ahead`, so `bounded` is
+            // still in `COMMON` (from the previous draw's `done`); emitting
+            // `done` (`INDIRECT_ARGUMENT -> COMMON`) without an `ExecuteIndirect`
+            // implicit promotion would be a mismatched barrier.
+            if !hit_window {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3499,6 +3522,29 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     unsafe { list.list.OMSetBlendFactor(factor) };
 }
 
+type HeapRangeMap =
+    std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+
+struct HeapRanges {
+    last_frame: u64,
+    passes: u64,
+    ranges: HeapRangeMap,
+}
+
+/// Per host view heap (keyed by monotonic [`crate::descriptor::host::HostHeap::id`]):
+/// the last frame its buffer views were scanned, its pass counter, and the host
+/// shadow ranges cached across passes. Entries are removed on `HostHeap::drop`.
+static HEAP_RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, HeapRanges>>> =
+    std::sync::Mutex::new(None);
+
+/// Drops cached dynamic-buffer range state (and its held `Arc<Shadow>` refs)
+/// when a `HostHeap` is destroyed.
+pub(crate) fn forget_heap(id: u64) {
+    if let Some(map) = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.remove(&id);
+    }
+}
+
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     #[cfg(feature = "diagnostics")]
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
@@ -3536,5 +3582,47 @@ mod tests {
         assert_eq!(State::wanted([0, 0]), [0, SAMPLERS_OURS]);
         // A title sampler heap stays without views.
         assert_eq!(State::wanted([0, 0x20]), [0, 0x20]);
+    }
+
+    #[test]
+    fn heap_ranges_tracks_frames_per_heap_and_cleans_up_on_forget() {
+        let mut guard = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(Default::default);
+        let id_a = u64::MAX - 10;
+        let id_b = u64::MAX - 11;
+        map.remove(&id_a);
+        map.remove(&id_b);
+
+        let claim = |map: &mut std::collections::HashMap<u64, HeapRanges>, id: u64, frame: u64| {
+            let e = map.entry(id).or_insert_with(|| HeapRanges {
+                last_frame: u64::MAX,
+                passes: 0,
+                ranges: HeapRangeMap::new(),
+            });
+            if e.last_frame == frame {
+                false
+            } else {
+                e.last_frame = frame;
+                e.passes += 1;
+                true
+            }
+        };
+
+        // Heap A and Heap B both run in frame 5 (no cross-heap starvation).
+        assert!(claim(map, id_a, 5));
+        assert!(claim(map, id_b, 5));
+        // Second call for Heap A in the same frame skips.
+        assert!(!claim(map, id_a, 5));
+        // Next frame runs again.
+        assert!(claim(map, id_a, 6));
+        drop(guard);
+
+        // Dropping a HostHeap calls forget_heap(id), freeing the map entry.
+        forget_heap(id_a);
+        forget_heap(id_b);
+        let guard = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.as_ref().unwrap();
+        assert!(!map.contains_key(&id_a));
+        assert!(!map.contains_key(&id_b));
     }
 }
