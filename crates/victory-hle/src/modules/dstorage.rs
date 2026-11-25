@@ -172,16 +172,17 @@ extern "system" fn create_status_array(
     put(out, array)
 }
 
-/// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// DSTORAGE_QUEUE_DESC1, passed to IDStorageFactoryX2::CreateQueue1.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
     priority: i8,
     name: *const c_char,
-    unknown: u64,
+    options: u64,
 }
+
+const AUTO_SUBMIT_DISABLED: u64 = 1;
 
 extern "system" fn create_queue(
     _: Factory,
@@ -194,12 +195,13 @@ extern "system" fn create_queue(
         return E_INVALIDARG;
     };
     let name = text(desc.name);
+    let auto_submit = desc.options & AUTO_SUBMIT_DISABLED == 0;
     tracing::info!(
         source = desc.source_type,
         capacity = desc.capacity,
         priority = desc.priority,
         name,
-        unknown = desc.unknown,
+        auto_submit,
         iid = iid_text(iid),
         "dstorage: queue"
     );
@@ -214,7 +216,10 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue { id, auto_submit },
+        ),
     )
 }
 
@@ -310,6 +315,7 @@ static STATUS_VTABLE: Methods<5> = Methods([
 /// A queue object: its lane in the scheduler.
 struct Queue {
     id: u64,
+    auto_submit: bool,
 }
 
 impl Drop for Queue {
@@ -823,11 +829,10 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// Blocks while full. Automatic queues submit when half their capacity is pending.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
-    let id = unsafe { &*this }.state.id;
+    let Queue { id, auto_submit } = unsafe { &*this }.state;
     let Some(scheduler) = scheduler() else {
         return;
     };
@@ -849,7 +854,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if auto_submit && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -1299,14 +1304,18 @@ mod tests {
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {
+        queue_with_options(source_type, 0x80, AUTO_SUBMIT_DISABLED)
+    }
+
+    fn queue_with_options(source_type: u64, capacity: u16, options: u64) -> *mut c_void {
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type,
-            capacity: 0x80,
+            capacity,
             priority: 0,
             name: c"test".as_ptr(),
-            unknown: 1,
+            options,
         };
         let mut queue = std::ptr::null_mut();
         assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
@@ -1402,7 +1411,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source), 0x20);
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
-        assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+        assert_eq!(std::mem::offset_of!(QueueDesc, options), 0x18);
     }
 
     fn compress_zlib(plain: &[u8]) -> Vec<u8> {
@@ -1500,25 +1509,26 @@ mod tests {
     }
 
     #[test]
-    fn half_a_queue_submits_itself() {
+    fn queue_options_control_submission_at_half_capacity() {
         let (_dir, file) = file_with(&pattern(64));
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type: 0,
-            capacity: 4,
-            priority: 1,
-            name: c"small".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        let array = status_array(1);
-        let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
-        assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, pattern(64)[8..24]);
+        for options in [0, AUTO_SUBMIT_DISABLED] {
+            let queue = queue_with_options(0, 4, options);
+            let array = status_array(1);
+            let mut out = [0u8; 16];
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+            enqueue_status(queue, array, 0);
+            if options == AUTO_SUBMIT_DISABLED {
+                // SAFETY: this test owns the live queue returned by CreateQueue1.
+                let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+                assert_eq!(scheduler().unwrap().lock().lanes[&id].unsubmitted.len(), 2);
+                assert_eq!(result(array, 0), E_PENDING);
+                void(queue, 0x30);
+            }
+            assert_eq!(wait(array, 0), S_OK);
+            assert_eq!(out, pattern(64)[8..24]);
+            release::<Queue>(queue.cast());
+            release::<StatusArray>(array.cast());
+        }
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
