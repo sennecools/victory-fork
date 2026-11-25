@@ -897,14 +897,65 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping {
+    _guard: std::sync::RwLockWriteGuard<'static, ()>,
+    /// When it was had, how long it was waited for (µs), and where.
+    #[cfg(feature = "diagnostics")]
+    taken: (std::time::Instant, u64, &'static std::panic::Location<'static>),
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
+#[track_caller]
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    #[cfg(feature = "diagnostics")]
+    let asked = std::time::Instant::now();
+    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    Remapping {
+        _guard: guard,
+        #[cfg(feature = "diagnostics")]
+        taken: (
+            std::time::Instant::now(),
+            asked.elapsed().as_micros() as u64,
+            std::panic::Location::caller(),
+        ),
+    }
+}
+
+/// Diagnostics: the changes of the mapping by where the runtime made them since the
+/// last asking: file, line, and [changes, µs waited for in-place reads to end, µs held,
+/// longest µs held]. The texture refreshes wait on these ("waiting for title memory to
+/// hold still").
+#[cfg(feature = "diagnostics")]
+static REMAPS: std::sync::Mutex<Vec<(&'static str, u32, [u64; 4])>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        let (at, waited, place) = self.taken;
+        let held = at.elapsed().as_micros() as u64;
+        let mut all = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let i = match all.iter().position(|r| r.0 == place.file() && r.1 == place.line()) {
+            Some(i) => i,
+            None => {
+                all.push((place.file(), place.line(), [0; 4]));
+                all.len() - 1
+            }
+        };
+        let k = &mut all[i].2;
+        k[0] += 1;
+        k[1] += waited;
+        k[2] += held;
+        k[3] = k[3].max(held);
+    }
+}
+
+/// [`REMAPS`], taken (and reset).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn remaps_taken() -> Vec<(&'static str, u32, [u64; 4])> {
+    std::mem::take(&mut *REMAPS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).

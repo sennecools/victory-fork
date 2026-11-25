@@ -6988,6 +6988,18 @@ impl Meter {
                  the rest is reading, hashing and detiling"
             );
         }
+        #[cfg(feature = "diagnostics")]
+        for (file, line, [n, waited, held, longest]) in crate::watch::remaps_taken() {
+            let per = |x: u64| x as f64 / 1000.0 / frames;
+            tracing::info!(
+                "title memory remapped per frame at {file}:{line}: {:.1} changes, {:.1} ms waiting for in-place reads to end, \
+                 {:.1} ms held (the longest {:.1} ms since the last line)",
+                n as f64 / frames,
+                per(waited),
+                per(held),
+                longest as f64 / 1000.0
+            );
+        }
         let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
         if through + left > 0.0 {
             tracing::info!(
