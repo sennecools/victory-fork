@@ -10,16 +10,27 @@
 //! A first use queues the pipeline and waits for it within a budget per
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
 //! bake) are there at once as before; past the budget a draw or dispatch
-//! whose pipeline is not ready is dropped, as an untranslated one is. One
-//! pipeline's uses wait for it one frame's budget in all, not in every
-//! frame: one the host driver takes minutes to compile, or never finishes,
-//! is used in every frame meanwhile and would spend each frame's whole
-//! budget.
+//! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame, and as much in all
-//! for one pipeline. A pass the title runs only once and whose pipeline
-//! takes longer is lost, and a pass it runs in every frame is dropped until
-//! its pipeline is made.
+//! The default budget is half a second per title frame. While pipelines are
+//! asked for by the hundred (loading, a world's first minutes) a frame may
+//! wait longer ([`LOADING_FRAME`], [`LOADING_FRAME_COMPUTE`]), up to a bound
+//! for the whole run (`VICTORY_PIPELINE_GATE_S`): a pass the title runs
+//! only once (one that unpacks a model, say) is lost if its pipeline is not
+//! there, and a draw comes again in the next frame. No frame waits for a
+//! pipeline the host driver has been at for longer than most take
+//! ([`slow`]).
+//!
+//! Once the world runs (a frame of [`WORLD_DRAWS`] draws or more), one
+//! pipeline's uses wait for it one frame's allowance in all, not in every
+//! frame: one the host driver takes minutes to compile, or that stands far
+//! back in the queue, is used in every frame meanwhile and would spend each
+//! frame's whole budget. Before the world that does not apply: counted
+//! from the first loading screen, it gave up on the passes the title runs
+//! once while its world loads, and those never came back.
+//!
+//! The loading-time waits and the slow-driver cutoff come from the AMD
+//! fork of the fork (commit 4436f8f1, GPL-3.0).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -39,8 +50,11 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
-    /// How long its uses have waited for it, in microseconds.
+    /// How long its uses have waited for it once the world runs, in
+    /// microseconds.
     waited_us: AtomicU64,
+    /// When a worker began it ([`slow`]).
+    begun: OnceLock<Instant>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -65,32 +79,39 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
+            begun: OnceLock::new(),
         }
     }
 
-    /// What is left of the waiting its uses are given: one frame's budget
-    /// in all.
-    fn wait_left(&self) -> Duration {
-        let waited = Duration::from_micros(self.waited_us.load(Ordering::Relaxed));
-        wait_budget().saturating_sub(waited)
+    /// Whether it is a compute pipeline.
+    fn computes(&self) -> bool {
+        matches!(self.shaders.as_slice(), [only] if only.stage == "compute")
     }
 
-    /// Counts a use's wait; whether it was the one that used up the
-    /// pipeline's waiting (true at most once, so it is named once).
-    fn count_wait(&self, waited: Duration) -> bool {
+    /// What is left of the waiting its uses are given once the world runs:
+    /// one frame's `allowance` in all.
+    fn wait_left(&self, allowance: Duration) -> Duration {
+        let waited = Duration::from_micros(self.waited_us.load(Ordering::Relaxed));
+        allowance.saturating_sub(waited)
+    }
+
+    /// Counts a use's wait against `allowance`; whether it was the one that
+    /// used up the pipeline's waiting (true at most once, so it is named
+    /// once).
+    fn count_wait(&self, waited: Duration, allowance: Duration) -> bool {
         // Relaxed: the count guards no other data (the host pipeline is
         // published through `made`). Uses that wait at once each saw some
-        // left, so together they may wait a little over the budget. A wait
-        // is at most the budget and is only counted while some was left,
-        // so the sum stays far below u64::MAX.
-        let budget = wait_budget();
-        let waited = waited.min(budget).as_micros() as u64;
-        let budget = budget.as_micros() as u64;
+        // left, so together they may wait a little over the allowance. A
+        // wait is at most the allowance and is only counted while some was
+        // left, so the sum stays far below u64::MAX.
+        let waited = waited.min(allowance).as_micros() as u64;
+        let allowance = allowance.as_micros() as u64;
         let before = self.waited_us.fetch_add(waited, Ordering::Relaxed);
-        before < budget && before + waited >= budget
+        before < allowance && before + waited >= allowance
     }
 
     fn make(&self) {
+        let _ = self.begun.set(Instant::now());
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
@@ -138,6 +159,107 @@ fn wait_budget() -> Duration {
     })
 }
 
+/// The draws a title frame records from which on the world is taken to
+/// run (the menus and loading screens record a few dozen; the world some
+/// 5,000). The same mark the world captures use.
+const WORLD_DRAWS: u64 = 500;
+
+/// Whether a frame has recorded [`WORLD_DRAWS`] draws or more.
+static WORLD: AtomicBool = AtomicBool::new(false);
+
+/// At a present: `recorded`, the draws the title has recorded so far
+/// (dropped ones included).
+pub(crate) fn frame_recorded(recorded: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let before = LAST.swap(recorded, Ordering::Relaxed);
+    if recorded.saturating_sub(before) >= WORLD_DRAWS && !WORLD.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            frame = crate::frame::current(),
+            "the world runs: a pipeline's uses now wait one frame's allowance in all"
+        );
+    }
+}
+
+/// Whether the world runs ([`frame_recorded`]).
+fn in_world() -> bool {
+    WORLD.load(Ordering::Relaxed)
+}
+
+/// Whether the host's driver has been at a pipeline for longer than most
+/// take (one of the title's takes 85 s), `begun` ago: no frame waits for
+/// it. A pass a title runs once (it unpacks a model, say) is lost if its
+/// pipeline is not there, and a draw comes again in the next frame, so a
+/// compute pipeline is given longer.
+fn is_slow(computes: bool, begun: Option<Duration>) -> bool {
+    let most = if computes { 10 } else { 3 };
+    begun.is_some_and(|elapsed| elapsed > Duration::from_secs(most))
+}
+
+/// [`is_slow`] of `p`.
+fn slow(p: &Pending) -> bool {
+    is_slow(p.computes(), p.begun.get().map(Instant::elapsed))
+}
+
+/// What a frame may wait while pipelines are asked for by the hundred
+/// (loading, a world's first minutes). All such waits of a run together
+/// are bounded (`VICTORY_PIPELINE_GATE_S`); the title's GPU watchdog
+/// bounds one frame's (30 s).
+const LOADING_FRAME: Duration = Duration::from_secs(4);
+/// The same for compute pipelines, waited for apart: the passes that unpack
+/// a world's models are dispatched once, and in a run whose pipelines were
+/// all still to be loaded 130 of them were dropped, and with them walls,
+/// floor, ceiling and faces (they never came back).
+const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
+
+/// `VICTORY_PIPELINE_GATE_S`: the bound on all waits past the frame's
+/// budget, per kind (graphics, compute); 0: none of them.
+fn gate_total() -> Duration {
+    static TOTAL: OnceLock<Duration> = OnceLock::new();
+    *TOTAL.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(120);
+        tracing::info!(
+            seconds,
+            "host pipeline waits past the budget, in all per kind"
+        );
+        Duration::from_secs(seconds)
+    })
+}
+
+/// What a frame may wait for pipelines of one kind: the `budget`, or the
+/// `loading` frame's while the gate has that much left of its `total` after
+/// `spent` (and what is left of it before that runs out).
+fn frame_allowance(
+    budget: Duration,
+    loading: Duration,
+    total: Duration,
+    spent: Duration,
+) -> Duration {
+    if budget.is_zero() {
+        // `VICTORY_PIPELINE_WAIT_MS=0` turns all waiting off.
+        return Duration::ZERO;
+    }
+    budget.max(loading.min(total.saturating_sub(spent)))
+}
+
+/// What was waited past the frame's budget since the start, in
+/// milliseconds; graphics, then compute.
+static PAST_BUDGET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// What a frame may wait for pipelines of `p`'s kind now.
+fn allowance(p: &Pending) -> Duration {
+    let compute = p.computes();
+    let spent = Duration::from_millis(PAST_BUDGET[usize::from(compute)].load(Ordering::Relaxed));
+    let loading = if compute {
+        LOADING_FRAME_COMPUTE
+    } else {
+        LOADING_FRAME
+    };
+    frame_allowance(wait_budget(), loading, gate_total(), spent)
+}
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -156,25 +278,31 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        // Only what a use really waited counts: one that got nothing
-        // because the frame's budget was taken by others leaves the
-        // pipeline's own waiting for a later frame. One that could not be
-        // made counts as made (with no host pipeline): it is neither
-        // waited for nor named.
-        let left = p.wait_left();
-        if !left.is_zero()
-            && p.count_wait(wait(p, crate::frame::current(), left))
-            && p.made.get().is_none()
-        {
-            let shaders: Vec<String> = p
-                .shaders
-                .iter()
-                .map(|s| format!("{} {}", s.stage, s.hash))
-                .collect();
-            tracing::info!(
-                shaders = %shaders.join(" + "),
-                "a pipeline is still being made after a frame's budget of waiting; its uses no longer wait"
-            );
+        // Once the world runs only what a use really waited counts: one
+        // that got nothing because the frame's budget was taken by others
+        // leaves the pipeline's own waiting for a later frame. One that
+        // could not be made counts as made (with no host pipeline): it is
+        // neither waited for nor named.
+        let allowance = allowance(p);
+        let world = in_world();
+        let left = if world {
+            p.wait_left(allowance)
+        } else {
+            allowance
+        };
+        if !left.is_zero() && !slow(p) {
+            let waited = wait(p, crate::frame::current(), left, allowance);
+            if world && p.count_wait(waited, allowance) && p.made.get().is_none() {
+                let shaders: Vec<String> = p
+                    .shaders
+                    .iter()
+                    .map(|s| format!("{} {}", s.stage, s.hash))
+                    .collect();
+                tracing::info!(
+                    shaders = %shaders.join(" + "),
+                    "a pipeline is still being made after a frame's allowance of waiting; its uses no longer wait"
+                );
+            }
         }
     }
     p.made.get()?.as_ref()
@@ -216,23 +344,25 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left, at most `most`; how
-/// long it waited.
-fn wait(p: &Pending, frame: u64, most: Duration) -> Duration {
-    let budget = wait_budget();
-    if budget.is_zero() {
+/// Waits for `p` while frame `frame` has some of `allowance` left for
+/// pipelines of its kind, at most `most`; how long it waited.
+fn wait(p: &Pending, frame: u64, most: Duration, allowance: Duration) -> Duration {
+    if allowance.is_zero() {
         return Duration::ZERO;
     }
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    // Per kind (graphics, compute): the frame the allowance belongs to, and
+    // what was waited of it (or is taken by a thread waiting now).
+    static SPENT: [Mutex<(u64, Duration)>; 2] =
+        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let compute = p.computes();
+    let frame_spent = &SPENT[usize::from(compute)];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1).min(most);
+        let left = allowance.saturating_sub(spent.1).min(most);
         if shared {
             spent.1 += left;
         }
@@ -244,17 +374,21 @@ fn wait(p: &Pending, frame: u64, most: Duration) -> Duration {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !slow(p) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
+        // Woken now and then to see whether it has become a slow one.
+        let rest = rest.min(Duration::from_millis(250));
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    let past = waited.saturating_sub(wait_budget());
+    PAST_BUDGET[usize::from(compute)].fetch_add(past.as_millis() as u64, Ordering::Relaxed);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -422,26 +556,64 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 
-    /// A pipeline's uses wait one frame's budget in all: a use that got no
-    /// waiting does not count, and the wait that uses it up is told so once.
+    /// A pipeline's uses wait one frame's allowance in all: a use that got
+    /// no waiting does not count, and the wait that uses it up is told so
+    /// once.
     #[test]
-    fn a_pipeline_is_waited_for_one_budget_in_all() {
-        let budget = wait_budget();
-        if budget.is_zero() {
-            // VICTORY_PIPELINE_WAIT_MS=0 turns waiting off; nothing to count.
-            return;
-        }
+    fn a_pipeline_is_waited_for_one_allowance_in_all() {
+        let allowance = Duration::from_millis(500);
         let p = Pending::new(Vec::new(), None);
-        assert_eq!(p.wait_left(), budget);
-        assert!(!p.count_wait(Duration::ZERO));
-        assert_eq!(p.wait_left(), budget);
-        assert!(!p.count_wait(budget / 2));
-        assert_eq!(p.wait_left(), budget / 2);
-        assert!(p.count_wait(budget / 2));
-        assert!(p.wait_left().is_zero());
+        assert_eq!(p.wait_left(allowance), allowance);
+        assert!(!p.count_wait(Duration::ZERO, allowance));
+        assert_eq!(p.wait_left(allowance), allowance);
+        assert!(!p.count_wait(allowance / 2, allowance));
+        assert_eq!(p.wait_left(allowance), allowance / 2);
+        assert!(p.count_wait(allowance / 2, allowance));
+        assert!(p.wait_left(allowance).is_zero());
         // A use that was waiting at the same time: counted, not named again.
-        assert!(!p.count_wait(budget));
-        assert!(p.wait_left().is_zero());
+        assert!(!p.count_wait(allowance, allowance));
+        assert!(p.wait_left(allowance).is_zero());
+        // A larger allowance (the loading gate's) leaves more.
+        assert_eq!(p.wait_left(allowance * 4), allowance * 2);
+    }
+
+    /// A frame waits the loading allowance while the gate has it, what is
+    /// left of the gate after that, and never less than the budget; a zero
+    /// budget turns all waiting off.
+    #[test]
+    fn the_loading_gate_bounds_the_frame_allowance() {
+        let ms = Duration::from_millis;
+        let s = Duration::from_secs;
+        let budget = ms(500);
+        assert_eq!(
+            frame_allowance(budget, s(12), s(120), Duration::ZERO),
+            s(12)
+        );
+        assert_eq!(frame_allowance(budget, s(4), s(120), s(118)), s(2));
+        assert_eq!(frame_allowance(budget, s(4), s(120), s(120)), budget);
+        assert_eq!(frame_allowance(budget, s(4), s(120), s(500)), budget);
+        // VICTORY_PIPELINE_GATE_S=0: the budget only.
+        assert_eq!(
+            frame_allowance(budget, s(12), Duration::ZERO, Duration::ZERO),
+            budget
+        );
+        assert_eq!(
+            frame_allowance(Duration::ZERO, s(12), s(120), Duration::ZERO),
+            Duration::ZERO
+        );
+    }
+
+    /// No frame waits for a pipeline the driver has been at for over 3 s
+    /// (graphics) or 10 s (compute); one not begun yet is waited for.
+    #[test]
+    fn slow_pipelines_are_not_waited_for() {
+        let s = Duration::from_secs;
+        assert!(!is_slow(false, None));
+        assert!(!is_slow(true, None));
+        assert!(!is_slow(false, Some(s(3))));
+        assert!(is_slow(false, Some(s(4))));
+        assert!(!is_slow(true, Some(s(10))));
+        assert!(is_slow(true, Some(s(11))));
     }
 
     #[test]

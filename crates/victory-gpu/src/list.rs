@@ -1664,6 +1664,16 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RECORDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Draws (any kind) recorded since the start.
+static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Draws (any kind, dropped ones included) recorded since the start.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn recorded() -> u64 {
+    RECORDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and

@@ -400,6 +400,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// At a present: the draws the title has recorded so far, from which the
+/// pipeline waits know whether the world runs.
+#[cfg(windows)]
+pub(crate) fn frame_recorded(recorded: u64) {
+    make::frame_recorded(recorded);
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
