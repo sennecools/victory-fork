@@ -149,6 +149,10 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_TEXTURE_SWEEP=0` | no paced look over the heap's placed texture views for ones nothing brings up to date (`count`: only count them; default on, putting them back in the queue) |
 | `VICTORY_HEAP_RECHECK=0` | a texture picked by index is uploaded once, not looked at again 4, 12, 40, 120 and 400 frames after its upload for memory the title filled after writing its view |
 | `VICTORY_VIEW_GUARD=0` | a guarded copy of title memory does not see writes through another view of the same pages (on by default; a page shown in more than 64 views is guarded at each view by itself) |
+| `VICTORY_EARLY_TEXTURES_MS=12` / `VICTORY_BAKE_TEXTURES_MS=1500` | milliseconds a frame for uploading textures picked by index before any shader asks for them, and before the draws of the title's decoration bake (`0`: each off) |
+| `VICTORY_TEXTURE_ROOM_PERCENT=90` | share of the card's memory budget up to which textures picked by index get host copies (50 to 97) |
+| `VICTORY_PLACED_FILLER=1` | placed textures keyed with the filler words of their description too, as before (two views that differ only there get two host copies) |
+| `VICTORY_RELAY=0`, `VICTORY_WIDE_BACK=0`, `VICTORY_CARD_BUFFERS_MIN_MB=16`, `VICTORY_CARD_BUFFERS_MB=512`, `VICTORY_LATE_WAIT_LISTS=128` | the earlier defaults: shader writes copied back without a thread of their own (`VICTORY_RELAY=1`: its first stage; default its second), without the wide copy, card copies of title buffers from 16 MiB and up to 512 MB, 128 lists in the air |
 | `VICTORY_NULL_MAGENTA=1` | diagnostics build: a 2D colour texture view with nothing to show yet reads magenta instead of black |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
