@@ -1563,23 +1563,21 @@ impl State {
         let bake = bake_ms > 0
             && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        // The frame whose early pass has run: taken only by a draw with a
+        // view heap, so a frame whose first draws have none still gets it.
+        static EARLY_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
-        if first {
+        if FRAME.swap(frame, Ordering::Relaxed) != frame {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
-        let budget = if bake && left > 0 {
-            // What a bake may read must be there now: up to 2 GiB.
-            (left, 2 << 30)
-        } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
-        } else {
+        let bake = bake && left > 0;
+        if !bake && (early_ms == 0 || EARLY_FRAME.load(Ordering::Relaxed) == frame) {
             return;
-        };
+        }
         let Some(heap) = self
             .heaps
             .iter()
@@ -1592,7 +1590,15 @@ impl State {
         let Some(host) = heap.host() else {
             return;
         };
-        let bake = bake && left > 0;
+        let budget = if bake {
+            // What a bake may read must be there now: up to 2 GiB.
+            (left, 2 << 30)
+        } else if EARLY_FRAME.swap(frame, Ordering::Relaxed) != frame {
+            (early_ms, 64 << 20)
+        } else {
+            // Another thread's draw took this frame's early pass.
+            return;
+        };
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
             let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
