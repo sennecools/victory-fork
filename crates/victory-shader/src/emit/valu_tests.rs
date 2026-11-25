@@ -382,6 +382,12 @@ fn permlane_source(lane: u32, s1: u32, s2: u32, cross: bool) -> u32 {
 
 #[test]
 fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
+    // Hardware only: `VICTORY_WARP=1` makes the hardware device WARP too, and WARP
+    // refuses a pipeline that declares a fixed wave size of 32.
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("skipped on WARP: it runs no fixed wave size of 32");
+        return;
+    }
     // 32 lanes, each with its lane number in v0; v1 = permute(v0, s0, s1);
     // lane `read` of v1 into s12, then into v0 for the store.
     let selectors: [(u32, u32); 3] = [
@@ -1465,6 +1471,12 @@ fn v_cvt_f32_f64_matches_ieee754() {
 
 #[test]
 fn whole_wave_f64_sum_and_cvt_f32_f64() {
+    // Hardware only: `VICTORY_WARP=1` makes the hardware device WARP too, and WARP
+    // refuses a pipeline that declares a fixed wave size of 32.
+    if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        eprintln!("skipped on WARP: it runs no fixed wave size of 32");
+        return;
+    }
     let s_or_saveexec_b32 =
         |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32;
     let v_mov_dpp8 = |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)];
