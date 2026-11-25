@@ -3457,6 +3457,18 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// Whether small title buffers inside one window cell share the cell's
+/// window as their copy (on by default; `VICTORY_FOLD_BUFFERS=0` gives each
+/// its own copy as before). Measured in the world (4090, same load):
+/// 179.2 -> 160.1 ms a frame, settles 4.5 -> 1.0 a frame.
+fn fold_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FOLD_BUFFERS").is_none_or(|v| v != "0"))
+}
+
+/// Buffers folded into windows so far ([`fold_buffers`]).
+pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
@@ -3481,6 +3493,32 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // Folded (`VICTORY_FOLD_BUFFERS`, on by default): a small buffer
+        // inside one window cell takes the cell's window as its copy, so that
+        // the buffer and the memory around it, which the title also reaches by
+        // address, are one copy. Two copies of the same bytes made every
+        // submission that refreshed one while a flight's shaders wrote the
+        // other wait for the card to drain: ~2.8 times a frame in the world,
+        // for 10-40 KB each (a 6.4 KB ring and a 465 KB buffer inside 4 MiB
+        // windows). One copy's own pending writes are left alone by its
+        // refresh and need no such wait.
+        if !big
+            && fold_buffers()
+            && !fine()
+            && key.0 & !(WINDOW - 1) == (entry.end - 1) & !(WINDOW - 1)
+        {
+            if let Some(window) = loose(key.0, entry.end, false, false) {
+                if FOLDED.fetch_add(1, Ordering::Relaxed) < 24 {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's copy is its window's (VICTORY_FOLD_BUFFERS)"
+                    );
+                }
+                entry.shadow = Some(window);
+                return entry.shadow.clone();
+            }
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
