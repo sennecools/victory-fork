@@ -8,6 +8,139 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
+## About the `combined` branch
+
+`combined` is a build line of the VIctory port for people who want the most fixes in one place. It is
+**`fxceless/victory-fork` main plus fixes from other forks and open pull requests, plus our own fixes**, rebuilt
+from those sources on every sync. It is a convenience line, not a replacement: every change is also (or is meant to
+be) offered to the project it came from.
+
+### What is in it
+
+- **Base:** `fxceless/victory-fork` `main`, taken as it is at the last sync.
+- **On top of it** (161 commits at the last count; the figures below are approximate and not meant to add up):
+  - pull requests of `fxceless/victory-fork`, ported one by one (92 of them, from 37 authors, in the table below);
+  - pull requests of the upstream project (`Marvisak/VIctory`) and commits of its main branch;
+  - pull requests and commits of the AMD-focused fork `myokex/victory-amd`;
+  - commits of `skornuta/victory-fork` (frame-time dump, shadow buffer folding);
+  - our own commits (merge glue, shader-cache key, pipeline gate, early texture pass and similar).
+- **Left out on purpose:** every part that is derived from code under GPL-2.0-only. This project is GPL-3.0,
+  which cannot take such code, so nothing from it is in this line, not even adapted. Where a pull request mixed such
+  parts with other work, only the other work was ported.
+
+### It is rebuilt and force-updated
+
+`combined` is **not a normal branch**. On every sync we start again from the fork's `main`, replay our stack of
+ported commits and own fixes onto it, build it and run the tests. The result is **force-pushed**. Do not base work
+on it and do not expect its history to be stable; if you want a fix, take the commit (each one names its source in
+the message) or the original pull request. Each commit that was ported says so in its message, for example
+`Ported from the fork's pull request N`.
+
+### Build and run
+
+Exactly as the fork's README says (Rust, Windows, your own game files; nothing else is needed):
+
+```
+cargo build --release -p victory
+target\release\victory.exe run <game dir>\<the title's exe> --execute
+cargo test --workspace                   # needs no game data
+```
+
+This line carries no game files and no data of the title. It still does not run the title at playable speed; see the
+fork's README for the current status.
+
+### Credits
+
+All of the work below is by the people named. Authorship is as in the commit history of this branch; the
+pull-request numbers are those of the project named in the heading.
+
+#### Pull requests of `fxceless/victory-fork` (92)
+
+| Author | Pull requests |
+|---|---|
+| AscilCH | #224, #225, #227, #300, #301, #302, #303, #304, #349, #350, #351, #352, #353, #355, #403, #404, #405, #406, #409, #410, #440, #442, #444, #446, #534, #537, #540, #541, #560, #562, #563, #564, #565, #567, #568, #586, #589 |
+| davutsimsekk | #275, #371, #374, #429, #430, #526 |
+| fffluffy-dev | #237, #238, #239, #241, #272 |
+| VIREX | #388, #391, #395, #447 |
+| avt0m4t | #104, #360, #387 |
+| Adrito | #276, #281 |
+| DoubleD17 | #439, #591 |
+| HailLucifer666 | #165, #358 |
+| Ortomanic | #257, #260 |
+| renzowit35 | #322, #324 |
+| alexdeliu | #135 |
+| Andrey Kalyachko | #285 |
+| Androtim | #572 |
+| armin | #32 |
+| axo-lotl | #507 |
+| bawhen | #229 |
+| cuebert | #575 |
+| devan | #414 |
+| DrTardis1963 | #411 |
+| GamingRipperDoc | #421 |
+| icecreammule277-dot | #195 |
+| Ivan Malison | #291 |
+| joroyt | #370 |
+| Kamiloj9 | #280 |
+| Lewandox | #583 |
+| lukka | #602 |
+| m335671 | #77 |
+| mynzjerko | #317 |
+| Nico Panu | #97 |
+| NuraadGit | #24 |
+| PastiiJay | #106 |
+| PAYSO | #343 |
+| Peppacodes | #160 |
+| TG0000 | #254 |
+| Twah2em | #91 |
+| YeokiNoewChi | #426 |
+| Yorivel | #501 |
+
+#### Pull requests of the upstream project `Marvisak/VIctory` (5)
+
+| Author | Pull request |
+|---|---|
+| desp | #491 |
+| Luiz Otavio Mello de Campos | #1453 |
+| tjthebigbearcat-hub | #1718 |
+| Manuel Pérez | #1732 |
+| Ivan | #1778 |
+
+#### `myokex/victory-amd`
+
+| Author | Pull request |
+|---|---|
+| jmal423 | #4 |
+| UwUCammie | #6 |
+
+plus commits by myokex taken from the branch `victory-amd` (descriptor and guard work, texture
+spans, a compute-group fix, the README of that fork).
+
+#### `skornuta/victory-fork`
+
+Commits by stas: the frame-time dump (`VICTORY_FRAMETIME_DUMP`), its machine block, and folding of
+small shadow buffers into their window copy.
+
+#### `fxceless/victory-fork`
+
+The base itself, and one later commit of its main (faster defaults, textures on the card before the decoration bake)
+that is replayed separately because the base was cut earlier.
+
+#### Our own changes
+
+Commits by the maintainer of this fork (fix-ups to ported work included).
+
+### AI-assisted
+
+The porting, the conflict resolutions, the tests and the commit messages of this line were made with the help of an
+AI coding assistant (Claude Code), with the changes reviewed by a second agent before they were
+published. Commits say `AI-assisted (Claude Code)` where that applies. The original authors' code is theirs; the
+assistant did not write the ported changes, only moved them onto this base.
+
+### Licence
+
+GPL-3.0, as the project.
+
 ## Status (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
