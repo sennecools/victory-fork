@@ -888,7 +888,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            // Two title resources over one host texture: a copy onto itself,
+            // which D3D12 does not allow, and nothing to do.
+            if to == from || unlike(dst, src) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
