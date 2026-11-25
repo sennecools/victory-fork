@@ -1398,6 +1398,12 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        self.heap_buffers_in(list, crate::frame::current())
+    }
+
+    /// [`State::heap_buffers`] in frame `frame` (the current one; tests
+    /// name their own).
+    fn heap_buffers_in(&self, list: &HostList, frame: u64) -> Option<u64> {
         let heap = self
             .heaps
             .iter()
@@ -1419,8 +1425,25 @@ impl State {
         // Once per frame per host heap: avoids re-scanning 81,000 views on
         // every list while never starving a second view heap bound in the same
         // frame, and releases all cached `Arc<Shadow>` refs on `HostHeap::drop`.
-        let frame = crate::frame::current();
+        // Claimed before the lock (`claim_pass`): the other lists of the
+        // frame go on recording, and their submissions wait for the walk.
+        let walking = if heap_claim() {
+            let gate = host.walk_gate();
+            let walking = claim_pass(gate, frame, heap_wait_at_submit(), |mark| {
+                list.needs_walk(gate.clone(), mark);
+            });
+            if walking.is_none() {
+                return Some(gpu);
+            }
+            walking
+        } else {
+            None
+        };
         let started = std::time::Instant::now();
+        // Every list that gets here waits for the lock, the pass's own list
+        // too (`won`: it runs the pass).
+        let mut lock_wait =
+            crate::profile::span_args("heap pass lock wait", &[("heap", host.id())]);
         let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let entry = kept
             .get_or_insert_with(Default::default)
@@ -1430,7 +1453,12 @@ impl State {
                 passes: 0,
                 ranges: HeapRangeMap::new(),
             });
-        if entry.last_frame == frame {
+        let won = entry.last_frame != frame;
+        if let Some(wait) = lock_wait.as_mut() {
+            wait.arg("won", u64::from(won));
+        }
+        drop(lock_wait);
+        if !won {
             return Some(gpu);
         }
         entry.last_frame = frame;
@@ -1438,13 +1466,26 @@ impl State {
         let passes = &mut entry.passes;
         let ranges = &mut entry.ranges;
         let changed = host.buffer_changes();
-        let slots = if (*passes).is_multiple_of(16) {
+        let full = (*passes).is_multiple_of(16);
+        let slots = if full {
             ranges.clear();
             host.buffer_slots()
         } else {
             changed
         };
         *passes += 1;
+        // The walk's parts are timed in sums, not in a span each (some
+        // 60,000 slots a pass): the views `mirror` makes (`make_us`) and the
+        // copies looked up (`copy_us`).
+        let mut walk = crate::profile::span_args(
+            "heap walk",
+            &[("slots", slots.len() as u64), ("full", u64::from(full))],
+        );
+        let timed = walk.is_some();
+        if timed {
+            crate::profile::parts_begin();
+        }
+        let mut copy_ticks = 0;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1455,9 +1496,17 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            // Its copy and range are taken below from what this returns:
+            // it does not mark the slot for the next pass.
+            let Some(view) = host.mirror_walked(index, handle) else {
                 continue;
             };
+            #[cfg(test)]
+            WALK_HOOK.with_borrow_mut(|hook| {
+                if let Some(hook) = hook {
+                    hook();
+                }
+            });
             // Every 64 views while the device lives (a cheap query).
             if alive
                 && n % 64 == 63
@@ -1475,7 +1524,10 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let copy_began = if timed { crate::profile::stamp() } else { 0 };
+            let copy = crate::descriptor::host::buffer_copy(&view);
+            copy_ticks += crate::profile::elapsed(copy_began);
+            let Some((shadow, address, len)) = copy else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1484,7 +1536,19 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        if let Some(walk) = walk.as_mut() {
+            let (make_ticks, made) = crate::profile::parts_end();
+            walk.arg("made", made);
+            walk.arg("make_us", crate::profile::micros(make_ticks));
+            walk.arg("copy_us", crate::profile::micros(copy_ticks));
+        }
+        drop(walk);
+        // The walk has ended: its last `mirror` is behind it, and what is
+        // left of the pass writes no slot of the heap's buffer views. The
+        // lists that lost the claim may run (`Host::submit`).
+        drop(walking);
         let views = ranges.len() as u32;
+        let mut spanning = crate::profile::span_args("heap spans", &[("ranges", u64::from(views))]);
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1495,6 +1559,8 @@ impl State {
             span.2 = span.2.max(*to);
         }
         drop(kept);
+        // Its deferred steps are the pass's (the `run_deferred` span says so).
+        list.ran_heap_pass();
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -1528,6 +1594,11 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        if let Some(span) = spanning.as_mut() {
+            span.arg("copies", spans.len() as u64);
+            span.arg("mb", bytes >> 20);
+        }
+        drop(spanning);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1721,7 +1792,11 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        let _pass = crate::profile::span("heap texture pass");
+        // On the profile, which caller's pass it is: 1 for one made early
+        // or for a bake (`State::early_textures`, with a budget of its
+        // own), 0 for the heap buffer pass's.
+        let early = ("early", u64::from(PASS_BUDGET.get().is_some()));
+        let _pass = crate::profile::span_args("heap texture pass", &[early]);
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames. Under
@@ -1741,6 +1816,7 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
+        let mut queue = crate::profile::span_args("texture pass: queue", &[early]);
         let mut room = crate::resource::room();
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
@@ -1779,6 +1855,11 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
+        if let Some(queue) = queue.as_mut() {
+            queue.arg("queued", census[0]);
+            queue.arg("due", census[1]);
+        }
+        drop(queue);
         // The frames in about four seconds, between 16 and 256: how long a
         // slot with nothing to upload waits at most for its next look. In
         // frames alone it was 120: four minutes at the opening cutscene's
@@ -1823,10 +1904,21 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        let mut uploads = crate::profile::span_args("texture pass: uploads", &[early]);
+        // Slots looked at, uploaded, their bytes, and why the loop stopped:
+        // 0 at the queue's end, 1 out of time, 2 out of bytes, 3 too many
+        // refused for lack of room, 4 the device went.
+        let (mut looked, mut uploaded, mut uploaded_bytes, mut stop) = (0u64, 0u64, 0u64, 0u64);
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most {
+                stop = 2;
                 break;
             }
+            if began.elapsed() > span {
+                stop = 1;
+                break;
+            }
+            looked += 1;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -1929,9 +2021,11 @@ impl State {
                         // goes on, within a count that bounds one pass.
                         host.texture_slot_held(index, write, frame + most);
                         if refused > 1024 {
+                            stop = 3;
                             break;
                         }
                     } else if refused > 256 {
+                        stop = 3;
                         break;
                     }
                     continue;
@@ -1979,7 +2073,9 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return;
+                // (The loop is the pass's last part: the end of the pass.)
+                stop = 4;
+                break;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -2022,6 +2118,8 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            uploaded += 1;
+            uploaded_bytes += bytes;
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
@@ -2030,6 +2128,12 @@ impl State {
                 }
                 None => host.texture_slot_done(index, write, again),
             }
+        }
+        if let Some(uploads) = uploads.as_mut() {
+            uploads.arg("looked", looked);
+            uploads.arg("uploaded", uploaded);
+            uploads.arg("mb", uploaded_bytes >> 20);
+            uploads.arg("stop", stop);
         }
     }
 
@@ -3572,6 +3676,63 @@ struct HeapRanges {
 static HEAP_RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, HeapRanges>>> =
     std::sync::Mutex::new(None);
 
+/// Whether the heap buffer pass of a frame is claimed per heap before
+/// [`HEAP_RANGES`] is taken ([`claim_pass`]); `VICTORY_HEAP_CLAIM=0`: every
+/// list that binds a shader picking buffers from the heap takes the lock
+/// first, and waits there for the whole walk to learn that the frame's
+/// pass ran, as before.
+fn heap_claim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_CLAIM").is_none_or(|v| v != "0"))
+}
+
+/// Whether a list that lost the claim of the heap buffer pass
+/// ([`claim_pass`]) waits for the walk when it is submitted
+/// (`crate::host::wait_for_walks`). `VICTORY_HEAP_WAIT_AT_SUBMIT=0` does
+/// not take the wait away, it moves it: the list waits while it records,
+/// at the bind that lost, until the walk has ended (the lock had it wait
+/// there).
+fn heap_wait_at_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WAIT_AT_SUBMIT").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Called by the walk of the heap buffer pass on this thread after
+    /// each view it mirrors: a test parks the walk there.
+    static WALK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Claims the heap buffer pass of `frame` on `gate`'s heap, before any
+/// lock: the walk to run (`Some`; it counts as ended when dropped), or
+/// `None` for a list whose frame's pass is claimed already. Such a list
+/// returns at once instead of waiting for the walk's lock: with
+/// `at_submit`, the walk it lost to goes to `defer` (the list's, waited
+/// for when it is submitted); else it is waited for here, at its bind,
+/// as the lock had it wait, but not for the rest of the pass nor for
+/// other heaps' walks.
+fn claim_pass(
+    gate: &std::sync::Arc<crate::descriptor::host::WalkGate>,
+    frame: u64,
+    at_submit: bool,
+    defer: impl FnOnce(u64),
+) -> Option<crate::descriptor::host::Walking> {
+    match gate.claim(frame) {
+        Ok(walking) => Some(walking),
+        Err(mark) => {
+            if at_submit {
+                if !gate.walked(mark) {
+                    defer(mark);
+                }
+            } else {
+                gate.wait(mark, false);
+            }
+            None
+        }
+    }
+}
+
 /// Drops cached dynamic-buffer range state (and its held `Arc<Shadow>` refs)
 /// when a `HostHeap` is destroyed.
 pub(crate) fn forget_heap(id: u64) {
@@ -3659,6 +3820,197 @@ mod tests {
         let map = guard.as_ref().unwrap();
         assert!(!map.contains_key(&id_a));
         assert!(!map.contains_key(&id_b));
+    }
+
+    /// `claim_pass` alone, on gates with no heap and no list (the pass
+    /// itself is in `a_bind_that_loses_the_claim_returns_while_the_walk_runs`):
+    /// it takes no lock, so a second claim of the frame returns while
+    /// `HEAP_RANGES` is held, with the walk its submission is to wait for,
+    /// and a second heap's pass is claimed in the same frame. With
+    /// `VICTORY_HEAP_WAIT_AT_SUBMIT=0` the second claim waits at its bind
+    /// until the walk has ended, and not for the lock.
+    #[test]
+    fn a_second_claim_of_the_frame_does_not_wait_for_the_lock() {
+        use crate::descriptor::host::WalkGate;
+        use std::sync::atomic::AtomicBool;
+        let gate = std::sync::Arc::new(WalkGate::new(u64::MAX - 20));
+        let other = std::sync::Arc::new(WalkGate::new(u64::MAX - 21));
+        let frame = 7;
+        let first = |_: u64| panic!("the first claim of a frame waits for nothing");
+        let walking = claim_pass(&gate, frame, true, first);
+        assert!(walking.is_some());
+        let lock = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let (sent, got) = std::sync::mpsc::channel();
+        let second = &gate;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let mut needed = None;
+                let walk = claim_pass(second, frame, true, |mark| needed = Some(mark));
+                sent.send((walk.is_none(), needed)).unwrap();
+            });
+            let returned = got.recv_timeout(std::time::Duration::from_secs(5));
+            assert_eq!(
+                returned,
+                Ok((true, Some(frame + 1))),
+                "returned while the walk ran"
+            );
+        });
+        assert!(!gate.walked(frame + 1));
+        assert!(
+            claim_pass(&other, frame, true, first).is_some(),
+            "another heap"
+        );
+        // At its bind (`VICTORY_HEAP_WAIT_AT_SUBMIT=0`): until the walk ends.
+        let ended = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                let walk = claim_pass(&gate, frame, false, |_| panic!("waited for at the bind"));
+                (walk.is_none(), ended.load(Ordering::SeqCst))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            ended.store(true, Ordering::SeqCst);
+            drop(walking);
+            assert_eq!(
+                waiter.join().unwrap(),
+                (true, true),
+                "let go after the walk"
+            );
+        });
+        drop(lock);
+        assert!(gate.walked(frame + 1));
+        assert!(
+            claim_pass(&gate, frame + 1, true, first).is_some(),
+            "the next frame"
+        );
+    }
+
+    /// Through `State::heap_buffers`, on a view heap with one buffer view:
+    /// while one list's walk is held after it mirrored that view (it holds
+    /// `HEAP_RANGES`), a second list's bind in the same frame returns, and
+    /// that list is left with the one walk its submission waits for. The
+    /// walk counts as ended only once the held walk goes on, not before
+    /// its last mirror.
+    #[test]
+    fn a_bind_that_loses_the_claim_returns_while_the_walk_runs() {
+        use crate::descriptor::{HeapDesc, View, create_heap, heap};
+        use crate::object::{S_OK, This, guid, slot};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        if !heap_claim() || !heap_wait_at_submit() {
+            return; // the switches are set once for the process
+        }
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        // What newer titles pass: the description, then no memory of theirs.
+        #[repr(C)]
+        struct Extended(HeapDesc, [u64; 2]);
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let extended = Extended(desc, [0; 2]);
+        let mut h: This = std::ptr::null();
+        assert_eq!(
+            create_heap(std::ptr::null(), &extended.0, &iid, &mut h),
+            S_OK
+        );
+        let views = heap(h).host().expect("host view heap");
+        // A title buffer in memory of its own and a view of 64 of its
+        // elements in slot 1, left for the walk (as in the host heap's
+        // `a_slot_the_pass_makes_is_not_walked_again`).
+        const SIZE: usize = 1 << 16;
+        // SAFETY: new memory, left to the process.
+        let memory = unsafe {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(memory, 0);
+        crate::shadow::register(memory, memory as u64, SIZE as u64);
+        let mut view = [0u32; 16];
+        view[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 64, 12, 0, 0]);
+        (view[10], view[11]) = (memory as u32, (memory as u64 >> 32) as u32);
+        let view = View::Placed(
+            false,
+            [1, 0, 0, 0, SIZE as u32, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+            view,
+        );
+        crate::descriptor::record(heap(h).handle(1).unwrap(), view);
+        assert!(!views.made(1), "left for the walk");
+        assert_eq!(views.buffer_slots(), [1]);
+        let gate = views.walk_gate().clone();
+        let (frame, mark) = (7, 8);
+        // Each thread makes its own list (a list stays on its thread) and
+        // binds the heap; `at` is the title heap's address.
+        let at = h as usize;
+        let bind = move |list: &HostList| {
+            let mut state = State::default();
+            state.heaps[0] = at;
+            state.heap_buffers_in(list, frame).is_some()
+        };
+        let (parked, is_parked) = channel();
+        let (go_on, gone_on) = channel::<()>();
+        let (returned, has_returned) = channel();
+        let wait = Duration::from_secs(30);
+        std::thread::scope(|s| {
+            // (Dropped with this closure if a check below fails.)
+            let go_on = go_on;
+            let walker = s.spawn(move || {
+                // Held until the test says so, or has failed.
+                WALK_HOOK.set(Some(Box::new(move || {
+                    parked.send(()).unwrap();
+                    let _ = gone_on.recv_timeout(wait);
+                })));
+                let list = host.new_list().unwrap();
+                let bound = bind(&list);
+                WALK_HOOK.set(None);
+                (bound, list.walks_needed().len())
+            });
+            is_parked
+                .recv_timeout(wait)
+                .expect("the walk mirrors the view");
+            assert!(!gate.walked(mark), "held after a mirror: not ended");
+            s.spawn(move || {
+                let list = host.new_list().unwrap();
+                let bound = bind(&list);
+                returned.send((bound, list.walks_needed())).unwrap();
+            });
+            let (bound, walks) = has_returned
+                .recv_timeout(wait)
+                .expect("returned while the walk was held");
+            assert!(bound);
+            assert_eq!(walks.len(), 1, "the walk its submission waits for");
+            assert!(std::sync::Arc::ptr_eq(&walks[0].0, &gate));
+            assert_eq!(walks[0].1, mark);
+            assert!(!gate.walked(mark), "the walk is still held");
+            go_on.send(()).unwrap();
+            assert_eq!(
+                walker.join().unwrap(),
+                (true, 0),
+                "the list that walks waits for none"
+            );
+        });
+        assert!(gate.walked(mark));
+        assert!(views.made(1), "made by the walk");
+        // The title releases its heap, and with it the pass's ranges.
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::shadow::unregister(memory, memory as u64);
     }
 
     #[test]

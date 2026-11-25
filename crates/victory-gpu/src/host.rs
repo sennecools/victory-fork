@@ -2059,6 +2059,30 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Whether the list ran the heap buffer pass (`State::heap_buffers`):
+    /// most of its steps are that pass's.
+    heap_pass: bool,
+    /// The walks of heap buffer passes the list's binds lost the claim to,
+    /// by heap and claim ([`HostList::needs_walk`]).
+    walks: Vec<(std::sync::Arc<crate::descriptor::host::WalkGate>, u64)>,
+}
+
+/// What a list's submission-time steps asked for and did
+/// ([`HostList::run_deferred`]), for the profiler's `run_deferred` span.
+#[derive(Default)]
+struct DeferredRun {
+    /// Refreshes of host copies asked for.
+    refreshes: u64,
+    /// The bytes of those refreshes.
+    asked: u64,
+    /// Texture staging buffers checked.
+    textures: u64,
+    /// Bytes copied while the steps ran: the title copies and fills, and
+    /// the refreshes a step made the batch do first (those only while the
+    /// profiler records, [`BatchDone::copied`]).
+    copied: u64,
+    /// Whether the list ran the heap buffer pass.
+    heap_pass: bool,
 }
 
 impl Deferred {
@@ -2744,6 +2768,67 @@ pub(crate) fn settle_now(why: usize) {
     };
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
     host.settle(&mut submitted, why);
+}
+
+/// Waits, before `runs` are submitted, for the walks of the heap buffer
+/// passes their binds lost the claim to (`State::heap_buffers` in
+/// `crate::draw`, [`HostList::needs_walk`]).
+///
+/// Which submissions wait: those holding a list that bound a shader
+/// picking buffers from a view heap after another list had claimed that
+/// heap's pass, each for the walk of the newest claim at its bind. The
+/// list that claims walks while it records, so it is closed after its
+/// walk; a list that binds such a shader in a frame before anyone claimed
+/// the frame's pass is the one that claims. So no list whose first bind
+/// of such a shader falls in a frame whose pass is claimed reaches the
+/// card before that walk has ended, or a newer one, which began after
+/// the bind and walks whatever the older one had still to walk: what the
+/// walk's lock gave at record time, kept at submit time. A walk counts as
+/// ended after its last `mirror` (`Walking`), not at the end of its pass.
+///
+/// What a shader may read in a slot the walk has not reached does not
+/// rest on this wait but on [`crate::descriptor::host::HostHeap::mirror`],
+/// the only writer of a slot and its word. Every mirror of a slot writes
+/// word 0 before it rewrites the descriptor and a non-zero word only once
+/// the descriptor is a buffer view, made or a null view of its kind
+/// (`write_word`). Such a slot is one of: made before from the record it
+/// holds (its view and its word); written by the title since with a
+/// buffer view, which is left for the walk (a null buffer view and the
+/// view's word: it reads zeros); written with a texture view (made, or the
+/// old view of the same placed texture, word 0); or empty (a null view,
+/// word 0). The walk turns the second kind into the first, through
+/// `mirror`. This wait keeps the frame's lists reading the views the walk
+/// made rather than zeros, as the lock did. A list that does not wait (it
+/// picks from no heap, or its first such bind was in an earlier frame) may
+/// run while a walk rewrites slots, as it could with the lock, which never
+/// held back lists past their bind: `write_word` covers that up to the
+/// window it names.
+///
+/// Lock order: this runs before `Host::submitted` and every other lock of
+/// the submission is taken, so the waiting thread holds none a walk may
+/// wait for. The one exception is `crate::queue::release_held`, which
+/// submits holding a queue's `held` lock and `RELEASING`: a walk takes
+/// neither (it takes `HEAP_RANGES`, the heap's `made`, `kept`, `changed`,
+/// `buffers`, `textures` and `placed` locks, the views' and the host
+/// copies' maps). No walk submits, so none waits here. A claimed walk ends
+/// however its pass leaves (its `Walking` is dropped), and between its
+/// claim and its end it waits only for `HEAP_RANGES`, which every holder
+/// gives back after its own walk, and for those locks, whose holders do
+/// not wait here while they hold them (`sync_heaps` takes `made` after
+/// this wait). Only a walk whose thread is gone without unwinding never
+/// ends: the wait gives up after a time
+/// ([`crate::descriptor::host::WalkGate::wait`]), with a line in the log,
+/// and the submission goes on with what the slots hold (above), so
+/// nothing that needs the locks of `release_held` waits for ever.
+fn wait_for_walks(runs: &[&HostList]) {
+    for list in runs {
+        // (A list submitted twice waits once: the second finds it ended.)
+        let walks = list.deferred().walks.clone();
+        for (gate, mark) in walks {
+            // Ended or given up: the submission goes on either way.
+            let _ = gate.wait(mark, true);
+        }
+    }
 }
 
 /// [`settle_now`] at a present, and for a fence the title blocks on.
@@ -4863,12 +4948,24 @@ impl Host {
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
     /// still held.
-    fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
-        #[cfg(feature = "diagnostics")]
-        let called = std::time::Instant::now();
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        late: bool,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
-        let _submit = crate::profile::span_args("submit", &[("lists", runs.len() as u64), ("late", u64::from(late))]);
+        let _submit = crate::profile::span_args(
+            "submit",
+            &[("lists", runs.len() as u64), ("late", u64::from(late))],
+        );
+        // Lists whose binds lost the heap buffer pass's claim: not before
+        // its walk has ended, and before the submission lock.
+        wait_for_walks(runs);
+        // Taken after that wait: the figure `lock` below is the wait for the
+        // submission lock and what comes before preparing, not for a walk.
+        #[cfg(feature = "diagnostics")]
+        let called = std::time::Instant::now();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let lock_wait = crate::profile::span("submission lock wait");
@@ -4968,8 +5065,16 @@ impl Host {
             settled += settling.elapsed();
         }
         for list in runs {
-            let deferred = crate::profile::span_args("run_deferred", &[("list", u64::from(list.id))]);
-            list.run_deferred(&mut batch);
+            let mut deferred =
+                crate::profile::span_args("run_deferred", &[("list", u64::from(list.id))]);
+            let run = list.run_deferred(&mut batch);
+            if let Some(deferred) = deferred.as_mut() {
+                deferred.arg("refreshes", run.refreshes);
+                deferred.arg("textures", run.textures);
+                deferred.arg("mb_asked", run.asked >> 20);
+                deferred.arg("mb_copied", run.copied >> 20);
+                deferred.arg("heap_pass", u64::from(run.heap_pass));
+            }
             drop(deferred);
             list.sent_ops();
             firsts.push(lists.len());
@@ -4978,8 +5083,18 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        let flush = crate::profile::span("batch flush");
+        let mut flush = crate::profile::span("batch flush");
+        let before = batch.done;
         batch.flush();
+        if let Some(flush) = flush.as_mut() {
+            // The flush's own refreshes; `textures`: the staging buffers the
+            // submission's lists checked.
+            let done = batch.done;
+            flush.arg("refreshes", done.refreshes - before.refreshes);
+            flush.arg("textures", done.textures);
+            flush.arg("mb_asked", (done.asked - before.asked) >> 20);
+            flush.arg("mb_copied", (done.copied - before.copied) >> 20);
+        }
         drop(flush);
         crate::watch::ask_once_end();
         // Where the title's lists (with their preludes) end in `lists`.
@@ -6265,6 +6380,33 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// The list ran the heap buffer pass: its submission-time steps are
+    /// mostly that pass's (the profiler's `run_deferred` span says so).
+    pub(crate) fn ran_heap_pass(&self) {
+        self.deferred().heap_pass = true;
+    }
+
+    /// A shader of the list picks buffers from the view heap of `gate`,
+    /// whose pass for the frame another list claimed (claim `mark`): the
+    /// list is not submitted before that walk has ended
+    /// ([`wait_for_walks`]).
+    pub(crate) fn needs_walk(
+        &self,
+        gate: std::sync::Arc<crate::descriptor::host::WalkGate>,
+        mark: u64,
+    ) {
+        self.deferred().walks.push((gate, mark));
+    }
+
+    /// The walks the list's submission waits for ([`HostList::needs_walk`];
+    /// tests).
+    #[cfg(test)]
+    pub(crate) fn walks_needed(
+        &self,
+    ) -> Vec<(std::sync::Arc<crate::descriptor::host::WalkGate>, u64)> {
+        self.deferred().walks.clone()
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -6286,10 +6428,16 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch) -> DeferredRun {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        let mut run = DeferredRun {
+            heap_pass: deferred.heap_pass,
+            ..DeferredRun::default()
+        };
+        let batch_copied = batch.done.copied;
+        for step in &deferred.copies {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -6319,6 +6467,8 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
+                    run.refreshes += 1;
+                    run.asked += *len as u64;
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -6361,14 +6511,18 @@ impl HostList {
                         staging.note_upload();
                     }
                     if batch.texture_due(staging) {
+                        run.textures += 1;
                         staging.refresh();
                     }
                     continue;
                 }
             };
+            run.copied += copied as u64;
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        run.copied += batch.done.copied - batch_copied;
+        run
     }
 }
 
@@ -6407,6 +6561,24 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// What the batch has refreshed so far, for the profiler's spans.
+    done: BatchDone,
+}
+
+/// What a submission's [`Batch`] has done so far, for the profiler's
+/// spans. The bytes are summed only while the profiler records: with it
+/// off they would be a pass over every copy's ranges at every flush, for
+/// no reader.
+#[derive(Default, Clone, Copy)]
+struct BatchDone {
+    /// Host copies brought up to date (one per copy and flush).
+    refreshes: u64,
+    /// The bytes of their merged ranges (while the profiler records).
+    asked: u64,
+    /// The bytes copied into them (while the profiler records).
+    copied: u64,
+    /// Texture staging buffers checked.
+    textures: u64,
 }
 
 type ShadowRefresh = (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges);
@@ -6478,11 +6650,27 @@ impl Batch {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
         ranges.merge();
-        Self::update(&shadow, &ranges);
+        self.done.refreshes += 1;
+        let copied = Self::update(&shadow, &ranges);
+        if crate::profile::on() {
+            self.done.asked += Self::bytes(&ranges);
+            self.done.copied += copied;
+        }
     }
 
-    /// Brings each requested range of a copy up to date, timed.
-    fn update(shadow: &crate::shadow::Shadow, ranges: &RefreshRanges) {
+    /// The bytes of a copy's merged ranges.
+    fn bytes(ranges: &RefreshRanges) -> u64 {
+        ranges
+            .as_slice()
+            .iter()
+            .map(|&(from, to)| (to - from) as u64)
+            .sum()
+    }
+
+    /// Brings each requested range of a copy up to date, timed; the bytes
+    /// copied.
+    fn update(shadow: &crate::shadow::Shadow, ranges: &RefreshRanges) -> u64 {
+        let mut all = 0;
         for &(from, to) in ranges.as_slice() {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
@@ -6491,13 +6679,19 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            all += copied as u64;
         }
+        all
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        let due = self
+            .textures
+            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize);
+        self.done.textures += u64::from(due);
+        due
     }
 
     /// Before a step that writes title memory: pending refreshes are done
@@ -6526,23 +6720,50 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        self.done.refreshes += self.refreshes.len() as u64;
+        // The bytes, for the profiler's spans only ([`BatchDone`]).
+        let profiling = crate::profile::on();
+        if profiling {
+            self.done.asked += self
+                .refreshes
+                .iter()
+                .map(|(_, ranges)| Self::bytes(ranges))
+                .sum::<u64>();
+        }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
+            // The bytes copied, summed across the threads.
+            let copied =
+                profiling.then(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, ranges)| Box::new(move || Self::update(&shadow, &ranges)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, ranges)| {
+                    let copied = copied.clone();
+                    Box::new(move || {
+                        let bytes = Self::update(&shadow, &ranges);
+                        if let Some(copied) = copied {
+                            copied.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
+            if let Some(copied) = copied {
+                self.done.copied += copied.load(Ordering::Relaxed);
+            }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
             for (shadow, ranges) in self.refreshes.drain(..) {
-                Self::update(&shadow, &ranges);
+                let copied = Self::update(&shadow, &ranges);
+                if profiling {
+                    self.done.copied += copied;
+                }
             }
         }
         if ahead {
@@ -8595,5 +8816,44 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             }
             assert!(errors.is_empty(), "D3D12 debug errors: {errors:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod walk_wait {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A list whose bind lost the claim of a heap buffer pass is not
+    /// submitted before that walk has ended; a list that lost none is
+    /// submitted at once.
+    #[test]
+    fn a_submission_does_not_pass_a_walk_in_progress() {
+        let Some(host) = super::host() else {
+            return; // no host GPU
+        };
+        let gate = std::sync::Arc::new(crate::descriptor::host::WalkGate::new(u64::MAX - 30));
+        let Ok(walking) = gate.claim(3) else {
+            panic!("the first claim of a frame runs the pass");
+        };
+        let Err(mark) = gate.claim(3) else {
+            panic!("the second claim of the frame loses");
+        };
+        let free = host.new_list().unwrap();
+        free.close();
+        host.execute(&[&free]);
+        let list = host.new_list().unwrap();
+        list.needs_walk(gate.clone(), mark);
+        list.close();
+        let ended = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                ended.store(true, Ordering::SeqCst);
+                drop(walking);
+            });
+            host.execute(&[&list]);
+            assert!(ended.load(Ordering::SeqCst), "submitted while the walk ran");
+        });
+        assert!(gate.walked(mark));
     }
 }

@@ -861,7 +861,9 @@ pub(crate) fn make_waiting() {
     }
 }
 
-fn record(handle: u64, view: View) {
+/// Writes the record of `view` into the descriptor slot at `handle`, and
+/// mirrors it if the slot is in a shader-visible heap.
+pub(crate) fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }

@@ -190,8 +190,11 @@ pub(crate) enum Track {
     List(u32),
 }
 
-/// Arguments an event carries: up to three named numbers.
-type Args = [(&'static str, u64); 3];
+/// The most named numbers an event carries.
+const MOST_ARGS: usize = 6;
+
+/// Arguments an event carries: up to [`MOST_ARGS`] named numbers.
+type Args = [(&'static str, u64); MOST_ARGS];
 
 /// One span, in [`now`] ticks.
 #[derive(Clone, Copy, Debug)]
@@ -217,10 +220,10 @@ impl Event {
             start,
             end,
             track,
-            args: [("", 0); 3],
+            args: [("", 0); MOST_ARGS],
             args_len: 0,
         };
-        for &(key, value) in args.iter().take(3) {
+        for &(key, value) in args.iter().take(MOST_ARGS) {
             event.args[usize::from(event.args_len)] = (key, value);
             event.args_len += 1;
         }
@@ -310,7 +313,7 @@ pub(crate) struct Span {
 }
 
 impl Span {
-    /// Adds a named number (three at most).
+    /// Adds a named number ([`MOST_ARGS`] at most).
     pub(crate) fn arg(&mut self, key: &'static str, value: u64) {
         if usize::from(self.args_len) < self.args.len() {
             self.args[usize::from(self.args_len)] = (key, value);
@@ -341,7 +344,7 @@ pub(crate) fn span(name: &'static str) -> Option<Span> {
     span_args(name, &[])
 }
 
-/// [`span`] with named numbers (three at most).
+/// [`span`] with named numbers ([`MOST_ARGS`] at most).
 #[inline]
 pub(crate) fn span_args(name: &'static str, args: &[(&'static str, u64)]) -> Option<Span> {
     if !on() {
@@ -350,7 +353,7 @@ pub(crate) fn span_args(name: &'static str, args: &[(&'static str, u64)]) -> Opt
     let mut span = Span {
         name,
         start: now(),
-        args: [("", 0); 3],
+        args: [("", 0); MOST_ARGS],
         args_len: 0,
     };
     for &(key, value) in args {
@@ -364,6 +367,90 @@ pub(crate) fn span_args(name: &'static str, args: &[(&'static str, u64)]) -> Opt
 #[inline]
 pub(crate) fn stamp() -> u64 {
     if on() { now() } else { 0 }
+}
+
+/// Ticks from `start` ([`stamp`]) until now; 0 for a `start` of 0, with no
+/// look at the clock.
+#[inline]
+pub(crate) fn elapsed(start: u64) -> u64 {
+    if start == 0 {
+        0
+    } else {
+        now().saturating_sub(start)
+    }
+}
+
+/// `ticks` of the clock ([`stamp`], [`elapsed`]) in whole microseconds.
+pub(crate) fn micros(ticks: u64) -> u64 {
+    (u128::from(ticks) * 1_000_000 / u128::from(frequency())) as u64
+}
+
+/// Records a span named `name` of the calling thread from `start`
+/// ([`stamp`]; 0: nothing) until now, if it lasted `least_us` microseconds
+/// or more: a wait timed only when it happens, kept only when it is long.
+#[inline]
+pub(crate) fn since(name: &'static str, start: u64, least_us: u64, args: &[(&'static str, u64)]) {
+    if start == 0 || STATE.load(Ordering::Relaxed) != ON {
+        return;
+    }
+    let end = now();
+    if micros(end.saturating_sub(start)) >= least_us {
+        push(Event::new(name, start, end, Track::Thread, args));
+    }
+}
+
+thread_local! {
+    /// The ticks and the count of the parts timed on this thread
+    /// ([`part_start`], [`part_end`]) since a span began to sum them
+    /// ([`parts_begin`]); `None` while no span sums them.
+    static PARTS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// A span of the calling thread begins to sum the time of parts timed
+/// deeper down (a call made many times inside it, too short and too many
+/// for a span each). The caller holds a recording span.
+pub(crate) fn parts_begin() {
+    let _ = PARTS.try_with(|parts| parts.set(Some((0, 0))));
+}
+
+/// The ticks and the count of the parts timed since [`parts_begin`]; they
+/// are no longer summed after it.
+pub(crate) fn parts_end() -> (u64, u64) {
+    PARTS
+        .try_with(std::cell::Cell::take)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// The start of a part ([`part_end`]): 0, with no look at the clock,
+/// unless recording and a span of this thread sums the parts.
+#[inline]
+pub(crate) fn part_start() -> u64 {
+    if on()
+        && PARTS
+            .try_with(|parts| parts.get().is_some())
+            .unwrap_or(false)
+    {
+        now()
+    } else {
+        0
+    }
+}
+
+/// The part begun at `start` ([`part_start`]) ends: its time is added to
+/// the sum of the span that sums them.
+#[inline]
+pub(crate) fn part_end(start: u64) {
+    if start == 0 {
+        return;
+    }
+    let ticks = elapsed(start);
+    let _ = PARTS.try_with(|parts| {
+        if let Some((sum, count)) = parts.get() {
+            parts.set(Some((sum + ticks, count + 1)));
+        }
+    });
 }
 
 /// Records the recording of title list `list` from `start` ([`stamp`]; 0:
@@ -1168,6 +1255,72 @@ mod tests {
         assert!(span("nothing").is_none());
         assert_eq!(stamp(), 0);
         list_recorded(1, 0);
+        assert_eq!(elapsed(0), 0);
+        since("nothing", 0, 0, &[]);
+        // No part is timed, summed or not.
+        assert_eq!(part_start(), 0);
+        parts_begin();
+        assert_eq!(part_start(), 0);
+        part_end(0);
+        assert_eq!(parts_end(), (0, 0));
+        assert_eq!(parts_end(), (0, 0));
+    }
+
+    /// The parts timed on a thread are summed and counted from
+    /// `parts_begin` to `parts_end`, which takes the sum: nothing is kept
+    /// after it, nor with no span to sum them.
+    #[test]
+    fn parts_are_summed_from_begin_to_end() {
+        // (Their starts from the clock itself: `part_start` gives one only
+        // while recording.)
+        assert!(elapsed(now()) < frequency(), "under a second");
+        parts_begin();
+        let first = now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        part_end(first);
+        part_end(now());
+        // One not timed (start 0) is not counted.
+        part_end(0);
+        let (ticks, count) = parts_end();
+        assert_eq!(count, 2);
+        assert!(micros(ticks) >= 2_000, "{ticks} ticks");
+        assert_eq!(parts_end(), (0, 0), "taken by the first end");
+        part_end(now());
+        assert_eq!(parts_end(), (0, 0), "no span sums the parts");
+        // A second span starts from nothing.
+        parts_begin();
+        part_end(now());
+        assert_eq!(parts_end().1, 1);
+    }
+
+    #[test]
+    fn micros_are_whole_microseconds_of_the_clock() {
+        assert_eq!(micros(frequency()), 1_000_000);
+        assert_eq!(micros(3 * frequency()), 3_000_000);
+        assert_eq!(micros(0), 0);
+    }
+
+    #[test]
+    fn an_event_keeps_six_args_and_drops_the_rest() {
+        let args = [
+            ("a", 1),
+            ("b", 2),
+            ("c", 3),
+            ("d", 4),
+            ("e", 5),
+            ("f", 6),
+            ("g", 7),
+        ];
+        let event = Event::new("walk", 1, 2, Track::Thread, &args);
+        assert_eq!(usize::from(event.args_len), MOST_ARGS);
+        assert_eq!(event.args[..], args[..MOST_ARGS]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.json");
+        let mut writer = Writer::create(&path, 0, 1_000_000).unwrap();
+        writer.write(&[(3, "thread 3", vec![event])]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(valid(&text), Ok(()), "{text}");
+        assert!(text.contains("\"args\":{\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6}}"));
     }
 
     /// On the software adapter: stamps around two parts of a submission come

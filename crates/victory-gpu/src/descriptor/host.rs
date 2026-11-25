@@ -93,6 +93,173 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The heap buffer pass's claim and walk ([`WalkGate`]).
+    walk: std::sync::Arc<WalkGate>,
+}
+
+/// The heap buffer pass of one view heap (`State::heap_buffers` in
+/// `crate::draw`): the frame whose pass was claimed last, and the frames
+/// whose walk over the heap's buffer views has ended. The walk gives the
+/// buffer views the title wrote their host slots; until it reaches one,
+/// such a slot holds a null view of its kind and its word
+/// ([`HostHeap::mirror`]), and a shader that picks it reads zeros. A list
+/// whose shader picks buffers from the heap after another list claimed
+/// the pass is not run before the walk it lost to has ended
+/// ([`WalkGate::wait`]), as when every such list waited for the walk's
+/// lock while it recorded.
+pub(crate) struct WalkGate {
+    /// The heap's id ([`HostHeap::id`]), for the profiler.
+    heap: u64,
+    /// The last frame whose pass was claimed, plus one (0: none).
+    claimed: std::sync::atomic::AtomicU64,
+    /// The highest claim (a frame plus one) whose walk has ended. Walks
+    /// run one at a time and end under the lock they run under
+    /// (`HEAP_RANGES` in `crate::draw`). So when a newer claim's walk ends
+    /// before an older one's (two claims a frame apart), the older has not
+    /// begun. A list that lost to the older claim bound before the newer
+    /// walk began: it found the older claim to be the last. The newer walk
+    /// took every slot changed until then, so its end lets that list go
+    /// too, as the lock let it go after whichever walk held it.
+    walked: Mutex<u64>,
+    /// Told when `walked` moves.
+    ended: std::sync::Condvar,
+}
+
+/// A claimed walk ([`WalkGate::claim`]): it counts as ended when this is
+/// dropped, whatever way the pass leaves.
+pub(crate) struct Walking {
+    gate: std::sync::Arc<WalkGate>,
+    mark: u64,
+}
+
+impl Drop for Walking {
+    fn drop(&mut self) {
+        self.gate.end(self.mark);
+    }
+}
+
+impl WalkGate {
+    pub(crate) fn new(heap: u64) -> Self {
+        WalkGate {
+            heap,
+            claimed: std::sync::atomic::AtomicU64::new(0),
+            walked: Mutex::new(0),
+            ended: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Claims the pass of `frame` without a lock: `Ok` for the one caller
+    /// that runs it, `Err` with the claim it lost to for every other
+    /// (the newest one, at least `frame` plus one). A caller that read an
+    /// older frame than the last claim loses to that claim.
+    pub(crate) fn claim(self: &std::sync::Arc<Self>, frame: u64) -> Result<Walking, u64> {
+        let mark = frame.saturating_add(1);
+        let last = self
+            .claimed
+            .fetch_max(mark, std::sync::atomic::Ordering::AcqRel);
+        if last < mark {
+            Ok(Walking {
+                gate: self.clone(),
+                mark,
+            })
+        } else {
+            Err(last)
+        }
+    }
+
+    /// Whether the walk of claim `mark` ([`WalkGate::claim`]) has ended.
+    pub(crate) fn walked(&self, mark: u64) -> bool {
+        *self.walked.lock().unwrap_or_else(|e| e.into_inner()) >= mark
+    }
+
+    /// How long a wait for a walk ([`WalkGate::wait`]) lasts before it is
+    /// told in the log, and before a submission goes on without the walk.
+    /// (The longest walk measured took under a second.)
+    const LONG: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Waits until the walk of claim `mark` has ended, and says whether it
+    /// has; a span on the profile when it had not ended at the call
+    /// (`at_submit`: the wait is the submission's, not the recording
+    /// list's). The waiting thread holds no lock a walk takes (see
+    /// `crate::host::wait_for_walks`).
+    ///
+    /// A wait of [`WalkGate::LONG`] is told once in the log. A submission
+    /// then goes on without the walk (`false`): it may hold locks that
+    /// every other submission, fence signal and present needs
+    /// (`crate::queue::release_held`), and a walking thread that is gone
+    /// without unwinding never ends its walk. The slots that walk had not
+    /// reached then read zeros, which [`HostHeap::mirror`] keeps safe. A
+    /// recording list waits on, as it did for the walk's lock.
+    pub(crate) fn wait(&self, mark: u64, at_submit: bool) -> bool {
+        self.wait_within(mark, at_submit, Self::LONG)
+    }
+
+    /// [`WalkGate::wait`], with `long` for [`WalkGate::LONG`].
+    fn wait_within(&self, mark: u64, at_submit: bool, long: std::time::Duration) -> bool {
+        let mut walked = self.walked.lock().unwrap_or_else(|e| e.into_inner());
+        if *walked >= mark {
+            return true;
+        }
+        let _wait = crate::profile::span_args(
+            "heap walk wait",
+            &[
+                ("heap", self.heap),
+                ("frame", mark - 1),
+                ("submit", u64::from(at_submit)),
+            ],
+        );
+        let started = std::time::Instant::now();
+        let step = long.min(std::time::Duration::from_secs(1));
+        let mut told = false;
+        loop {
+            if *walked >= mark {
+                // (The span is written without the lock the walk's end takes.)
+                drop(walked);
+                return true;
+            }
+            if !told && started.elapsed() >= long {
+                told = true;
+                // Told without that lock too.
+                drop(walked);
+                tracing::warn!(
+                    heap = self.heap,
+                    frame = mark - 1,
+                    at_submit,
+                    ms = long.as_millis() as u64,
+                    "the walk of the heap buffer pass has not ended: a submission goes on without it, a recording list waits on"
+                );
+                if at_submit {
+                    return false;
+                }
+                walked = self.walked.lock().unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+            walked = self
+                .ended
+                .wait_timeout(walked, step)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// The walk of claim `mark` has ended. Called after the walk's last
+    /// [`HostHeap::mirror`], so a waiter that sees `walked` move also sees
+    /// every slot and word the walk wrote (the lock orders them).
+    fn end(&self, mark: u64) {
+        let mut walked = self.walked.lock().unwrap_or_else(|e| e.into_inner());
+        *walked = (*walked).max(mark);
+        drop(walked);
+        self.ended.notify_all();
+    }
+}
+
+/// Whether the heap buffer pass walks a slot it makes once: the walk
+/// leaves the slot out of the next pass's set
+/// ([`HostHeap::mirror_walked`]). `VICTORY_HEAP_WALK_ONCE=0`: the walk
+/// marks the slot changed and the next pass walks it again, as before.
+fn walk_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WALK_ONCE").is_none_or(|v| v != "0"))
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1053,8 +1220,9 @@ impl HostHeap {
             })
             .flatten();
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let h = HostHeap {
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id,
             heap,
             cpu,
             step,
@@ -1084,6 +1252,7 @@ impl HostHeap {
                 }
                 spans
             },
+            walk: std::sync::Arc::new(WalkGate::new(id)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1222,6 +1391,11 @@ impl HostHeap {
     /// caches without pointer-reuse aliasing.
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The heap buffer pass's claim and walk.
+    pub(crate) fn walk_gate(&self) -> &std::sync::Arc<WalkGate> {
+        &self.walk
     }
 
     /// `n` consecutive free dynamic slots (view heaps only), taken until
@@ -1864,11 +2038,12 @@ impl HostHeap {
     /// buffers from the heap: whether it is a buffer view at all (the
     /// caller writes the table of strides, [`HostHeap::write_word`]).
     /// `seen`: the slot was not written now, a draw or a pass made its
-    /// host slot from what it held.
+    /// host slot from what it held. `mark`: a slot that is or was a buffer
+    /// view goes into the set of changes ([`HostHeap::mirror_walked`]).
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
-    fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+    fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool, mark: bool) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
@@ -1939,7 +2114,7 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        if was && mark {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2200,6 +2375,25 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_marking(index, handle, for_draw, true)
+    }
+
+    /// [`HostHeap::mirror`] for a draw, by the walk of the heap buffer
+    /// pass, which takes the slot's copy and range from the view this
+    /// returns at once: the slot is not marked changed for the next pass
+    /// ([`HostHeap::buffer_changes`]) by what this makes or empties. That
+    /// mark had every slot the walk made walked again by the next pass,
+    /// only to find the same copy. A write after this one marks the slot
+    /// itself: the title's writes and copies, and the draws and the
+    /// texture pass that make a slot from a record no write told us of.
+    /// `VICTORY_HEAP_WALK_ONCE=0`: marked, as before.
+    pub(crate) fn mirror_walked(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_marking(index, handle, true, !walk_once())
+    }
+
+    /// [`HostHeap::mirror`]; `mark`: a slot that is or was a buffer view
+    /// goes into the set the next heap buffer pass walks.
+    fn mirror_marking(&self, index: u32, handle: u64, for_draw: bool, mark: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2218,7 +2412,19 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // Timed only when another thread holds it, and on the profile only
+        // when the wait is long (the walk of the heap buffer pass and
+        // `sync_heaps` before a submission both mirror many slots).
+        let mut made = match self.made.try_lock() {
+            Ok(made) => made,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let waited = crate::profile::stamp();
+                let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                crate::profile::since("made lock wait", waited, 50, &[("heap", self.id)]);
+                made
+            }
+        };
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -2227,11 +2433,11 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.write_word(index, 0);
                 self.make_null(index);
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer(index, None, false, mark);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
                 self.write_word(index, 0);
-                let _ = self.note_buffer(index, None, false);
+                let _ = self.note_buffer(index, None, false, mark);
             }
             return None;
         };
@@ -2241,7 +2447,7 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
+            for stale in self.note_buffer(index, Some(&view), for_draw, mark) {
                 if stale != index {
                     self.unmake(&mut made, stale);
                 }
@@ -2276,7 +2482,11 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                // Summed for the walk of the heap buffer pass (`make_us`).
+                let making = crate::profile::part_start();
+                let kept = make(&view, self.cpu(index));
+                crate::profile::part_end(making);
+                kept
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -3824,7 +4034,7 @@ mod tests {
         super::super::record(handle(1).unwrap(), view(64, at));
         super::super::record(handle(2).unwrap(), view(64, at + 0x8_0000));
         // A newer, wider texture in the second one's memory.
-        host.note_buffer(5, Some(&view(128, at + 0x8_0000)), false);
+        host.note_buffer(5, Some(&view(128, at + 0x8_0000)), false, true);
         let queued = || -> Vec<u32> {
             host.texture_slots_due(u64::MAX, 8)
                 .0
@@ -3899,6 +4109,168 @@ mod tests {
         assert_eq!(heap.word(1), Some(SLOT_CONSTANT), "emptied, not yet seen");
         heap.mirror(1, at, true);
         assert_eq!(heap.word(1), Some(0), "emptied");
+    }
+
+    /// The heap buffer pass is claimed once a frame: every other caller
+    /// of the frame loses to that claim, and one that read an older frame
+    /// loses to the newest. A newer walk that ends lets go the lists that
+    /// lost to an older claim too (it began after their binds), and the
+    /// older walk's end takes nothing back.
+    #[test]
+    fn the_heap_buffer_pass_is_claimed_once_a_frame() {
+        let gate = std::sync::Arc::new(WalkGate::new(u64::MAX - 10));
+        let first = gate.claim(5).expect("the first claim of frame 5");
+        assert_eq!(gate.claim(5).err(), Some(6), "the frame's second caller");
+        assert!(!gate.walked(6));
+        let second = gate.claim(6).expect("the first claim of frame 6");
+        assert_eq!(gate.claim(5).err(), Some(7), "a caller that read frame 5");
+        assert_eq!(gate.claim(6).err(), Some(7));
+        assert!(!gate.walked(6) && !gate.walked(7));
+        drop(second);
+        assert!(gate.walked(6) && gate.walked(7));
+        drop(first);
+        assert!(gate.walked(7), "not back to the older claim");
+        assert!(!gate.walked(8));
+        // Ended already: nothing to wait for.
+        assert!(gate.wait(7, true));
+    }
+
+    /// A submission does not wait for ever for a walk that does not end
+    /// (its thread gone without unwinding): after the long wait it goes on
+    /// without the walk. A recording list waits on until the walk ends.
+    #[test]
+    fn a_submission_gives_up_a_walk_that_does_not_end() {
+        let gate = std::sync::Arc::new(WalkGate::new(u64::MAX - 11));
+        let walking = gate.claim(2).expect("the first claim of frame 2");
+        let long = std::time::Duration::from_millis(50);
+        let began = std::time::Instant::now();
+        assert!(!gate.wait_within(3, true, long), "the walk has not ended");
+        assert!(began.elapsed() >= long);
+        assert!(!gate.walked(3), "giving up ends no walk");
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| {
+                let began = std::time::Instant::now();
+                (gate.wait_within(3, false, long), began.elapsed())
+            });
+            std::thread::sleep(4 * long);
+            drop(walking);
+            let (ended, waited) = waiter.join().unwrap();
+            assert!(ended && waited >= 3 * long, "waited {waited:?}");
+        });
+        assert!(gate.wait_within(3, true, long), "ended since");
+    }
+
+    /// The walk of the heap buffer pass takes what it makes from the set it
+    /// walks and does not put it back: a slot it made is not walked again
+    /// by the next pass; one the title wrote since is, and so is one a draw
+    /// made from a record no write told us of.
+    #[test]
+    fn a_slot_the_pass_makes_is_not_walked_again() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // A title buffer in memory of its own: a view of it is left for the
+        // walk when the title writes it, and the walk finds its host copy.
+        const SIZE: usize = 1 << 16;
+        // SAFETY: new memory, left to the process.
+        let memory = unsafe {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(memory, 0);
+        crate::shadow::register(memory, memory as u64, SIZE as u64);
+        // The buffer as the title placed it (dimension 1, its width), and
+        // a view of 64 of its elements: format, dimension (1: buffer),
+        // mapping, a pad, first element, elements, stride, flags.
+        let buffer = |stride: u32| {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 64, stride, 0, 0]);
+            (desc[10], desc[11]) = (memory as u32, (memory as u64 >> 32) as u32);
+            View::Placed(
+                false,
+                [1, 0, 0, 0, SIZE as u32, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+                desc,
+            )
+        };
+        let mut slots = vec![[0u32; 8]; 8];
+        let one = slots.as_mut_ptr() as u64 + 32;
+        let two = one + 32;
+        let changes = |heap: &HostHeap| {
+            let mut slots = heap.buffer_changes();
+            slots.sort_unstable();
+            slots
+        };
+        let none: [u32; 0] = [];
+        // The title writes two buffer views: left for the walk, both walked.
+        super::super::record(one, buffer(12));
+        heap.mirror(1, one, false);
+        super::super::record(two, buffer(16));
+        heap.mirror(2, two, false);
+        assert!(!heap.made(1) && !heap.made(2), "left for the walk");
+        assert_eq!(heap.word(1), Some(12), "a null buffer view under its word");
+        assert_eq!(changes(&heap), [1, 2]);
+        // The walk makes them and takes their copy: nothing for the next pass.
+        let view = heap
+            .mirror_marking(1, one, true, false)
+            .expect("a buffer view");
+        assert!(
+            buffer_copy(&view).is_some(),
+            "the copy the walk brings up to date"
+        );
+        heap.mirror_marking(2, two, true, false);
+        assert!(heap.made(1) && heap.made(2));
+        assert_eq!(changes(&heap), none, "made by the walk");
+        // Walked once more with nothing written: still nothing.
+        heap.mirror_marking(1, one, true, false);
+        assert_eq!(changes(&heap), none);
+        // The title writes slot 1 again: walked again.
+        super::super::record(one, buffer(20));
+        heap.mirror(1, one, false);
+        assert!(!heap.made(1), "left for the walk again");
+        assert_eq!(changes(&heap), [1], "written by the title");
+        heap.mirror_marking(1, one, true, false);
+        assert!(heap.made(1));
+        assert_eq!(heap.word(1), Some(20));
+        assert_eq!(changes(&heap), none);
+        // Slot 2's record changes with no write we see (a byte copy into a
+        // slot tables read): the draw that makes it marks it.
+        super::super::record(two, buffer(24));
+        heap.mirror(2, two, true);
+        assert_eq!(changes(&heap), [2], "made by a draw from a new record");
+        // The title empties slot 1's record with no write we see: the walk
+        // empties the host slot and drops its range at once.
+        // SAFETY: the record's first words, in `slots`.
+        unsafe { (one as *mut [u32; 3]).write_unaligned([0; 3]) };
+        assert!(heap.mirror_marking(1, one, true, false).is_none());
+        assert!(!heap.made(1));
+        assert_eq!(heap.word(1), Some(0));
+        assert_eq!(changes(&heap), none, "emptied by the walk");
+        // Through the walk's own entry, which reads the switch (once for
+        // the process): marked only with `VICTORY_HEAP_WALK_ONCE=0`.
+        super::super::record(two, buffer(32));
+        heap.mirror(2, two, false);
+        assert_eq!(changes(&heap), [2]);
+        assert!(heap.mirror_walked(2, two).is_some());
+        assert_eq!(heap.word(2), Some(32));
+        let again: &[u32] = if walk_once() { &[] } else { &[2] };
+        assert_eq!(changes(&heap), again, "made through `mirror_walked`");
+        // As before (`VICTORY_HEAP_WALK_ONCE=0`): the walk marks what it
+        // made, and the next pass walks it again.
+        super::super::record(one, buffer(28));
+        heap.mirror(1, one, false);
+        assert_eq!(changes(&heap), [1]);
+        heap.mirror_marking(1, one, true, true);
+        assert_eq!(changes(&heap), [1], "the double visit");
+        drop(heap);
+        crate::shadow::unregister(memory, memory as u64);
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
@@ -4154,8 +4526,12 @@ mod tests {
         let at = 0x7fed_0000_0000u64;
         let mut desc = [0u32; 16];
         (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
-        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
-        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        let view = View::Placed(
+            false,
+            [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0],
+            desc,
+        );
+        assert!(heap.note_buffer(1, Some(&view), false, true).is_empty());
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
         assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
@@ -4237,8 +4613,14 @@ mod tests {
             (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
             View::Placed(false, [3, 0, 0, 0, width, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
         };
-        let len = crate::resource::placed_bytes(&[3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0]).unwrap();
-        assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
+        let len = crate::resource::placed_bytes(&[
+            3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0,
+        ])
+        .unwrap();
+        assert!(
+            heap.note_buffer(1, Some(&view(at, 64)), false, true)
+                .is_empty()
+        );
         let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
@@ -4250,7 +4632,7 @@ mod tests {
         assert_eq!(slots(50), []);
         assert_eq!(slots(51), [1]);
         // A wider texture written at the same address: slot 1 is stale.
-        assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
+        assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false, true), [1]);
         assert_eq!(slots(u64::MAX), [2]);
     }
 
