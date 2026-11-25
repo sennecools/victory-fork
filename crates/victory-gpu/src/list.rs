@@ -1407,7 +1407,13 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    let Some(end) = u64::from(count)
+        .checked_mul(bytes)
+        .and_then(|n| offset.checked_add(n))
+    else {
+        return;
+    };
+    if end > size {
         return;
     }
     for i in 0..u64::from(count) {
@@ -1722,6 +1728,17 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Returns `base + offset` when `[offset, offset + len)` lies inside `buffer`
+/// without overflowing `u64`.
+fn checked_buffer_offset(buffer: This, offset: u64, len: u64) -> Option<u64> {
+    let (data, size) = crate::resource::buffer_bytes(buffer)?;
+    let end = offset.checked_add(len)?;
+    if end > size {
+        return None;
+    }
+    (data as u64).checked_add(offset)
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1744,8 +1761,9 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let args_len = u64::from(stride) * u64::from(max.max(1));
+    let address = checked_buffer_offset(arguments, offset, args_len);
+    let counter = checked_buffer_offset(count, count_offset, 4);
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -2444,6 +2462,98 @@ mod tests {
         host.execute(&[hlist]);
         assert_eq!(reset(list, allocator, null), S_OK);
 
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn resolve_queries_and_execute_indirect_reject_overflowing_offsets() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Props {
+            kind: u32,
+            cpu: u32,
+            pool: u32,
+            creation: u32,
+            visible: u32,
+        }
+        #[repr(C)]
+        struct Desc {
+            dim: u32,
+            align: u64,
+            width: u64,
+            height: u32,
+            depth: u16,
+            mips: u16,
+            format: u32,
+            samples: u32,
+            quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        let props = Props {
+            kind: 1,
+            cpu: 0,
+            pool: 0,
+            creation: 1,
+            visible: 1,
+        };
+        let desc = Desc {
+            dim: 1, // BUFFER
+            align: 0,
+            width: 64,
+            height: 1,
+            depth: 1,
+            mips: 1,
+            format: 0,
+            samples: 1,
+            quality: 0,
+            layout: 1, // ROW_MAJOR
+            flags: 0,
+        };
+        let resource_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut buf = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const props).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                &mut buf,
+            ),
+            S_OK
+        );
+
+        // Wrapping offset in resolve_queries must not panic or schedule an OOB write.
+        resolve_queries(list, null, 0, 0, 1, buf, u64::MAX - 4);
+        resolve_queries(list, null, 3, 0, u32::MAX, buf, 16);
+
+        // checked_buffer_offset must reject both OOB and wrapping offsets.
+        assert!(checked_buffer_offset(buf, 0, 64).is_some());
+        assert_eq!(checked_buffer_offset(buf, 60, 8), None);
+        assert_eq!(checked_buffer_offset(buf, u64::MAX - 2, 4), None);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(buf), 0);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }

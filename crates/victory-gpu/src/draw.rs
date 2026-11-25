@@ -2874,20 +2874,18 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, src_bytes, dst_bytes)) = rect_vertex_span(v, first, count, rects) else {
+                once!(slot, "rectangle vertices outside their buffer");
+                return false;
+            };
+            if crate::shadow::find(from, src_bytes).is_none() {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
+            let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
             let n = rects as usize;
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
@@ -2906,7 +2904,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -3201,6 +3199,28 @@ fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
         .iter()
         .find(|u| u.root == base)?;
     Some((param, word.index))
+}
+
+/// Computes `(src_address, src_bytes, expanded_dst_bytes)` for rectangle
+/// expansion over `first..first + count`, rejecting overflows, out-of-bounds
+/// views, and expanded sizes exceeding `u32::MAX`.
+fn rect_vertex_span(v: VertexView, first: u32, count: u32, rects: u64) -> Option<(u64, u64, u32)> {
+    let stride = u64::from(v.stride);
+    if v.address == 0 || stride == 0 {
+        return None;
+    }
+    let total_vertices = u64::from(first) + u64::from(count);
+    let end_bytes = total_vertices.checked_mul(stride)?;
+    if end_bytes > u64::from(v.size) {
+        return None;
+    }
+    let from = u64::from(first)
+        .checked_mul(stride)
+        .and_then(|off| v.address.checked_add(off))?;
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    let dst_bytes = rects.checked_mul(6)?.checked_mul(stride)?;
+    let dst_bytes = u32::try_from(dst_bytes).ok()?;
+    Some((from, src_bytes, dst_bytes))
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -3624,5 +3644,43 @@ mod tests {
         let map = guard.as_ref().unwrap();
         assert!(!map.contains_key(&id_a));
         assert!(!map.contains_key(&id_b));
+    }
+
+    #[test]
+    fn rect_vertex_span_rejects_overflow_and_out_of_bounds() {
+        let view = VertexView {
+            address: 0x1000_0000,
+            size: 192,
+            stride: 16,
+        };
+        // Valid: 2 rectangles (6 vertices starting at 0) -> 96 src bytes, 192 dst bytes.
+        assert_eq!(rect_vertex_span(view, 0, 6, 2), Some((0x1000_0000, 96, 192)));
+        // Valid with non-zero first: 1 rect (3 vertices at first=3) -> 48 src bytes, 96 dst bytes.
+        assert_eq!(
+            rect_vertex_span(view, 3, 3, 1),
+            Some((0x1000_0000 + 48, 48, 96))
+        );
+        // u32 overflow in `first + count`: 0x8000_0000 + 0x8000_0000 wraps to 0 in u32!
+        assert_eq!(
+            rect_vertex_span(view, 0x8000_0000, 0x8000_0000, 0x8000_0000 / 3),
+            None
+        );
+        // `v.address + first * stride` u64 overflow.
+        let high = VertexView {
+            address: u64::MAX - 16,
+            size: 256,
+            stride: 16,
+        };
+        assert_eq!(rect_vertex_span(high, 4, 3, 1), None);
+        // Expanded 6-vertex buffer exceeding u32::MAX must not silently truncate SizeInBytes.
+        let huge = VertexView {
+            address: 0x1000_0000,
+            size: u32::MAX,
+            stride: 16,
+        };
+        assert_eq!(
+            rect_vertex_span(huge, 0, 0x0FFF_FFFC, 0x0FFF_FFFC / 3),
+            None
+        );
     }
 }
