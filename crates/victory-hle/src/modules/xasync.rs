@@ -894,10 +894,41 @@ pub fn result<T>(block: *mut AsyncBlock, identity: *const c_void, out: *mut T) -
     )
 }
 
-/// The bytes of a value, for [`finished_with`].
-pub fn bytes<T: Copy>(value: T) -> Vec<u8> {
-    // SAFETY: a `Copy` value is plain data; padding bytes are never read.
-    unsafe { std::slice::from_raw_parts((&raw const value).cast::<u8>(), size_of::<T>()) }.to_vec()
+/// A value whose in-memory representation has a well-defined, padding-free
+/// byte serialization for [`finished_with`].
+pub trait ToResultBytes {
+    fn to_result_bytes(self) -> Vec<u8>;
+}
+
+macro_rules! impl_result_bytes {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl ToResultBytes for $ty {
+                fn to_result_bytes(self) -> Vec<u8> {
+                    self.to_ne_bytes().to_vec()
+                }
+            }
+        )+
+    };
+}
+
+impl_result_bytes!(u8, u16, u32, u64, i32, i64, usize);
+
+impl<T> ToResultBytes for *const T {
+    fn to_result_bytes(self) -> Vec<u8> {
+        (self as usize).to_ne_bytes().to_vec()
+    }
+}
+
+impl<T> ToResultBytes for *mut T {
+    fn to_result_bytes(self) -> Vec<u8> {
+        (self as usize).to_ne_bytes().to_vec()
+    }
+}
+
+/// The initialized bytes of a value, for [`finished_with`].
+pub fn bytes<T: ToResultBytes>(value: T) -> Vec<u8> {
+    value.to_result_bytes()
 }
 
 type Work = extern "system" fn(*mut AsyncBlock) -> HRESULT;

@@ -194,8 +194,32 @@ fn game_license() -> GameLicense {
     }
 }
 
+impl GameLicense {
+    /// Serializes `self` into its exact `#[repr(C)]` byte representation with
+    /// zeroed padding so `XStoreQueryGameLicenseAsync` never reads
+    /// uninitialized padding bytes.
+    fn to_bytes(self) -> Vec<u8> {
+        use std::mem::offset_of;
+        let mut out = [0u8; size_of::<Self>()];
+        let sku = offset_of!(Self, sku_store_id);
+        out[sku..sku + self.sku_store_id.len()].copy_from_slice(&self.sku_store_id);
+        out[offset_of!(Self, is_active)] = u8::from(self.is_active);
+        out[offset_of!(Self, is_trial_owned_by_this_user)] =
+            u8::from(self.is_trial_owned_by_this_user);
+        out[offset_of!(Self, is_disc_license)] = u8::from(self.is_disc_license);
+        out[offset_of!(Self, is_trial)] = u8::from(self.is_trial);
+        let rem = offset_of!(Self, trial_seconds_remaining);
+        out[rem..rem + 4].copy_from_slice(&self.trial_seconds_remaining.to_ne_bytes());
+        let uid = offset_of!(Self, trial_unique_id);
+        out[uid..uid + self.trial_unique_id.len()].copy_from_slice(&self.trial_unique_id);
+        let exp = offset_of!(Self, expiration);
+        out[exp..exp + 8].copy_from_slice(&self.expiration.to_ne_bytes());
+        out.to_vec()
+    }
+}
+
 extern "system" fn game_license_async(_: This, _: Handle, block: *mut AsyncBlock) -> HRESULT {
-    let license = xasync::bytes(game_license());
+    let license = game_license().to_bytes();
     xasync::finished_with(block, (&raw const GAME_LICENSE).cast(), Ok(license))
 }
 extern "system" fn game_license_result(
@@ -475,5 +499,43 @@ mod tests {
         assert!(!method::<extern "system" fn(This, Handle) -> bool>(
             &OBJECT, 0xb0
         )(this, l));
+    }
+
+    #[test]
+    fn game_license_bytes_zeroes_padding_and_preserves_every_field() {
+        let mut sku = [0u8; 18];
+        sku[..10].copy_from_slice(b"9ABC/0010\0");
+        let mut uid = [0u8; 64];
+        uid[..4].copy_from_slice(b"uid\0");
+        let raw = GameLicense {
+            sku_store_id: sku,
+            is_active: true,
+            is_trial_owned_by_this_user: false,
+            is_disc_license: true,
+            is_trial: false,
+            trial_seconds_remaining: 1234,
+            trial_unique_id: uid,
+            expiration: 0x0123_4567_89AB_CDEF,
+        };
+        let bytes = raw.to_bytes();
+        assert_eq!(bytes.len(), size_of::<GameLicense>());
+        // Padding ranges [22..24] and [92..96] are deterministically zeroed.
+        assert_eq!(&bytes[22..24], &[0, 0]);
+        assert_eq!(&bytes[92..96], &[0, 0, 0, 0]);
+        // Round-trip through the C ABI layout matches every field.
+        let mut dst = std::mem::MaybeUninit::<GameLicense>::zeroed();
+        // SAFETY: `bytes.len() == size_of::<GameLicense>()` and all bytes are initialized.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.as_mut_ptr().cast::<u8>(), bytes.len());
+            let back = dst.assume_init();
+            assert_eq!(back.sku_store_id, raw.sku_store_id);
+            assert_eq!(back.is_active, raw.is_active);
+            assert_eq!(back.is_trial_owned_by_this_user, raw.is_trial_owned_by_this_user);
+            assert_eq!(back.is_disc_license, raw.is_disc_license);
+            assert_eq!(back.is_trial, raw.is_trial);
+            assert_eq!(back.trial_seconds_remaining, raw.trial_seconds_remaining);
+            assert_eq!(back.trial_unique_id, raw.trial_unique_id);
+            assert_eq!(back.expiration, raw.expiration);
+        }
     }
 }
