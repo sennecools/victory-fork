@@ -656,9 +656,19 @@ mod tests {
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
+    /// Advances the thread stack's guard page if `Rsp` sits close enough to
+    /// `TEB.StackLimit` that Windows 10's `RtlCaptureStackBackTrace` crosses
+    /// the guard page mid-walk and aborts with zero frames.
+    #[inline(never)]
+    fn ensure_stack_headroom() {
+        let mut page = [0u8; 4096];
+        std::hint::black_box(&mut page);
+    }
+
     #[test]
     #[inline(never)]
     fn unwinds_like_the_system_walk() {
+        ensure_stack_headroom();
         // SAFETY: zeroed CONTEXT is valid; both calls write our buffers.
         let (frames, walked) = unsafe {
             // `RtlCaptureContext` wants it 16-byte aligned too.
