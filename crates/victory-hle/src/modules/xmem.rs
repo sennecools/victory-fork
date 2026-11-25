@@ -785,9 +785,51 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// Diagnostics: where the time under the remapping lock goes, since the last
+/// line: [unmaps, their µs, kernel maps (placeholder split, view, commit),
+/// their µs, µs of our own bookkeeping after a map (the GPU side's guards and
+/// census)]. The texture refreshes wait for all of it.
+#[cfg(feature = "diagnostics")]
+static REMAP_TIME: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+fn remap_time(k: usize, since: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    REMAP_TIME[k].fetch_add(since.elapsed().as_micros() as u64, Relaxed);
+    if k != 4 {
+        REMAP_TIME[k - 1].fetch_add(1, Relaxed);
+    }
+}
+
+/// Logs [`REMAP_TIME`] at most every 5 s (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn remap_time_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if last.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(5)) {
+        return;
+    }
+    let secs = last.map_or(5.0, |t| now.duration_since(t).as_secs_f64());
+    *last = Some(now);
+    let [unmaps, unmap_us, maps, map_us, books] = [0, 1, 2, 3, 4].map(|i| REMAP_TIME[i].swap(0, Relaxed));
+    tracing::info!(
+        "remapping work per second over {secs:.0} s: {:.0} unmaps {:.1} ms, {:.0} kernel maps {:.1} ms, \
+         {:.1} ms of our bookkeeping after them",
+        unmaps as f64 / secs,
+        unmap_us as f64 / 1e3 / secs,
+        maps as f64 / secs,
+        map_us as f64 / 1e3 / secs,
+        books as f64 / 1e3 / secs,
+    );
+}
+
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -823,6 +865,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    #[cfg(feature = "diagnostics")]
+    remap_time(3, began);
+    #[cfg(feature = "diagnostics")]
+    let books = std::time::Instant::now();
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
@@ -831,6 +877,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
+    #[cfg(feature = "diagnostics")]
+    remap_time(4, books);
     true
 }
 
@@ -885,6 +933,13 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let _timed = Defer(move || {
+        remap_time(1, began);
+        remap_time_line();
+    });
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
@@ -1525,5 +1580,17 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+}
+
+/// Runs its closure when dropped (diagnostics timing of a function with
+/// several returns).
+#[cfg(feature = "diagnostics")]
+struct Defer<F: FnMut()>(F);
+
+#[cfg(feature = "diagnostics")]
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)();
     }
 }
