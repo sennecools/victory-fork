@@ -1148,6 +1148,32 @@ impl BufferStates {
     }
 }
 
+/// What a list recorded since its last wait for every earlier shader write
+/// that may have written memory ([`HostList::since_wait`]), from least to
+/// most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SinceWait {
+    /// Nothing: a clamp needs no wait before it.
+    Nothing = 0,
+    /// Clamps only: they wrote the list's budget (and their scratch
+    /// buffers, which their state changes order).
+    Clamps = 1,
+    /// Anything else, or not known: a draw or dispatch whose shaders store,
+    /// a command of the title's that may write memory, a buffer moved to be
+    /// written, or the work before the list (it starts so).
+    Anything = 2,
+}
+
+impl SinceWait {
+    fn from_byte(byte: u8) -> Self {
+        match byte {
+            0 => Self::Nothing,
+            1 => Self::Clamps,
+            _ => Self::Anything,
+        }
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -1196,6 +1222,10 @@ pub(crate) struct HostList {
     /// the recording may add to it (`VICTORY_GROUPED_MESH_CLAMP=1`,
     /// `crate::indirect::MeshBatch`).
     mesh_batch: Mutex<Option<crate::indirect::MeshBatch>>,
+    /// What may have written memory since the list's last wait for every
+    /// earlier shader write ([`SinceWait`] as a byte): what a clamp waits for
+    /// with `VICTORY_CLAMP_PRECISE=1` (`crate::indirect::precise`).
+    since_wait: std::sync::atomic::AtomicU8,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// Names the list in the device-removed report's [`SENT_OPS`].
@@ -5442,6 +5472,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 mesh_batch: Mutex::default(),
+                since_wait: std::sync::atomic::AtomicU8::new(SinceWait::Anything as u8),
                 _alive: Counted::new(),
                 id: LIST_IDS.fetch_add(1, Ordering::Relaxed),
                 ops: Mutex::new(Vec::with_capacity(if dred() == Dred::Off {
@@ -7764,6 +7795,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         // A batch of a recording that was never closed goes with it.
         *self.mesh_batch() = None;
+        self.may_write();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.buffer_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7815,6 +7847,12 @@ impl HostList {
             let barrier = transition(buffer, before, wanted);
             // SAFETY: an open direct command list and a live buffer.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+        // A buffer about to be written (common: by promotion, to anything).
+        let read_only = wanted != D3D12_RESOURCE_STATE_COMMON
+            && wanted.0 & !D3D12_RESOURCE_STATE_GENERIC_READ.0 == 0;
+        if !read_only {
+            self.may_write();
         }
     }
 
@@ -8707,6 +8745,42 @@ impl HostList {
         if let Some(batch) = open {
             batch.finish(self);
         }
+    }
+
+    /// What may have written memory since the list's last wait for every
+    /// earlier shader write (`crate::indirect::precise`).
+    pub(crate) fn since_wait(&self) -> SinceWait {
+        SinceWait::from_byte(self.since_wait.load(Ordering::Relaxed))
+    }
+
+    /// What is recorded from here on may write memory: the list's next
+    /// clamp waits for every earlier shader write. Called before such a
+    /// command is recorded (and when the list is reset).
+    pub(crate) fn may_write(&self) {
+        self.since_wait
+            .store(SinceWait::Anything as u8, Ordering::Relaxed);
+    }
+
+    /// A wait for every earlier shader write was just recorded.
+    pub(crate) fn waited_for_writes(&self) {
+        self.since_wait
+            .store(SinceWait::Nothing as u8, Ordering::Relaxed);
+    }
+
+    /// A clamp's dispatch was just recorded with no wait after it: its
+    /// writes to the budget are not waited for yet.
+    pub(crate) fn clamp_wrote(&self) {
+        self.since_wait
+            .fetch_max(SinceWait::Clamps as u8, Ordering::Relaxed);
+    }
+
+    /// The buffer the list's clamps charge ([`HostList::budget`]): the
+    /// card's copy if there is one. None before the first clamp.
+    pub(crate) fn budget_buffer(&self) -> Option<&ID3D12Resource> {
+        if let Some(Some((card, _))) = self.card_budget.get() {
+            return Some(card);
+        }
+        self.budget.get()?.as_ref().map(|(mapped, _)| mapped)
     }
 
     /// Keeps `object` alive until the list is reset.

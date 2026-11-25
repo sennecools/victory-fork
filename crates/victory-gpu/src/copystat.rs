@@ -127,6 +127,11 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Of the clamps' two waits for every earlier shader write, those left
+    /// out (`VICTORY_CLAMP_PRECISE=1`), and the waits for the budget's
+    /// writes alone recorded in place of one.
+    ClampWaitsLeftOut,
+    ClampBudgetWaits,
     /// `watch::writes` kernel askings that failed (the range is not
     /// write-watched: view memory or not watchable).
     WatchFailed,
@@ -1280,10 +1285,13 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each, of which {:.0} left out, {:.0} of them for a wait on the budget alone); \
+         barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::ClampWaitsLeftOut as usize],
+        c[C::ClampBudgetWaits as usize],
         barrier_test()
     );
     // What is compared after submissions, largest first, and how much of

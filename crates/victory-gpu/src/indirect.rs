@@ -46,6 +46,11 @@
 //! reads its record from its own slot. Every record is bounded and charged
 //! as by a clamp of its own, in draw order.
 //!
+//! Every clamp waits for every earlier shader write before its dispatch
+//! and again after it: on the card a wait for the whole pipe to drain,
+//! twice per clamp. `VICTORY_CLAMP_PRECISE=1` ([`precise`]; off by default)
+//! keeps only the waits the clamp needs ([`Waits`]).
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -829,23 +834,180 @@ fn clamp_into(
     (how, keep): (u32, bool),
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, how);
-    if recorded && keep {
-        list.indirect_readable(dst);
+    let waits = Waits::for_list(list);
+    let target = (dst, before);
+    let recorded =
+        record_clamp_waiting(c, &list.list, waits, target, budget, src, count, spec, how);
+    if recorded {
+        waits.noted(list, spec.2 > 0);
+        if keep {
+            list.indirect_readable(dst);
+        }
     }
     recorded
 }
 
-/// Records the clamp into `dst`, which is in state `before` (common, or
-/// indirect arguments after an earlier clamp into it that the list kept
-/// readable), and leaves `dst` in `INDIRECT_ARGUMENT`. `how`: [`AHEAD`],
-/// the records are a window clamped ahead of their draws ([`bound_ahead`]);
-/// [`IN_PARTS`], one dispatch in parts ([`bound_split`]). False, with
-/// nothing recorded, if the layout or the addresses do not fit the clamp.
+/// Whether a clamp keeps only the waits it needs (`VICTORY_CLAMP_PRECISE=1`;
+/// off by default; [`Waits::for_list`]).
+///
+/// Without the switch every clamp waits for every earlier shader write
+/// before its dispatch, and again after it. With it:
+/// - after the dispatch, no wait: the clamp writes its scratch buffer,
+///   whose move from unordered access to indirect arguments orders those
+///   writes before the execution that reads them, and the list's budget,
+///   which only a later clamp reads, and that clamp waits for it;
+/// - before it, a wait for every earlier shader write only if something
+///   recorded since the list's last such wait may have written memory
+///   (`HostList::may_write`: a draw or dispatch whose shaders store, a
+///   command of the title's that may write memory such as a copy or a
+///   clear, a buffer moved to be written; a list starts so); a wait for
+///   the writes to the budget alone if only clamps wrote since; else none.
+///   A title barrier on a buffer or a barrier group is such a wait.
+///
+/// What the clamp reads (the title's arguments and count, the budget) is
+/// then ordered as before. A write the shaders make that their translation
+/// does not know of is no longer waited for at every clamp.
+pub(crate) fn precise() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PRECISE_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CLAMP_PRECISE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "argument clamps keep only the waits they need (VICTORY_CLAMP_PRECISE=1)"
+            );
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`precise`] as a test on this thread sets it, whatever the
+    /// switch says (`tests::with_precise`).
+    static PRECISE_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// What a clamp waits for before its dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait<'a> {
+    /// Every earlier shader write.
+    All,
+    /// The writes to one buffer (the list's budget).
+    On(&'a ID3D12Resource),
+    /// Nothing.
+    Nothing,
+}
+
+/// The waits a clamp records around its dispatch: before it, [`Wait`];
+/// after it, for every shader write or not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waits<'a> {
+    before: Wait<'a>,
+    after: bool,
+}
+
+impl<'a> Waits<'a> {
+    /// No wait at all.
+    const NONE: Waits<'static> = Waits {
+        before: Wait::Nothing,
+        after: false,
+    };
+
+    /// Every earlier shader write waited for before the dispatch and after
+    /// it, as without [`precise`]. Diagnostics: `VICTORY_BARRIER_TEST=indirect`
+    /// leaves both out (the state changes stay).
+    fn both() -> Waits<'static> {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::barrier_test() & 2 != 0 {
+            return Waits::NONE;
+        }
+        Waits {
+            before: Wait::All,
+            after: true,
+        }
+    }
+
+    /// What a clamp about to be recorded on `list` waits for ([`precise`]).
+    fn for_list(list: &'a HostList) -> Self {
+        let both = Waits::both();
+        if !precise() || both == Waits::NONE {
+            return both;
+        }
+        Self::after_list(list.since_wait(), list.budget_buffer())
+    }
+
+    /// With [`precise`]: the waits of a clamp after a list recorded `since`
+    /// since its last wait for every earlier shader write, `budget` the
+    /// buffer the list's clamps charge.
+    fn after_list(since: crate::host::SinceWait, budget: Option<&'a ID3D12Resource>) -> Self {
+        use crate::host::SinceWait;
+        let before = match (since, budget) {
+            (SinceWait::Nothing, _) => Wait::Nothing,
+            (SinceWait::Clamps, Some(budget)) => Wait::On(budget),
+            (SinceWait::Clamps, None) | (SinceWait::Anything, _) => Wait::All,
+        };
+        Waits {
+            before,
+            after: false,
+        }
+    }
+
+    /// The clamp is recorded on `list` (a dispatch if `dispatched`): what
+    /// it left unwaited for is noted there. Diagnostics: counted.
+    fn noted(self, list: &HostList, dispatched: bool) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let left_out = u64::from(self.before != Wait::All) + u64::from(!self.after);
+            add(C::ClampWaitsLeftOut, left_out);
+            if matches!(self.before, Wait::On(_)) {
+                add(C::ClampBudgetWaits, 1);
+            }
+        }
+        if self.before == Wait::All {
+            list.waited_for_writes();
+        }
+        if self.after {
+            list.waited_for_writes();
+        } else if dispatched {
+            list.clamp_wrote();
+        }
+    }
+}
+
+/// Tests: [`record_clamp_waiting`] with both waits for every earlier shader
+/// write ([`Waits::both`]).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    target: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    how: u32,
+) -> bool {
+    record_clamp_waiting(c, l, Waits::both(), target, budget, src, count, spec, how)
+}
+
+/// Records the clamp into `dst`, which is in state `before` (common, or
+/// indirect arguments after an earlier clamp into it that the list kept
+/// readable), with `waits` around its dispatch, and leaves `dst` in
+/// `INDIRECT_ARGUMENT`. `how`: [`AHEAD`], the records are a window clamped
+/// ahead of their draws ([`bound_ahead`]); [`IN_PARTS`], one dispatch in
+/// parts ([`bound_split`]). False, with nothing recorded, if the layout or
+/// the addresses do not fit the clamp.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_waiting(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    waits: Waits<'_>,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
@@ -907,6 +1069,7 @@ fn record_clamp_as(
     record_gpu_clamp(
         c,
         l,
+        waits,
         (dst, before),
         constants,
         [src_gpu, count_gpu, dst_gpu, budget],
@@ -916,12 +1079,13 @@ fn record_clamp_as(
 }
 
 /// Records `groups` groups of clamp `c` with `constants` and the source,
-/// count, scratch and budget addresses, between the two waits for earlier
-/// shader writes, moving `dst` from `before` to unordered access and on to
-/// `INDIRECT_ARGUMENT` (no dispatch for none: the state changes only).
+/// count, scratch and budget addresses, between `waits`, moving `dst` from
+/// `before` to unordered access and on to `INDIRECT_ARGUMENT` (no dispatch
+/// for none: the state changes only).
 fn record_gpu_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    waits: Waits<'_>,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     constants: [u32; 6],
     [src_gpu, count_gpu, dst_gpu, budget]: [u64; 4],
@@ -932,17 +1096,17 @@ fn record_gpu_clamp(
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
     // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
     // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
-    // earlier execution's reads of the scratch buffer; nothing else writes it.
-    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // earlier execution's reads of the scratch buffer, and its move back
+    // orders them before the execution that reads them; nothing else
+    // writes it. Diagnostics: counted.
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
+    let wait = match waits.before {
+        Wait::On(buffer) => uav_barrier_on(buffer),
+        Wait::All | Wait::Nothing => uav_barrier(),
+    };
     let first = [
-        uav_barrier(),
+        wait,
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
     let second = [
@@ -953,16 +1117,20 @@ fn record_gpu_clamp(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
+    let (skip_first, skip_second) = (
+        usize::from(waits.before == Wait::Nothing),
+        usize::from(!waits.after),
+    );
     {
+        // (A wait for the budget's writes alone is no global barrier.)
         use crate::profile::{Count, count};
         count(Count::Clamps, 1);
-        count(Count::UavClampFirst, u64::from(waits));
-        count(Count::UavClampSecond, u64::from(waits));
+        count(Count::UavClampFirst, u64::from(waits.before == Wait::All));
+        count(Count::UavClampSecond, u64::from(waits.after));
     }
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[skip_first..]);
         if groups > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -973,7 +1141,7 @@ fn record_gpu_clamp(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(groups, 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[skip_second..]);
     }
 }
 
@@ -1118,8 +1286,18 @@ impl MeshBatch {
         unsafe { words.cast::<u32>().write(0) };
         let before = list.indirect_state(&bounded);
         let addresses = [src_gpu, words_gpu, dst_gpu, budget];
-        record_gpu_clamp(c, &list.list, (&bounded, before), [0; 6], addresses, 1);
+        let waits = Waits::for_list(list);
+        record_gpu_clamp(
+            c,
+            &list.list,
+            waits,
+            (&bounded, before),
+            [0; 6],
+            addresses,
+            1,
+        );
         crate::profile::count(crate::profile::Count::MeshBatches, 1);
+        waits.noted(list, true);
         if keep {
             list.indirect_readable(&bounded);
         }
@@ -1210,6 +1388,21 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
                 pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    }
+}
+
+/// An unordered access barrier on `buffer` alone: its earlier shader
+/// writes finish before later work reads or writes it.
+fn uav_barrier_on(buffer: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed pointer; the barrier never releases it.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
             }),
         },
     }
@@ -3154,7 +3347,16 @@ void main() {
         let dst_gpu = unsafe { dst.GetGPUVirtualAddress() };
         let addresses = [src_gpu, words_gpu, dst_gpu, budget_gpu];
         let common = D3D12_RESOURCE_STATE_COMMON;
-        record_gpu_clamp(&clamp, &warp.list, (&dst, common), [0; 6], addresses, 1);
+        let waits = Waits::both();
+        record_gpu_clamp(
+            &clamp,
+            &warp.list,
+            waits,
+            (&dst, common),
+            [0; 6],
+            addresses,
+            1,
+        );
         // SAFETY: the mapped words, written before the list runs; an open
         // list, and the scratch buffer in INDIRECT_ARGUMENT after the clamp.
         unsafe {
@@ -3462,6 +3664,252 @@ void main() {
             assert_eq!(host.log_messages(), None, "the debug layer found an error");
             host.execute(&[&list]);
             list.reset();
+        }
+    }
+
+    /// Runs `f` with [`precise`] `on` on this thread.
+    fn with_precise<R>(on: bool, f: impl FnOnce() -> R) -> R {
+        PRECISE_HERE.set(Some(on));
+        let out = f();
+        PRECISE_HERE.set(None);
+        out
+    }
+
+    /// With [`precise`], a clamp waits for every earlier shader write only
+    /// after what may have written memory, for the budget alone after
+    /// clamps, and for nothing after a wait; never after its dispatch.
+    #[test]
+    fn precise_waits_follow_what_the_list_recorded() {
+        use crate::host::SinceWait;
+        let after = |since| Waits::after_list(since, None);
+        let before = |before| Waits {
+            before,
+            after: false,
+        };
+        assert_eq!(after(SinceWait::Nothing), before(Wait::Nothing));
+        assert_eq!(after(SinceWait::Anything), before(Wait::All));
+        assert_eq!(
+            after(SinceWait::Clamps),
+            before(Wait::All),
+            "with no budget buffer known, every earlier write"
+        );
+        assert!(SinceWait::Nothing < SinceWait::Clamps && SinceWait::Clamps < SinceWait::Anything);
+        assert_eq!(
+            Waits::both(),
+            Waits {
+                before: Wait::All,
+                after: true
+            }
+        );
+    }
+
+    /// A host list notes what may have written memory since its last wait
+    /// for every earlier shader write, and its clamps wait for that with
+    /// `VICTORY_CLAMP_PRECISE=1` (and for everything twice without it): a
+    /// list starts as written and is so again after a reset; a clamp leaves
+    /// its budget's writes; a wait leaves nothing; a buffer moved to be
+    /// written, or a command noted as one that may write, leaves anything.
+    #[test]
+    fn host_list_notes_what_may_have_written_since_its_last_wait() {
+        use crate::host::SinceWait;
+        let Some(host) = software_host() else {
+            return;
+        };
+        let (Some((src, src_ptr)), Some(other)) = (host.shared_buffer(256), host.uav_buffer(256))
+        else {
+            return;
+        };
+        // SAFETY: the mapping holds 256 bytes.
+        unsafe { std::ptr::write_bytes(src_ptr, 0, 256) };
+        let spec = (10, MESH_STRIDE, 1);
+        for card in [false, true] {
+            let list = host.new_list().expect("a host list");
+            if card {
+                assert!(list.force_card_budget(), "no budget in the card's memory");
+            }
+            let _ = host.log_messages();
+            let clamp = |list: &HostList| {
+                let dst = bound_as(list, (&src, 0), None, spec, (0, false)).expect("a clamp");
+                done(list, &dst);
+            };
+            assert_eq!(
+                list.since_wait(),
+                SinceWait::Anything,
+                "a list starts as written"
+            );
+            with_precise(true, || {
+                let all = Waits {
+                    before: Wait::All,
+                    after: false,
+                };
+                assert_eq!(Waits::for_list(&list), all);
+                clamp(&list);
+                assert_eq!(
+                    list.since_wait(),
+                    SinceWait::Clamps,
+                    "the clamp's own writes"
+                );
+                let budget = list.budget_buffer().expect("a budget after a clamp");
+                assert_eq!(Waits::for_list(&list).before, Wait::On(budget));
+                clamp(&list);
+                assert_eq!(list.since_wait(), SinceWait::Clamps);
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[uav_barrier()]) };
+                list.waited_for_writes();
+                assert_eq!(Waits::for_list(&list).before, Wait::Nothing);
+                list.buffer_read(&src);
+                assert_eq!(
+                    list.since_wait(),
+                    SinceWait::Nothing,
+                    "a read writes nothing"
+                );
+                clamp(&list);
+                assert_eq!(list.since_wait(), SinceWait::Clamps);
+                list.buffer_uav(&other);
+                assert_eq!(
+                    list.since_wait(),
+                    SinceWait::Anything,
+                    "a buffer to be written"
+                );
+                assert_eq!(Waits::for_list(&list), all);
+                clamp(&list);
+                list.may_write();
+                assert_eq!(Waits::for_list(&list), all);
+            });
+            with_precise(false, || {
+                assert_eq!(Waits::for_list(&list), Waits::both());
+                clamp(&list);
+                assert_eq!(
+                    list.since_wait(),
+                    SinceWait::Nothing,
+                    "the wait after the clamp"
+                );
+            });
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            assert_eq!(
+                list.since_wait(),
+                SinceWait::Anything,
+                "a reset list starts as written"
+            );
+        }
+    }
+
+    /// With `VICTORY_CLAMP_PRECISE=1`, clamps of their own and batches of
+    /// mesh draws give every record what they give it with both waits for
+    /// every earlier shader write, and charge the budget the same: with the
+    /// budget in mapped words and in the card's memory, the scratch buffer
+    /// kept readable and not. The first records are clamped alone, the next
+    /// in batches, the last alone again; writes noted on the way bring the
+    /// wait for every earlier write back, and waits recorded on the way
+    /// leave none. The debug layer stays silent.
+    #[test]
+    fn host_list_precise_clamps_match_the_waited_ones() {
+        const STEP: u32 = 32;
+        const COPY: u64 = 9;
+        let Some(host) = software_host() else {
+            return;
+        };
+        let batch = make_from(&host.device, MESH_BATCH_SOURCE, false).expect("batch clamp");
+        let records = mesh_records();
+        let n = records.len();
+        let Some((src, src_ptr)) = host.shared_buffer(n as u64 * u64::from(STEP)) else {
+            return;
+        };
+        // SAFETY: a mapped buffer of this size; nothing runs yet.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0xff, n * STEP as usize);
+            for (i, record) in records.iter().enumerate() {
+                src_ptr
+                    .add(i * STEP as usize)
+                    .cast::<[u32; 3]>()
+                    .write_unaligned(*record);
+            }
+        }
+        let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let run = |precise: bool, card: bool, keep: bool| {
+            with_precise(precise, || {
+                let list = host.new_list().expect("a host list");
+                if card {
+                    assert!(list.force_card_budget(), "no budget in the card's memory");
+                }
+                let _ = host.log_messages();
+                let (out, out_ptr) = host
+                    .shared_buffer(n as u64 * 12)
+                    .expect("a read-back buffer");
+                for i in 0..n as u32 {
+                    if i % 9 == 4 {
+                        list.end_mesh_batch();
+                        list.may_write();
+                    }
+                    if i % 11 == 7 {
+                        list.end_mesh_batch();
+                        // SAFETY: an open list.
+                        unsafe { list.list.ResourceBarrier(&[uav_barrier()]) };
+                        list.waited_for_writes();
+                    }
+                    let offset = i * STEP;
+                    let alone = !(10..30).contains(&i);
+                    let (bounded, at) = if alone {
+                        let spec = (10, MESH_STRIDE, 1);
+                        let at = (&src, u64::from(offset));
+                        (
+                            bound_as(&list, at, None, spec, (0, keep)).expect("a clamp"),
+                            0,
+                        )
+                    } else {
+                        let (bounded, at, _) = grouped_mesh_as(&list, COPY, offset, |list| {
+                            MeshBatch::open_with(list, &batch, COPY, &src, keep)
+                        })
+                        .expect("a batch");
+                        (bounded, at)
+                    };
+                    // SAFETY: an open list; the scratch buffer is in
+                    // INDIRECT_ARGUMENT after a clamp (and through a
+                    // batch), and goes back there; buffers held until the
+                    // list ran.
+                    unsafe {
+                        list.list
+                            .ResourceBarrier(&[transition(&bounded, args, copy)]);
+                        list.list
+                            .CopyBufferRegion(&out, u64::from(i) * 12, &bounded, at, 12);
+                        list.list
+                            .ResourceBarrier(&[transition(&bounded, copy, args)]);
+                    }
+                    if alone {
+                        done(&list, &bounded);
+                    }
+                    list.keep(&bounded);
+                }
+                list.close();
+                let how = format!("precise {precise}, card budget {card}, readable {keep}");
+                assert_eq!(
+                    host.log_messages(),
+                    None,
+                    "{how}: the debug layer found an error"
+                );
+                host.execute(&[&list]);
+                list.reset();
+                // SAFETY: the list has run; a mapped buffer of `n` records.
+                let clamped = unsafe {
+                    std::slice::from_raw_parts(out_ptr.cast::<[u32; 3]>().cast_const(), n).to_vec()
+                };
+                (clamped, list.budget_words().expect("budget words"))
+            })
+        };
+        let (expected, _) = clamped_alone(&records);
+        for card in [false, true] {
+            for keep in [false, true] {
+                let waited = run(false, card, keep);
+                let precise = run(true, card, keep);
+                let how = format!("card budget {card}, readable {keep}");
+                assert_eq!(waited.0, expected, "{how}: with both waits");
+                assert_eq!(precise.0, expected, "{how}: precise");
+                assert_eq!(precise.1, waited.1, "{how}: the budget's words");
+            }
         }
     }
 

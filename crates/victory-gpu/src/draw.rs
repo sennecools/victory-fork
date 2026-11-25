@@ -1229,6 +1229,11 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            if t.stores {
+                // The list's next clamp waits for what it stores
+                // (`crate::indirect::precise`).
+                list.may_write();
+            }
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);

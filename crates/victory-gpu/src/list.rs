@@ -183,11 +183,14 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 /// [`host_list`] for a command that may write memory (a barrier, a copy, a
 /// clear, a value write, a pass of ours): the list's open batch of mesh
 /// draws ends before it (`VICTORY_GROUPED_MESH_CLAMP=1`,
-/// `crate::indirect::grouped`).
+/// `crate::indirect::grouped`), and the list's next clamp waits for every
+/// earlier shader write (`VICTORY_CLAMP_PRECISE=1`,
+/// `crate::indirect::precise`).
 #[cfg(windows)]
 fn recording_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     let list = host_list(this)?;
     list.end_mesh_batch();
+    list.may_write();
     Some(list)
 }
 
@@ -820,6 +823,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+            // A wait for every earlier shader write (the title's own, or the
+            // one for buffers): the list's next clamp needs none of its own.
+            let waits_all = host
+                .iter()
+                .any(|b| b.kind == UAV_BARRIER.kind && b.first.is_null());
             // SAFETY: the same layout; borrowed resource pointers, never
             // released through this slice.
             let host = unsafe {
@@ -830,6 +838,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+            if waits_all {
+                list.waited_for_writes();
+            }
         }
     }
     0
@@ -2110,6 +2121,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         crate::profile::count(crate::profile::Count::UavTitleGroup, 1);
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.waited_for_writes();
     }
     #[cfg(not(windows))]
     let _ = (this, count);
