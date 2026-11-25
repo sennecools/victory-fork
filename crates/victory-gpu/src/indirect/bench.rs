@@ -141,7 +141,7 @@ fn bench_indirect_draw_barriers() {
     // The per-record clamp, and the one that charges once per group if a
     // case takes it; both with their notes of compute records, as with no
     // switch.
-    let clamp_of = |source| make_from(device, source).expect("the clamp must compile");
+    let clamp_of = |source| make_from(device, source, true).expect("the clamp must compile");
     let clamps = [
         Some(clamp_of(SOURCE)),
         cases

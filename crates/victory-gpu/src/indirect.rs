@@ -31,7 +31,10 @@
 //! ([`by_group`]) takes a clamp whose thread groups charge once each
 //! ([`GROUP_SOURCE`]), and `VICTORY_INDIRECT_CARD_BUDGET=1` keeps the
 //! budget word in the card's own memory (`HostList::budget`). What a record
-//! costs and how much work a list may do are the same with either.
+//! costs and how much work a list may do are the same with either. The
+//! clamp also notes what compute records asked for, for a line of the frame
+//! summary: two more atomics per record, which `VICTORY_CLAMP_LEAN=1`
+//! ([`lean`]; off by default) leaves out.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
@@ -39,7 +42,7 @@
 //! the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
@@ -96,7 +99,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
         uint3 asked = src_args.Load3(src_at);
-        // Diagnostics, in the budget buffer's words after the mesh ones:
+#ifdef NOTE_COMPUTE
+        // Diagnostics (left out with VICTORY_CLAMP_LEAN=1), in the budget
+        // buffer's words after the mesh ones:
         // the largest x a compute record asked for, and the records that
         // asked for more groups in x than one dispatch runs (they are cut
         // to 65,535 below unless run in parts, so the groups past it never
@@ -109,6 +114,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 budget.InterlockedAdd(16, 1u, noted);
             }
         }
+#endif
         uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // In parts: one dimension, and not the garbage of an argument
         // nothing wrote.
@@ -224,11 +230,13 @@ groupshared uint fits[64];
 // the groups in all.
 groupshared uint largest_asked;
 groupshared uint all_asked;
-// Diagnostics, of the group's compute
+#ifdef NOTE_COMPUTE
+// Diagnostics (left out with VICTORY_CLAMP_LEAN=1), of the group's compute
 // records: the largest x asked for, and the records that asked for more
 // groups in x than one dispatch runs.
 groupshared uint widest_asked;
 groupshared uint cut_asked;
+#endif
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
@@ -250,8 +258,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
+#ifdef NOTE_COMPUTE
         widest_asked = 0;
         cut_asked = 0;
+#endif
     }
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -265,10 +275,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 wanted = src_args.Load3(src_at);
+#ifdef NOTE_COMPUTE
         // Not the garbage of a slot nothing wrote.
         if (wanted.x <= (1u << 24) && wanted.y <= 64u && wanted.z <= 64u) {
             asked = wanted.x;
         }
+#endif
         uint3 g = min(wanted, uint3(65535u, 65535u, 65535u));
         // In parts: one dimension, and not the garbage of an argument
         // nothing wrote.
@@ -305,6 +317,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
     }
+#ifdef NOTE_COMPUTE
     if (active && kind == 2) {
         // And of compute records, in the words after those: a record over
         // 65,535 is cut to that above unless run in parts, so the groups
@@ -315,6 +328,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             InterlockedAdd(cut_asked, 1u, was);
         }
     }
+#endif
     // The group's own records: none for a group past a count buffer's
     // count (an execution may ask for thousands and count a few), which
     // touches the budget not at all, as its threads do not when every
@@ -359,11 +373,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
     }
+#ifdef NOTE_COMPUTE
     if (gi == 0 && kind == 2 && n > 0) {
         uint was;
         budget.InterlockedMax(12, widest_asked, was);
         budget.InterlockedAdd(16, cut_asked, was);
     }
+#endif
     if (!active) {
         return;
     }
@@ -410,7 +426,14 @@ fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
         .get_or_init(|| {
-            pick(by_group(), make)
+            let clamp = pick(by_group(), make);
+            if clamp.is_some() && lean() {
+                tracing::info!(
+                    "the argument clamp takes no notes of indirect compute records \
+                     (VICTORY_CLAMP_LEAN=1)"
+                );
+            }
+            clamp
         })
         .as_ref()
 }
@@ -466,21 +489,48 @@ fn pick(
 
 fn make(source: &'static str) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    make_from(device, source)
+    make_from(device, source, !lean())
+}
+
+/// Whether the clamp leaves out its notes of what indirect compute records
+/// asked for (`VICTORY_CLAMP_LEAN=1`; off by default).
+///
+/// The notes are the largest group count in x and the records cut to what
+/// one dispatch runs: two more atomics on the budget buffer per compute
+/// record (per group of them, charging once per group), read back at the
+/// next submission (`HostList::budget`) for the frame line "indirect
+/// compute dispatches". With the switch the clamp is compiled without them
+/// (`NOTE_COMPUTE` in the source), the two words stay zero and that line is
+/// not logged; what a record is clamped to and charged is the same.
+pub(crate) fn lean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_LEAN").is_some_and(|v| v == "1"))
 }
 
 /// The clamp for `device` compiled from `source` ([`SOURCE`] or
-/// [`GROUP_SOURCE`]).
-fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+/// [`GROUP_SOURCE`]); `notes`: with the atomics that note what indirect
+/// compute records asked for (`NOTE_COMPUTE` in the source; without them
+/// with [`lean`]).
+fn make_from(device: &ID3D12Device, source: &str, notes: bool) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
+    // The list of defines ends with an entry of nulls.
+    let defines = [
+        D3D_SHADER_MACRO {
+            Name: s!("NOTE_COMPUTE"),
+            Definition: s!("1"),
+        },
+        D3D_SHADER_MACRO::default(),
+    ];
+    let defines = notes.then_some(defines.as_ptr());
+    // SAFETY: the source, names and defines live through the call; out
+    // pointers ours.
     let compiled = unsafe {
         D3DCompile(
             source.as_ptr().cast(),
             source.len(),
             s!("clamp"),
-            None,
+            defines,
             None,
             s!("main"),
             s!("cs_5_1"),
@@ -917,8 +967,9 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
+                // With its notes of compute records, as with no switch.
                 let clamp =
-                    make_from(&device, source).expect("clamp shader must compile on WARP");
+                    make_from(&device, source, true).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -1661,6 +1712,65 @@ void main() {
         }
     }
 
+    /// The two words the clamp notes of indirect compute records (the
+    /// largest group count in x asked for, the records cut to what one
+    /// dispatch runs) are written unless the clamp is compiled without its
+    /// notes (`VICTORY_CLAMP_LEAN=1`, [`lean`]): that one leaves them zero,
+    /// and clamps and charges the same. So for both clamps, the one that
+    /// charges record by record and the one that charges once per thread
+    /// group.
+    #[test]
+    fn warp_compute_notes_are_left_out_by_the_lean_clamp_only() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        for (grouped, notes) in [(false, false), (false, true), (true, false), (true, true)] {
+            let source = if grouped { GROUP_SOURCE } else { SOURCE };
+            let clamp =
+                make_from(&warp.device, source, notes).expect("the clamp must compile either way");
+            let (src_buf, src_ptr, _) = warp.shared_buffer(16);
+            let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (readback_buf, readback_ptr, _) = warp.shared_buffer(64);
+            let dst_buf = warp.default_uav(64);
+            let asked = [100_000u32, 1, 1];
+            // SAFETY: mapped buffers of these sizes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(asked.as_ptr().cast(), src_ptr, 12);
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(readback_ptr, 0, 64);
+            }
+            assert!(record_clamp_as(
+                &clamp,
+                &warp.list,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (2, 12, 1),
+                0,
+            ));
+            done_on(&warp.list, &dst_buf);
+            // SAFETY: an open list and live buffers.
+            unsafe {
+                warp.list
+                    .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 12)
+            };
+            warp.submit_and_wait();
+            // SAFETY: the work is done; the mappings hold these words.
+            let (made, words) = unsafe {
+                (
+                    readback_ptr.cast::<[u32; 3]>().read_volatile(),
+                    budget_ptr.cast::<[u32; 5]>().read_volatile(),
+                )
+            };
+            let which = format!("by group {grouped}, notes {notes}");
+            assert_eq!(made, [65_535, 1, 1], "{which}");
+            assert_eq!(words[0], 65_535 * 64, "{which}");
+            let noted = if notes { [100_000, 1] } else { [0, 0] };
+            assert_eq!(words[3..], noted, "{which}");
+        }
+    }
+
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
     /// wraparound across >64 huge indexed-draw records (`count = None`), while
     /// preserving `StartIndexLocation`, `BaseVertexLocation`,
@@ -2081,7 +2191,7 @@ void main() {
                 if refused.contains(&source) {
                     return Err(windows::core::Error::empty());
                 }
-                make_from(&warp.device, source)
+                make_from(&warp.device, source, true)
             });
             (made.is_some(), asked.into_inner())
         };
@@ -2209,9 +2319,10 @@ void main() {
     }
 
     /// What the clamp notes of a list's records (mesh: the largest group
-    /// count asked for and the groups asked in all; compute: the largest x
-    /// asked for and the records cut) is in the list's mapped words once it
-    /// has run, where the next submission takes it for the frame line.
+    /// count asked for and the groups asked in all; compute, unless the
+    /// tests run with `VICTORY_CLAMP_LEAN=1`: the largest x asked for and
+    /// the records cut) is in the list's mapped words once it has run,
+    /// where the next submission takes it for the frame line.
     #[test]
     fn host_list_budget_notes_are_in_the_mapped_words_after_a_run() {
         budget_notes(false);
@@ -2288,7 +2399,7 @@ void main() {
                 [519, 524],
                 "round {round}: the mesh records' notes"
             );
-            let noted = [100_000, 1];
+            let noted = if lean() { [0, 0] } else { [100_000, 1] };
             assert_eq!(
                 words[3..],
                 noted,
