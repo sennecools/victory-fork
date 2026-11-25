@@ -25,6 +25,14 @@
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
 //!
+//! Every record charges the budget on its own, with an atomic read and a
+//! compare and swap on the budget word, in memory the CPU maps. Two
+//! switches, both off by default, change that: `VICTORY_CLAMP_GROUP=1`
+//! ([`by_group`]) takes a clamp whose thread groups charge once each
+//! ([`GROUP_SOURCE`]), and `VICTORY_INDIRECT_CARD_BUDGET=1` keeps the
+//! budget word in the card's own memory (`HostList::budget`). What a record
+//! costs and how much work a list may do are the same with either.
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -173,6 +181,221 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// [`SOURCE`] with one charge of the budget per thread group
+/// (`VICTORY_CLAMP_GROUP=1`, [`by_group`]): the same constants, buffers and
+/// root signature, the same bounds, and the same result for every record
+/// but one thing. Which records of a group still fit when the budget runs
+/// out is their order in the group, where the per-record clamp leaves it
+/// to the order the card served their race for the budget word.
+const GROUP_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+cbuffer Record : register(b0) {
+    uint kind;
+    uint stride;
+    uint records;
+    uint args_offset;
+    // Bit 0: a count buffer bounds the records. Bit 1: the records are a
+    // window clamped ahead of their draws: one that asks for more than can
+    // run is left empty and costs nothing. Bit 2: one dispatch, written as
+    // SPLIT records of at most 65,535 groups in x each.
+    uint has_count;
+    uint count_offset;
+};
+ByteAddressBuffer src_args : register(t0);
+ByteAddressBuffer count_buf : register(t1);
+RWByteAddressBuffer dst_args : register(u0);
+// The list's work so far (vertex instances, threads): past the budget,
+// records run empty.
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+// Groups of one dispatch; more run empty.
+static const uint GROUPS = 1u << 20;
+static const uint SPLIT = 2;
+// Each group charges the budget once: the costs of its records go here,
+// one thread charges their sum, saturating as each record would in lane
+// order, and every thread then reads whether its own record fitted. A
+// compare and swap per record, 64 threads racing for one word, costs a
+// round for each record of a window, and in memory the CPU maps (where the
+// budget is unless VICTORY_INDIRECT_CARD_BUDGET=1) every atomic crosses
+// the bus on a card of its own.
+groupshared uint costs[64];
+groupshared uint fits[64];
+// What the group's mesh records asked for: the largest group count, and
+// the groups in all.
+groupshared uint largest_asked;
+groupshared uint all_asked;
+// Diagnostics, of the group's compute
+// records: the largest x asked for, and the records that asked for more
+// groups in x than one dispatch runs.
+groupshared uint widest_asked;
+groupshared uint cut_asked;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    uint eff_count = records;
+    bool ahead = (has_count & 2u) != 0;
+    bool split = (has_count & 4u) != 0;
+    if ((has_count & 1u) != 0) {
+        eff_count = min(eff_count, count_buf.Load(count_offset));
+    }
+    // Threads past the records take part in the group's charge (cost 0)
+    // and store nothing.
+    bool active = id.x < eff_count;
+    uint src_at = args_offset + id.x * stride;
+    uint dst_at = id.x * stride;
+    uint cost = 0;
+    uint asked = 0;
+    uint2 draw_counts = uint2(0, 0);
+    uint3 groups = uint3(0, 0, 0);
+    if (gi == 0) {
+        largest_asked = 0;
+        all_asked = 0;
+        widest_asked = 0;
+        cut_asked = 0;
+    }
+    if (active && kind <= 1) {
+        // Draws: vertex or index count, then instances.
+        uint2 want = src_args.Load2(src_at);
+        if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
+            want = uint2(0, 0);
+        }
+        uint count = min(want.x, 1u << 24);
+        uint instances = min(want.y, (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        draw_counts = uint2(count, instances);
+    } else if (active && kind == 2) {
+        uint3 wanted = src_args.Load3(src_at);
+        // Not the garbage of a slot nothing wrote.
+        if (wanted.x <= (1u << 24) && wanted.y <= 64u && wanted.z <= 64u) {
+            asked = wanted.x;
+        }
+        uint3 g = min(wanted, uint3(65535u, 65535u, 65535u));
+        // In parts: one dimension, and not the garbage of an argument
+        // nothing wrote.
+        if (split && g.y <= 1u && g.z <= 1u && wanted.x <= SPLIT * 65535u) {
+            g.x = wanted.x;
+        }
+        // x * y fits 32 bits; the whole count may not.
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64u;
+        groups = g;
+    } else if (active) {
+        // Mesh dispatches: the console's are one-dimensional.
+        uint3 g = src_args.Load3(src_at);
+        // Ahead of its draw, a record over the most a dispatch runs is a
+        // slot the title has not filled (the title leaves all
+        // ones there): empty, and not counted below either.
+        if (ahead && g.x > 65535u) {
+            g = uint3(0, 0, 0);
+        }
+        asked = g.x;
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z * 128u;
+        groups = g;
+    }
+    costs[gi] = cost;
+    GroupMemoryBarrierWithGroupSync();
+    if (active && kind > 2) {
+        // Diagnostics, in the budget buffer's next words (below): the
+        // largest group count a mesh record asked for, and the groups
+        // asked in all.
+        uint was;
+        InterlockedMax(largest_asked, asked, was);
+        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+    }
+    if (active && kind == 2) {
+        // And of compute records, in the words after those: a record over
+        // 65,535 is cut to that above unless run in parts, so the groups
+        // past it never run.
+        uint was;
+        InterlockedMax(widest_asked, asked, was);
+        if (asked > 65535u) {
+            InterlockedAdd(cut_asked, 1u, was);
+        }
+    }
+    // The group's own records: none for a group past a count buffer's
+    // count (an execution may ask for thousands and count a few), which
+    // touches the budget not at all, as its threads do not when every
+    // record charges on its own.
+    uint first = id.x - gi;
+    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+    if (gi == 0 && n > 0) {
+        // What the records charge, from `before` on, in lane order: a
+        // record that does not fit whole runs empty and takes the rest.
+        // Only the group's own records are walked (one, clamped alone).
+        uint before;
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint next = before;
+            for (uint j = 0; j < n; j++) {
+                uint c = costs[j];
+                if (c > 0 && next < BUDGET) {
+                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                }
+            }
+            if (next == before) break;
+            uint prev;
+            budget.InterlockedCompareExchange(0, before, next, prev);
+            if (prev == before) break;
+            before = prev;
+        }
+        uint at = before;
+        for (uint k = 0; k < n; k++) {
+            uint c = costs[k];
+            uint fit = 1;
+            if (c > 0) {
+                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+            }
+            fits[k] = fit;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0 && kind > 2 && n > 0) {
+        uint was;
+        budget.InterlockedMax(4, largest_asked, was);
+        budget.InterlockedAdd(8, all_asked, was);
+    }
+    if (gi == 0 && kind == 2 && n > 0) {
+        uint was;
+        budget.InterlockedMax(12, widest_asked, was);
+        budget.InterlockedAdd(16, cut_asked, was);
+    }
+    if (!active) {
+        return;
+    }
+    bool over = fits[gi] == 0;
+    if (kind <= 1) {
+        if (over) {
+            draw_counts = uint2(0, 0);
+        }
+        dst_args.Store2(dst_at, draw_counts);
+        for (uint off = 8; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    } else {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        if (split) {
+            for (uint part = 0; part < SPLIT; part++) {
+                uint before = part * 65535u;
+                uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;
+                dst_args.Store3(dst_at + part * 12u, uint3(x, groups.yz));
+            }
+            return;
+        }
+        dst_args.Store3(dst_at, groups);
+        for (uint off = 12; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    }
+}
+"#;
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -186,29 +409,76 @@ unsafe impl Sync for Clamp {}
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
-                None
-            }
+        .get_or_init(|| {
+            pick(by_group(), make)
         })
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    make_for(device)
+/// Whether the clamp charges a list's budget once per thread group
+/// (`VICTORY_CLAMP_GROUP=1`; off by default).
+///
+/// The clamp charges record by record: an atomic read and a compare and
+/// swap loop on the budget word for each, every thread of a group racing
+/// for it, so a window of n records takes n rounds and about n * n / 2
+/// atomics. With the switch the records' costs go to memory the group
+/// shares, one thread charges their sum with one compare and swap (retried
+/// only if another group got there first) and every thread reads whether
+/// its record fitted ([`GROUP_SOURCE`]). A group past a count buffer's
+/// count touches the budget not at all, either way.
+fn by_group() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_GROUP").is_some_and(|v| v == "1"))
 }
 
-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+/// The clamp the lists use, made by `make` from a source. `grouped`
+/// ([`by_group`]): the one that charges once per thread group, or, if the
+/// host does not take that one, the per-record clamp after all (one
+/// warning: an execution with a slower clamp, not a dropped one).
+fn pick(
+    grouped: bool,
+    make: impl Fn(&'static str) -> windows::core::Result<Clamp>,
+) -> Option<Clamp> {
+    if grouped {
+        match make(GROUP_SOURCE) {
+            Ok(c) => {
+                tracing::info!(
+                    "the argument clamp charges the budget once per thread group \
+                     (VICTORY_CLAMP_GROUP=1)"
+                );
+                return Some(c);
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "no argument clamp that charges once per thread group (VICTORY_CLAMP_GROUP=1): \
+                 the one that charges record by record is used"
+            ),
+        }
+    }
+    match make(SOURCE) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
+            None
+        }
+    }
+}
+
+fn make(source: &'static str) -> windows::core::Result<Clamp> {
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    make_from(device, source)
+}
+
+/// The clamp for `device` compiled from `source` ([`SOURCE`] or
+/// [`GROUP_SOURCE`]).
+fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -613,7 +883,14 @@ void main() {
     }
 
     impl WarpHarness {
+        /// With the clamp that charges record by record.
         fn new() -> Option<Self> {
+            Self::with(SOURCE)
+        }
+
+        /// With the clamp compiled from `source`: [`SOURCE`], or
+        /// [`GROUP_SOURCE`] as with `VICTORY_CLAMP_GROUP=1`.
+        fn with(source: &str) -> Option<Self> {
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -640,7 +917,8 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
+                let clamp =
+                    make_from(&device, source).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -1062,7 +1340,7 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
-        two_clamps_in_one_list(false);
+        two_clamps_in_one_list(SOURCE, false);
     }
 
     /// The same two calls with the scratch buffer kept readable
@@ -1072,14 +1350,25 @@ void main() {
     /// and is charged as without the switch.
     #[test]
     fn warp_second_clamp_takes_a_readable_scratch_buffer_straight_back() {
-        two_clamps_in_one_list(true);
+        two_clamps_in_one_list(SOURCE, true);
     }
 
-    /// Two counted calls in one list on WARP; `keep`:
+    /// The same two calls through the clamp that charges once per thread
+    /// group (`VICTORY_CLAMP_GROUP=1`), with the scratch buffer returned to
+    /// common and kept readable: of the 64 groups each call dispatches, 63
+    /// lie past the count and leave the budget alone, and the one with
+    /// records charges what its records cost, as record by record.
+    #[test]
+    fn warp_group_clamp_charges_only_the_records_below_the_count() {
+        two_clamps_in_one_list(GROUP_SOURCE, false);
+        two_clamps_in_one_list(GROUP_SOURCE, true);
+    }
+
+    /// Two counted calls in one list on WARP, clamped by `source`; `keep`:
     /// the scratch buffer stays readable as arguments between them, as a
     /// list records them with `VICTORY_INDIRECT_READABLE=1`.
-    fn two_clamps_in_one_list(keep: bool) {
-        let Some(mut warp) = WarpHarness::new() else {
+    fn two_clamps_in_one_list(source: &str, keep: bool) {
+        let Some(mut warp) = WarpHarness::with(source) else {
             return;
         };
         const KIND_DISPATCH: u32 = 2;
@@ -1297,7 +1586,36 @@ void main() {
     /// clamped, or empty.
     #[test]
     fn warp_large_dispatch_is_made_in_parts() {
-        let Some(mut warp) = WarpHarness::new() else {
+        large_dispatch_in_parts(SOURCE);
+    }
+
+    /// The tests of one clamp that take a `source`, through the clamp that
+    /// charges once per thread group (`VICTORY_CLAMP_GROUP=1`): a dispatch
+    /// in parts, a window clamped ahead, a budget that runs out, and
+    /// windows read with no barrier between their executions come out as
+    /// they do record by record.
+    #[test]
+    fn warp_group_clamp_makes_a_large_dispatch_in_parts() {
+        large_dispatch_in_parts(GROUP_SOURCE);
+    }
+
+    #[test]
+    fn warp_group_clamp_leaves_unfilled_window_slots_empty_and_uncharged() {
+        window_slots(GROUP_SOURCE);
+    }
+
+    #[test]
+    fn warp_group_clamp_saturates_the_budget_without_wraparound() {
+        budget_saturates(GROUP_SOURCE);
+    }
+
+    #[test]
+    fn warp_group_clamp_window_executions_read_their_records() {
+        window_executions(GROUP_SOURCE);
+    }
+
+    fn large_dispatch_in_parts(source: &str) {
+        let Some(mut warp) = WarpHarness::with(source) else {
             return;
         };
         let cases: [([u32; 3], [u32; 6]); 6] = [
@@ -1354,7 +1672,11 @@ void main() {
     /// to the most and spend the budget.
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
-        let Some(mut warp) = WarpHarness::new() else {
+        window_slots(SOURCE);
+    }
+
+    fn window_slots(source: &str) {
+        let Some(mut warp) = WarpHarness::with(source) else {
             return;
         };
         const KIND_MESH: u32 = 10;
@@ -1437,7 +1759,11 @@ void main() {
 
     #[test]
     fn warp_budget_saturates_without_wraparound_and_preserves_draw_fields() {
-        let Some(mut warp) = WarpHarness::new() else {
+        budget_saturates(SOURCE);
+    }
+
+    fn budget_saturates(source: &str) {
+        let Some(mut warp) = WarpHarness::with(source) else {
             return;
         };
         const KIND_INDEXED: u32 = 1;
@@ -1666,6 +1992,109 @@ void main() {
         list.reset();
     }
 
+    /// A group charges its records in lane order: with 300 left of the
+    /// budget, the first draw (100) fits, the second (250) does not and
+    /// takes the rest, and the ones after it run empty. (Racing for the
+    /// word record by record, which of them fits is up to the card.)
+    #[test]
+    fn warp_a_group_charges_its_records_in_lane_order() {
+        let Some(mut warp) = WarpHarness::with(GROUP_SOURCE) else {
+            return;
+        };
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 16;
+        const BUDGET_CAP: u32 = 1 << 27;
+        let counts = [100u32, 250, 50, 100];
+        let total = counts.len() * STRIDE as usize;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+        let dst_buf = warp.default_uav(total as u64);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            for (i, &count) in counts.iter().enumerate() {
+                let words = [count, 1, 7, 9];
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr().cast::<u8>(),
+                    src_ptr.add(i * STRIDE as usize),
+                    16,
+                );
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - 300);
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DRAW, STRIDE, counts.len() as u32),
+            0,
+        ));
+        // SAFETY: an open list; the clamped records are copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list
+                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4)
+                    .to_vec(),
+            )
+        };
+        assert_eq!(out[0..4], [100, 1, 7, 9], "the first record fits");
+        for i in 1..counts.len() {
+            assert_eq!(out[i * 4..i * 4 + 4], [0, 0, 7, 9], "record {i} runs empty");
+        }
+        assert_eq!(
+            spent, BUDGET_CAP,
+            "the record that did not fit took the rest"
+        );
+    }
+
+    /// Which clamp the lists take ([`pick`]): without the switch the
+    /// per-record one, and the group clamp is not made at all; with
+    /// `VICTORY_CLAMP_GROUP=1` the group clamp, and if the host does not
+    /// make it the per-record one after all, so indirect executions go on.
+    /// None only if that one fails too.
+    #[test]
+    fn a_group_clamp_that_cannot_be_made_falls_back_to_the_record_clamp() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        // Whether a clamp came out, and which were asked for (true: the
+        // group clamp), when the host refuses the ones in `refused`.
+        let tried = |grouped: bool, refused: &[&str]| {
+            let asked = std::cell::RefCell::new(Vec::new());
+            let made = pick(grouped, |source| {
+                asked.borrow_mut().push(source == GROUP_SOURCE);
+                if refused.contains(&source) {
+                    return Err(windows::core::Error::empty());
+                }
+                make_from(&warp.device, source)
+            });
+            (made.is_some(), asked.into_inner())
+        };
+        assert_eq!(tried(false, &[]), (true, vec![false]));
+        assert_eq!(tried(true, &[]), (true, vec![true]));
+        assert_eq!(tried(true, &[GROUP_SOURCE]), (true, vec![true, false]));
+        assert_eq!(
+            tried(true, &[GROUP_SOURCE, SOURCE]),
+            (false, vec![true, false])
+        );
+        assert_eq!(tried(false, &[SOURCE]), (false, vec![false]));
+    }
+
     /// A command signature of one dispatch record of `stride` bytes.
     fn dispatch_signature(device: &ID3D12Device, stride: u32) -> ID3D12CommandSignature {
         signature_of(
@@ -1675,10 +2104,205 @@ void main() {
         )
     }
 
+    /// The list's budget starts empty at each submission, wherever it
+    /// lives: a recording whose clamps spend all of it is followed, after
+    /// the reset, by one whose small record still runs.
+    #[test]
+    fn host_list_budget_starts_empty_at_each_submission() {
+        budget_starts_empty(false);
+    }
+
+    /// The same with the budget in the card's own memory
+    /// (`VICTORY_INDIRECT_CARD_BUDGET=1`), which the list zeroes itself
+    /// before its first clamp.
+    #[test]
+    fn host_list_card_budget_starts_empty_at_each_submission() {
+        budget_starts_empty(true);
+    }
+
+    /// `card`: the list's budget is in the card's own memory whatever the
+    /// switch says (on a software adapter only: [`software_host`]);
+    /// otherwise where the switch puts it.
+    fn budget_starts_empty(card: bool) {
+        let host = if card { software_host() } else { super::host() };
+        let Some(host) = host else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        if card {
+            assert!(list.force_card_budget(), "no budget in the card's memory");
+        }
+        let _ = host.log_messages();
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let signature = dispatch_signature(&host.device, STRIDE);
+        // Three records of 65,535 x 16 groups: about half the budget each.
+        let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
+            return;
+        };
+        let Some((small, small_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
+            return;
+        };
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            for i in 0..3 {
+                let words = [65535u32, 16, 1];
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr().cast::<u8>(),
+                    big_ptr.add(i * STRIDE as usize),
+                    12,
+                );
+            }
+            std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr().cast::<u8>(), small_ptr, 12);
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+        }
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        // Clamps the small record and executes it, as
+        // `State::execute_indirect` does; then the list runs.
+        let small_runs = || {
+            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            // SAFETY: an open list; the worker's root signature and
+            // pipeline; buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list
+                    .ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
+            }
+            done(&list, &scratch);
+            list.close();
+            // Read before the submission, which moves the messages to the log.
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; a mapped buffer.
+            unsafe { (hits_ptr as *const u32).read_volatile() }
+        };
+        for round in 0..2 {
+            // Spends the budget (clamped, not executed), then one group.
+            let spent = bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            done(&list, &spent);
+            // The small record comes after the big ones spent the budget:
+            // it runs empty, in every round alike (none carries over).
+            assert_eq!(
+                small_runs(),
+                0,
+                "round {round}: a spent budget empties the next record"
+            );
+        }
+        // A recording with only the small record: the budget is empty
+        // again, so it runs.
+        assert_eq!(
+            small_runs(),
+            1,
+            "the budget starts empty at the next submission"
+        );
+        assert_eq!(list.budget_on_card(), card || crate::host::card_budget());
+    }
+
+    /// What the clamp notes of a list's records (mesh: the largest group
+    /// count asked for and the groups asked in all; compute: the largest x
+    /// asked for and the records cut) is in the list's mapped words once it
+    /// has run, where the next submission takes it for the frame line.
+    #[test]
+    fn host_list_budget_notes_are_in_the_mapped_words_after_a_run() {
+        budget_notes(false);
+    }
+
+    /// The same with the budget in the card's own memory
+    /// (`VICTORY_INDIRECT_CARD_BUDGET=1`): the list copies the notes to
+    /// the mapped words when it closes, and the mapped budget word itself
+    /// is not charged. The closed list runs twice in one call to the
+    /// queue: it leaves both budget buffers as it found them, and its
+    /// second run zeroes the card's copy again, so the notes are those of
+    /// one run.
+    #[test]
+    fn host_list_card_budget_copies_its_notes_to_the_mapped_words() {
+        budget_notes(true);
+    }
+
+    /// `card`: as for [`budget_starts_empty`].
+    fn budget_notes(card: bool) {
+        let host = if card { software_host() } else { super::host() };
+        let Some(host) = host else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        if card {
+            assert!(list.force_card_budget(), "no budget in the card's memory");
+        }
+        let _ = host.log_messages();
+        const KIND_DISPATCH: u32 = 2;
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 12;
+        let Some((mesh, mesh_ptr)) = host.shared_buffer(2 * u64::from(STRIDE)) else {
+            return;
+        };
+        let Some((compute, compute_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
+            return;
+        };
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            let records = [5u32, 1, 1, 519, 1, 1];
+            std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), mesh_ptr, 24);
+            let record = [100_000u32, 1, 1];
+            std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), compute_ptr, 12);
+        }
+        // Twice: the second recording finds the words of the first, which
+        // its submission takes and zeroes before it runs.
+        for round in 0..2 {
+            let scratch = bound(&list, (&mesh, 0), None, (KIND_MESH, STRIDE, 2)).unwrap();
+            done(&list, &scratch);
+            let scratch = bound(&list, (&compute, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            done(&list, &scratch);
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            if card {
+                host.execute(&[&list, &list]);
+            } else {
+                host.execute(&[&list]);
+            }
+            list.reset();
+            let on_card = list.budget_on_card();
+            assert_eq!(on_card, card || crate::host::card_budget());
+            let words = list.budget_words().unwrap();
+            // The compute record is cut to 65,535 groups of 64 threads.
+            let charged = (5 + 519) * 128 + 65_535 * 64;
+            assert_eq!(
+                words[0],
+                if on_card { 0 } else { charged },
+                "round {round}: the budget is charged where it lives"
+            );
+            assert_eq!(
+                words[1..3],
+                [519, 524],
+                "round {round}: the mesh records' notes"
+            );
+            let noted = [100_000, 1];
+            assert_eq!(
+                words[3..],
+                noted,
+                "round {round}: the compute record's notes"
+            );
+        }
+    }
+
     /// [`bound`], [`bound_ahead`] and [`bound_split`] take the mode from the
     /// switch ([`readable`]): unset, every clamp's execution ends with the
     /// scratch buffer common; with `VICTORY_INDIRECT_READABLE=1` in the
-    /// test's environment it stays readable until the list closes.
+    /// test's environment it stays readable until the list closes. Where
+    /// the budget they charge lives follows its switch too
+    /// (`VICTORY_INDIRECT_CARD_BUDGET=1`: the card's own memory).
     #[test]
     fn host_list_clamps_follow_the_switch() {
         let Some(host) = super::host() else {
@@ -1706,6 +2330,7 @@ void main() {
         executed(bound(&list, (&src_buf, 0), None, (2, 12, 1)));
         executed(bound_ahead(&list, (&src_buf, 0), (10, 32, 4)));
         executed(bound_split(&list, (&src_buf, 0)));
+        assert_eq!(list.budget_on_card(), crate::host::card_budget());
         list.close();
         host.execute(&[&list]);
         list.reset();
@@ -1742,7 +2367,11 @@ void main() {
     /// with the group count it asked for.
     #[test]
     fn warp_window_executions_read_their_records_with_no_barrier_between() {
-        let Some(mut warp) = WarpHarness::new() else {
+        window_executions(SOURCE);
+    }
+
+    fn window_executions(source: &str) {
+        let Some(mut warp) = WarpHarness::with(source) else {
             return;
         };
         const KIND_DISPATCH: u32 = 2;
@@ -1887,6 +2516,11 @@ void main() {
         }
     }
 }
+
+/// The benchmark of the clamp, its barriers and its budget (ignored by
+/// default).
+#[cfg(test)]
+mod bench;
 
 /// What one small draw costs this card, bare and with one thing changed
 /// between every two draws: a measurement, not a check (it asserts only

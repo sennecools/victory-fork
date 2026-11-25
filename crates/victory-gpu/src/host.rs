@@ -855,8 +855,15 @@ pub(crate) struct HostList {
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted.
+    /// shader-writable word, zeroed when the list is submitted, and after
+    /// it what the clamp notes about mesh and compute records. In memory
+    /// the CPU maps.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The same words in the card's own memory ([`card_budget`]), which the
+    /// clamp uses instead when there is one: zeroed in the list before its
+    /// first clamp, its notes copied to `budget` when the list closes. With
+    /// it the list's own interface that records the zeroing.
+    card_budget: OnceLock<Option<(ID3D12Resource, ID3D12GraphicsCommandList2)>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -1494,6 +1501,20 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// 65,535 one dispatch runs (cut to that: the groups past it do not run).
 static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Whether a list's indirect-work budget lives in the card's own memory
+/// (`VICTORY_INDIRECT_CARD_BUDGET=1`; off by default: it stays in memory
+/// the CPU maps, zeroed on the CPU at submission). The clamp charges it
+/// with atomics, at least two in a row for every clamp; in mapped memory
+/// on a card of its own each of them crosses the bus.
+pub(crate) fn card_budget() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_some_and(|v| v == "1"))
+}
+
+/// The words of a list's budget buffer: the budget, then what the clamp
+/// notes (two words about mesh records, two about compute records).
+const BUDGET_WORDS: usize = 5;
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED=1`).
@@ -2057,7 +2078,8 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
-    /// Whether a step zeroes the indirect-work budget.
+    /// Whether the indirect-work budget is zeroed for this recording (a
+    /// step on the CPU, and in the list for the card's copy).
     budget_zeroed: bool,
     /// Whether the list ran the heap buffer pass (`State::heap_buffers`):
     /// most of its steps are that pass's.
@@ -3574,6 +3596,7 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
                 id: LIST_IDS.fetch_add(1, Ordering::Relaxed),
@@ -5662,6 +5685,7 @@ impl HostList {
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
         }
+        self.card_budget_out();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6318,7 +6342,9 @@ impl HostList {
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
+    /// submission of the list from the first use after a reset on: on the
+    /// CPU for the mapped words, in the list itself for the card's copy
+    /// ([`card_budget`]), whose address this then is.
     pub(crate) fn budget(&self) -> Option<u64> {
         let (buffer, data) = self
             .budget
@@ -6327,6 +6353,10 @@ impl HostList {
                 Some((b, d as usize))
             })
             .as_ref()?;
+        let card = self
+            .card_budget
+            .get_or_init(|| self.make_card_budget(card_budget()))
+            .as_ref();
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
@@ -6334,7 +6364,8 @@ impl HostList {
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all): taken, then zeroed.
+            // asked for, the groups asked in all; with the card's copy, as
+            // the list's end copied them here): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
@@ -6345,13 +6376,125 @@ impl HostList {
                 let (widest, cut) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 COMPUTE_GROUPS[0].fetch_max(u64::from(widest), Ordering::Relaxed);
                 COMPUTE_GROUPS[1].fetch_add(u64::from(cut), Ordering::Relaxed);
-                for k in 0..5 {
+                for k in 0..BUDGET_WORDS {
                     words.add(k).write_volatile(0);
                 }
             })));
+            drop(deferred);
+            if let Some((card, list)) = card {
+                self.zero_card_budget(card, list);
+            }
         }
+        let buffer = card.map_or(buffer, |(card, _)| card);
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The budget's words in the card's own memory, if `on`
+    /// ([`card_budget`]) and the list can zero them itself
+    /// (`WriteBufferImmediate`). Said once in the log, either way: a list
+    /// that cannot have them keeps the mapped words, as with no switch.
+    fn make_card_budget(&self, on: bool) -> Option<(ID3D12Resource, ID3D12GraphicsCommandList2)> {
+        if !on {
+            return None;
+        }
+        static MADE: std::sync::Once = std::sync::Once::new();
+        static REFUSED: std::sync::Once = std::sync::Once::new();
+        let made = self
+            .list
+            .cast::<ID3D12GraphicsCommandList2>()
+            .ok()
+            .and_then(|list| {
+                let buffer = host()?.uav_buffer(256)?;
+                name(&buffer, || "indirect budget".to_owned());
+                Some((buffer, list))
+            });
+        if made.is_some() {
+            MADE.call_once(|| {
+                tracing::info!(
+                    "the indirect budget lives in the card's memory (VICTORY_INDIRECT_CARD_BUDGET=1)"
+                );
+            });
+        } else {
+            REFUSED.call_once(|| {
+                tracing::warn!(
+                    "no indirect budget in the card's memory (VICTORY_INDIRECT_CARD_BUDGET=1): the mapped words are used"
+                );
+            });
+        }
+        made
+    }
+
+    /// Records, before the recording's first clamp, the zeroing of the
+    /// card's copy of the budget: written as a copy, then left for
+    /// unordered access until the list closes
+    /// ([`HostList::card_budget_out`]). Its states are tracked with the
+    /// list's other buffers ([`HostList::buffer_state`]): common at the
+    /// start of every recording.
+    fn zero_card_budget(&self, card: &ID3D12Resource, list: &ID3D12GraphicsCommandList2) {
+        // SAFETY: a live buffer.
+        let at = unsafe { card.GetGPUVirtualAddress() };
+        let zeros: [_; BUDGET_WORDS] =
+            std::array::from_fn(|word| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                Dest: at + 4 * word as u64,
+                Value: 0,
+            });
+        self.buffer_state(card, D3D12_RESOURCE_STATE_COPY_DEST);
+        // SAFETY: an open list (`list` is this list's own interface); the
+        // buffer is the list's own, 256 bytes, and a copy destination.
+        unsafe { list.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None) };
+        self.buffer_state(card, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    /// Before the list closes, if this recording charged the card's copy
+    /// of the budget: what the clamp noted there goes to the mapped words
+    /// (read at the next submission), and both go back to common: the list
+    /// ends as it begins, so it may run again in the same call to the
+    /// queue, where no buffer decays between two lists. No clamp of this
+    /// recording used the mapped words.
+    fn card_budget_out(&self) {
+        if !self.deferred().budget_zeroed {
+            return;
+        }
+        let (Some(Some((card, _))), Some(Some((mapped, _)))) =
+            (self.card_budget.get(), self.budget.get())
+        else {
+            return;
+        };
+        // The words after the budget.
+        let notes = 4 * (BUDGET_WORDS as u64 - 1);
+        self.buffer_state(card, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        self.buffer_state(mapped, D3D12_RESOURCE_STATE_COPY_DEST);
+        // SAFETY: an open list; both buffers are the list's own, of 256
+        // bytes, and in the states of a copy.
+        unsafe { self.list.CopyBufferRegion(mapped, 4, card, 4, notes) };
+        self.buffer_state(card, D3D12_RESOURCE_STATE_COMMON);
+        self.buffer_state(mapped, D3D12_RESOURCE_STATE_COMMON);
+    }
+
+    /// Tests: puts the list's budget in the card's own memory whatever the
+    /// switch says, if called before the list's first clamp; whether it is
+    /// there.
+    #[cfg(test)]
+    pub(crate) fn force_card_budget(&self) -> bool {
+        self.card_budget
+            .get_or_init(|| self.make_card_budget(true))
+            .is_some()
+    }
+
+    /// Tests: whether the list's clamps charge a budget in the card's own
+    /// memory (false before its first clamp).
+    #[cfg(test)]
+    pub(crate) fn budget_on_card(&self) -> bool {
+        matches!(self.card_budget.get(), Some(Some(_)))
+    }
+
+    /// Tests: the list's mapped budget words as they are now.
+    #[cfg(test)]
+    pub(crate) fn budget_words(&self) -> Option<[u32; BUDGET_WORDS]> {
+        let (_, data) = self.budget.get()?.as_ref()?;
+        // SAFETY: the list's own mapping, of 256 bytes.
+        Some(unsafe { (*data as *const [u32; BUDGET_WORDS]).read_volatile() })
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
