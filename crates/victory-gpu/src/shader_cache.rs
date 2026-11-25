@@ -10,7 +10,7 @@
 //! are ignored anyway).
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
@@ -105,11 +105,11 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// The cache entry's converter retains the translation so a cache I/O
+/// failure does not discard usable shader code or repeat translation.
 struct Translate<F> {
     translate: F,
-    ran: AtomicBool,
+    result: Mutex<Option<Result<HostShader, String>>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -121,9 +121,13 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let result = (self.translate)(&input[32..]);
+        let encoded = match &result {
+            Ok(shader) => Ok(encode(shader)),
+            Err(error) => Err(anyhow::Error::msg(error.clone())),
+        };
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        encoded
     }
 }
 
@@ -136,20 +140,35 @@ fn cached(
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
-        ran: AtomicBool::new(false),
+        result: Mutex::new(None),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let published = cache.get_or_convert(&converter, &input);
+        let translated = converter.result.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(result) = translated {
+            // Converter errors are real translation failures, not cache misses.
+            // On a successful conversion, use the in-memory shader even if
+            // creating, writing or publishing the cache entry failed.
+            if result.is_ok() {
+                MISSES.fetch_add(1, Ordering::Relaxed);
+                match published {
+                    Ok(path) => tracing::debug!(path = %path.display(), "shader translated and cached"),
+                    Err(error) => tracing::debug!(%error, "shader translated; cache write failed"),
+                }
+            }
+            return result;
+        }
+        let path = match published {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::debug!(%error, "shader cache unavailable; translating directly");
+                MISSES.fetch_add(1, Ordering::Relaxed);
+                return (converter.translate)(container);
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader from the cache");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
@@ -396,6 +415,46 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn failed_cache_publication_keeps_the_shader_without_retranslation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [9u8; 32];
+        let container = b"synthetic container";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let converter = Translate {
+            translate,
+            result: Mutex::new(None),
+        };
+        let input = [&build[..], &container[..]].concat();
+        let path = cache.path_for(&victory_pipeline::CacheKey::new(&converter, &input));
+        // A directory at the entry path prevents publishing a regular file.
+        std::fs::create_dir_all(&path).unwrap();
+        assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn failed_translation_is_not_retried_as_cache_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Err("unsupported".to_owned())
+        };
+        assert_eq!(
+            cached(&cache, &[9; 32], b"synthetic failure", translate),
+            Err("unsupported".to_owned())
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
