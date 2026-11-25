@@ -4682,7 +4682,27 @@ impl<'a> Lower<'a> {
                 .filter(|(s, b)| *s != site && *b == a && same(*s))
                 .find_map(|(s, _)| use_of(*s))
         };
-        let use_at = use_of(site).or_else(twin);
+        // shortcut: an image descriptor the code reads only for its size, picked from a
+        // table by a computed index (the puddle passes read one texture's width, height
+        // and base level, then sample others of the same table by other indices): its
+        // kind is that of the nearest other load of as many dwords from the same table
+        // by a computed index that the code uses as a descriptor. The handle is still
+        // this load's own; a view of another kind there would give wrong sizes.
+        let sibling = || {
+            let a = address?;
+            if count != 8 || a.dynamic.is_none() {
+                return None;
+            }
+            let same = |s: Site| x.p.blocks[s.0].insts[s.1].name() == inst.name();
+            x.res
+                .scalar
+                .iter()
+                .filter(|(s, b)| *s != site && b.param == a.param && b.dynamic.is_some() && same(*s))
+                .filter_map(|(s, _)| use_of(*s).map(|u| (*s, u)))
+                .min_by_key(|(s, _)| (s.0.abs_diff(site.0), s.1.abs_diff(site.1)))
+                .map(|(_, u)| u)
+        };
+        let use_at = use_of(site).or_else(twin).or_else(sibling);
         // A descriptor nothing uses as one, whose size the code reads all the same (a
         // texture picked from the heap by an index in a constant buffer, its width and
         // height turned into a texel size; a buffer tested for being empty by its record
