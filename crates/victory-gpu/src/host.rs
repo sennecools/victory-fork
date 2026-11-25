@@ -117,6 +117,30 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// The host device's adapter name and dedicated video memory, when DXGI
+/// named it (the frametime dump's hardware line).
+pub(crate) fn adapter_summary() -> Option<(String, u64)> {
+    let host = host()?;
+    let adapter = host.adapter.as_ref()?;
+    // SAFETY: a plain DXGI adapter query on an adapter the device named.
+    let desc = unsafe {
+        adapter
+            .cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter1>()
+            .ok()?
+            .GetDesc1()
+            .ok()?
+    };
+    let end = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    Some((
+        String::from_utf16_lossy(&desc.Description[..end]),
+        desc.DedicatedVideoMemory as u64,
+    ))
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
