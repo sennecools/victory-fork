@@ -257,7 +257,6 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }
@@ -290,20 +289,31 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
+    // Each copy once per list, whichever list numbered it: the builder alone
+    // dispatches hundreds of times a frame. The title records its lists on
+    // several threads, so a copy can be numbered by another list (or by the
+    // frame's fault notes) after this list's first dispatch: this list's
+    // shaders reach it through the directory all the same, and a copy it
+    // has not brought up to date, or not declared written, would be read as
+    // it stands and its stores never looked for. Copies are only ever
+    // added, so the ones a list has not taken yet are the last ones.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
+    const READ_COPY: usize = usize::MAX - 0x1_0000;
+    const WRITE_COPY: usize = usize::MAX - 0x2_0000;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
-        let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
+    for (n, shadow) in m.copies.iter().enumerate().rev() {
+        if !list.first_use(READ_COPY - n) {
+            break;
         }
-        if writes && (first_write || n >= numbered) {
+        let (start, len) = shadow.span();
+        shadow.refresh(list, start, len);
+    }
+    if writes {
+        for (n, shadow) in m.copies.iter().enumerate().rev() {
+            if !list.first_use(WRITE_COPY - n) {
+                break;
+            }
+            let (start, len) = shadow.span();
             shadow.gpu_writes(list, start, len);
         }
     }
