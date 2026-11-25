@@ -147,6 +147,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_FLIP=<n>` | compares two arms in one run (release builds too): one `flip` line a second, the arm changing every `n` lines in the order ABBA. A switch given a pair `a\|b` (`VICTORY_TEXTURE_STAGE_MB`, `VICTORY_TEXTURE_STAGE_MS`, `VICTORY_TEXTURE_NO_WAIT`) takes `a` under the first arm and `b` under the second |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_TEXTURE_SWEEP=0` | no paced look over the heap's placed texture views for ones nothing brings up to date (`count`: only count them; default on, putting them back in the queue) |
+| `VICTORY_HEAP_RECHECK=0` | a texture picked by index is uploaded once, not looked at again 4, 12, 40, 120 and 400 frames after its upload for memory the title filled after writing its view |
+| `VICTORY_VIEW_GUARD=0` | a guarded copy of title memory does not see writes through another view of the same pages (on by default; a page shown in more than 64 views is guarded at each view by itself) |
 | `VICTORY_NULL_MAGENTA=1` | diagnostics build: a 2D colour texture view with nothing to show yet reads magenta instead of black |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
