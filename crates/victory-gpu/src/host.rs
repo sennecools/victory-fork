@@ -6949,12 +6949,20 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows `texture` as frame `frame` (saved if captures are on), moving its
+    /// tracked host state to `COPY_SOURCE` through the copy list's prelude
+    /// under `self.submitted` so concurrent submissions never race on
+    /// `HostTexture::state` and no redundant `COPY_SOURCE -> COPY_SOURCE`
+    /// barrier is emitted. `None` if nothing was shown; else, in diagnostics
+    /// builds, whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &std::sync::Arc<crate::resource::HostTexture>,
+        frame: u64,
+    ) -> Option<bool> {
+        let raw = &texture.texture;
         // SAFETY: a live resource.
-        let desc = unsafe { texture.GetDesc() };
+        let desc = unsafe { raw.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
@@ -6997,7 +7005,6 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -7027,32 +7034,34 @@ impl Host {
                 None => &p.copy,
             };
             copy.reset();
+            // Track and retain the presented texture on `copy` so `copy.prelude()`
+            // transitions it to `COPY_SOURCE` atomically under `self.submitted`
+            // (and emits no barrier when it is already in `COPY_SOURCE`).
+            copy.settle(texture, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+            list.CopyResource(&back, raw);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, raw))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() {
+                None
+            } else {
+                crate::capture::probe(&self.device, list, raw)
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            )]);
             copy.close();
             match slot {
                 Some(i) => {
@@ -7942,5 +7951,80 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(&dst[16..32], &[0xCCu8; 16]);
         assert_eq!(&dst[32..48], &[0x5Au8; 16]);
         assert_eq!(&dst[48..64], &[0xCCu8; 16]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn present_settle_skips_redundant_copy_source_barrier_and_tracks_state_at_prelude() {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let Some(host) = super::host() else {
+            return;
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut raw: Option<ID3D12Resource> = None;
+        // SAFETY: creating a plain 16x16 render-target texture on the test device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut raw,
+                )
+                .unwrap();
+        }
+        let copy = Arc::new(crate::resource::HostTexture::new(
+            raw.unwrap(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+        ));
+        let list = host.new_list().unwrap();
+        list.settle(&copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        // Recording on the present copy list does not eagerly mutate `copy.state`
+        // before submission, and retains `copy` until reset.
+        assert_eq!(
+            copy.state.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32
+        );
+        assert!(Arc::strong_count(&copy) >= 2);
+        list.close();
+
+        // First submission transitions RENDER_TARGET -> COPY_SOURCE in prelude.
+        host.execute(&[&list]);
+        assert_eq!(
+            copy.state.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32
+        );
+
+        // Second submission when already in COPY_SOURCE must emit NO prelude barrier
+        // (avoiding illegal COPY_SOURCE -> COPY_SOURCE barriers) and execute cleanly.
+        list.reset();
+        list.settle(&copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        list.close();
+        assert!(list.prelude().is_none());
+        host.execute(&[&list]);
+        assert_eq!(
+            copy.state.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32
+        );
     }
 }
