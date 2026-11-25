@@ -232,18 +232,42 @@ fn total_ram_mib() -> Option<u64> {
 }
 
 /// The display class key's driver version; for NVIDIA also the public number
-/// (`32.0.16.2124` -> `621.24`), which is what people quote.
+/// (`32.0.16.2124` -> `621.24`), which is what people quote. The class has a
+/// subkey per display adapter (`0000`, `0001`, ...), so match `DriverDesc`
+/// against the DXGI adapter rather than assuming `0000`.
 #[cfg(windows)]
 fn display_driver_version(gpu: Option<&str>) -> Option<String> {
     const CLASS: &str =
-        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000";
-    let version = registry_string(CLASS, "DriverVersion")?;
-    if gpu.is_some_and(|name| name.to_ascii_lowercase().contains("nvidia"))
-        && let Some(public) = nvidia_driver_number(&version)
-    {
-        return Some(format!("{public} ({version})"));
+        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let gpu = gpu?.to_ascii_lowercase();
+    let mut fallback = None;
+    for index in 0..16 {
+        let key = format!(r"{CLASS}\{index:04}");
+        let Some(desc) = registry_string(&key, "DriverDesc") else {
+            continue;
+        };
+        if desc.is_empty() {
+            continue;
+        }
+        let desc = desc.to_ascii_lowercase();
+        let nvidia = desc.contains("nvidia");
+        if index == 0 {
+            fallback = registry_string(&key, "DriverVersion");
+        }
+        let matches =
+            desc == gpu || desc.contains(&gpu) || gpu.contains(&desc) || (nvidia && gpu.contains("nvidia"));
+        if !matches {
+            continue;
+        }
+        let version = registry_string(&key, "DriverVersion")?;
+        if nvidia
+            && let Some(public) = nvidia_driver_number(&version)
+        {
+            return Some(format!("{public} ({version})"));
+        }
+        return Some(version);
     }
-    Some(version)
+    fallback
 }
 
 /// `32.0.16.2124` -> `621.24`: the last five digits of the third and fourth
