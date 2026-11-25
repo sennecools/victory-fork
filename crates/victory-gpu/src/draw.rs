@@ -462,12 +462,17 @@ pub(crate) fn dispatched() -> u64 {
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
-/// shortcut: a root view has no size; constant buffers are taken as 64 KiB
-/// (cut at their buffer's end), other views as all that is left of their
-/// buffer. (They were taken as 1 MiB: 1,452 of the 2,021 mesh vertex
-/// streams of a cutscene frame reach further, and what lay past the first
-/// megabyte was never brought up to date - meshes without bodies, exploded
-/// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
+/// other views as all that is left of their buffer. A constant buffer view
+/// in a window of memory outside buffers is bound from a copy that holds the
+/// whole 64 KiB ([`root_view_copy`], [`root_cbv_reach`]), and an unaligned
+/// one takes 64 KiB of the list's scratch, because the title's memory goes
+/// on past a window's end; in a title buffer's copy it is still cut at the
+/// buffer's end, taken to hold the title's constant blocks. (Other views
+/// were taken as 1 MiB: 1,452 of the 2,021 mesh vertex streams of a
+/// cutscene frame reach further, and what lay past the first megabyte was
+/// never brought up to date - meshes without bodies, exploded triangles.
+/// `VICTORY_ROOT_VIEW_MB` sets a limit again.)
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -476,19 +481,132 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = root_view_copy(address, srv)?;
     let len = shadow
         .left(address)
-        .min(if srv { limit } else { 1 << 16 });
+        .min(if srv { limit } else { ROOT_CBV_REACH });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         list.buffer_read(&shadow.buffer);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
+    // The whole reach in the list's scratch, so that no read runs past the
+    // end of a scratch chunk; the title's bytes in the first `len`.
+    let reach = if root_cbv_reach() {
+        ROOT_CBV_REACH
+    } else {
+        len
+    };
+    let (gpu, to) = list.scratch(reach)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
+}
+
+/// The most a root constant buffer view reads from its address: a constant
+/// buffer of 4,096 vectors of 16 bytes.
+const ROOT_CBV_REACH: u64 = 64 << 10;
+
+/// Whether a root constant buffer view near the end of a window of memory
+/// outside buffers is bound from a window that holds all it can read (on by
+/// default; `VICTORY_ROOT_CBV_REACH=0`: the window its address names, as
+/// before).
+///
+/// A root descriptor has no size, and a root view is found by its address
+/// alone, which names its 4 MiB cell's window (or the cell's tail). The
+/// title's memory goes on past the cell's end, and a constant block that
+/// straddles a 4 MiB line is read past the end of the window's host buffer,
+/// into whatever the host placed after it: as root shader resource views
+/// were before they became bounded tables
+/// (`crate::pipeline::host::bounded_root_srvs`). Where that is memory the
+/// host has freed, the card reads freed memory. This is the suspected cause
+/// of page faults "inside freed" allocations of whatever kind lay there
+/// before (texture staging, host textures, other windows) in relay runs
+/// with `VICTORY_WINDOW_KB=1024`, where more host buffers come and go; no
+/// run has confirmed it yet. [`ROOT_CBV_SHORT`] counts such views with the
+/// switch on and off.
+///
+/// limit: windows only. A title buffer's copy is kept as its address names
+/// it: it is rounded up to 64 KiB, but a view in its last bytes still has
+/// less than 64 KiB of it left, and the title is taken to keep its constant
+/// blocks inside the buffer (counted in [`ROOT_CBV_SHORT`] too). If those
+/// occur, the full fix is a one-view constant buffer table with a size,
+/// which reads zeros past the end, as the bounded root shader resource
+/// views do.
+pub(crate) fn root_cbv_reach() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_CBV_REACH").is_none_or(|v| v != "0"))
+}
+
+/// Root constant buffer views whose copy, as their address names it, ends
+/// less than [`ROOT_CBV_REACH`] on, since the start: in a window of memory
+/// outside buffers (with [`root_cbv_reach`] on or off); of those, bound
+/// from a window that holds the whole reach; not, because no window held it
+/// (the short one kept); and in a title buffer's copy (kept).
+pub(crate) static ROOT_CBV_SHORT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Counts a root constant buffer view in [`ROOT_CBV_SHORT`]`[kind]`, and
+/// tells the first of each kind with the copy's range and how far the view
+/// is from its end.
+fn short_root_cbv(kind: usize, what: &str, shadow: &crate::shadow::Shadow, address: u64) {
+    static FIRST: [std::sync::Once; 4] = [const { std::sync::Once::new() }; 4];
+    ROOT_CBV_SHORT[kind].fetch_add(1, Ordering::Relaxed);
+    FIRST[kind].call_once(|| {
+        let (start, len) = shadow.span();
+        tracing::info!(
+            "root constant buffer view {what}: copy {start:#x} + {len:#x}, the view at {address:#x} with {:#x} bytes \
+             of the copy left (a constant buffer reads up to {ROOT_CBV_REACH:#x})",
+            shadow.left(address)
+        );
+    });
+}
+
+/// The host copy a root view at `address` is bound from ([`root_view`]):
+/// the one its address names, or, for a constant buffer view that would
+/// end less than [`ROOT_CBV_REACH`] on in a window of memory outside
+/// buffers, a window that holds the whole reach ([`root_cbv_reach`]). A
+/// title buffer's copy is kept (see the limit there). Each constant buffer
+/// view with less than the reach left is counted ([`ROOT_CBV_SHORT`]).
+fn root_view_copy(address: u64, srv: bool) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    let shadow = crate::shadow::find(address, 1)?;
+    if srv || shadow.left(address) >= ROOT_CBV_REACH {
+        return Some(shadow);
+    }
+    if !shadow.is_window() {
+        short_root_cbv(
+            3,
+            "near the end of a title buffer's copy (kept)",
+            &shadow,
+            address,
+        );
+        return Some(shadow);
+    }
+    short_root_cbv(0, "near the end of a window", &shadow, address);
+    if !root_cbv_reach() {
+        return Some(shadow);
+    }
+    let whole =
+        crate::shadow::find(address, ROOT_CBV_REACH).filter(|s| s.left(address) >= ROOT_CBV_REACH);
+    match whole {
+        Some(whole) => {
+            short_root_cbv(
+                1,
+                "bound from a window that holds its reach",
+                &whole,
+                address,
+            );
+            Some(whole)
+        }
+        None => {
+            short_root_cbv(
+                2,
+                "near the end of a window, no window holds its reach (the short one kept)",
+                &shadow,
+                address,
+            );
+            Some(shadow)
+        }
+    }
 }
 
 macro_rules! once {
@@ -3830,6 +3948,39 @@ mod tests {
         assert_eq!(State::wanted([0, 0]), [0, SAMPLERS_OURS]);
         // A title sampler heap stays without views.
         assert_eq!(State::wanted([0, 0x20]), [0, 0x20]);
+    }
+
+    /// A root constant view 256 bytes before a 4 MiB line of memory outside
+    /// buffers: the window its address names ends 256 bytes on, while a
+    /// constant buffer reads up to 64 KiB. It is bound from a window that
+    /// holds all of that; a root shader resource view keeps the window its
+    /// address names (it is bound as a bounded table). With
+    /// `VICTORY_ROOT_CBV_REACH=0` the first assertion fails (WARP).
+    #[cfg(windows)]
+    #[test]
+    fn warp_a_root_constant_view_at_a_windows_end_is_bound_from_a_window_that_holds_its_reach() {
+        let Some(_) = crate::host::host() else {
+            return;
+        };
+        let short = ROOT_CBV_SHORT[0].load(Ordering::Relaxed);
+        // Memory outside buffers that no other test asks for.
+        let address = 0x7f_3c00_0000u64 + (4 << 20) - 256;
+        let named = crate::shadow::find(address, 1).expect("a window of memory outside buffers");
+        assert!(named.is_window());
+        assert_eq!(named.left(address), 256);
+        let bound = root_view_copy(address, false).expect("a window");
+        assert!(
+            bound.left(address) >= ROOT_CBV_REACH,
+            "a root constant view is bound with {} bytes of its copy left, less than a constant buffer reads",
+            bound.left(address)
+        );
+        assert_eq!(bound.gpu(address) % 256, address % 256);
+        assert!(
+            ROOT_CBV_SHORT[0].load(Ordering::Relaxed) > short,
+            "the short window is counted"
+        );
+        let srv = root_view_copy(address, true).expect("a window");
+        assert!(std::sync::Arc::ptr_eq(&srv, &named));
     }
 
     #[test]

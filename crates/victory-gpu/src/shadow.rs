@@ -2604,6 +2604,12 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
+    /// Whether the copy is a window of memory outside buffer objects, which
+    /// the title's memory goes on past.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// Whether the memory behind the copy turned out not to be write-watched:
     /// every refresh then copies its whole range.
     pub(crate) fn unwatched(&self) -> bool {

@@ -8429,6 +8429,20 @@ impl Meter {
             );
             crate::tiles::status();
             {
+                let [window, whole, kept, buffer] =
+                    [0, 1, 2, 3].map(|i| crate::draw::ROOT_CBV_SHORT[i].load(Ordering::Relaxed));
+                let reach = if crate::draw::root_cbv_reach() {
+                    "on"
+                } else {
+                    "=0"
+                };
+                tracing::info!(
+                    "root constant buffer views with less than 64 KiB of their copy left, since the start: {window} near \
+                     the end of a window ({whole} bound from a window that holds the 64 KiB, {kept} with no such window, \
+                     the short one kept), {buffer} near the end of a title buffer's copy (kept); VICTORY_ROOT_CBV_REACH {reach}"
+                );
+            }
+            {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =
