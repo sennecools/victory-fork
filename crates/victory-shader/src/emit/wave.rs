@@ -149,14 +149,18 @@ pub(crate) struct Section {
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
+    let restore = if p.wave64 { "s_mov_b64" } else { "s_mov_b32" };
     let mut out = HashMap::new();
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
-        // EXEC becomes every lane: `s_or_saveexec -1` or `s_nand_saveexec 0`.
-        let all = match inst.name() {
-            "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(Operand::Const(193)),
-            "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Some(Operand::Const(128)),
+        // EXEC becomes every lane: `s_or_saveexec -1` or `s_nand_saveexec 0`,
+        // matching the program's wave width.
+        let all = match (p.wave64, inst.name()) {
+            (true, "s_or_saveexec_b64") | (false, "s_or_saveexec_b32") => Some(Operand::Const(193)),
+            (true, "s_nand_saveexec_b64") | (false, "s_nand_saveexec_b32") => {
+                Some(Operand::Const(128))
+            }
             _ => None,
         };
         let start = all.is_some_and(
@@ -166,34 +170,80 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             Fields::Sop {
                 dst: Some(Operand::Scalar { code, .. }),
                 ..
-            } if start => inst.write(Reg::S(*code)),
+            } if start => inst.write(Reg::S(*code)).and_then(|lo| {
+                if p.wave64 {
+                    inst.write(Reg::S(*code + 1)).map(|hi| (*code, lo, Some(hi)))
+                } else {
+                    Some((*code, lo, None))
+                }
+            }),
             _ => None,
         };
-        let Some(saved) = saved else {
+        let Some((code, saved_lo, saved_hi)) = saved else {
             i += 1;
             continue;
         };
         let end = (i + 1..insts.len()).find(|&j| {
-            insts[j].write(Reg::S(EXEC)).is_some()
-                && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
+            let cand = &insts[j];
+            cand.name() == restore
+                && cand.write(Reg::S(EXEC)).is_some()
+                && (!p.wave64 || cand.write(Reg::S(EXEC + 1)).is_some())
+                && cand.read(Reg::S(code)) == Some(saved_lo)
+                && saved_hi.is_none_or(|hi| cand.read(Reg::S(code + 1)) == Some(hi))
         });
         let Some(end) = end else {
-            break;
+            i += 1;
+            continue;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
+        // Lowering skips emitting instructions inside a section directly, so a
+        // section containing any side-effecting instruction cannot be replaced
+        // by pure symbolic shapes.
+        if insts[i + 1..end].iter().any(has_side_effect) {
+            i += 1;
+            continue;
+        }
+        let shapes = simulate(&insts[i + 1..end], wave, saved_lo);
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
     out
 }
 
-fn saved_code(inst: &Inst) -> u8 {
+fn has_side_effect(inst: &Inst) -> bool {
+    let name = inst.name();
     match &inst.fields {
-        Fields::Sop {
-            dst: Some(Operand::Scalar { code, .. }),
-            ..
-        } => *code,
-        _ => NULL,
+        Fields::Exp { .. } => true,
+        Fields::Ds { .. } => {
+            !(name.starts_with("ds_read")
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute"))
+        }
+        Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => {
+            *lds || name.contains("store") || name.contains("atomic")
+        }
+        Fields::Image { .. } | Fields::Smem { .. } => {
+            name.contains("store") || name.contains("atomic")
+        }
+        Fields::Sopp { .. } => matches!(
+            name,
+            "s_barrier"
+                | "s_sendmsg"
+                | "s_sendmsghalt"
+                | "s_wakeup"
+                | "s_round_mode"
+                | "s_denorm_mode"
+                | "s_endpgm"
+                | "s_endpgm_saved"
+                | "s_endpgm_ordered_ps_done"
+                | "s_code_end"
+        ),
+        Fields::Sop { .. } => {
+            name.starts_with("s_setpc")
+                || name.starts_with("s_swappc")
+                || name.starts_with("s_call")
+                || name.starts_with("s_rfe")
+        }
+        Fields::Valu(_) | Fields::Vintrp { .. } => false,
     }
 }
 
@@ -364,7 +414,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 _ => one(Sym::Unknown),
             }
         };
-        let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
+        let modifiers = v.abs != 0
+            || v.neg != 0
+            || v.neg_hi != 0
+            || v.clamp
+            || v.omod != 0
+            || v.opsel_hi != 0
+            || v.sdwa.is_some()
+            || (name != "v_permlanex16_b32" && v.opsel != 0)
+            || (name == "v_permlanex16_b32" && v.opsel & !3 != 0);
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
@@ -587,7 +645,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
             ("v_permlanex16_b32", Some(a)) => {
                 // Lanes of each row read the other row of their half; lane
-                // i's pick is nibble i of {src2, src1}.
+                // i's pick is nibble i of {src2, src1}. op_sel[0] is FI (fetch
+                // inactive) and op_sel[1] is BOUND_CTRL (0 on inactive source,
+                // else keep dst).
+                let fi = v.opsel & 1 != 0;
+                let bound_ctrl = v.opsel & 2 != 0;
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
@@ -600,7 +662,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                             .map(|l| {
                                 let other = (l & !31) | ((l & 16) ^ 16);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                let src_lane = other | pick;
+                                if fi || (exec >> src_lane) & 1 != 0 {
+                                    a[src_lane as usize]
+                                } else if bound_ctrl {
+                                    Sym::K(0)
+                                } else {
+                                    old[l as usize]
+                                }
                             })
                             .collect()
                     }
@@ -1198,5 +1267,116 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    #[test]
+    fn sections_reject_side_effects_wrong_width_and_non_restore_exec() {
+        // Side effects inside a whole-wave section must not be silently dropped.
+        let with_ds_write = build(
+            &[
+                sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+                0xD834_0000,
+                0x0000_0505,        // ds_write_b32 v5, v5
+                sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+            ],
+            false,
+        );
+        assert!(sections(&with_ds_write, 0).is_empty());
+
+        let with_barrier = build(
+            &[
+                sop1(0, 0x3D, 193),  // s_or_saveexec_b32 s0, -1
+                0xBF8A_0000,         // s_barrier
+                sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+            ],
+            false,
+        );
+        assert!(sections(&with_barrier, 0).is_empty());
+
+        // Half-width s_or_saveexec_b32 in wave64 does not enable lanes 32..63.
+        let wrong_start_width = build(
+            &[
+                sop1(0, 0x3D, 193),  // s_or_saveexec_b32 s0, -1
+                vop1(1, 0x01, 135),  // v_mov_b32 v1, 7
+                sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+            ],
+            true,
+        );
+        assert!(sections(&wrong_start_width, 0).is_empty());
+
+        // Half-width s_mov_b32 exec_lo, s4 in wave64 is not a full EXEC restore.
+        let half_restore = build(
+            &[
+                sop1(4, 0x25, 193),  // s_or_saveexec_b64 s[4:5], -1
+                vop1(1, 0x01, 135),  // v_mov_b32 v1, 7
+                sop1(EXEC, 0x03, 4), // s_mov_b32 exec_lo, s4
+            ],
+            true,
+        );
+        assert!(sections(&half_restore, 0).is_empty());
+
+        // Non-restore EXEC write (`s_xor_b64 exec, exec, s[4:5]`) is not a restore.
+        let xor_exec = build(
+            &[
+                sop1(4, 0x25, 193), // s_or_saveexec_b64 s[4:5], -1
+                vop1(1, 0x01, 135), // v_mov_b32 v1, 7
+                0x89FE_047E,        // s_xor_b64 exec, exec, s[4:5]
+            ],
+            true,
+        );
+        assert_eq!(xor_exec.blocks[0].insts[2].name(), "s_xor_b64");
+        assert!(sections(&xor_exec, 0).is_empty());
+    }
+
+    #[test]
+    fn vop3_opsel_rejects_f16_sum_and_controls_permlanex16_inactive_reads() {
+        // VOP3 v_add_f16 with op_sel[0]=1 reads the high half and must not match Op::AddH.
+        let mut add_hi = vop3(1, 0x132, 257, 257, 0);
+        add_hi[0] |= 1 << 11; // op_sel[0] = 1
+        let p = build(
+            &[
+                sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+                vop1(1, 0x01, 128), // v_mov_b32 v1, 0
+                add_hi[0],
+                add_hi[1],           // v_add_f16 v1, v1, v1 op_sel:[1,0,0]
+                sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+            ],
+            false,
+        );
+        assert_eq!(p.blocks[0].insts[2].name(), "v_add_f16");
+        let v1_val = p.blocks[0].insts[2].write(Reg::V(1)).unwrap();
+        assert_eq!(sections(&p, 0)[&0].shapes.get(&v1_val), None);
+
+        // v_permlanex16_b32 under partial EXEC (lanes 0..15 inactive, 16..31 active):
+        // lane 16 reads lane 0 (inactive), verifying FI (op_sel[0]) and BOUND_CTRL (op_sel[1]).
+        let perm_lane16 = |opsel: u32| -> Option<Shape> {
+            let mut perm = vop3(2, 0x378, 257, 128, 128); // v_permlanex16_b32 v2, v1, 0, 0
+            perm[0] |= opsel << 11;
+            let read16 = vop3(2, 0x360, 258, 128 + 16, 0); // v_readlane_b32 s2, v2, 16
+            let prog = build(
+                &[
+                    sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+                    vop1(1, 0x01, 135), // v_mov_b32 v1, 7
+                    vop1(2, 0x01, 133), // v_mov_b32 v2, 5
+                    sop1(EXEC, 0x03, 255),
+                    0xFFFF_0000, // s_mov_b32 exec_lo, 0xFFFF_0000
+                    perm[0],
+                    perm[1],
+                    sop1(EXEC, 0x03, 193), // s_mov_b32 exec_lo, -1
+                    read16[0],
+                    read16[1],
+                    sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+                ],
+                false,
+            );
+            let insts = &prog.blocks[0].insts;
+            assert_eq!(insts[4].name(), "v_permlanex16_b32");
+            let s2 = insts[6].write(Reg::S(2)).unwrap();
+            sections(&prog, 0)[&0].shapes.get(&s2).copied()
+        };
+        assert_eq!(perm_lane16(0), Some(Shape::K(5))); // FI=0, BOUND_CTRL=0 -> keeps old v2 (5)
+        assert_eq!(perm_lane16(2), Some(Shape::K(0))); // FI=0, BOUND_CTRL=1 -> returns 0
+        assert_eq!(perm_lane16(1), Some(Shape::K(7))); // FI=1 -> fetches inactive lane 0 (7)
+        assert_eq!(perm_lane16(4), None); // invalid op_sel bit -> unknown
     }
 }
