@@ -1552,3 +1552,48 @@ mod mapping_tests {
         assert!(read.load(Ordering::SeqCst));
     }
 }
+
+#[cfg(test)]
+mod wrote_tests {
+    use super::{PAGE, ask_once, ask_once_end, asked, writes, wrote};
+
+    #[test]
+    fn wrote_keeps_ahead_asked_at_or_above_written_timestamps() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        // SAFETY: private write-watched 64 KiB page owned by this test.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+
+        ask_once(&[(p, p + PAGE)]);
+        wrote(p, PAGE);
+
+        let (now, written) = writes(p, p + PAGE, false).expect("write-watched page");
+        let (asked_now, asked_written) = asked(p, p + PAGE).expect("in ask_once range");
+        ask_once_end();
+
+        // SAFETY: freeing our private reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+
+        assert_eq!(now, asked_now);
+        let page = p / PAGE;
+        let &(_, w) = written
+            .iter()
+            .find(|&&(pg, _)| pg == page)
+            .expect("page recorded by wrote()");
+        assert_eq!(asked_written, written);
+        assert!(
+            now >= w,
+            "writes() returned now={now} < written timestamp w={w} after wrote()"
+        );
+    }
+}
