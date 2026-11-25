@@ -11,8 +11,8 @@
 //! (the app points this at Victory's cache folder; `%TEMP%\victory-profile.json`
 //! if it did not). Recording starts at the first presented frame that
 //! recorded more than [`FIRST_DRAWS`] draws (`VICTORY_PROFILE_DELAY=<s>`:
-//! that many seconds after the profiler was first asked instead, i.e. the
-//! first submission or present) and lasts `VICTORY_PROFILE_SECONDS` (60), or
+//! that many seconds after the profiler was first asked instead, in practice
+//! when the title makes its first command list) and lasts `VICTORY_PROFILE_SECONDS` (60), or
 //! until the file holds [`MOST_BYTES`]. The closing `]}` is written after
 //! every chunk and written over by the next, so the file is valid JSON
 //! whenever the run ends.
@@ -28,6 +28,10 @@
 //! CPU clock with `GetClockCalibration`. They show as the process "GPU". Our
 //! other sends (the card copies' uploads in `card_before`, their fetches in
 //! `card_back`) are not stamped and show as gaps there.
+//!
+//! The recording of each title list (open to close) shows as the process
+//! "title lists", one line per list (lists overlap on one thread, and the
+//! title can close a list on another thread than the one that opened it).
 //!
 //! Threads are named by their Rust name (ours) or `thread <id>`; the names
 //! the title gives its threads are not written.
@@ -180,6 +184,10 @@ pub(crate) enum Track {
     Frames,
     /// The card's line.
     Gpu,
+    /// The line of one title list (by id): lists overlap on one thread and
+    /// can be closed on another thread than the one that opened them, so
+    /// their spans would not nest on the threads' lines.
+    List(u32),
 }
 
 /// Arguments an event carries: up to three named numbers.
@@ -358,12 +366,21 @@ pub(crate) fn stamp() -> u64 {
     if on() { now() } else { 0 }
 }
 
-/// Records `name` on the calling thread from `start` ([`stamp`]; 0: nothing)
-/// until now.
+/// Records the recording of title list `list` from `start` ([`stamp`]; 0:
+/// nothing) until now, on the list's own line, with the closing thread.
 #[inline]
-pub(crate) fn since(name: &'static str, start: u64, args: &[(&'static str, u64)]) {
+pub(crate) fn list_recorded(list: u32, start: u64) {
     if start != 0 && STATE.load(Ordering::Relaxed) == ON {
-        push(Event::new(name, start, now(), Track::Thread, args));
+        push(Event::new(
+            "title list",
+            start,
+            now(),
+            Track::List(list),
+            &[
+                ("list", u64::from(list)),
+                ("thread", u64::from(thread_id())),
+            ],
+        ));
     }
 }
 
@@ -396,7 +413,8 @@ pub(crate) fn presented(recorded: u64) {
                     let armed = ARMED_AT.load(Ordering::Relaxed);
                     at.saturating_sub(armed) as f64 / frequency() as f64 >= delay
                 }
-                None => draws > FIRST_DRAWS,
+                // (Not at the first present: its draws are all since the start.)
+                None => last != 0 && draws > FIRST_DRAWS,
             };
             if due {
                 start(config, frame, draws);
@@ -455,8 +473,12 @@ fn write_out(config: &'static Config, base: u64) {
         let taken: Vec<(u32, &str, Vec<Event>)> = buffers
             .iter()
             .map(|b| {
-                let events =
-                    std::mem::take(&mut *b.events.lock().unwrap_or_else(|e| e.into_inner()));
+                // The thread keeps a buffer as large: its next pushes do not
+                // allocate.
+                let mut held = b.events.lock().unwrap_or_else(|e| e.into_inner());
+                let capacity = held.capacity();
+                let events = std::mem::replace(&mut *held, Vec::with_capacity(capacity));
+                drop(held);
                 (b.tid, b.name.as_str(), events)
             })
             .collect();
@@ -484,8 +506,8 @@ struct Writer {
     file: std::fs::File,
     /// Where the trailer starts.
     at: u64,
-    /// Threads whose name was written.
-    named: std::collections::HashSet<u32>,
+    /// Lines whose name was written (pid, tid).
+    named: std::collections::HashSet<(u32, u32)>,
     /// Ticks at the trace's 0, and per second.
     base: u64,
     frequency: f64,
@@ -501,6 +523,7 @@ impl Writer {
              {{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"tid\":0,\"args\":{{\"name\":\"CPU\"}}}},\n\
              {{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":2,\"tid\":0,\"args\":{{\"name\":\"GPU\"}}}},\n\
              {{\"name\":\"process_sort_index\",\"ph\":\"M\",\"pid\":2,\"tid\":0,\"args\":{{\"sort_index\":-1}}}},\n\
+             {{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":3,\"tid\":0,\"args\":{{\"name\":\"title lists\"}}}},\n\
              {{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":0,\"args\":{{\"name\":\"frames\"}}}},\n\
              {{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":2,\"tid\":1,\"args\":{{\"name\":\"host queue\"}}}}",
             env!("CARGO_PKG_VERSION")
@@ -534,20 +557,25 @@ impl Writer {
             if events.is_empty() {
                 continue;
             }
-            if self.named.insert(*tid) {
-                let _ = write!(
-                    chunk,
-                    ",\n{{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":{tid},\"args\":{{\"name\":"
-                );
-                json_string(&mut chunk, name);
-                chunk.push_str("}}");
-            }
             for event in events {
                 let (pid, tid) = match event.track {
                     Track::Thread => (1, *tid),
                     Track::Frames => (1, 0),
                     Track::Gpu => (2, 1),
+                    Track::List(list) => (3, list),
                 };
+                if (pid == 1 && tid != 0 || pid == 3) && self.named.insert((pid, tid)) {
+                    let _ = write!(
+                        chunk,
+                        ",\n{{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":{pid},\"tid\":{tid},\"args\":{{\"name\":"
+                    );
+                    if pid == 3 {
+                        let _ = write!(chunk, "\"list {tid}\"");
+                    } else {
+                        json_string(&mut chunk, name);
+                    }
+                    chunk.push_str("}}");
+                }
                 chunk.push_str(",\n{\"name\":");
                 json_string(&mut chunk, event.name);
                 let ts = self.micros(event.start);
@@ -1094,13 +1122,11 @@ mod tests {
                 (
                     9,
                     "thread 9",
-                    vec![Event::new(
-                        "host list",
-                        base + 30,
-                        base + 40,
-                        Track::Gpu,
-                        &[],
-                    )],
+                    vec![
+                        Event::new("host list", base + 30, base + 40, Track::Gpu, &[]),
+                        Event::new("title list", base, base + 50, Track::List(12), &[]),
+                        Event::new("title list", base + 60, base + 70, Track::List(12), &[]),
+                    ],
                 ),
             ])
             .unwrap();
@@ -1109,7 +1135,7 @@ mod tests {
         assert!(text.ends_with(TRAILER));
         assert_eq!(writer.bytes(), text.len() as u64);
         // Complete events with times in microseconds (10 MHz ticks).
-        assert_eq!(text.matches("\"ph\":\"X\"").count(), 4);
+        assert_eq!(text.matches("\"ph\":\"X\"").count(), 6);
         assert!(text.contains(
             "{\"name\":\"submit\",\"ph\":\"X\",\"ts\":1.000,\"dur\":200.000,\"pid\":1,\"tid\":7,\
              \"args\":{\"lists\":3,\"late\":0}}"
@@ -1118,13 +1144,20 @@ mod tests {
         assert!(text.contains(
             "\"name\":\"host list\",\"ph\":\"X\",\"ts\":3.000,\"dur\":1.000,\"pid\":2,\"tid\":1}"
         ));
-        // Each thread named once, escaped; one with no events not at all.
+        // Each thread named once, escaped; one with no spans of its own (only
+        // frames, the card's and lists') not at all; each list's line once.
         assert_eq!(
             text.matches("\"tid\":7,\"args\":{\"name\":\"victory \\\"main\\\"\\\\\"}")
                 .count(),
             1
         );
-        assert_eq!(text.matches("\"args\":{\"name\":\"thread 9\"}").count(), 1);
+        assert_eq!(text.matches("\"args\":{\"name\":\"thread 9\"}").count(), 0);
+        assert!(text.contains("\"ts\":6.000,\"dur\":1.000,\"pid\":3,\"tid\":12}"));
+        assert_eq!(
+            text.matches("\"pid\":3,\"tid\":12,\"args\":{\"name\":\"list 12\"}")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1134,7 +1167,7 @@ mod tests {
         assert!(!on());
         assert!(span("nothing").is_none());
         assert_eq!(stamp(), 0);
-        since("nothing", 0, &[]);
+        list_recorded(1, 0);
     }
 
     /// On the software adapter: stamps around two parts of a submission come

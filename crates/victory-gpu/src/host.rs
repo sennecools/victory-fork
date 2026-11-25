@@ -5090,6 +5090,8 @@ impl Host {
             None
         };
         submitting(2, runs.len());
+        // Whether a group went unwaited: the card may still write its stamps.
+        let mut unwaited = false;
         for (i, group) in groups.iter().enumerate() {
             let group: &[Option<ID3D12CommandList>] = match &stamped {
                 Some((all, _)) => all,
@@ -5115,7 +5117,10 @@ impl Host {
                         stood(started);
                         working(true);
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        unwaited = true;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             // With timing on each group is one of `runs` (and the compare
@@ -5145,7 +5150,9 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        if let Some((_, plan)) = stamped {
+        if let Some((_, plan)) = stamped
+            && !unwaited
+        {
             crate::profile::gpu::done(&self.queue, plan);
         }
         FINISHED.store(this_submission, Ordering::Release);
@@ -5516,8 +5523,12 @@ impl HostList {
     /// The title closed the list: the profiler's span of its recording
     /// ends (on the closing thread).
     pub(crate) fn recording_closed(&self) {
+        // (A plain load while the profiler is off: no locked swap per close.)
+        if self.opened.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         let opened = self.opened.swap(0, Ordering::Relaxed);
-        crate::profile::since("title list", opened, &[("list", u64::from(self.id))]);
+        crate::profile::list_recorded(self.id, opened);
     }
 
     pub(crate) fn close(&self) {
