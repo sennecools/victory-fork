@@ -4687,18 +4687,34 @@ impl<'a> Lower<'a> {
         // and base level, then sample others of the same table by other indices): its
         // kind is that of the nearest other load of as many dwords from the same table
         // by a computed index that the code uses as a descriptor. The handle is still
-        // this load's own; a view of another kind there would give wrong sizes.
+        // this load's own; a view of another kind there would give wrong sizes. Only an
+        // image read of a dimension lowered here counts: a buffer, a ray-tracing
+        // structure, a cube or a multisampled image leaves the kind to
+        // `unused_descriptor_kind` (a 2D texture), and a load kept per lane
+        // (`Resources::lane_copied`) keeps its own handling below.
         let sibling = || {
             let a = address?;
-            if count != 8 || a.dynamic.is_none() {
+            if count != 8 || a.dynamic.is_none() || x.res.lane_copied.contains(&site) {
                 return None;
             }
             let same = |s: Site| x.p.blocks[s.0].insts[s.1].name() == inst.name();
+            let image = |u: &(Site, u8)| {
+                let i = &x.p.blocks[u.0.0].insts[u.0.1];
+                matches!(
+                    i.fields,
+                    Fields::Image {
+                        dim: 0 | 1 | 2 | 4 | 5,
+                        ..
+                    }
+                ) && !i.name().starts_with("image_bvh")
+            };
             x.res
                 .scalar
                 .iter()
-                .filter(|(s, b)| *s != site && b.param == a.param && b.dynamic.is_some() && same(*s))
-                .filter_map(|(s, _)| use_of(*s).map(|u| (*s, u)))
+                .filter(|(s, b)| {
+                    *s != site && b.param == a.param && b.dynamic.is_some() && same(*s)
+                })
+                .filter_map(|(s, _)| use_of(*s).filter(image).map(|u| (*s, u)))
                 .min_by_key(|(s, _)| (s.0.abs_diff(site.0), s.1.abs_diff(site.1)))
                 .map(|(_, u)| u)
         };

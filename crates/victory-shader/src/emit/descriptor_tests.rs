@@ -143,6 +143,48 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
 }
 
 #[test]
+fn an_image_read_only_for_its_size_takes_the_kind_a_sibling_load_samples() {
+    // Two image descriptors loaded from one table by computed indices: one
+    // read only for its size, the other read as a 3D image (the puddle
+    // passes size one texture of a table and sample others). The sized one
+    // takes the 3D kind, so its depth (dword 4) is the host view's, not the
+    // 1 of the 2D texture nothing else would tell.
+    let mut words = vec![
+        S_MOV_S1_0,
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0x7E08_0500, // v_readfirstlane_b32 s4, v0 (the thread's index, 0)
+        0x8F05_8104, // s_lshl_b32 s5, s4, 1 (0, another computed term)
+        0xF40C_0200,
+        0x0800_0000, // s_load_dwordx8 s[8:15], s[0:1], s4: read for its size
+        0xF40C_0600,
+        0x0A00_0000, // s_load_dwordx8 s[24:31], s[0:1], s5: read as an image
+    ];
+    words.extend(s_load_x4(16, 0x20)); // s[16:19]: the result's UAV
+    words.push(S_WAITCNT);
+    words.extend([0xF000_1110, 0x0006_0D06]); // image_load v13, v[6:8], s[24:31] dmask:0x1 3D
+    words.push(S_WAITCNT);
+    words.extend(store(0, 12, 0)); // dword 4: depth - 1
+    words.extend(store(1, 11, 4)); // dword 3: last level and type
+    // buffer_store_dword v13, off, s[16:19], 0 offset:8
+    words.extend([
+        0x38 << 26 | 0x1C << 18 | 8,
+        0x80 << 24 | (16 >> 2) << 16 | 13 << 8,
+    ]);
+    words.push(S_ENDPGM);
+    let shader = build(&words, ResourceType::Srv, 8, 0);
+    let texels: Vec<[f32; 4]> = (0..4 * 2 * 3).map(|i| [i as f32, 0.0, 0.0, 1.0]).collect();
+    let views = [View::Texture3D(4, 2, 3, &texels), View::RawUav(8)];
+    let results = run(&shader, &views);
+    assert!(!results.is_empty());
+    for (label, got) in results {
+        assert_eq!(got[0], 2, "{label}: depth - 1");
+        assert_eq!(got[1], 0xA000_0FAC, "{label}: a 3D image of one level");
+    }
+}
+
+#[test]
 fn the_record_count_of_a_buffer_view_never_read_through_comes_from_the_host_view() {
     // A buffer descriptor whose record count (dword 2) the code tests and
     // nothing reads through, as a program does that skips its work for an
