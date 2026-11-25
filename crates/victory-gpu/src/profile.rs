@@ -517,7 +517,8 @@ pub(crate) fn flight_stamps() -> bool {
 /// processor time of each thread that recorded, and every two seconds the
 /// memory split and the distinct views the view heaps' slots were made
 /// from ([`sample_memory`]). The samples take the heaps' `made` locks for a
-/// copy of their slots and ask Windows about the page pools' pages.
+/// copy of their slots (with `VICTORY_MADE_ATOMIC=1`, read a slot at a
+/// time) and ask Windows about the page pools' pages.
 pub(crate) fn samples() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PROFILE_SAMPLES").is_some_and(|v| v == "1"))
