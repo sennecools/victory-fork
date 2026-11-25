@@ -127,9 +127,11 @@ impl Pending {
                     LeftOut::ShadesHits => &LEFT_OUT[0],
                     LeftOut::Builds => &LEFT_OUT[1],
                 };
-                counter.fetch_add(1, Ordering::Relaxed);
-                let [hit_shading, builder] = left_out_counts();
-                if (hit_shading + builder).is_power_of_two() {
+                // Each kind's own count decides: a sum loaded afterwards
+                // can step over a power of two when two workers race.
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    let [hit_shading, builder] = left_out_counts();
                     tracing::info!(
                         hit_shading,
                         builder,
@@ -835,14 +837,27 @@ mod tests {
 
     /// The programs that walk the structures are never left out: each
     /// reads memory by address, reports faults and uses 2 KiB of LDS, and
-    /// any one of the three rules it out. The user data and SGPRs are
-    /// those the census found, and the hit shaders' ones.
+    /// any one of the three rules it out. The user-data dwords and user
+    /// SGPRs are each pair the census found in a walker, and the hit
+    /// shaders' pair.
     #[test]
     fn walkers_are_made() {
         use victory_shader::emit::{SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES};
         let srvs: [&[u8]; 2] = [&[SLOT_MEMORY], &[SLOT_MEMORY, SLOT_STRIDES]];
+        let found = [
+            (6, 6),
+            (8, 7),
+            (10, 7),
+            (10, 8),
+            (8, 12),
+            (9, 12),
+            (10, 12),
+            (12, 12),
+            (13, 12),
+            (4, 12),
+        ];
         for root_srvs in srvs {
-            for (user_data, user_sgprs) in [(6, 6), (8, 7), (10, 8), (9, 12), (10, 12), (4, 12)] {
+            for (user_data, user_sgprs) in found {
                 let walker = Shape {
                     root_srvs,
                     root_uavs: &[SLOT_FAULTS],
@@ -853,7 +868,7 @@ mod tests {
                 };
                 assert_eq!(leaves_out(true, true, || Some(walker)), None, "{walker:?}");
             }
-            // A hit shader with one of the three as a walker has it.
+            // A hit shader given any one of the three a walker has is made.
             let memory = hit_shader(|s| s.root_srvs = root_srvs);
             let faults = hit_shader(|s| s.root_uavs = &[SLOT_FAULTS]);
             let lds = hit_shader(|s| s.lds_bytes = 2048);
