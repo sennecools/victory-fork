@@ -3819,6 +3819,51 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// The one host copy that holds title memory `[address, address + len)`,
+/// if exactly one copy holds any of those bytes, it holds all of them, and
+/// it is a copy (not title memory in place, `crate::inplace`): a copy on
+/// the card from or into it is then what every list of ours sees of those
+/// bytes (`crate::host`'s lifted reads). Makes no copy: `None` where none
+/// is made yet, or more than one (a buffer inside another with a copy of
+/// its own, a window over a buffer) holds some of the bytes.
+///
+/// shortcut: every title buffer and window that begins below the range's
+/// end is looked at; it runs only for submissions whose reads would wait
+/// for flights (a few a frame).
+pub(crate) fn sole(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let mut found: Option<Arc<Shadow>> = None;
+    // False at a second copy.
+    let mut one = |shadow: &Arc<Shadow>| match &found {
+        Some(f) => Arc::ptr_eq(f, shadow),
+        None => {
+            found = Some(shadow.clone());
+            true
+        }
+    };
+    {
+        let map = buffers();
+        for (_, entry) in map.range(..(end, 0)).rev() {
+            if entry.end > address
+                && let Some(shadow) = &entry.shadow
+                && !one(shadow)
+            {
+                return None;
+            }
+        }
+    }
+    {
+        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for (&(start, bytes), shadow) in loose.range(..(end, 0)).rev() {
+            if start + bytes > address && !one(shadow) {
+                return None;
+            }
+        }
+    }
+    let shadow = found?;
+    (shadow.place.is_none() && shadow.start <= address && shadow.left(address) >= len).then_some(shadow)
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the

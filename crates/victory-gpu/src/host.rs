@@ -669,6 +669,7 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
+        gpu_upload_probe(&device, &queue);
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -703,6 +704,98 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// Says, once at the start, whether the device has the GPU upload heap
+/// (`D3D12_FEATURE_D3D12_OPTIONS16`: memory on the card the CPU maps, which
+/// a discrete card offers only with resizable BAR and a runtime that knows
+/// the heap), for moving upload memory and host copies there later. If it
+/// has, 64 KiB written into such a buffer by the kernel's copy of process
+/// memory (`ReadProcessMemory`, as title memory reaches host copies) are
+/// copied on the card into read-back memory and compared. Logging only.
+fn gpu_upload_probe(device: &ID3D12Device, queue: &ID3D12CommandQueue) {
+    let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+    // SAFETY: a plain query into a structure of its size.
+    let asked = unsafe {
+        device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32)
+    };
+    if asked.is_err() || !o16.GPUUploadHeapSupported.as_bool() {
+        tracing::info!(
+            options16 = asked.is_ok(),
+            "GPU upload heap: not supported (it needs resizable BAR and a runtime that has the heap)"
+        );
+        return;
+    }
+    match gpu_upload_self_test(device, queue) {
+        Ok(true) => tracing::info!(
+            "GPU upload heap: supported; 64 KiB written into one by the kernel's copy of process memory reached the card intact"
+        ),
+        Ok(false) => tracing::warn!(
+            "GPU upload heap: supported, but 64 KiB written into one by the kernel's copy of process memory did not reach the card intact"
+        ),
+        Err(e) => tracing::warn!(error = %e, "GPU upload heap: supported, but its self-test could not run"),
+    }
+}
+
+/// [`gpu_upload_probe`]'s test: whether the bytes arrived intact.
+fn gpu_upload_self_test(device: &ID3D12Device, queue: &ID3D12CommandQueue) -> windows::core::Result<bool> {
+    const LEN: usize = 64 << 10;
+    let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> windows::core::Result<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: kind,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: LEN as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer.
+        unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made)? };
+        made.ok_or_else(windows::core::Error::empty)
+    };
+    let upload = buffer(D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_RESOURCE_STATE_COMMON)?;
+    let back = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)?;
+    let pattern: Vec<u8> = (0..LEN as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    let mut mapped = std::ptr::null_mut();
+    let nothing_read = D3D12_RANGE { Begin: 0, End: 0 };
+    // SAFETY: the buffer holds LEN bytes, mapped here for writing only.
+    let written = unsafe {
+        upload.Map(0, Some(&nothing_read), Some(&mut mapped))?;
+        let written = read(pattern.as_ptr(), mapped.cast(), LEN);
+        upload.Unmap(0, None);
+        written
+    };
+    if !written {
+        return Ok(false);
+    }
+    // SAFETY: our own list, fence and buffers; the copy lies in both, and
+    // the fence wait (no event: it blocks) ends before the read-back.
+    unsafe {
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+        list.CopyBufferRegion(&back, 0, &upload, 0, LEN as u64);
+        list.Close()?;
+        queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        queue.Signal(&fence, 1)?;
+        fence.SetEventOnCompletion(1, HANDLE::default())?;
+        if fence.GetCompletedValue() != 1 {
+            return Ok(false);
+        }
+        let range = D3D12_RANGE { Begin: 0, End: LEN };
+        let mut out = std::ptr::null_mut();
+        back.Map(0, Some(&range), Some(&mut out))?;
+        let same = std::slice::from_raw_parts(out.cast::<u8>(), LEN) == pattern.as_slice();
+        back.Unmap(0, Some(&nothing_read));
+        Ok(same)
     }
 }
 
@@ -1063,6 +1156,10 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// The list at the head of a submission this list is the first of that
+    /// does the submission's lifted reads ([`HostList::lift_list`]), made
+    /// when first needed.
+    lifts: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -2207,9 +2304,10 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping and its host GPU address.
+/// mapping and its host GPU address. (Shared memory with
+/// `VICTORY_LIFT_READS=2`, so that a lifted fill may copy into the buffer.)
 struct Chunk {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
 }
@@ -2301,7 +2399,16 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    // With lifted fills (`VICTORY_LIFT_READS=2`) a copy on the card writes
+    // into chunks, which upload memory cannot take: shared memory instead
+    // (it starts in the common state and is read from there, as host
+    // copies are). The mode is fixed for the run, so kept chunks are of
+    // one kind.
+    let (buffer, data) = if lift_mode() == LiftMode::Fills {
+        host.shared_buffer(size)?
+    } else {
+        host.upload_buffer(size)?
+    };
     let kind = match (scratch_pool(), size == SCRATCH_FIRST) {
         (true, true) => "list scratch pooled first chunk",
         (true, false) => "list scratch pooled chunk",
@@ -2314,7 +2421,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
-        _buffer: buffer,
+        buffer,
         data: data as usize,
         gpu,
     })
@@ -2829,6 +2936,96 @@ enum Step {
         staging: std::sync::Arc<crate::texture::Staging>,
         uploads: bool,
     },
+    /// A `Copy` or `Fill` that read or wrote what flights in the air may
+    /// write, moved to the card ([`lift_mode`]): copied at the head of the
+    /// submission from one host copy to another, or into the list's scratch.
+    Lifted(Box<Lifted>),
+}
+
+/// A title buffer copy or a fill done on the card ([`Step::Lifted`]).
+struct Lifted {
+    /// The host copy read, and the title address read from.
+    src: std::sync::Arc<crate::shadow::Shadow>,
+    src_at: usize,
+    len: usize,
+    to: LiftedTo,
+}
+
+/// Where a lifted read ([`Lifted`]) goes.
+enum LiftedTo {
+    /// A title buffer copy: the host copy of the destination, and the title
+    /// address. Its bytes reach title memory as shaders' writes do. Within
+    /// one host copy, the bounce buffer it goes through (one the list holds
+    /// in [`Deferred::bounces`], taken when the step was lifted).
+    Copy(std::sync::Arc<crate::shadow::Shadow>, usize, Option<ID3D12Resource>),
+    /// A fill: the list's scratch chunk ([`take_chunk`], shared memory with
+    /// `VICTORY_LIFT_READS=2`), the offset in it, and the fill's destination
+    /// (the CPU address of those bytes, for [`Lifted::cpu_step`]).
+    Fill(ID3D12Resource, u64, usize),
+}
+
+impl Lifted {
+    /// The step it was lifted from, done on the CPU at submission: what a
+    /// submission that did not plan it does ([`HostList::unlift`]).
+    fn cpu_step(&self) -> Step {
+        match &self.to {
+            LiftedTo::Copy(_, at, _) => Step::Copy(*at, self.src_at, self.len),
+            LiftedTo::Fill(_, _, dst) => Step::Fill(*dst, self.src_at, self.len),
+        }
+    }
+}
+
+impl Step {
+    /// The ranges of host copies the step brings up to date from title
+    /// memory at submission (copy, title address, bytes): a refresh's, and
+    /// a lifted read's source and destination.
+    fn refreshes(&self) -> impl Iterator<Item = (&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+        let (first, second) = match self {
+            Step::Refresh(shadow, address, len) => (Some((shadow, *address, *len)), None),
+            Step::Lifted(lift) => (
+                Some((&lift.src, lift.src_at, lift.len)),
+                match &lift.to {
+                    LiftedTo::Copy(dst, at, _) => Some((dst, *at, lift.len)),
+                    LiftedTo::Fill(..) => None,
+                },
+            ),
+            _ => (None, None),
+        };
+        first.into_iter().chain(second)
+    }
+
+    /// The range of a host copy (copy, title address, bytes) the card writes
+    /// in this step's list and that goes back to title memory: shaders'
+    /// declared writes, or a lifted copy's destination.
+    fn card_writes(&self) -> Option<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+        match self {
+            Step::GpuWrite(shadow, address, len) => Some((shadow, *address, *len)),
+            Step::Lifted(lift) => match &lift.to {
+                LiftedTo::Copy(dst, at, _) => Some((dst, *at, lift.len)),
+                LiftedTo::Fill(..) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// What [`plan_lifts`] sees of the step.
+    fn seen(&self) -> Seen {
+        match self {
+            &Step::Copy(dst, src, len) => Seen::Copy(dst, src, len),
+            &Step::Fill(dst, src, len) => Seen::Fill(dst, src, len),
+            Step::Texture { staging, .. } => {
+                let (at, len) = staging.memory();
+                Seen::Texture(at, len)
+            }
+            // Lifted steps are not there when a submission plans: each
+            // submission starts by turning those of an earlier one back
+            // ([`HostList::unlift`]). Were one there, the plan would abort.
+            Step::Run(_) | Step::Lifted(_) => Seen::Run,
+            // Shaders' writes and reads run after every lifted read, as
+            // after every CPU copy: the order is the same either way.
+            Step::GpuWrite(..) | Step::Refresh(..) | Step::Host(_) => Seen::Other,
+        }
+    }
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2873,6 +3070,16 @@ struct Deferred {
     /// stays readable until the next clamp into it
     /// ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// The lifted reads ([`Step::Lifted`]) of the submission being prepared,
+    /// for the submission's lift list to record ([`HostList::lift_list`]).
+    lifted: Vec<LiftCopy>,
+    /// Bounce buffers the list's lifted copies use, given back to
+    /// [`BOUNCES`] when the list is reset (its submissions have run).
+    bounces: Vec<(Bounce, u64)>,
+    /// Steps lifted at an earlier submission of the list and done on the
+    /// CPU again since ([`HostList::unlift`]): held until the reset, as that
+    /// submission's lift list reads and writes their buffers.
+    spent: Vec<Lifted>,
 }
 
 /// What a list's submission-time steps asked for and did
@@ -2891,6 +3098,9 @@ struct DeferredRun {
     copied: u64,
     /// Whether the list ran the heap buffer pass.
     heap_pass: bool,
+    /// Whether it left lifted reads for the submission's lift list
+    /// ([`HostList::lift_list`]).
+    lifted: bool,
 }
 
 impl Deferred {
@@ -2908,6 +3118,13 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        if !self.bounces.is_empty() {
+            let mut spare = BOUNCES.lock().unwrap_or_else(|e| e.into_inner());
+            for (bounce, size) in self.bounces.drain(..) {
+                // Past the most kept it is freed.
+                drop(spare.give(bounce, size, BOUNCE_SPARE_MOST));
+            }
+        }
     }
 }
 
@@ -3459,11 +3676,532 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                // Lifted: read and written on the card, behind the flights.
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::Lifted(_) => {}
             }
         }
     }
     None
+}
+
+/// Whether a submission that reads title memory flights in the air may
+/// write (a title buffer copy, a fill of upload memory) does those reads on
+/// the card instead of waiting for the flights to land
+/// (`VICTORY_LIFT_READS`; off by default, and only with [`relay_exact`],
+/// where that wait is: `relay_wait` for "title memory read", 67-84 ms a
+/// frame of the best set).
+///
+/// Values: `count` plans and counts only ([`plan_lifts`]; the waits stay
+/// as they are, and fills count as `=2` would do them); `1` lifts title
+/// buffer copies (a plan with a fill to lift is aborted); `2` lifts fills
+/// too, and for that the lists' scratch chunks are shared memory, which a
+/// copy on the card may write (`take_chunk`), instead of upload memory.
+///
+/// A lifted copy is a `CopyBufferRegion` from the source's host copy to the
+/// destination's (through a bounce buffer within one copy), and its
+/// destination counts as written by the list's shaders: its bytes reach
+/// title memory when the flight lands, as what shaders wrote does. A lifted
+/// fill is a copy from the source's host copy into the list's scratch. All
+/// of a submission's lifted reads, in step order, are recorded in one list
+/// at the head of the submission ([`HostList::lift_list`]), before the first
+/// list's prelude: as the CPU did every copy of a submission before any
+/// list ran, so the lists' shaders read and write after them either way,
+/// and every buffer is still in the common state there. The card runs them
+/// behind the flights on the queue, after what they wrote; the host copies
+/// are brought up to date from title memory first, as for any refresh
+/// (ranges the flights write are left as they are).
+///
+/// What would differ from the CPU doing them at submission is a reason
+/// [`plan_lifts`] aborts on (counted): a CPU copy, a texture or a step of
+/// ours that touches what a lifted read reads or writes, in the other order.
+///
+/// A lift holds for its one submission: a list submitted again before its
+/// reset has its lifted steps done on the CPU again, unless that submission
+/// plans them anew ([`HostList::unlift`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LiftMode {
+    Off,
+    Count,
+    Copies,
+    Fills,
+}
+
+impl LiftMode {
+    /// The switch's value.
+    fn value(self) -> &'static str {
+        match self {
+            LiftMode::Off => "0",
+            LiftMode::Count => "count",
+            LiftMode::Copies => "1",
+            LiftMode::Fills => "2",
+        }
+    }
+}
+
+fn lift_mode() -> LiftMode {
+    static MODE: OnceLock<LiftMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LIFT_READS").as_deref() {
+        Ok("count") => LiftMode::Count,
+        Ok("1") => LiftMode::Copies,
+        Ok("2") => LiftMode::Fills,
+        _ => LiftMode::Off,
+    })
+}
+
+/// The most bytes a lifted copy within one host copy moves through a
+/// bounce buffer; a longer one aborts its plan ([`LiftAbort::SameBuffer`]).
+const BOUNCE_MOST: usize = 16 << 20;
+
+/// The most bytes of bounce buffers kept while no list holds them.
+const BOUNCE_SPARE_MOST: u64 = 64 << 20;
+
+/// A bounce buffer (in the card's memory) for lifted copies within one
+/// host copy.
+struct Bounce(ID3D12Resource);
+
+// SAFETY: a D3D12 resource (free-threaded), touched under the pool's lock
+// or by the list that holds it.
+unsafe impl Send for Bounce {}
+
+/// Bounce buffers no list holds ([`Deferred::bounces`]).
+static BOUNCES: Mutex<Spare<Bounce>> = Mutex::new(Spare::new());
+
+/// What [`plan_lifts`] sees of a step ([`Step::seen`]).
+#[derive(Clone, Copy, Debug)]
+enum Seen {
+    /// A title buffer copy the CPU would do: destination, source, bytes.
+    Copy(usize, usize, usize),
+    /// A fill of the list's upload memory: destination, source, bytes.
+    Fill(usize, usize, usize),
+    /// A texture's memory is read (address, bytes).
+    Texture(usize, usize),
+    /// Work of ours that may read or write title memory anywhere.
+    Run,
+    /// Nothing that matters here.
+    Other,
+}
+
+/// Why [`plan_lifts`] did not lift a submission's reads: it then waits as
+/// before. The counters' order ([`LIFT_ABORTED`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LiftAbort {
+    /// The source or destination is not in exactly one host copy of ours
+    /// (none, or more than one holds some of its bytes, or it is title
+    /// memory in place): a copy on the card would not be seen by the others.
+    NotSole,
+    /// Source and destination are in one host copy and longer than a
+    /// bounce buffer ([`BOUNCE_MOST`]).
+    SameBuffer,
+    /// A bounce buffer for copies within one host copy could not be had.
+    NoBounce,
+    /// Source and destination overlap.
+    InPlace,
+    /// A fill into upload memory a copy on the card cannot write: a scratch
+    /// of its own past a chunk, or any scratch without `=2`.
+    BigScratch,
+    /// A texture's memory is what flights or a lifted copy write.
+    TextureAfter,
+    /// A step of ours that may read or write title memory anywhere.
+    Run,
+    /// A copy the CPU still does writes title memory a lifted copy reads or
+    /// writes: the two would happen in the other order.
+    CpuWrites,
+    /// The submission names a list twice.
+    Twice,
+    /// A planned step was no longer the copy or fill the plan saw when the
+    /// steps were rewritten (counted after the rewrite, see [`lift_reads`]).
+    Changed,
+}
+
+impl LiftAbort {
+    const ALL: [LiftAbort; 10] = [
+        LiftAbort::NotSole,
+        LiftAbort::SameBuffer,
+        LiftAbort::NoBounce,
+        LiftAbort::InPlace,
+        LiftAbort::BigScratch,
+        LiftAbort::TextureAfter,
+        LiftAbort::Run,
+        LiftAbort::CpuWrites,
+        LiftAbort::Twice,
+        LiftAbort::Changed,
+    ];
+
+    /// Its name on the frame-rate line (no commas: the names are joined
+    /// with them).
+    fn name(self) -> &'static str {
+        match self {
+            LiftAbort::NotSole => "not one copy",
+            LiftAbort::SameBuffer => "too long to bounce",
+            LiftAbort::NoBounce => "no bounce buffer",
+            LiftAbort::InPlace => "overlapping",
+            LiftAbort::BigScratch => "a fill into upload memory",
+            LiftAbort::TextureAfter => "a texture reads it",
+            LiftAbort::Run => "a step of ours",
+            LiftAbort::CpuWrites => "a CPU copy writes it",
+            LiftAbort::Twice => "a list named twice",
+            LiftAbort::Changed => "a step changed",
+        }
+    }
+}
+
+/// A step [`plan_lifts`] moves to the card. `T` names a host copy, `C` a
+/// scratch chunk.
+#[derive(Debug, PartialEq)]
+struct Lift<T, C> {
+    /// The list's place in the submission, and the step's in the list.
+    list: usize,
+    step: usize,
+    /// The host copy read.
+    src: T,
+    to: LiftTo<T, C>,
+    len: usize,
+}
+
+#[derive(Debug, PartialEq)]
+enum LiftTo<T, C> {
+    /// A title buffer copy into this host copy; `bounce`: it is the source's
+    /// too, and the copy goes through a bounce buffer.
+    Copy { dst: T, bounce: bool },
+    /// A fill into this scratch chunk.
+    Fill(C),
+}
+
+/// Plans moving a submission's reads of what flights may write to the card
+/// ([`lift_mode`]): of `steps` (list, step, what it is) in submission
+/// order, the copies and fills to lift, or why none.
+///
+/// The steps are walked in order with the title memory the card writes
+/// before they run: `written` (the flights', in order and joined) and the
+/// destination of each copy lifted so far. A copy or fill that reads or
+/// writes it is lifted; one that does not stays on the CPU. Then:
+/// - a lifted copy's source and destination must each be the whole of one
+///   host copy's bytes there (`sole`: an identity and the copy), and not
+///   overlap; within one copy it goes through a bounce buffer;
+/// - a lifted fill must go into a scratch chunk (`scratch`: list,
+///   destination, bytes), and `fills` must allow it;
+/// - a texture whose memory the card writes, or a step that may touch title
+///   memory anywhere, aborts the plan (they read on the CPU);
+/// - a copy left on the CPU that writes what a lift reads or writes aborts
+///   (the CPU's copies all run before the card's).
+///
+/// Steps lifted at an earlier submission of a list are not among `steps`:
+/// they are the CPU's copies and fills again ([`HostList::unlift`]).
+///
+/// Shaders' writes and reads need no look: the lifted reads run at the
+/// head of the submission, before every list (see [`lift_mode`]).
+fn plan_lifts<T, C>(
+    written: &[(usize, usize)],
+    steps: impl IntoIterator<Item = (usize, usize, Seen)>,
+    fills: bool,
+    mut sole: impl FnMut(usize, usize) -> Option<(usize, T)>,
+    mut scratch: impl FnMut(usize, usize, usize) -> Option<C>,
+) -> Result<Vec<Lift<T, C>>, LiftAbort> {
+    // What the card writes before the step: the flights', and lifted
+    // copies' destinations.
+    let mut reach = written.to_vec();
+    // What lifted steps read, and what copies left on the CPU write.
+    let (mut read, mut cpu) = (Vec::new(), Vec::new());
+    let mut lifts = Vec::new();
+    // A copy left on the CPU before writes this range a lift reads or
+    // writes.
+    let cpu_wrote = |cpu: &[(usize, usize)], at: usize, len: usize| {
+        if touches(cpu, at, at + len) {
+            return Err(LiftAbort::CpuWrites);
+        }
+        Ok(())
+    };
+    for (list, step, seen) in steps {
+        match seen {
+            Seen::Copy(dst, src, len) => {
+                if !touches(&reach, src, src + len) && !touches(&reach, dst, dst + len) {
+                    // On the CPU, at submission, before any list runs.
+                    if touches(&read, dst, dst + len) {
+                        return Err(LiftAbort::CpuWrites);
+                    }
+                    join_ranges(&mut cpu, [(dst, dst + len)]);
+                    continue;
+                }
+                if src < dst + len && dst < src + len {
+                    return Err(LiftAbort::InPlace);
+                }
+                cpu_wrote(&cpu, src, len)?;
+                cpu_wrote(&cpu, dst, len)?;
+                let (from, src_copy) = sole(src, len).ok_or(LiftAbort::NotSole)?;
+                let (to, dst_copy) = sole(dst, len).ok_or(LiftAbort::NotSole)?;
+                let bounce = from == to;
+                if bounce && len > BOUNCE_MOST {
+                    return Err(LiftAbort::SameBuffer);
+                }
+                lifts.push(Lift {
+                    list,
+                    step,
+                    src: src_copy,
+                    to: LiftTo::Copy { dst: dst_copy, bounce },
+                    len,
+                });
+                join_ranges(&mut reach, [(dst, dst + len)]);
+                join_ranges(&mut read, [(src, src + len)]);
+            }
+            Seen::Fill(dst, src, len) => {
+                if !touches(&reach, src, src + len) {
+                    continue;
+                }
+                cpu_wrote(&cpu, src, len)?;
+                let chunk = fills
+                    .then(|| scratch(list, dst, len))
+                    .flatten()
+                    .ok_or(LiftAbort::BigScratch)?;
+                let (_, src_copy) = sole(src, len).ok_or(LiftAbort::NotSole)?;
+                lifts.push(Lift {
+                    list,
+                    step,
+                    src: src_copy,
+                    to: LiftTo::Fill(chunk),
+                    len,
+                });
+                join_ranges(&mut read, [(src, src + len)]);
+            }
+            Seen::Texture(at, len) => {
+                if touches(&reach, at, at + len) {
+                    return Err(LiftAbort::TextureAfter);
+                }
+            }
+            Seen::Run => return Err(LiftAbort::Run),
+            Seen::Other => {}
+        }
+    }
+    Ok(lifts)
+}
+
+/// Since the last frame-rate line, with [`lift_mode`], by the slots below.
+static LIFT_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// [`LIFT_STATS`]: plans made.
+const LIFT_PLANS: usize = 0;
+/// [`LIFT_STATS`]: plans without an abort.
+const LIFT_CLEAN: usize = 1;
+/// [`LIFT_STATS`]: copies in those plans.
+const LIFT_COPIES: usize = 2;
+/// [`LIFT_STATS`]: fills in those plans.
+const LIFT_FILLS: usize = 3;
+/// [`LIFT_STATS`]: the bytes of those copies and fills.
+const LIFT_BYTES: usize = 4;
+/// [`LIFT_STATS`]: copies through a bounce buffer.
+const LIFT_BOUNCED: usize = 5;
+/// [`LIFT_STATS`]: plans with fills (aborted at `=1`).
+const LIFT_WITH_FILLS: usize = 6;
+/// [`LIFT_STATS`]: waits for flights to land left out.
+const LIFT_WAITS_LEFT: usize = 7;
+
+/// Since the last frame-rate line: plans aborted, by [`LiftAbort`].
+static LIFT_ABORTED: [std::sync::atomic::AtomicU64; LiftAbort::ALL.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; LiftAbort::ALL.len()];
+
+/// A bounce buffer ([`Bounce`]) of at least `len` bytes, and its size: a
+/// kept one, or a new one.
+fn take_bounce(len: usize) -> Option<(Bounce, u64)> {
+    let size = (len as u64).next_power_of_two().max(1 << 16);
+    if let Some(kept) = BOUNCES.lock().unwrap_or_else(|e| e.into_inner()).take(size) {
+        return Some((kept, size));
+    }
+    let buffer = host()?.uav_buffer(size)?;
+    label(&buffer, "lifted copy bounce", size);
+    name(&buffer, || "lifted copy bounce".into());
+    Some((Bounce(buffer), size))
+}
+
+/// [`lift_mode`] at a submission whose reads of title memory wait for
+/// flights to land ([`relay_exact`], `WHY_READ`): plans lifting them
+/// ([`plan_lifts`]), counts the plan and, with `=1` or `=2`, rewrites the
+/// steps. Whether the submission no longer needs the wait.
+fn lift_reads(runs: &[&HostList]) -> bool {
+    use std::sync::Arc;
+    let mode = lift_mode();
+    if mode == LiftMode::Off {
+        return false;
+    }
+    let abort = |why: LiftAbort| {
+        LIFT_ABORTED[why as usize].fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    LIFT_STATS[LIFT_PLANS].fetch_add(1, Ordering::Relaxed);
+    let written = line().written.clone();
+    let twice = runs.iter().enumerate().any(|(i, a)| runs[..i].iter().any(|b| std::ptr::eq(*a, *b)));
+    let plan = if twice {
+        Err(LiftAbort::Twice)
+    } else {
+        // One list's lock at a time.
+        let steps: Vec<(usize, usize, Seen)> = runs
+            .iter()
+            .enumerate()
+            .flat_map(|(l, list)| {
+                list.deferred().copies.iter().enumerate().map(|(i, step)| (l, i, step.seen())).collect::<Vec<_>>()
+            })
+            .collect();
+        plan_lifts(
+            &written,
+            steps,
+            mode != LiftMode::Copies,
+            |at, len| crate::shadow::sole(at as u64, len as u64).map(|s| (Arc::as_ptr(&s) as usize, s)),
+            |l, at, len| runs[l].scratch_chunk(at, len),
+        )
+    };
+    let lifts = match plan {
+        Ok(lifts) => lifts,
+        Err(why) => return abort(why),
+    };
+    let lifting = mode != LiftMode::Count && !lifts.is_empty();
+    // A bounce buffer per list with copies within one host copy, as long
+    // as its longest, before any step is rewritten: without one the plan
+    // is not made.
+    let bounces: Vec<Option<(Bounce, u64)>> = if lifting {
+        let taken: Option<Vec<_>> = (0..runs.len())
+            .map(|l| {
+                let longest = lifts
+                    .iter()
+                    .filter(|lift| lift.list == l && matches!(lift.to, LiftTo::Copy { bounce: true, .. }))
+                    .map(|lift| lift.len)
+                    .max();
+                match longest {
+                    Some(len) => take_bounce(len).map(Some),
+                    None => Some(None),
+                }
+            })
+            .collect();
+        // (Those taken for the lists before are freed: memory is short.)
+        let Some(taken) = taken else {
+            tracing::warn!("no bounce buffer for a lifted copy: the submission waits instead");
+            return abort(LiftAbort::NoBounce);
+        };
+        taken
+    } else {
+        Vec::new()
+    };
+    LIFT_STATS[LIFT_CLEAN].fetch_add(1, Ordering::Relaxed);
+    let mut has_fills = false;
+    for lift in &lifts {
+        match &lift.to {
+            LiftTo::Copy { bounce, .. } => {
+                LIFT_STATS[LIFT_COPIES].fetch_add(1, Ordering::Relaxed);
+                LIFT_STATS[LIFT_BOUNCED].fetch_add(u64::from(*bounce), Ordering::Relaxed);
+            }
+            LiftTo::Fill(_) => {
+                LIFT_STATS[LIFT_FILLS].fetch_add(1, Ordering::Relaxed);
+                has_fills = true;
+            }
+        }
+        LIFT_STATS[LIFT_BYTES].fetch_add(lift.len as u64, Ordering::Relaxed);
+    }
+    LIFT_STATS[LIFT_WITH_FILLS].fetch_add(u64::from(has_fills), Ordering::Relaxed);
+    if !lifting {
+        return false;
+    }
+    // The bounce buffers, held by their lists until they are reset.
+    let bounces: Vec<Option<ID3D12Resource>> = bounces
+        .into_iter()
+        .zip(runs)
+        .map(|(bounce, list)| {
+            let (bounce, size) = bounce?;
+            let buffer = bounce.0.clone();
+            list.deferred().bounces.push((bounce, size));
+            Some(buffer)
+        })
+        .collect();
+    // Whether every planned step was rewritten. The steps were seen as the
+    // plan has them just now, under the submission lock, so this holds; if
+    // it does not, the submission waits as before (steps already rewritten
+    // are done on the card behind the flights all the same).
+    let mut rewritten = true;
+    for lift in lifts {
+        let mut deferred = runs[lift.list].deferred();
+        let Some(step) = deferred.copies.get_mut(lift.step) else {
+            rewritten = false;
+            continue;
+        };
+        let lifted = match (&*step, lift.to) {
+            (&Step::Copy(dst, src, len), LiftTo::Copy { dst: copy, bounce }) if len == lift.len => Lifted {
+                src: lift.src,
+                src_at: src,
+                len,
+                to: LiftedTo::Copy(copy, dst, bounce.then(|| bounces[lift.list].clone()).flatten()),
+            },
+            (&Step::Fill(dst, src, len), LiftTo::Fill((buffer, offset))) if len == lift.len => Lifted {
+                src: lift.src,
+                src_at: src,
+                len,
+                to: LiftedTo::Fill(buffer, offset, dst),
+            },
+            _ => {
+                rewritten = false;
+                continue;
+            }
+        };
+        *step = Step::Lifted(Box::new(lifted));
+    }
+    if !rewritten {
+        tracing::warn!("a lifted read's step changed before it was rewritten: the submission waits instead");
+        return abort(LiftAbort::Changed);
+    }
+    LIFT_STATS[LIFT_WAITS_LEFT].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// A lifted read ([`Step::Lifted`]) as the submission's lift list records
+/// it: from a buffer and offset to a buffer and offset, bytes; within one
+/// buffer, the bounce buffer it goes through (at least as long).
+struct LiftCopy {
+    src: ID3D12Resource,
+    src_offset: u64,
+    dst: ID3D12Resource,
+    dst_offset: u64,
+    len: u64,
+    bounce: Option<ID3D12Resource>,
+}
+
+impl LiftCopy {
+    /// Whether it goes through a bounce buffer: source and destination are
+    /// one buffer, which cannot be in the copy source and destination
+    /// states at once.
+    fn bounces(&self) -> bool {
+        self.src.as_raw() == self.dst.as_raw()
+    }
+}
+
+/// Records `lifts` ([`lift_mode`]) in order, in the list at the head of a
+/// submission ([`HostList::lift_list`]): each copy between barriers from
+/// and back to the common state. Every buffer is there at the head of a
+/// submission (buffers decay to it at the end of each `ExecuteCommandLists`,
+/// see [`BufferStates`]), and the next copy, and the lists after, find it
+/// done.
+///
+/// # Safety
+/// `list` is open; the buffers are live and the ranges lie in them; a copy
+/// within one buffer has its bounce buffer.
+unsafe fn record_lifts(list: &ID3D12GraphicsCommandList, lifts: &[LiftCopy]) {
+    let common = D3D12_RESOURCE_STATE_COMMON;
+    let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    // SAFETY: as the caller vouches.
+    unsafe {
+        for lift in lifts {
+            if !lift.bounces() {
+                list.ResourceBarrier(&[transition(&lift.src, common, source), transition(&lift.dst, common, dest)]);
+                list.CopyBufferRegion(&lift.dst, lift.dst_offset, &lift.src, lift.src_offset, lift.len);
+                list.ResourceBarrier(&[transition(&lift.src, source, common), transition(&lift.dst, dest, common)]);
+                continue;
+            }
+            // `lift_reads` takes one for every such copy before it lifts it.
+            let Some(bounce) = &lift.bounce else {
+                fail(format_args!("a lifted copy within one buffer has no bounce buffer"));
+            };
+            let buffer = &lift.src;
+            list.ResourceBarrier(&[transition(buffer, common, source), transition(bounce, common, dest)]);
+            list.CopyBufferRegion(bounce, 0, buffer, lift.src_offset, lift.len);
+            list.ResourceBarrier(&[transition(buffer, source, dest), transition(bounce, dest, source)]);
+            list.CopyBufferRegion(buffer, lift.dst_offset, bounce, 0, lift.len);
+            list.ResourceBarrier(&[transition(buffer, dest, common), transition(bounce, source, common)]);
+        }
+    }
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -3478,12 +4216,14 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
+            // (A lifted read's ranges are refreshed too.)
+            for (shadow, address, len) in step.refreshes() {
+                if !shadow.writes_pending() {
+                    continue;
+                }
                 match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+                    Some(s) => (s.1, s.2) = (s.1.min(address), s.2.max(address + len)),
+                    None => spans.push((shadow.clone(), address, address + len)),
                 }
             }
         }
@@ -3736,6 +4476,13 @@ fn late_threads() {
                 "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY=1)"
             );
         }
+        if lift_mode() != LiftMode::Off {
+            tracing::info!(
+                mode = lift_mode().value(),
+                active = relay_exact(),
+                "reads of title memory flights write are planned for the card (VICTORY_LIFT_READS; only with VICTORY_RELAY=2)"
+            );
+        }
     });
 }
 
@@ -3965,6 +4712,32 @@ fn late_line(frames: f64) {
             );
         }
     }
+    if lift_mode() != LiftMode::Off {
+        let l: Vec<f64> = LIFT_STATS.iter().map(|l| l.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        // Only the reasons that aborted a plan.
+        let aborted: Vec<String> = LiftAbort::ALL
+            .iter()
+            .filter_map(|&why| {
+                let n = LIFT_ABORTED[why as usize].swap(0, Ordering::Relaxed);
+                (n > 0).then(|| format!("{} {:.2}", why.name(), n as f64 / frames))
+            })
+            .collect();
+        tracing::info!(
+            "title memory reads lifted to the card per frame (VICTORY_LIFT_READS={}): {:.2} plans, {:.2} without an abort \
+             ({:.2} with fills); {:.1} copies ({:.1} through a bounce buffer) and {:.1} fills, {:.3} MB; {:.2} waits for flights \
+             to land left out; aborted: {}",
+            lift_mode().value(),
+            l[LIFT_PLANS],
+            l[LIFT_CLEAN],
+            l[LIFT_WITH_FILLS],
+            l[LIFT_COPIES],
+            l[LIFT_BOUNCED],
+            l[LIFT_FILLS],
+            l[LIFT_BYTES] / (1 << 20) as f64,
+            l[LIFT_WAITS_LEFT],
+            if aborted.is_empty() { "none".to_owned() } else { aborted.join(", ") },
+        );
+    }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -4027,6 +4800,106 @@ mod late_tests {
     }
 }
 
+#[cfg(test)]
+mod lift_tests {
+    use super::{BOUNCE_MOST, Lift, LiftAbort, LiftTo, Seen, plan_lifts};
+
+    /// Copies by the hundreds of their address: 1000..1999 one copy, and so
+    /// on; 9000.. none. Scratch from 0x10_0000 on.
+    fn sole(at: usize, len: usize) -> Option<(usize, usize)> {
+        let copy = at / 1000;
+        (copy < 9 && (at + len - 1) / 1000 == copy).then_some((copy, copy))
+    }
+
+    fn scratch(_list: usize, at: usize, _len: usize) -> Option<usize> {
+        at.checked_sub(0x10_0000)
+    }
+
+    fn plan(written: &[(usize, usize)], steps: &[(usize, Seen)]) -> Result<Vec<Lift<usize, usize>>, LiftAbort> {
+        let steps = steps.iter().enumerate().map(|(i, &(list, seen))| (list, i, seen));
+        plan_lifts(written, steps, true, sole, scratch)
+    }
+
+    /// Reads and writes of what flights write are lifted in order, and what
+    /// a lifted copy writes counts as written for the steps after it; what
+    /// touches neither stays on the CPU.
+    #[test]
+    fn lifts_follow_what_the_card_writes() {
+        let written = [(1000, 1100)];
+        let steps = [
+            // Reads what a flight writes.
+            (0, Seen::Copy(2000, 1000, 16)),
+            // Touches nothing the card writes: on the CPU.
+            (0, Seen::Copy(5000, 4000, 16)),
+            // Reads what the first copy writes.
+            (1, Seen::Copy(3000, 2008, 8)),
+            // Writes what a flight writes.
+            (1, Seen::Copy(1050, 6000, 4)),
+            (1, Seen::Fill(0x10_0100, 3000, 8)),
+            // A fill of memory nobody writes: on the CPU.
+            (1, Seen::Fill(0x10_0200, 7000, 8)),
+            (1, Seen::Other),
+        ];
+        let lifts = plan(&written, &steps).expect("a plan");
+        assert_eq!(
+            lifts,
+            [
+                Lift { list: 0, step: 0, src: 1, to: LiftTo::Copy { dst: 2, bounce: false }, len: 16 },
+                Lift { list: 1, step: 2, src: 2, to: LiftTo::Copy { dst: 3, bounce: false }, len: 8 },
+                Lift { list: 1, step: 3, src: 6, to: LiftTo::Copy { dst: 1, bounce: false }, len: 4 },
+                Lift { list: 1, step: 4, src: 3, to: LiftTo::Fill(0x100), len: 8 },
+            ]
+        );
+        // Nothing the card writes: nothing to lift.
+        assert_eq!(plan(&[], &steps[..2]), Ok(Vec::new()));
+    }
+
+    /// Within one host copy a copy goes through the bounce buffer, up to its
+    /// size.
+    #[test]
+    fn copies_within_one_copy_bounce() {
+        let written = [(1000, 1100)];
+        let lifts = plan(&written, &[(0, Seen::Copy(1500, 1000, 64))]).expect("a plan");
+        assert_eq!(lifts[0].to, LiftTo::Copy { dst: 1, bounce: true });
+        // Longer than a bounce buffer: within one copy it aborts, between
+        // two it is lifted.
+        let big = |at: usize, _len: usize| Some((at / 1000, ()));
+        let steps = [(0, 0, Seen::Copy(1000 + 2 * BOUNCE_MOST, 1000, BOUNCE_MOST + 1))];
+        let none = |_: usize, _: usize, _: usize| None::<()>;
+        let same = |_: usize, _: usize| Some((7, ()));
+        assert_eq!(plan_lifts(&written, steps, true, same, none), Err(LiftAbort::SameBuffer));
+        assert!(plan_lifts(&written, steps, true, big, none).is_ok());
+    }
+
+    /// Every reason a plan is aborted.
+    #[test]
+    fn plans_abort_for_each_reason() {
+        let written = [(1000, 1100)];
+        let cases: [(&[(usize, Seen)], LiftAbort); 9] = [
+            // The destination spans two copies, or lies in none.
+            (&[(0, Seen::Copy(1990, 1000, 16))], LiftAbort::NotSole),
+            (&[(0, Seen::Fill(0x10_0000, 1000, 8)), (0, Seen::Copy(9100, 1010, 8))], LiftAbort::NotSole),
+            (&[(0, Seen::Copy(1004, 1000, 16))], LiftAbort::InPlace),
+            (&[(0, Seen::Fill(0x0f_0000, 1000, 8))], LiftAbort::BigScratch),
+            // A texture over a flight's writes, or over a lifted copy's.
+            (&[(0, Seen::Texture(1090, 64))], LiftAbort::TextureAfter),
+            (&[(0, Seen::Copy(2000, 1000, 8)), (0, Seen::Texture(2004, 4))], LiftAbort::TextureAfter),
+            (&[(0, Seen::Copy(2000, 1000, 8)), (1, Seen::Run)], LiftAbort::Run),
+            // A copy on the CPU writes a lifted copy's source, before or after.
+            (&[(0, Seen::Copy(2000, 5000, 8)), (0, Seen::Copy(1000, 2000, 8))], LiftAbort::CpuWrites),
+            (&[(0, Seen::Copy(3000, 1096, 16)), (0, Seen::Copy(1100, 6000, 4))], LiftAbort::CpuWrites),
+        ];
+        for (i, (steps, why)) in cases.iter().enumerate() {
+            assert_eq!(plan(&written, steps), Err(*why), "case {i}");
+        }
+        // Without fills allowed every fill to lift aborts.
+        let steps = [(0, 0, Seen::Fill(0x10_0000, 1000, 8))];
+        assert_eq!(plan_lifts(&written, steps, false, sole, scratch), Err(LiftAbort::BigScratch));
+        // A texture away from what the card writes is no reason either.
+        assert!(plan(&written, &[(0, Seen::Copy(2000, 1000, 8)), (0, Seen::Texture(4000, 64))]).is_ok());
+    }
+}
+
 /// Whether a title buffer copy that continues the one recorded before it
 /// in its list becomes one step with it (`VICTORY_JOIN_COPIES=1`; off by
 /// default).
@@ -4074,8 +4947,9 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let range = (*address, *address + *len);
+            // (A lifted copy's destination is written as shaders write.)
+            if let Some((shadow, address, len)) = step.card_writes() {
+                let range = (address, address + len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
                         if !ranges.contains(&range) {
@@ -4374,6 +5248,7 @@ impl Host {
                 buffer_states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                lifts: OnceLock::new(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
@@ -4615,10 +5490,11 @@ impl Host {
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                // (A lifted copy's destination is written as shaders write.)
+                if let Some((shadow, address, len)) = step.card_writes()
                     && shadow.carded()
                 {
-                    let range = (*address, *address + *len);
+                    let range = (address, address + len);
                     match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
                         Some((_, ranges)) => {
                             if !ranges.contains(&range) {
@@ -5856,6 +6732,12 @@ impl Host {
         drop(lock_wait);
         let was_working = working(true);
         submitting(1, runs.len());
+        // Steps an earlier submission of a list lifted: on the CPU again,
+        // unless this submission's plan lifts them (only these switches
+        // lift steps).
+        if matches!(lift_mode(), LiftMode::Copies | LiftMode::Fills) {
+            HostList::unlift(runs);
+        }
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -5863,9 +6745,13 @@ impl Host {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
             if relay_exact() && why == WHY_READ {
-                // Only until the flights that may write what is read have
-                // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                // The reads done on the card behind the flights, if they
+                // can be (`VICTORY_LIFT_READS`); else only until the flights
+                // that may write what is read have landed: their
+                // copy-back's end, not the card's other work.
+                if !lift_reads(runs) {
+                    relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                }
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -5920,13 +6806,15 @@ impl Host {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
+                    // (A lifted read's ranges are refreshed too.)
+                    for (shadow, address, len) in step.refreshes() {
+                        if shadow.unwatched() {
+                            continue;
+                        }
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                            .or_insert((address, address + len));
+                        *span = (span.0.min(address), span.1.max(address + len));
                     }
                 }
             }
@@ -5947,10 +6835,14 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        // Each run's prelude and list, in order.
+        let mut ordered = Vec::with_capacity(runs.len());
+        let mut lifted = false;
         for list in runs {
             let mut deferred =
                 crate::profile::span_args("run_deferred", &[("list", u64::from(list.id))]);
             let run = list.run_deferred(&mut batch);
+            lifted |= run.lifted;
             if let Some(deferred) = deferred.as_mut() {
                 deferred.arg("refreshes", run.refreshes);
                 deferred.arg("textures", run.textures);
@@ -5960,11 +6852,20 @@ impl Host {
             }
             drop(deferred);
             list.sent_ops();
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            ordered.push((list.prelude(), list.list.cast().ok()));
+        }
+        // The lifted reads of all lists (`VICTORY_LIFT_READS`) at the head,
+        // as the CPU did its copies before any list: with the first run's
+        // lists (timing and the profiler's parts count it in them).
+        if lifted && let Some(lifts) = HostList::lift_list(runs) {
+            lists.push(Some(lifts));
+        }
+        for (prelude, list) in ordered {
+            firsts.push(if firsts.is_empty() { 0 } else { lists.len() });
+            if let Some(prelude) = prelude {
                 lists.push(Some(prelude));
             }
-            lists.push(list.list.cast().ok());
+            lists.push(list);
         }
         let mut flush = crate::profile::span("batch flush");
         let before = batch.done;
@@ -6868,6 +7769,62 @@ impl HostList {
         }
     }
 
+    /// At submission, after every list's `run_deferred`: the list that does
+    /// the lifted reads of all `runs` ([`lift_mode`]), in their order, to go
+    /// at the head of the submission, ahead of the first list's prelude
+    /// (see [`record_lifts`]). It is the first list's (its submission has
+    /// run before it is reset, as for a prelude). `None` when nothing is
+    /// lifted; called only when a `run_deferred` left lifted reads
+    /// ([`DeferredRun::lifted`]).
+    fn lift_list(runs: &[&HostList]) -> Option<ID3D12CommandList> {
+        let first = runs.first()?;
+        let lifted: Vec<LiftCopy> = runs.iter().flat_map(|l| std::mem::take(&mut l.deferred().lifted)).collect();
+        if lifted.is_empty() {
+            return None;
+        }
+        let Some((allocator, list)) = first.lifts.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref() else {
+            fail(format_args!("no host list for lifted reads"));
+        };
+        // SAFETY: the list is not executing (as for the prelude); the
+        // buffers of the lifted reads are live (their steps hold the host
+        // copies and the lists their scratch chunks and bounce buffers), the
+        // ranges lie in them, and each copy within a buffer has its bounce
+        // buffer (`lift_reads`).
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                list.Reset(allocator, None)?;
+                record_lifts(list, &lifted);
+                list.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("a list of lifted reads did not record ({e})"));
+        }
+        list.cast().ok()
+    }
+
+    /// At the start of a submission ([`lift_mode`] `1` or `2`): the steps of
+    /// `runs` lifted at an earlier submission of their list (submitted again
+    /// before its reset) become the CPU's copies and fills again
+    /// ([`Lifted::cpu_step`]). A lift is planned for one submission only:
+    /// this one plans its own ([`lift_reads`]) or does them on the CPU,
+    /// in step order with the other lists' copies, as without the switch.
+    /// The lifted steps are held until the reset ([`Deferred::spent`]).
+    fn unlift(runs: &[&HostList]) {
+        for list in runs {
+            let mut deferred = list.deferred();
+            let deferred = &mut *deferred;
+            for step in &mut deferred.copies {
+                if let Step::Lifted(lift) = step {
+                    let cpu = lift.cpu_step();
+                    if let Step::Lifted(lift) = std::mem::replace(step, cpu) {
+                        deferred.spent.push(*lift);
+                    }
+                }
+            }
+        }
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
@@ -7537,12 +8494,14 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) -> DeferredRun {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        let deferred = self.deferred();
+        let mut deferred = self.deferred();
         let mut run = DeferredRun {
             heap_pass: deferred.heap_pass,
             ..DeferredRun::default()
         };
         let batch_copied = batch.done.copied;
+        // For the submission's lift list ([`Step::Lifted`]).
+        let mut lifted = Vec::new();
         for step in &deferred.copies {
             let started = std::time::Instant::now();
             let copied = match step {
@@ -7622,13 +8581,55 @@ impl HostList {
                     }
                     continue;
                 }
+                Step::Lifted(lift) => {
+                    // Done on the card at the head of the submission: the
+                    // source's host copy brought up to date (ranges flights
+                    // write stay as they are), nothing read or written on
+                    // the CPU.
+                    batch.add(&lift.src, lift.src_at, lift.len);
+                    let (dst, dst_offset, bounce) = match &lift.to {
+                        LiftedTo::Copy(dst, at, bounce) => {
+                            // As shaders' writes: the destination's copy up
+                            // to date first, then its bytes kept, so that
+                            // the landing finds every byte the copy changed.
+                            batch.add(dst, *at, lift.len);
+                            batch.flush_one(dst);
+                            dst.writing(*at, lift.len);
+                            (dst.buffer.clone(), dst.offset(*at as u64), bounce.clone())
+                        }
+                        LiftedTo::Fill(buffer, offset, _) => (buffer.clone(), *offset, None),
+                    };
+                    lifted.push(LiftCopy {
+                        src: lift.src.buffer.clone(),
+                        src_offset: lift.src.offset(lift.src_at as u64),
+                        dst,
+                        dst_offset,
+                        len: lift.len as u64,
+                        bounce,
+                    });
+                    continue;
+                }
             };
             run.copied += copied as u64;
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        run.lifted = !lifted.is_empty();
+        deferred.lifted = lifted;
         run.copied += batch.done.copied - batch_copied;
         run
+    }
+
+    /// The list's scratch chunk that holds `[at, at + len)` of its upload
+    /// memory (CPU addresses, as a fill's destination): the chunk's buffer
+    /// and the offset in it. `None` outside the chunks (a scratch of its own).
+    fn scratch_chunk(&self, at: usize, len: usize) -> Option<(ID3D12Resource, u64)> {
+        let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        scratch
+            .chunks
+            .iter()
+            .find(|(chunk, size)| chunk.data <= at && at.checked_add(len).is_some_and(|end| end <= chunk.data + *size as usize))
+            .map(|(chunk, _)| (chunk.buffer.clone(), (at - chunk.data) as u64))
     }
 }
 
@@ -10088,5 +11089,260 @@ mod walk_wait {
             assert!(ended.load(Ordering::SeqCst), "submitted while the walk ran");
         });
         assert!(gate.walked(mark));
+    }
+}
+
+#[cfg(test)]
+mod lift_gpu_tests {
+    use super::*;
+
+    /// A buffer of `len` bytes in system memory the CPU maps (as
+    /// `Host::shared_buffer`), on `device`, zeroed: the buffer and its
+    /// mapping.
+    fn shared(device: &ID3D12Device, len: usize) -> (ID3D12Resource, &'static mut [u8]) {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a buffer of `len` bytes,
+        // which lives (leaked) for the test.
+        unsafe {
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .unwrap();
+            let buffer = buffer.unwrap();
+            buffer.Map(0, None, Some(&mut data)).unwrap();
+            let bytes = std::slice::from_raw_parts_mut(data.cast::<u8>(), len);
+            bytes.fill(0);
+            (buffer, bytes)
+        }
+    }
+
+    fn pattern(len: usize, seed: u32) -> Vec<u8> {
+        (0..len as u32).map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 24) as u8).collect()
+    }
+
+    /// Lifted copies ([`record_lifts`]) on a device of their own with the debug
+    /// layer (WARP): one between two buffers, one within a buffer through
+    /// the bounce, one into a scratch chunk, in that order (the last reads
+    /// what the second wrote). The bytes are those of the same copies on
+    /// the CPU, and the debug layer has nothing to say about the barriers.
+    #[test]
+    fn lifted_copies_match_the_cpu_and_keep_the_debug_layer_quiet() {
+        let mut debug: Option<ID3D12Debug> = None;
+        // SAFETY: plain calls; the layer is on for devices made after this.
+        unsafe {
+            if D3D12GetDebugInterface(&mut debug).is_ok()
+                && let Some(d) = &debug
+            {
+                d.EnableDebugLayer();
+            }
+        }
+        let Ok(adapter) = warp_adapter() else {
+            return; // no software adapter here
+        };
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation.
+        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) }.unwrap();
+        let device = device.unwrap();
+        let messages: Option<ID3D12InfoQueue> = device.cast().ok();
+        const LEN: usize = 1 << 16;
+        let (a, a_bytes) = shared(&device, LEN);
+        let (b, b_bytes) = shared(&device, LEN);
+        let (chunk, chunk_bytes) = shared(&device, LEN);
+        a_bytes.copy_from_slice(&pattern(LEN, 7));
+        let (bounce, _) = shared(&device, LEN);
+        let lifts = [
+            LiftCopy { src: a.clone(), src_offset: 100, dst: b.clone(), dst_offset: 1000, len: 256, bounce: None },
+            LiftCopy { src: a.clone(), src_offset: 0, dst: a.clone(), dst_offset: 4096, len: 512, bounce: Some(bounce) },
+            LiftCopy { src: a.clone(), src_offset: 4096 + 64, dst: chunk.clone(), dst_offset: 256, len: 300, bounce: None },
+        ];
+        assert!(!lifts[0].bounces() && lifts[1].bounces() && !lifts[2].bounces());
+        // The same copies on the CPU, in order.
+        let mut cpu = [a_bytes.to_vec(), b_bytes.to_vec(), chunk_bytes.to_vec()];
+        for (from, to, at, into, len) in [(0, 1, 100, 1000, 256), (0, 0, 0, 4096, 512), (0, 2, 4096 + 64, 256, 300)] {
+            let bytes = cpu[from][at..at + len].to_vec();
+            cpu[to][into..into + len].copy_from_slice(&bytes);
+        }
+        // SAFETY: our own device's objects; the copies lie in the buffers,
+        // and the fence wait (no event: it blocks) ends before the reads.
+        unsafe {
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            record_lifts(&list, &lifts);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, HANDLE::default()).unwrap();
+            assert_eq!(device.GetDeviceRemovedReason(), Ok(()));
+        }
+        assert!(a_bytes[..] == cpu[0][..], "the copy within a buffer");
+        assert!(b_bytes[..] == cpu[1][..], "the copy between buffers");
+        assert!(chunk_bytes[..] == cpu[2][..], "the copy into the chunk");
+        let Some(messages) = messages else {
+            return; // no debug layer installed
+        };
+        let mut errors = Vec::new();
+        // SAFETY: each message is read into a buffer of the size the queue
+        // reports.
+        unsafe {
+            for i in 0..messages.GetNumStoredMessages() {
+                let mut size = 0;
+                if messages.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                    continue;
+                }
+                let mut buffer = vec![0u64; size.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if messages.GetMessage(i, Some(message), &mut size).is_ok() {
+                    let m = &*message;
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                        let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                        errors.push(String::from_utf8_lossy(text).trim_end_matches('\0').to_owned());
+                    }
+                }
+            }
+        }
+        assert!(errors.is_empty(), "the debug layer: {errors:?}");
+    }
+
+    /// Through the host: lifted steps in a list (between two title buffers'
+    /// host copies, within one through the bounce, into a chunk of shared
+    /// memory) are copied on the card at its submission, and the copies'
+    /// bytes reach the destinations' title memory as shaders' writes do.
+    /// Submitted again before its reset without a plan, the list does them
+    /// on the CPU, from the title's bytes as they are then.
+    #[test]
+    fn lifted_copies_reach_title_memory() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const LEN: usize = 1 << 16;
+        let title_a: &'static mut [u8] = Box::leak(pattern(LEN, 3).into_boxed_slice());
+        let title_b: &'static mut [u8] = Box::leak(vec![0u8; LEN].into_boxed_slice());
+        let (a_at, b_at) = (title_a.as_ptr() as usize, title_b.as_ptr() as usize);
+        let (resource_a, resource_b) = (0x11f7_0a01usize, 0x11f7_0b01usize);
+        crate::shadow::register(resource_a, a_at as u64, LEN as u64);
+        crate::shadow::register(resource_b, b_at as u64, LEN as u64);
+        let a = crate::shadow::find(a_at as u64, LEN as u64).expect("a host copy");
+        let b = crate::shadow::find(b_at as u64, LEN as u64).expect("a host copy");
+        // Each is the one copy of its bytes.
+        assert!(crate::shadow::sole(a_at as u64 + 64, 512).is_some_and(|s| std::sync::Arc::ptr_eq(&s, &a)));
+        assert!(crate::shadow::sole(b_at as u64, LEN as u64).is_some_and(|s| std::sync::Arc::ptr_eq(&s, &b)));
+        assert!(crate::shadow::sole(b_at as u64 + LEN as u64 - 8, 16).is_none(), "past the buffer's end");
+        let (chunk, chunk_data) = host.shared_buffer(LEN as u64).expect("a shared buffer");
+        let expected = title_a.to_vec();
+        let list = host.new_list().unwrap();
+        {
+            let mut deferred = list.deferred();
+            // Held by the list until its reset, as `lift_reads` leaves it.
+            let (bounce, size) = take_bounce(256).expect("a bounce buffer");
+            let buffer = bounce.0.clone();
+            deferred.bounces.push((bounce, size));
+            let lifted = [
+                Lifted { src: a.clone(), src_at: a_at + 64, len: 512, to: LiftedTo::Copy(b.clone(), b_at + 128, None) },
+                Lifted { src: a.clone(), src_at: a_at, len: 256, to: LiftedTo::Copy(a.clone(), a_at + 8192, Some(buffer)) },
+                Lifted {
+                    src: a.clone(),
+                    src_at: a_at + 1024,
+                    len: 300,
+                    to: LiftedTo::Fill(chunk.clone(), 256, chunk_data as usize + 256),
+                },
+            ];
+            deferred.copies.extend(lifted.into_iter().map(|l| Step::Lifted(Box::new(l))));
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert!(title_b[128..640] == expected[64..576], "between two copies");
+        assert!(title_b[..128].iter().chain(&title_b[640..]).all(|&v| v == 0), "nothing else of the destination");
+        assert!(title_a[8192..8448] == expected[..256], "within one copy");
+        assert!(title_a[..8192] == expected[..8192] && title_a[8448..] == expected[8448..], "nothing else of the source");
+        // SAFETY: the chunk's mapping holds LEN bytes; the submission ran.
+        let chunk_bytes = unsafe { std::slice::from_raw_parts(chunk_data, LEN) };
+        assert!(chunk_bytes[256..556] == expected[1024..1324], "into the chunk");
+        // Submitted again before its reset: that submission starts by
+        // turning the lifted steps back into the CPU's copies and fill
+        // (`unlift`, with `VICTORY_LIFT_READS` at `1` or `2`), which run in
+        // step order on the CPU as no plan was made for them.
+        HostList::unlift(&[&list]);
+        {
+            let deferred = list.deferred();
+            assert_eq!(
+                deferred.spent.len(),
+                3,
+                "the lifted steps are held until the reset"
+            );
+            let steps: Vec<_> = deferred
+                .copies
+                .iter()
+                .map(|step| match *step {
+                    Step::Copy(dst, src, len) => Some((false, dst, src, len)),
+                    Step::Fill(dst, src, len) => Some((true, dst, src, len)),
+                    _ => None,
+                })
+                .collect();
+            let chunk_at = chunk_data as usize + 256;
+            assert_eq!(
+                steps,
+                [
+                    Some((false, b_at + 128, a_at + 64, 512)),
+                    Some((false, a_at + 8192, a_at, 256)),
+                    Some((true, chunk_at, a_at + 1024, 300)),
+                ]
+            );
+        }
+        let again = pattern(LEN, 11);
+        title_a.copy_from_slice(&again);
+        host.execute(&[&list]);
+        assert!(
+            title_b[128..640] == again[64..576],
+            "between two copies, again"
+        );
+        assert!(
+            title_b[..128]
+                .iter()
+                .chain(&title_b[640..])
+                .all(|&v| v == 0),
+            "nothing else of the destination, again"
+        );
+        assert!(
+            title_a[8192..8448] == again[..256],
+            "within one copy, again"
+        );
+        assert!(
+            title_a[..8192] == again[..8192] && title_a[8448..] == again[8448..],
+            "nothing else of the source, again"
+        );
+        // SAFETY: as above; the second submission ran.
+        let chunk_bytes = unsafe { std::slice::from_raw_parts(chunk_data, LEN) };
+        assert!(
+            chunk_bytes[256..556] == again[1024..1324],
+            "into the chunk, again"
+        );
+        list.reset();
+        crate::shadow::unregister(resource_a, a_at as u64);
+        crate::shadow::unregister(resource_b, b_at as u64);
     }
 }
