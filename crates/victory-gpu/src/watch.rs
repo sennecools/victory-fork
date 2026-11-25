@@ -22,9 +22,14 @@
 //! read-only, [`open`] gives them all back; not a page of more than
 //! [`MANY_VIEWS`] views). A
 //! system call writing into a guarded block fails (none is known to).
+//!
+//! With `VICTORY_EPOCH_JOURNAL=1` the journal is kept in [`epoch`]'s tables
+//! instead: a number per 4 KiB page, no lock shared by every asking.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+
+mod epoch;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -72,14 +77,20 @@ struct Journal {
     kept: bool,
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
-    asked: 0,
-    written: BTreeMap::new(),
-    found: Vec::new(),
-    ahead: Vec::new(),
-    ahead_asked: 0,
-    kept: false,
-});
+impl Journal {
+    const fn new() -> Self {
+        Self {
+            asked: 0,
+            written: BTreeMap::new(),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        }
+    }
+}
+
+static JOURNAL: Mutex<Journal> = Mutex::new(Journal::new());
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -96,28 +107,28 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    match epoch::on() {
+        Some(epochs) => epochs.ask_ahead(ranges),
+        None => ask_ahead_in(&JOURNAL, ranges),
+    }
+}
+
+/// `ranges` as page ranges in order, empty ones left out.
+fn pieces_of(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    if pieces.len() < 2 {
-        return;
-    }
-    // On the profile: the journal's share of a refresh (its lock, its map),
-    // less the kernel askings made under it.
-    let _journal = crate::profile::journal_timer();
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if j.kept {
-        return;
-    }
-    j.asked += 1;
-    j.ahead_asked = j.asked;
-    j.ahead.clear();
+    pieces
+}
+
+/// `pieces` (page ranges in order) cut into the runs asked about together:
+/// each run `[i, k)` of pieces closer than [`AHEAD_GAP`] to the one before
+/// and spanning at most [`AHEAD_MAX`] pages.
+fn runs_of(pieces: &[(usize, usize)]) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -130,8 +141,33 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(j, &pieces[i..k]);
+        runs.push(i..k);
         i = k;
+    }
+    runs
+}
+
+/// [`ask_ahead`] in `journal`.
+fn ask_ahead_in(journal: &Mutex<Journal>, ranges: &[(usize, usize)]) {
+    let pieces = pieces_of(ranges);
+    if pieces.len() < 2 {
+        return;
+    }
+    // On the profile: the journal's share of a refresh (its lock, its map),
+    // less the kernel askings made under it.
+    let _journal = crate::profile::journal_timer();
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`.
+    if j.kept {
+        return;
+    }
+    j.asked += 1;
+    j.ahead_asked = j.asked;
+    j.ahead.clear();
+    for run in runs_of(&pieces) {
+        ask_run(j, &pieces[run]);
     }
 }
 
@@ -162,7 +198,15 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    match epoch::on() {
+        Some(epochs) => epochs.ask_ahead_done(),
+        None => ask_ahead_done_in(&JOURNAL),
+    }
+}
+
+/// [`ask_ahead_done`] in `journal`.
+fn ask_ahead_done_in(journal: &Mutex<Journal>) {
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
     if !j.kept {
         j.ahead.clear();
     }
@@ -199,10 +243,18 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    match epoch::on() {
+        Some(epochs) => epochs.ask_once(ranges),
+        None => ask_once_in(&JOURNAL, ranges),
+    }
+}
+
+/// [`ask_once`] in `journal`, whatever [`once`] says.
+fn ask_once_in(journal: &Mutex<Journal>, ranges: &[(usize, usize)]) {
     let _journal = crate::profile::journal_timer();
-    ask_once_end();
-    ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    ask_once_end_in(journal);
+    ask_ahead_in(journal, ranges);
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -229,7 +281,15 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    match epoch::on() {
+        Some(epochs) => epochs.ask_once_end(),
+        None => ask_once_end_in(&JOURNAL),
+    }
+}
+
+/// [`ask_once_end`] in `journal`.
+fn ask_once_end_in(journal: &Mutex<Journal>) {
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -240,7 +300,15 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    match epoch::on() {
+        Some(epochs) => epochs.wrote(at, len),
+        None => wrote_in(&JOURNAL, at, len),
+    }
+}
+
+/// [`wrote`] in `journal`.
+fn wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
     if !j.kept || len == 0 {
         return;
     }
@@ -325,8 +393,20 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// written, with the number of the asking that stands (as [`writes`] gives
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    match epoch::on() {
+        Some(epochs) => epochs.asked(start, end),
+        None => asked_in(&JOURNAL, start, end),
+    }
+}
+
+/// [`asked`] in `journal`.
+fn asked_in(
+    journal: &Mutex<Journal>,
+    start: usize,
+    end: usize,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -339,11 +419,24 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    match epoch::on() {
+        Some(epochs) => epochs.writes(start, end, guarded),
+        None => writes_in(&JOURNAL, start, end, guarded),
+    }
+}
+
+/// [`writes`] in `journal`.
+fn writes_in(
+    journal: &Mutex<Journal>,
+    start: usize,
+    end: usize,
+    guarded: bool,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let _journal = crate::profile::journal_timer();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
