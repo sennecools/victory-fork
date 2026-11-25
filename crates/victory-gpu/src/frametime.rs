@@ -122,6 +122,10 @@ fn metadata() -> &'static str {
             if let Some((gpu, vram)) = crate::host::adapter_summary() {
                 out.push_str(&format!("# gpu: {gpu} ({} MiB dedicated)\n", vram >> 20));
             }
+            let gpu_name = crate::host::adapter_summary().map(|(name, _)| name);
+            if let Some(driver) = display_driver_version(gpu_name.as_deref()) {
+                out.push_str(&format!("# driver: {driver}\n"));
+            }
             if let Some(total) = total_ram_mib() {
                 out.push_str(&format!("# ram: {total} MiB\n"));
             }
@@ -225,6 +229,38 @@ fn total_ram_mib() -> Option<u64> {
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
     ok.then_some(m.ullTotalPhys >> 20)
+}
+
+/// The display class key's driver version; for NVIDIA also the public number
+/// (`32.0.16.2124` -> `621.24`), which is what people quote.
+#[cfg(windows)]
+fn display_driver_version(gpu: Option<&str>) -> Option<String> {
+    const CLASS: &str =
+        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000";
+    let version = registry_string(CLASS, "DriverVersion")?;
+    if gpu.is_some_and(|name| name.to_ascii_lowercase().contains("nvidia"))
+        && let Some(public) = nvidia_driver_number(&version)
+    {
+        return Some(format!("{public} ({version})"));
+    }
+    Some(version)
+}
+
+/// `32.0.16.2124` -> `621.24`: the last five digits of the third and fourth
+/// parts.
+#[cfg(windows)]
+fn nvidia_driver_number(windows: &str) -> Option<String> {
+    let mut parts = windows.split('.');
+    let _major = parts.next()?;
+    let _minor = parts.next()?;
+    let third = parts.next()?;
+    let fourth = parts.next()?;
+    let digits: String = format!("{third}{fourth}")
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let tail = digits.get(digits.len().checked_sub(5)?..)?;
+    Some(format!("{}.{}", &tail[..3], &tail[3..]))
 }
 
 /// Times one presented frame. Called for every present, before the frame
