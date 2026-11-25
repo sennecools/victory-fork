@@ -42,6 +42,7 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+pub mod profile;
 pub mod query;
 pub mod queue;
 pub mod resource;

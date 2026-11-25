@@ -867,6 +867,9 @@ pub(crate) struct HostList {
     /// Its draws and dispatches in recorded order ([`HostList::op`]),
     /// unless device-removed data is off.
     ops: Mutex<Vec<Op>>,
+    /// When the title opened it for recording ([`crate::profile::stamp`]; 0:
+    /// not timed), for the profiler's span of its recording.
+    opened: std::sync::atomic::AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -3488,6 +3491,8 @@ impl Host {
                 } else {
                     OPS_RESERVED
                 })),
+                // A new list is open: the title records into it from here.
+                opened: std::sync::atomic::AtomicU64::new(crate::profile::stamp()),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4489,6 +4494,7 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
+                    let _wait = crate::profile::span_args("card fetch wait", &[("bytes", total)]);
                     WaitForSingleObject(self.event, INFINITE);
                     stood(waiting);
                     working(was_working);
@@ -4693,6 +4699,7 @@ impl Host {
             return;
         }
         let was_working = working(true);
+        let _settle = crate::profile::span_args("settle", &[("why", why as u64)]);
         let mut counted = false;
         loop {
             let items = {
@@ -4722,6 +4729,10 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
+                            let _wait = crate::profile::span_args(
+                                "settle: gpu wait",
+                                &[("flights", flights as u64), ("why", why as u64)],
+                            );
                             WaitForSingleObject(self.event, INFINITE);
                             stood(waiting);
                             working(true);
@@ -4756,6 +4767,7 @@ impl Host {
                 }
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
+                let _copy_back = crate::profile::span_args("settle: copy back", &[("flights", flights as u64)]);
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
                 for item in &items {
@@ -4829,6 +4841,7 @@ impl Host {
         }
         if completed < target {
             let started = std::time::Instant::now();
+            let _wait = crate::profile::span("staging wait");
             let was_working = working(false);
             // SAFETY: target was signalled on the host queue before preparation began.
             let waited = unsafe { self.fence.SetEventOnCompletion(target, HANDLE::default()) };
@@ -4855,9 +4868,12 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        let _submit = crate::profile::span_args("submit", &[("lists", runs.len() as u64), ("late", u64::from(late))]);
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let lock_wait = crate::profile::span("submission lock wait");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        drop(lock_wait);
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -4876,7 +4892,10 @@ impl Host {
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        {
+            let _sync = crate::profile::span("sync heaps");
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -4884,6 +4903,7 @@ impl Host {
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
+            let _sweep = crate::profile::span("sweep");
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
@@ -4901,6 +4921,7 @@ impl Host {
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
+        let prepare = crate::profile::span_args("prepare", &[("submission", this_submission)]);
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
@@ -4947,7 +4968,9 @@ impl Host {
             settled += settling.elapsed();
         }
         for list in runs {
+            let deferred = crate::profile::span_args("run_deferred", &[("list", u64::from(list.id))]);
             list.run_deferred(&mut batch);
+            drop(deferred);
             list.sent_ops();
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -4955,14 +4978,19 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        let flush = crate::profile::span("batch flush");
         batch.flush();
+        drop(flush);
         crate::watch::ask_once_end();
+        // Where the title's lists (with their preludes) end in `lists`.
+        let runs_end = lists.len();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
+            let _snapshots = crate::profile::span("snapshots");
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
@@ -4976,19 +5004,24 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        let card_before = crate::profile::span("card_before");
         let card = self.card_before(runs, flown);
+        drop(card_before);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        drop(prepare);
         if late {
             *submitted += 1;
+            let execute = crate::profile::span_args("ExecuteCommandLists", &[("lists", lists.len() as u64)]);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            drop(execute);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -5029,21 +5062,55 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // The profiler's timestamps on the card ([`crate::profile::gpu`]):
+        // around each title list (with its prelude) and the card compare,
+        // when the lists go as one group.
+        let stamped = if crate::profile::on() && groups.len() == 1 {
+            use crate::profile::gpu::Part;
+            let mut parts: Vec<Part> = firsts
+                .iter()
+                .enumerate()
+                .map(|(r, &first)| Part {
+                    first,
+                    end: firsts.get(r + 1).copied().unwrap_or(runs_end),
+                    name: "host list",
+                    arg: ("list", u64::from(runs[r].id)),
+                })
+                .collect();
+            if lists.len() > runs_end {
+                parts.push(Part {
+                    first: runs_end,
+                    end: lists.len(),
+                    name: "card compare",
+                    arg: ("lists", (lists.len() - runs_end) as u64),
+                });
+            }
+            crate::profile::gpu::around(&self.device, &self.queue, &lists, &parts, this_submission)
+        } else {
+            None
+        };
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
+            let group: &[Option<ID3D12CommandList>] = match &stamped {
+                Some((all, _)) => all,
+                None => group,
+            };
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                let execute = crate::profile::span_args("ExecuteCommandLists", &[("lists", group.len() as u64)]);
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                drop(execute);
                 match waited {
                     Ok(()) => {
                         working(false);
+                        let _wait = crate::profile::span_args("gpu wait", &[("submission", this_submission)]);
                         WaitForSingleObject(self.event, INFINITE);
                         stood(started);
                         working(true);
@@ -5078,6 +5145,9 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        if let Some((_, plan)) = stamped {
+            crate::profile::gpu::done(&self.queue, plan);
+        }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -5115,13 +5185,18 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let copy_back = crate::profile::span_args("copy back", &[("submission", this_submission)]);
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
+            let _card_back = crate::profile::span("card_back");
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = declared_writes(runs);
-        hand_back(&back);
+        {
+            let _hand_back = crate::profile::span_args("hand_back", &[("shadows", back.len() as u64)]);
+            hand_back(&back);
+        }
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -5139,6 +5214,8 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        drop(copy_back);
+        let read_back = crate::profile::span("read backs");
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
@@ -5147,6 +5224,7 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        drop(read_back);
         self.log_messages();
         submitting(0, 0);
         #[cfg(feature = "diagnostics")]
@@ -5427,6 +5505,19 @@ impl HostList {
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    /// The title opens the list for recording (a reset): the profiler's
+    /// span of the recording starts.
+    pub(crate) fn recording_opens(&self) {
+        self.opened.store(crate::profile::stamp(), Ordering::Relaxed);
+    }
+
+    /// The title closed the list: the profiler's span of its recording
+    /// ends (on the closing thread).
+    pub(crate) fn recording_closed(&self) {
+        let opened = self.opened.swap(0, Ordering::Relaxed);
+        crate::profile::since("title list", opened, &[("list", u64::from(self.id))]);
     }
 
     pub(crate) fn close(&self) {
@@ -7219,6 +7310,7 @@ impl Host {
                 Some(i) => &p.ahead[i].0,
                 None => &p.copy,
             };
+            let record = crate::profile::span("present: record");
             copy.reset();
             // Track and retain the presented texture on `copy` so `copy.prelude()`
             // transitions it to `COPY_SOURCE` atomically under `self.submitted`
@@ -7249,6 +7341,7 @@ impl Host {
                 D3D12_RESOURCE_STATE_PRESENT,
             )]);
             copy.close();
+            drop(record);
             match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
@@ -7260,7 +7353,9 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            let swap = crate::profile::span("present: swap chain");
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            drop(swap);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

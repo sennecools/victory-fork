@@ -621,6 +621,7 @@ extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
+        host.recording_closed();
     }
     S_OK
 }
@@ -649,6 +650,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
+        host.recording_opens();
         host.reset();
         state.reset(pipeline);
     });

@@ -1434,6 +1434,7 @@ impl State {
             return Some(gpu);
         }
         entry.last_frame = frame;
+        let _pass = crate::profile::span_args("heap buffer pass", &[("heap", host.id())]);
         let passes = &mut entry.passes;
         let ranges = &mut entry.ranges;
         let changed = host.buffer_changes();
@@ -1720,6 +1721,7 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        let _pass = crate::profile::span("heap texture pass");
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames. Under

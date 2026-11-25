@@ -571,6 +571,7 @@ fn log_refused() {
 
 /// Blocks until `p` is made, is a slow one, or `until` passes.
 fn block_until(p: &Pending, until: Instant) {
+    let _wait = crate::profile::span_args("pipeline wait", &[("compute", u64::from(p.computes()))]);
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !slow(p) {

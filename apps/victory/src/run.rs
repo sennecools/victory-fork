@@ -34,6 +34,10 @@ pub fn run(
     if std::env::var_os("VICTORY_FRAMETIME_DUMP").is_some_and(|v| v.to_str() == Some("1")) {
         victory_gpu::frametime::use_dump_path(cfg.cache_dir.join("frametime.csv"));
     }
+    // `VICTORY_PROFILE=1`: likewise.
+    if std::env::var_os("VICTORY_PROFILE").is_some_and(|v| v.to_str() == Some("1")) {
+        victory_gpu::profile::use_profile_path(cfg.cache_dir.join("profile.json"));
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();

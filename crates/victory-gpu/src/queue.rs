@@ -774,6 +774,10 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    // The frame ends here for the profiler (which may start recording now).
+    #[cfg(windows)]
+    crate::profile::presented(crate::list::recorded());
+    let _present = crate::profile::span("present");
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
