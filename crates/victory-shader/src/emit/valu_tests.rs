@@ -1311,7 +1311,9 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     let u16_cases: &[(u16, u16)] = &[
         (0xBC00, 0),      // -1.0 -> 0
         (0xFC00, 0),      // -inf -> 0
-        (0x7E00, 0),      // NaN -> 0
+        (0x7E00, 0),      // +qNaN -> 0
+        (0xFE00, 0),      // -qNaN -> 0
+        (0x7C01, 0),      // +sNaN -> 0
         (0x57BC, 123),    // 123.75 -> 123
         (0x7BFF, 65504),  // 65504.0 (max finite f16) -> 65504
         (0x7C00, 0xFFFF), // +inf -> 65535 (saturated)
@@ -1334,13 +1336,15 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     );
 
     let i16_cases: &[(u16, u16)] = &[
-        (0xFC00, 0x8000),       // -inf -> -32768
-        (0xF8E2, 0x8000),       // -40000.0 -> -32768 (saturated, not wrapped)
+        (0xFC00, 0x8000),           // -inf -> -32768
+        (0xF8E2, 0x8000),           // -40000.0 -> -32768 (saturated, not wrapped)
         (0xD7BC, (-123i16) as u16), // -123.75 -> -123
-        (0x7E00, 0),            // NaN -> 0
-        (0x57BC, 123),          // 123.75 -> 123
-        (0x78E2, 0x7FFF),       // +40000.0 -> 32767 (saturated, not wrapped)
-        (0x7C00, 0x7FFF),       // +inf -> 32767
+        (0x7E00, 0),                // +qNaN -> 0
+        (0xFE00, 0),                // -qNaN -> 0
+        (0x7C01, 0),                // +sNaN -> 0
+        (0x57BC, 123),              // 123.75 -> 123
+        (0x78E2, 0x7FFF),           // +40000.0 -> 32767 (saturated, not wrapped)
+        (0x7C00, 0x7FFF),           // +inf -> 32767
     ];
     let i16_in: Vec<[u32; 4]> = i16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
     run_cases(&cvt_i16, &i16_in, |backend, i, inp, got| {
@@ -2862,6 +2866,132 @@ fn mimg_cube_sample_d_selects_exact_log2_mip() {
                     (got - want).abs() < 0.05,
                     "{backend}: cube image_sample_d g={g} returned LOD {got}, want {want}",
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn wave_prefix_f32_uses_signed_flag_and_validates() {
+    // 32-thread wave32 inclusive float prefix sum over v5 = float(v0):
+    // lowers via `dx.op.wavePrefixOp.f32(val, 0 /*Sum*/, 0 /*signed*/)`.
+    // Passing `unsigned = 1` on f32 is rejected by `dxil.dll`.
+    let dpp16 = |src0: u8, ctrl: u16| -> u32 {
+        0xF << 28 | 0xF << 24 | (ctrl as u32 & 0x1FF) << 8 | src0 as u32
+    };
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80)); // s5 = 0
+    words.extend_from_slice(&s_load_dwordx4(8, 4)); // s[8:11] = UAV
+    words.push(vop1(0x006, 5, vgpr(0))); // v_cvt_f32_u32 v5, v0
+    // Whole-wave inclusive f32 prefix sum of v5 into v1:
+    words.push(0xBE80_0000 | 6 << 16 | 0x3D << 8 | 193); // s_or_saveexec_b32 s6, -1
+    words.extend_from_slice(&vop3(0x101, 1, 0x80, vgpr(5), sgpr(6))); // v_cndmask_b32 v1, 0.0, v5, s6
+    for shift in [1u16, 2, 4, 8] {
+        words.push(vop2(0x03, 1, 0xFA, 1)); // v_add_f32_dpp v1, v1, v1 row_shr:shift
+        words.push(dpp16(1, 0x110 + shift));
+    }
+    words.extend_from_slice(&vop3(0x360, 7, vgpr(1), 128 + 15, 0)); // v_readlane_b32 s7, v1, 15
+    words.extend_from_slice(&[0xBEFE_03FF, 0xFFFF_0000]); // s_mov_b32 exec_lo, 0xFFFF0000
+    words.push(vop2(0x03, 1, sgpr(7), 1)); // v_add_f32 v1, s7, v1
+    words.push(0xBEFE_0306); // s_mov_b32 exec_lo, s6
+    // Store each lane's prefix sum to UAV[v0].
+    words.push(0x340E_0082); // v_lshlrev_b32 v7, 2, v0
+    words.extend_from_slice(&[0xE070_1000, 0x8002_0107]); // buffer_store_dword v1, v7, s[8:11], 0 offen
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .unwrap();
+    assert!(l.wave_ops, "expected wave prefix lowering");
+    let mut dxil = l.dxil;
+    #[cfg(windows)]
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut dxil).unwrap();
+    }
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil,
+        user_data: l.user_data,
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: Vec::new(),
+    };
+    #[cfg(windows)]
+    {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(host) = Host::new(false)
+            && let Ok((root, pso)) = host.compute_pipeline(&shader)
+        {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            for lane in 0..32u32 {
+                let got = f32::from_bits(out[0][lane as usize]);
+                let want = (lane * (lane + 1) / 2) as f32;
+                assert_eq!(got, want, "lane {lane}: got {got}, want {want}");
             }
         }
     }
