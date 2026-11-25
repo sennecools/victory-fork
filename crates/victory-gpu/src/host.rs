@@ -6790,6 +6790,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        crate::frametime::tick();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -6841,35 +6842,32 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
-        {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if passes + compares > 0.0 {
-                tracing::info!(
-                    "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
-                );
-            }
+        let [card_passes, card_pieces, card_compares] =
+            [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if card_passes + card_compares > 0.0 {
+            tracing::info!(
+                "our passes over copies in the card's memory per frame: {card_passes:.0} hash passes over {card_pieces:.0} pieces after \
+                 ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {card_compares:.0} compare passes",
+                if rehash_runs() { "on" } else { "off" }
+            );
         }
-        {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-            let staging = STAGING_WAIT_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
-            if all >= 1.0 {
-                tracing::info!(
-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
-                     is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it), {staging:.1} ms waiting for the staging upload; \
-                     the rest is reading, hashing and detiling"
-                );
-            }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
-                tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
-                );
-            }
+        let [own, asking, still, texture_refresh_ms] =
+            [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        let staging = STAGING_WAIT_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
+        if texture_refresh_ms >= 1.0 {
+            tracing::info!(
+                "texture refreshes per frame, all threads: {texture_refresh_ms:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+                 is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
+                 hold still (the runtime remapping it), {staging:.1} ms waiting for the staging upload; \
+                 the rest is reading, hashing and detiling"
+            );
+        }
+        let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if through + left > 0.0 {
+            tracing::info!(
+                "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                 {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+            );
         }
         {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -6905,6 +6903,47 @@ impl Meter {
                 crate::pipeline::making(),
                 crate::draw::HEAP_TEXTURES_QUEUE[0].load(Ordering::Relaxed)
             )
+        });
+        // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
+        // buckets above and the worst/mean frame measured at each present.
+        let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
+        crate::frametime::record(&crate::frametime::Row {
+            frame: crate::queue::frame_count(),
+            frames,
+            fps,
+            ms,
+            frame_ms_max,
+            frame_ms_avg,
+            cpu_prepare_ms: cpu,
+            gpu_ms: gpu,
+            gpu_pct: 0.0, // our caption has no GPU load figure
+            copies_ms: copy_ms,
+            copies_mb: copy_mb,
+            textures_ms: texture_ms,
+            textures_mb: texture_mb,
+            copyback_ms: back_ms,
+            copyback_mb: back_mb,
+            draws,
+            dropped,
+            making: crate::pipeline::making() as f64,
+            indirect,
+            heap_passes: picked,
+            heap_ms: picked_ms,
+            texture_refresh_ms,
+            card_passes,
+            card_compares,
+            card_sent_mb: card[0] as f64 / frames / 1e6,
+            card_ranges: card[1] as f64 / frames,
+            card_pieces: card[2] as f64 / frames,
+            card_fetched: card[3] as f64 / frames,
+            card_fetched_mb: card[4] as f64 / frames / 1e6,
+            card_waits: card[5] as f64 / frames,
+            card_wait_ms: card[6] as f64 / frames / 1e3,
+            twins_into_depth: twin_to_depth,
+            twins_into_colour: twin_to_colour,
+            depth_planes: planes,
+            ram_mb: 0.0, // nor RAM
+            cpu_pct: 0.0, // nor CPU load
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
