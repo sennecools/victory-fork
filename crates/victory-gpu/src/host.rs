@@ -1725,6 +1725,10 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// Whether `pso` is [`CARD_COMPARE_WIDE`] ([`hash_wide`]): the hashes
+    /// kept on the card are its hashes, and its passes take a group per
+    /// piece ([`hash_parts`]).
+    wide: bool,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -1818,6 +1822,136 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// As [`CARD_COMPARE`] (the same constants, cuts and results; another
+/// hash), with a group of 64 threads per piece: the threads take the
+/// piece's 16-byte steps in turn, 64 each, and their hashes are summed.
+/// One thread per piece made 4,096 loads one after the other, so a pass
+/// took milliseconds however few its pieces, and a wide one left the
+/// card's load units waiting. A change in the steps of one thread always
+/// changes that thread's hash, as before; the last mixing keeps changes in
+/// several threads from cancelling out in the sum.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint sum0;
+groupshared uint sum1;
+groupshared uint sum2;
+groupshared uint sum3;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    if (t == 0u) { sum0 = 0u; sum1 = 0u; sum2 = 0u; sum3 = 0u; }
+    GroupMemoryBarrierWithGroupSync();
+    uint piece = first + group.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ ((t + 1u) * 0x9E3779B1u);
+    [loop]
+    for (uint at = lo + t * 16u; at < hi; at += 1024u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    // Two rounds in which every word goes into every other.
+    h = (h ^ (h >> 16)) * 0x85EBCA6Bu;
+    h += h.yzwx;
+    h = (h ^ (h >> 13)) * 0xC2B2AE35u;
+    h += h.zwxy;
+    h ^= h >> 16;
+    InterlockedAdd(sum0, h.x);
+    InterlockedAdd(sum1, h.y);
+    InterlockedAdd(sum2, h.z);
+    InterlockedAdd(sum3, h.w);
+    GroupMemoryBarrierWithGroupSync();
+    if (t != 0u || group.x >= pieces) return;
+    uint4 all = uint4(sum0, sum1, sum2, sum3);
+    if (compare != 0u) {
+        differs.Store(out_at + group.x * 4u, any(all != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, all);
+    } else {
+        hashes.Store4(piece * 16u, all);
+    }
+}
+"#;
+
+/// Whether the passes over copies in the card's memory hash with a group
+/// per piece ([`CARD_COMPARE_WIDE`]), and those before a submission's lists
+/// come after all its copies, behind one barrier
+/// (`VICTORY_CARD_HASH_WIDE=1`; off by default: a thread per piece, copies
+/// and passes in turn).
+///
+/// The two hashes differ and a copy's hashes stay on the card from one
+/// submission to the next, so the choice is made once, when the compare is
+/// made (`CardWork::wide`): every pass that stores or compares hashes runs
+/// the one pipeline. A host that does not take the new one keeps the one
+/// with a thread per piece ([`pick_compare`]).
+///
+/// Measured on another line only: timestamps in the lists on an RX 6800
+/// gave these passes 129 of 197 ms of the card's busy time in a frame
+/// (3.5 GB hashed). It is a compute pipeline of a shape no card has run
+/// here, so it stays off until a run shows it clean.
+fn hash_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_some_and(|v| v == "1"))
+}
+
+/// The compare the card's work uses, made by `make` from a source, and
+/// whether it is the one with a group per piece. `wide` ([`hash_wide`]):
+/// that one, or, if the host does not take it, the one with a thread per
+/// piece after all (one warning: copies still go to the card's memory,
+/// hashed as with no switch).
+pub(crate) fn pick_compare<T>(
+    wide: bool,
+    make: impl Fn(&'static str) -> windows::core::Result<T>,
+) -> windows::core::Result<(T, bool)> {
+    if wide {
+        match make(CARD_COMPARE_WIDE) {
+            Ok(compare) => {
+                tracing::info!(
+                    "the passes over copies in the card's memory hash with a group per piece, behind one barrier (VICTORY_CARD_HASH_WIDE=1)"
+                );
+                return Ok((compare, true));
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "no card compare with a group per piece (VICTORY_CARD_HASH_WIDE=1): the one with a thread per piece is used"
+            ),
+        }
+    }
+    Ok((make(CARD_COMPARE)?, false))
+}
+
+/// The dispatches of a pass over `pieces` pieces: for each, the pieces
+/// before it, its own, and its groups. A thread per piece (`wide` off): one
+/// dispatch, a group per 64 pieces, as it always was. A group per piece: a
+/// dispatch may have 65,535 groups, so more pieces than that take one more
+/// each time. (A title buffer's copy is below 1 GiB, 16,385 pieces at
+/// most; a window's has no such bound.)
+pub(crate) fn hash_parts(wide: bool, pieces: u32) -> impl Iterator<Item = (u32, u32, u32)> {
+    const MOST: u32 = 65535;
+    let parts = if wide { pieces.div_ceil(MOST) } else { 1 };
+    (0..parts).map(move |part| {
+        if wide {
+            let own = (pieces - part * MOST).min(MOST);
+            (part * MOST, own, own)
+        } else {
+            (0, pieces, pieces.div_ceil(64))
+        }
+    })
+}
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
@@ -3678,6 +3812,34 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
+        let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
+        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
+        // in one submission.
+        const RESULTS: u64 = 1 << 20;
+        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        name(&differs, || "card compare results".into());
+        let ((root, pso), wide) = pick_compare(hash_wide(), |source| self.make_compare(source))?;
+        Ok(CardWork {
+            sync: vec![list()?],
+            check: vec![list()?],
+            fetch: list()?,
+            root,
+            pso,
+            wide,
+            differs: (differs, data as usize, RESULTS),
+            fetched: None,
+            taken: 0,
+            out: 0,
+            inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+        })
+    }
+
+    /// The compare's root signature and pipeline, compiled from `source`
+    /// ([`CARD_COMPARE`] or [`CARD_COMPARE_WIDE`]).
+    fn make_compare(
+        &self,
+        source: &str,
+    ) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
@@ -3685,8 +3847,8 @@ impl Host {
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -3699,12 +3861,6 @@ impl Host {
             )?;
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
-        let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
-        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
-        name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
@@ -3718,18 +3874,7 @@ impl Host {
                 },
                 ..Default::default()
             })?;
-            Ok(CardWork {
-                sync: vec![list()?],
-                check: vec![list()?],
-                fetch: list()?,
-                root,
-                pso,
-                differs: (differs, data as usize, RESULTS),
-                fetched: None,
-                taken: 0,
-                out: 0,
-                inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
-            })
+            Ok((root, pso))
         }
     }
 
@@ -3883,15 +4028,44 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
-                            continue;
-                        };
+                    let copies = |shadow: &crate::shadow::Shadow,
+                                  staging: &ID3D12Resource,
+                                  ranges: &[(usize, usize)]| {
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                    };
+                    // All copies first, then one barrier, then all passes
+                    // ([`hash_wide`]).
+                    let wide = work.wide;
+                    if wide {
+                        let mut barriers = Vec::new();
+                        for (shadow, ranges) in &dirty {
+                            let Some((staging, before, _)) = shadow.card_sides() else {
+                                continue;
+                            };
+                            copies(shadow, staging, ranges);
+                            if before.is_some() && !ranges.is_empty() {
+                                barriers.push(transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                ));
+                            }
+                        }
+                        if !barriers.is_empty() {
+                            list.ResourceBarrier(&barriers);
+                        }
+                    }
+                    for (shadow, ranges) in &dirty {
+                        let Some((staging, before, size)) = shadow.card_sides() else {
+                            continue;
+                        };
+                        if !wide {
+                            copies(shadow, staging, ranges);
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -3901,7 +4075,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        if !wide && !ranges.is_empty() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -3923,9 +4097,17 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            for (skip, pieces, groups) in hash_parts(wide, run.pieces) {
+                                let constants =
+                                    [run.first + skip, run.skew, size as u32, pieces, 0, 0];
+                                list.SetComputeRoot32BitConstants(
+                                    0,
+                                    6,
+                                    constants.as_ptr().cast(),
+                                    0,
+                                );
+                                list.Dispatch(groups, 1, 1);
+                            }
                         }
                     }
                     list.Close()?;
@@ -4009,11 +4191,26 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        for (skip, pieces, groups) in hash_parts(work.wide, r.span.pieces) {
+                            let constants = [
+                                r.span.first + skip,
+                                r.span.skew,
+                                size as u32,
+                                pieces,
+                                (r.at + skip) * 4,
+                                if flown { 2 } else { 1 },
+                            ];
+                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                            list.SetComputeRootShaderResourceView(
+                                1,
+                                r.shadow.buffer.GetGPUVirtualAddress(),
+                            );
+                            list.SetComputeRootUnorderedAccessView(
+                                2,
+                                before.GetGPUVirtualAddress(),
+                            );
+                            list.Dispatch(groups, 1, 1);
+                        }
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind

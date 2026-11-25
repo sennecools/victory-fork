@@ -554,6 +554,74 @@ mod card_tests {
         assert!(most.is_power_of_two() && u64::from(most) * INFLIGHT_SLOT <= 1 << 32);
     }
 
+    /// The dispatches of a hash pass (`hash_parts` in host.rs). A thread
+    /// per piece: one dispatch of a group per 64 pieces, whatever the
+    /// count. A group per piece: every piece once and in order, in
+    /// dispatches of at most 65,535 groups.
+    #[test]
+    fn hash_passes_take_every_piece_once_within_a_dispatch() {
+        use crate::host::hash_parts;
+        for pieces in [
+            0u32, 1, 63, 64, 65, 16385, 65535, 65536, 65537, 131070, 200000,
+        ] {
+            let narrow: Vec<_> = hash_parts(false, pieces).collect();
+            assert_eq!(narrow, [(0, pieces, pieces.div_ceil(64))]);
+            let mut next = 0;
+            for (skip, own, groups) in hash_parts(true, pieces) {
+                assert_eq!(skip, next, "{pieces} pieces");
+                assert!(
+                    (1..=65535).contains(&groups) && groups == own,
+                    "{pieces} pieces"
+                );
+                next += own;
+            }
+            assert_eq!(next, pieces);
+        }
+        assert_eq!(
+            hash_parts(true, 16385).collect::<Vec<_>>(),
+            [(0, 16385, 16385)]
+        );
+        assert_eq!(
+            hash_parts(true, 65536).collect::<Vec<_>>(),
+            [(0, 65535, 65535), (65535, 1, 1)]
+        );
+    }
+
+    /// Which compare the card's work takes (`pick_compare` in host.rs):
+    /// without the switch the one with a thread per piece, and the other is
+    /// not made at all; with `VICTORY_CARD_HASH_WIDE=1` the one with a
+    /// group per piece, and if the host does not make it the one with a
+    /// thread per piece after all, so copies still go to the card's memory.
+    /// None only if that one fails too.
+    #[test]
+    fn a_wide_compare_that_cannot_be_made_falls_back_to_a_thread_per_piece() {
+        use crate::host::{CARD_COMPARE, CARD_COMPARE_WIDE, pick_compare};
+        // Which compare came out (true: a group per piece), and which were
+        // asked for, when the host refuses the ones in `refused`.
+        let tried = |wide: bool, refused: &[&str]| {
+            let asked = std::cell::RefCell::new(Vec::new());
+            let made = pick_compare(wide, |source| {
+                asked.borrow_mut().push(source == CARD_COMPARE_WIDE);
+                if refused.contains(&source) {
+                    return Err(windows::core::Error::empty());
+                }
+                Ok(())
+            });
+            (made.ok().map(|((), wide)| wide), asked.into_inner())
+        };
+        assert_eq!(tried(false, &[]), (Some(false), vec![false]));
+        assert_eq!(tried(true, &[]), (Some(true), vec![true]));
+        assert_eq!(
+            tried(true, &[CARD_COMPARE_WIDE]),
+            (Some(false), vec![true, false])
+        );
+        assert_eq!(
+            tried(true, &[CARD_COMPARE_WIDE, CARD_COMPARE]),
+            (None, vec![true, false])
+        );
+        assert_eq!(tried(false, &[CARD_COMPARE]), (None, vec![false]));
+    }
+
     /// Tickets drawn and landed in order, the mark raised as the landing
     /// raises it (every ticket a landed flight drew), through the counter's
     /// wrap with the slots the default gives: no two tickets in the air

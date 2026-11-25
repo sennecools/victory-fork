@@ -1184,10 +1184,24 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores(crate::host::CARD_COMPARE, false);
+    }
+
+    /// The same of the compare with a group per piece
+    /// (`VICTORY_CARD_HASH_WIDE=1`).
+    #[test]
+    fn warp_wide_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores(crate::host::CARD_COMPARE_WIDE, true);
+    }
+
+    /// `source` is the compare with a group per piece (`wide`) or with a
+    /// thread per piece.
+    fn card_compare_stores(source: &str, wide: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare =
+            compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -1213,7 +1227,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list
+                    .Dispatch(if wide { PIECES } else { PIECES.div_ceil(64) }, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1241,6 +1256,41 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Every byte counts, a piece's first and last among them.
+        for (at, flagged) in [
+            (0, [1, 0, 0]),
+            (PIECE - 1, [1, 0, 0]),
+            (PIECE, [0, 1, 0]),
+            (2 * PIECE + 4096, [0, 0, 1]),
+            (size - 1, [0, 0, 1]),
+        ] {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(!content[at]) };
+            assert_eq!(run(&mut warp, 2), flagged, "byte {at}");
+        }
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        // Two 16-byte steps that change places, in the steps of one thread
+        // or of two, and the same change in two threads.
+        for (a, b) in [
+            (PIECE, PIECE + 16),
+            (PIECE, PIECE + 1024),
+            (PIECE + 48, PIECE + 5 * 1024 + 160),
+        ] {
+            for i in 0..16 {
+                // SAFETY: inside the mapping.
+                unsafe { std::ptr::swap(now_ptr.add(a + i), now_ptr.add(b + i)) };
+            }
+            assert_eq!(run(&mut warp, 2), [0, 1, 0], "{a} and {b}");
+        }
+        for at in [PIECE + 32, PIECE + 64] {
+            // SAFETY: inside the mapping.
+            unsafe {
+                now_ptr
+                    .add(at)
+                    .write_volatile(now_ptr.add(at).read_volatile() ^ 0x80)
+            };
+        }
+        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
@@ -1251,12 +1301,28 @@ void main() {
     /// slots is written but copies nothing.
     #[test]
     fn warp_card_fetch_copies_flagged_pieces_to_their_slots() {
-        use crate::host::{CARD_COMPARE, CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
+        card_fetch_copies(crate::host::CARD_COMPARE, false);
+    }
+
+    /// The same behind the compare with a group per piece
+    /// (`VICTORY_CARD_HASH_WIDE=1`): the fetch reads the compare's flags
+    /// and the copy's bytes, never a hash, so it takes either compare's.
+    #[test]
+    fn warp_card_fetch_copies_pieces_the_wide_compare_flagged() {
+        card_fetch_copies(crate::host::CARD_COMPARE_WIDE, true);
+    }
+
+    /// `compare` is the compare with a group per piece (`wide`) or with a
+    /// thread per piece.
+    fn card_fetch_copies(compare: &str, wide: bool) {
+        use crate::host::{CARD_FETCH, INFLIGHT_NONE, INFLIGHT_SLOT};
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, CARD_COMPARE).expect("the card compare must compile on WARP");
-        let fetch = compile_cs(&warp.device, CARD_FETCH).expect("the card fetch must compile on WARP");
+        let compare =
+            compile_cs(&warp.device, compare).expect("the card compare must compile on WARP");
+        let fetch =
+            compile_cs(&warp.device, CARD_FETCH).expect("the card fetch must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         // The copy starts 40 bytes into its piece 0: piece 0 is short, the
@@ -1287,7 +1353,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(1, 1, 1);
+                warp.list.Dispatch(if wide { pieces } else { 1 }, 1, 1);
                 if mode == 2 {
                     warp.list.ResourceBarrier(&[uav_barrier()]);
                     warp.list.SetComputeRootSignature(&fetch.root);
@@ -1344,6 +1410,286 @@ void main() {
         assert_eq!(slot(PIECE - SKEW as usize), piece0);
     }
 
+    /// The compare with a thread per piece and the one with a group per
+    /// piece (`VICTORY_CARD_HASH_WIDE=1`), each with hashes and results of
+    /// its own, over one copy on the software adapter: through 120 passes
+    /// of every kind over runs of its pieces, with bytes changed and
+    /// changed back between them, both flag the pieces whose bytes are not
+    /// those last hashed, and no other. The copy starts 40 bytes into its
+    /// piece 0, and the passes are dispatched as `Host::card_before`
+    /// dispatches them (`crate::host::hash_parts`).
+    #[test]
+    fn warp_wide_and_narrow_card_compares_flag_the_same_pieces() {
+        use crate::host::{CARD_COMPARE, CARD_COMPARE_WIDE, hash_parts};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compares = [(CARD_COMPARE, false), (CARD_COMPARE_WIDE, true)].map(|(source, wide)| {
+            (
+                compile_cs(&warp.device, source).expect("the card compare must compile on WARP"),
+                wide,
+            )
+        });
+        const PIECE: usize = 64 << 10;
+        const SKEW: usize = 40;
+        const PIECES: usize = 6;
+        // The dwords of the results before the first piece's.
+        const AT: usize = 3;
+        let size = (PIECES - 1) * PIECE;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let sides = [(); 2].map(|()| {
+            (
+                warp.shared_buffer(16 * PIECES as u64),
+                warp.shared_buffer(4 * (AT + PIECES) as u64),
+            )
+        });
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        // The bytes a pass hashes for a piece: the piece as the shaders cut
+        // it, widened to 16 bytes at both ends.
+        let hashed = |piece: usize| {
+            let (lo, hi) = (
+                (piece * PIECE).saturating_sub(SKEW),
+                ((piece + 1) * PIECE - SKEW).min(size),
+            );
+            (lo & !15)..((hi + 15) & !15)
+        };
+        let mut now = content.clone();
+        // Each piece's bytes when a pass last stored its hash.
+        let mut stored: Vec<Vec<u8>> = (0..PIECES)
+            .map(|piece| now[hashed(piece)].to_vec())
+            .collect();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut draw = |below: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % below
+        };
+        let mut changed: Vec<usize> = Vec::new();
+        let (mut flagged, mut clean) = (0, 0);
+        for pass in 0..120 {
+            // The first pass stores every piece's hash; then one to three
+            // bytes change, or the last one changed goes back.
+            let (mode, first, pieces) = if pass == 0 {
+                (0, 0, PIECES)
+            } else {
+                for _ in 0..1 + draw(3) {
+                    let at = match changed.pop() {
+                        Some(at) if draw(3) == 0 => at,
+                        back => {
+                            changed.extend(back);
+                            let at = draw(size);
+                            changed.push(at);
+                            at
+                        }
+                    };
+                    now[at] = if now[at] == content[at] {
+                        !content[at]
+                    } else {
+                        content[at]
+                    };
+                    // SAFETY: inside the mapping.
+                    unsafe { now_ptr.add(at).write_volatile(now[at]) };
+                }
+                let first = draw(PIECES);
+                ([0, 1, 1, 2, 2][draw(5)], first, 1 + draw(PIECES - first))
+            };
+            // SAFETY: our open list, live buffers, the compares' own root
+            // signatures; the mappings hold what is read and written.
+            unsafe {
+                for ((compare, wide), ((_, _, hashes_gpu), (_, differs_ptr, differs_gpu))) in
+                    compares.iter().zip(&sides)
+                {
+                    for dword in 0..AT + PIECES {
+                        differs_ptr.cast::<u32>().add(dword).write_volatile(7);
+                    }
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, *hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, *differs_gpu);
+                    for (skip, own, groups) in hash_parts(*wide, pieces as u32) {
+                        let constants = [
+                            first as u32 + skip,
+                            SKEW as u32,
+                            size as u32,
+                            own,
+                            (AT as u32 + skip) * 4,
+                            mode,
+                        ];
+                        warp.list
+                            .SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        warp.list.Dispatch(groups, 1, 1);
+                    }
+                }
+            }
+            warp.submit_and_wait();
+            // What both must have left in their results: 7 where a pass
+            // stores nothing.
+            let mut wanted = vec![7u32; AT + PIECES];
+            for i in 0..pieces {
+                let piece = first + i;
+                if mode != 0 {
+                    wanted[AT + i] = u32::from(stored[piece] != now[hashed(piece)]);
+                    flagged += wanted[AT + i];
+                    clean += 1 - wanted[AT + i];
+                }
+                if mode != 1 {
+                    stored[piece] = now[hashed(piece)].to_vec();
+                }
+            }
+            for ((_, wide), (_, (_, differs_ptr, _))) in compares.iter().zip(&sides) {
+                // SAFETY: the mapping holds these dwords.
+                let got: Vec<u32> = (0..AT + PIECES)
+                    .map(|dword| unsafe { differs_ptr.cast::<u32>().add(dword).read_volatile() })
+                    .collect();
+                assert_eq!(
+                    got, wanted,
+                    "pass {pass} (kind {mode}, {pieces} pieces from {first}), a group per piece: {wide}"
+                );
+            }
+        }
+        assert!(
+            flagged > 50 && clean > 50,
+            "the passes flagged {flagged} pieces and found {clean} unchanged"
+        );
+    }
+
+    /// The passes before a submission's lists as `Host::card_before` records
+    /// them with `VICTORY_CARD_HASH_WIDE=1`, on the software adapter: every
+    /// range sent up to two copies in the card's memory first, one barrier
+    /// for both copies, then the passes that hash them. The hashes are
+    /// those of the bytes just sent up: a compare finds nothing changed,
+    /// flags a piece whose bytes went up with no pass behind them, and
+    /// finds nothing again once that range was sent up the same way.
+    #[test]
+    fn warp_wide_hash_passes_follow_all_copies_behind_one_barrier() {
+        use crate::host::{CARD_COMPARE_WIDE, hash_parts};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, CARD_COMPARE_WIDE)
+            .expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 2;
+        let size = PIECE * PIECES as usize;
+        // Per copy: the card's side, the CPU's side (mapped), the hashes.
+        let copies = [(); 2].map(|()| {
+            (
+                warp.default_uav(size as u64),
+                warp.shared_buffer(size as u64),
+                warp.default_uav(16 * u64::from(PIECES)),
+            )
+        });
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(4 * 2 * u64::from(PIECES));
+        for (n, (_, (_, staging_ptr, _), _)) in copies.iter().enumerate() {
+            let content: Vec<u8> = (0..size)
+                .map(|i| (i * 31 + i / 251 + n * 7) as u8)
+                .collect();
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), *staging_ptr, size) };
+        }
+        // One pass of kind `mode` over each copy, the second copy's results
+        // behind the first's.
+        let passes = |warp: &WarpHarness, mode: u32| {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature.
+            unsafe {
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                for (n, (card, _, hashes)) in copies.iter().enumerate() {
+                    warp.list
+                        .SetComputeRootShaderResourceView(1, card.GetGPUVirtualAddress());
+                    warp.list
+                        .SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                    for (skip, own, groups) in hash_parts(true, PIECES) {
+                        let constants = [
+                            skip,
+                            0,
+                            size as u32,
+                            own,
+                            (n as u32 * PIECES + skip) * 4,
+                            mode,
+                        ];
+                        warp.list
+                            .SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        warp.list.Dispatch(groups, 1, 1);
+                    }
+                }
+            }
+        };
+        // The ranges go up to both copies and, with `hash`, are hashed
+        // behind one barrier; then, in a list of its own as after a
+        // submission's lists, the compare. What it left in its results.
+        let send = |warp: &mut WarpHarness, range: (usize, usize), hash: bool| -> [u32; 4] {
+            let (from, to) = range;
+            // SAFETY: our open list and live buffers; the ranges lie in
+            // them. Both copies are in the common state when a list starts
+            // (buffers return to it after every run), a copy into them
+            // makes them copy destinations, and the barrier names that.
+            unsafe {
+                for (card, (staging, _, _), _) in &copies {
+                    warp.list.CopyBufferRegion(
+                        card,
+                        from as u64,
+                        staging,
+                        from as u64,
+                        (to - from) as u64,
+                    );
+                }
+                if hash {
+                    let barriers = copies
+                        .iter()
+                        .map(|(card, _, _)| {
+                            transition(
+                                card,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    warp.list.ResourceBarrier(&barriers);
+                    passes(warp, 0);
+                }
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above; the mapping holds four dwords.
+            unsafe {
+                for dword in 0..4 {
+                    differs_ptr.cast::<u32>().add(dword).write_volatile(7);
+                }
+                warp.list.ResourceBarrier(&[uav_barrier()]);
+            }
+            passes(warp, 1);
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2, 3]
+                .map(|dword| unsafe { differs_ptr.cast::<u32>().add(dword).read_volatile() })
+        };
+        assert_eq!(send(&mut warp, (0, size), true), [0, 0, 0, 0]);
+        // A byte of the second copy's second piece.
+        let at = PIECE + 4321;
+        // SAFETY: inside the mapping.
+        unsafe {
+            copies[1]
+                .1
+                .1
+                .add(at)
+                .write_volatile(!copies[1].1.1.add(at).read_volatile())
+        };
+        assert_eq!(
+            send(&mut warp, (at & !15, (at & !15) + 16), false),
+            [0, 0, 0, 1]
+        );
+        assert_eq!(
+            send(&mut warp, (at & !15, (at & !15) + 16), true),
+            [0, 0, 0, 0]
+        );
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -1351,6 +1697,17 @@ void main() {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// So does the compare of copies in the card's memory, as the host
+    /// makes it: with a thread per piece, or with a group per piece when
+    /// the tests run with `VICTORY_CARD_HASH_WIDE=1`.
+    #[test]
+    fn card_compare_builds() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        assert!(host.card_ready());
     }
 
     #[test]
