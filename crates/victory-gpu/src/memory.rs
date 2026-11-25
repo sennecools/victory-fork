@@ -186,6 +186,7 @@ impl Memory {
                 return;
             }
         };
+        shadow.handed(crate::shadow::Hand::Memory, start);
         let offset = shadow.offset_in(start).unwrap_or(0);
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.

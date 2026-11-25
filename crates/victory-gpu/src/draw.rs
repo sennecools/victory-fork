@@ -23,6 +23,7 @@ use windows::core::Interface;
 use crate::host::{HostList, OpKind};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+use crate::shadow::Hand;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -244,6 +245,12 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// Root constant buffer views bound as one-view tables in this list
+    /// ([`crate::pipeline::host::bounded_root_cbvs`]), likewise, with the
+    /// bytes the view holds: of their host copy, of the title's bytes in
+    /// the host list's scratch (left out when the list is cut,
+    /// [`State::replay`]), or a null view.
+    root_cbv_slots: std::collections::HashMap<(usize, u64), RootCbvSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -278,6 +285,7 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.root_cbv_slots.clear();
         self.tables_gone = true;
     }
 }
@@ -360,6 +368,11 @@ pub(crate) fn take_dropped() -> u64 {
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
+
+/// A root constant buffer view's one-view table: its dynamic slot, the
+/// host copy the slot shows (none: the list's scratch, or with no bytes a
+/// null view), and the bytes the view holds.
+type RootCbvSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>, u64);
 
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
@@ -482,6 +495,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .map_or(u64::MAX, |mb| mb << 20)
     });
     let shadow = root_view_copy(address, srv)?;
+    shadow.handed(if srv { Hand::RootSrv } else { Hand::RootCbv }, address);
     let len = shadow
         .left(address)
         .min(if srv { limit } else { ROOT_CBV_REACH });
@@ -529,10 +543,12 @@ const ROOT_CBV_REACH: u64 = 64 << 10;
 /// limit: windows only. A title buffer's copy is kept as its address names
 /// it: it is rounded up to 64 KiB, but a view in its last bytes still has
 /// less than 64 KiB of it left, and the title is taken to keep its constant
-/// blocks inside the buffer (counted in [`ROOT_CBV_SHORT`] too). If those
-/// occur, the full fix is a one-view constant buffer table with a size,
-/// which reads zeros past the end, as the bounded root shader resource
-/// views do.
+/// blocks inside the buffer (counted in [`ROOT_CBV_SHORT`] too). Whatever
+/// copy is taken, a root constant buffer view is bound as a one-view table
+/// whose view holds only what that copy has
+/// ([`crate::pipeline::host::bounded_root_cbvs`], on by default): a shader
+/// reads at offsets it computes, also past 64 KiB, and those reads give
+/// zeros past the view.
 pub(crate) fn root_cbv_reach() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_CBV_REACH").is_none_or(|v| v != "0"))
@@ -544,6 +560,65 @@ pub(crate) fn root_cbv_reach() -> bool {
 /// from a window that holds the whole reach; not, because no window held it
 /// (the short one kept); and in a title buffer's copy (kept).
 pub(crate) static ROOT_CBV_SHORT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Root constant buffer views made one-view tables of title bytes
+/// ([`crate::pipeline::host::bounded_root_cbvs`]) since the start; of
+/// those, views that hold less than 64 KiB because their copy ends sooner
+/// (reads past the view give zeros: through a root descriptor they reached
+/// past the copy's end); and draws dropped because no view heap was bound
+/// (a root descriptor needed none) or no dynamic slot was free.
+pub(crate) static ROOT_CBV_TABLED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Makes dynamic slot `index` of `host` the constant buffer view of a root
+/// constant buffer view at title `address` ([`State::root_cbv`]): the host
+/// copy it shows (none for the list's scratch or a null view) and the bytes
+/// the view holds (0: a null view).
+fn root_cbv_view(
+    list: &HostList,
+    host: &crate::descriptor::host::HostHeap,
+    index: u32,
+    address: Option<u64>,
+) -> (Option<std::sync::Arc<crate::shadow::Shadow>>, u64) {
+    let Some((a, shadow)) = address.and_then(|a| Some((a, root_view_copy(a, false)?))) else {
+        host.constant_at(index, 0, 0);
+        return (None, 0);
+    };
+    shadow.handed(Hand::RootCbv, a);
+    let len = shadow.left(a).min(ROOT_CBV_REACH);
+    let bytes = len.next_multiple_of(256);
+    let gpu = shadow.gpu(a);
+    // SAFETY: a live buffer.
+    let (base, width) = unsafe {
+        (
+            shadow.buffer.GetGPUVirtualAddress(),
+            shadow.buffer.GetDesc().Width,
+        )
+    };
+    ROOT_CBV_TABLED[0].fetch_add(1, Ordering::Relaxed);
+    if len < ROOT_CBV_REACH {
+        ROOT_CBV_TABLED[1].fetch_add(1, Ordering::Relaxed);
+    }
+    if gpu.is_multiple_of(256) && gpu - base + bytes <= width {
+        host.constant_view_at(index, &shadow.buffer, gpu, bytes as u32);
+        shadow.refresh(list, a, len);
+        list.buffer_read(&shadow.buffer);
+        return (Some(shadow), bytes);
+    }
+    // The title's bytes in the list's scratch (whole 256s of it are the
+    // list's), filled when the list is submitted: every bind of the address
+    // in the list reads the same bytes.
+    let Some((gpu, to)) = list.scratch(bytes) else {
+        host.constant_at(index, 0, 0);
+        return (None, 0);
+    };
+    list.defer_fill(to, a as *const u8, len as usize);
+    // SAFETY: the list's scratch, `bytes` of it from `to`: what the view
+    // holds past the title's bytes reads zeros, not what an earlier list
+    // left there.
+    unsafe { std::ptr::write_bytes(to.add(len as usize), 0, (bytes - len) as usize) };
+    host.constant_at(index, gpu, bytes as u32);
+    (None, bytes)
+}
 
 /// Counts a root constant buffer view in [`ROOT_CBV_SHORT`]`[kind]`, and
 /// tells the first of each kind with the copy's range and how far the view
@@ -835,6 +910,10 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        // Root constant views in the old host list's scratch: that list's
+        // fills, made when its part is submitted (their slots stay held).
+        self.root_cbv_slots
+            .retain(|_, (_, shadow, bytes)| shadow.is_some() || *bytes == 0);
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1006,6 +1085,7 @@ impl State {
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 continue;
             };
+            shadow.handed(Hand::Vertex, v.address);
             shadow.refresh(list, v.address, u64::from(v.size));
             list.buffer_read(&shadow.buffer);
             *view = D3D12_VERTEX_BUFFER_VIEW {
@@ -1025,6 +1105,7 @@ impl State {
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
                 return false;
             };
+            shadow.handed(Hand::Index, v.address);
             shadow.refresh(list, v.address, u64::from(v.size));
             list.buffer_read(&shadow.buffer);
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1229,6 +1310,7 @@ impl State {
                         continue;
                     }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let constant_table = !srv && crate::pipeline::host::bounded_root_cbvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -1236,8 +1318,17 @@ impl State {
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
                         }
+                        if constant_table && !self.root_cbv_table(list, None, param, compute) {
+                            return false;
+                        }
                         continue;
                     };
+                    if constant_table {
+                        if !self.root_cbv_table(list, Some(address), param, compute) {
+                            return false;
+                        }
+                        continue;
+                    }
                     // The shader adds the bytes a raw view begins early by.
                     let biased = srv
                         && t.host.user_data.iter().any(|u| {
@@ -1345,6 +1436,7 @@ impl State {
             Some(s)
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
+            s.handed(Hand::RootUav, a);
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             list.buffer_uav(&s.buffer);
@@ -1493,6 +1585,7 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
+            s.handed(Hand::RootSrv, *a);
             s.refresh(list, *a, s.left(*a));
             list.buffer_read(&s.buffer);
         }
@@ -1506,6 +1599,91 @@ impl State {
             }
         }
         true
+    }
+
+    /// Binds a root constant buffer view as a one-view table
+    /// ([`crate::pipeline::host::bounded_root_cbvs`]; [`State::root_cbv`]).
+    /// False if the draw must be dropped (no view heap, no slot).
+    fn root_cbv_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let Some((index, _)) = self.root_cbv(list, address) else {
+            return false;
+        };
+        let Some((_, host)) = self.view_heap() else {
+            return false;
+        };
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
+            }
+        }
+        true
+    }
+
+    /// The bound title view heap and its host view heap.
+    fn view_heap(
+        &self,
+    ) -> Option<(
+        &'static crate::descriptor::Heap,
+        &'static crate::descriptor::host::HostHeap,
+    )> {
+        match self.heaps[0] {
+            0 => None,
+            h => {
+                let heap = crate::descriptor::heap(h as This);
+                Some((heap, heap.host()?))
+            }
+        }
+    }
+
+    /// The one-view table a root constant buffer view at title `address`
+    /// is bound as ([`crate::pipeline::host::bounded_root_cbvs`]; without
+    /// it the caller binds a root descriptor at the host address
+    /// [`root_view`] gives, as before): its dynamic slot in the bound view
+    /// heap and the bytes the view holds. The view holds only what its host
+    /// copy has from `address` on (at most the 64 KiB a host view may), so
+    /// a read past that gives zeros instead of whatever the host placed
+    /// after the copy: of the copy its address names ([`root_view_copy`],
+    /// which takes a window that holds the 64 KiB where the named one ends
+    /// sooner), or for an address not on 256 bytes there (the console needs
+    /// 16) of the title's bytes in the list's scratch; a null view without
+    /// an address or a copy. One slot per address per list (a view in the
+    /// scratch per host list), a copy brought up to date at each bind.
+    /// `None` if the draw must be dropped: no view heap or no slot (counted
+    /// in [`ROOT_CBV_TABLED`]).
+    fn root_cbv(&mut self, list: &HostList, address: Option<u64>) -> Option<(u32, u64)> {
+        let Some((heap, host)) = self.view_heap() else {
+            ROOT_CBV_TABLED[2].fetch_add(1, Ordering::Relaxed);
+            once!("a root constant buffer view without a bound view heap: the draw is dropped");
+            return None;
+        };
+        // The title heap: `tables_done` gives the slot back by it.
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        if let Some((index, shadow, bytes)) = self.root_cbv_slots.get(&key) {
+            if let (Some(shadow), Some(a)) = (shadow, address) {
+                shadow.handed(Hand::RootCbv, a);
+                shadow.refresh(list, a, shadow.left(a).min(ROOT_CBV_REACH));
+                list.buffer_read(&shadow.buffer);
+            }
+            return Some((*index, *bytes));
+        }
+        let Some(index) = host.dynamic(1) else {
+            ROOT_CBV_TABLED[3].fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        self.dynamic.push((key.0, index, 1));
+        let (shadow, bytes) = root_cbv_view(list, host, index, address);
+        self.root_cbv_slots.insert(key, (index, shadow, bytes));
+        Some((index, bytes))
     }
 
     /// For a shader that picks buffers from the view heap by an index it
@@ -3307,6 +3485,17 @@ impl State {
             && !p.stages.iter().any(|stage| stage.translated().stores)
             && offset.is_multiple_of(4)
             && offset <= u64::from(u32::MAX - stride);
+        args.handed(
+            if grouped {
+                Hand::MeshBatch
+            } else {
+                Hand::Arguments
+            },
+            arguments,
+        );
+        if let Some((s, at)) = &counter {
+            s.handed(Hand::Count, *at);
+        }
         let batched = if grouped {
             args.refresh(list, arguments, len);
             list.buffer_read(&args.buffer);
@@ -3981,6 +4170,240 @@ mod tests {
         );
         let srv = root_view_copy(address, true).expect("a window");
         assert!(std::sync::Arc::ptr_eq(&srv, &named));
+    }
+
+    /// Root constant views in a title buffer of 0x38400 bytes (the size of
+    /// the copy just below the fault of a device removal): one 256 bytes
+    /// before its end, one at its start, and one 240 bytes before its end,
+    /// not on 256 bytes in the copy. A host root signature makes a title's
+    /// root constant view a one-view table, and each is bound as one whose
+    /// view holds what the copy has from its address on: 256 bytes, the 64
+    /// KiB a view may, and 256 bytes of the list's scratch with the title's
+    /// 240 in front. On the card a shader reads the title's bytes inside the
+    /// views and zeros past the short ones, where the title's memory goes on
+    /// but the copy ends (through a root descriptor, which has no size, such
+    /// a read reaches whatever the host placed after the copy). Binding
+    /// again in the list takes no new slot, and once the list has run all
+    /// its slots are free again. With `VICTORY_ROOT_CBV_TABLES=0` the first
+    /// assertion fails: the root signature has a root descriptor (WARP).
+    #[cfg(windows)]
+    #[test]
+    fn warp_a_root_constant_view_holds_only_what_its_copy_has() {
+        use crate::descriptor::{HeapDesc, create_heap, heap};
+        use crate::object::{S_OK, This, guid, slot};
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        const LEN: usize = 0x38400;
+        const MAPPED: usize = 0x40000;
+        assert!(
+            crate::pipeline::host::tabled_root_view(D3D12_ROOT_PARAMETER_TYPE_CBV, 0),
+            "a title's root constant view is a one-view table in a host root signature"
+        );
+        assert!(!crate::pipeline::host::tabled_root_view(
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            victory_shader::emit::SLOT_STRIDES
+        ));
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        // What newer titles pass: the description, then no memory of theirs.
+        #[repr(C)]
+        struct Extended(HeapDesc, [u64; 2]);
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let extended = Extended(desc, [0; 2]);
+        let mut h: This = std::ptr::null();
+        assert_eq!(
+            create_heap(std::ptr::null(), &extended.0, &iid, &mut h),
+            S_OK
+        );
+        let views = heap(h).host().expect("host view heap");
+        // A title buffer in memory of its own, which goes on past the
+        // buffer's end; every dword holds its offset and a mark.
+        // SAFETY: new memory, left to the process.
+        let memory = unsafe {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            VirtualAlloc(
+                std::ptr::null(),
+                MAPPED,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(memory, 0);
+        let word = |offset: usize| 0x8000_0000 | offset as u32;
+        for offset in (0..MAPPED).step_by(4) {
+            // SAFETY: inside the new memory.
+            unsafe { ((memory + offset) as *mut u32).write(word(offset)) };
+        }
+        crate::shadow::register(memory, memory as u64, LEN as u64);
+        // The title releases its heap and its buffer, also when an
+        // assertion fails: later tests find no copy of this memory.
+        struct Release(This, usize);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+                crate::shadow::unregister(self.1, self.1 as u64);
+            }
+        }
+        let _release = Release(h, memory);
+        let free = views.free_dynamic();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.heaps[0] = h as usize;
+        let near_end = (memory + LEN - 0x100) as u64;
+        let (short, bytes) = state.root_cbv(&list, Some(near_end)).expect("a slot");
+        assert_eq!(
+            bytes, 0x100,
+            "the view holds what the copy has from its address on"
+        );
+        let (whole, bytes) = state.root_cbv(&list, Some(memory as u64)).expect("a slot");
+        assert_eq!(bytes, ROOT_CBV_REACH, "the view holds the most a view may");
+        let unaligned = (memory + LEN - 0xf0) as u64;
+        let (odd, bytes) = state.root_cbv(&list, Some(unaligned)).expect("a slot");
+        assert_eq!(
+            bytes, 0x100,
+            "whole 256s of scratch, the title's 240 bytes in front"
+        );
+        let (null, bytes) = state.root_cbv(&list, None).expect("a slot");
+        assert_eq!(bytes, 0, "a null view");
+        // Bound again in the list: the same slots, and no others taken.
+        for (address, index, bytes) in [
+            (Some(near_end), short, 0x100),
+            (Some(unaligned), odd, 0x100),
+            (None, null, 0),
+        ] {
+            assert_eq!(state.root_cbv(&list, address), Some((index, bytes)));
+        }
+        assert_eq!(
+            views.free_dynamic(),
+            free - 4,
+            "one slot per view in the list"
+        );
+        // The whole buffer brought up to date in its copy: a read past the
+        // whole view that reached the copy would find the title's bytes.
+        let copy = crate::shadow::find(memory as u64, LEN as u64).expect("the buffer's copy");
+        copy.refresh(&list, memory as u64, LEN as u64);
+
+        // On the card: rows 0 and 15 of the short view, row 16 past it,
+        // the last row of the whole one, and a row past it at an index the
+        // shader computes (in dword 4), where the copy goes on; rows 0 and
+        // 14 of the unaligned view, row 15 past the title's bytes in it and
+        // row 16 past it.
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(CBV(b0)), DescriptorTable(CBV(b1)), DescriptorTable(CBV(b2)), UAV(u0)"
+cbuffer Short : register(b0) { uint4 near_end[4096]; };
+cbuffer Whole : register(b1) { uint4 start[4096]; };
+cbuffer Odd : register(b2) { uint4 odd[4096]; };
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint past = o.Load(16);
+    o.Store4(0, uint4(near_end[0].x, near_end[15].w, near_end[16].x, start[4095].w));
+    o.Store(20, start[past].x);
+    o.Store4(32, uint4(odd[0].x, odd[14].w, odd[15].x, odd[16].x));
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names outlive the call; the out pointer is ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("bounded"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the test shader compiles");
+        let code = code.unwrap();
+        // SAFETY: the blob's own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: the root signature is in the shader.
+        let root: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, bytes) }.unwrap();
+        // SAFETY: the bytecode and root signature live through the call.
+        let pso: ID3D12PipelineState = unsafe {
+            host.device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+        }
+        .unwrap();
+        let (out, data) = host.shared_buffer(256).unwrap();
+        // Row 4,112: byte 0x10100 of the copy, inside it.
+        const PAST: usize = 4096 + 16;
+        // SAFETY: the mapping of 256 bytes; nothing runs yet.
+        unsafe { (data as *mut u32).add(4).write(PAST as u32) };
+        // SAFETY: an open list; our heap, root signature, pipeline and
+        // buffers, which live until the list has run.
+        unsafe {
+            let l = &list.list;
+            l.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.SetComputeRootDescriptorTable(0, views.gpu_handle(short));
+            l.SetComputeRootDescriptorTable(1, views.gpu_handle(whole));
+            l.SetComputeRootDescriptorTable(2, views.gpu_handle(odd));
+            l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
+            l.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the mapping of 256 bytes; the list has run.
+        let read = unsafe { (data as *const [u32; 12]).read_volatile() };
+        state.tables_done();
+        list.reset();
+        assert_eq!(
+            read[..4],
+            [word(LEN - 0x100), word(LEN - 4), 0, word(0xfffc)],
+            "the title's bytes inside the views, zeros past the short one"
+        );
+        assert_eq!(
+            read[5],
+            0,
+            "a row past the whole view reads zeros where the copy holds {:#x}",
+            word(PAST * 16)
+        );
+        assert_eq!(
+            read[8..],
+            [word(LEN - 0xf0), word(LEN - 4), 0, 0],
+            "the title's bytes in the scratch, zeros past them where its memory holds {:#x}",
+            word(LEN)
+        );
+        assert_eq!(
+            views.free_dynamic(),
+            free,
+            "the list's slots are given back"
+        );
     }
 
     #[test]

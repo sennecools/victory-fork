@@ -9437,10 +9437,20 @@ impl Meter {
                 } else {
                     "=0"
                 };
+                let [tabled, short, no_heap, no_slot] =
+                    [0, 1, 2, 3].map(|i| crate::draw::ROOT_CBV_TABLED[i].load(Ordering::Relaxed));
+                let tables = if crate::pipeline::host::bounded_root_cbvs() {
+                    "on"
+                } else {
+                    "=0"
+                };
                 tracing::info!(
                     "root constant buffer views with less than 64 KiB of their copy left, since the start: {window} near \
                      the end of a window ({whole} bound from a window that holds the 64 KiB, {kept} with no such window, \
-                     the short one kept), {buffer} near the end of a title buffer's copy (kept); VICTORY_ROOT_CBV_REACH {reach}"
+                     the short one kept), {buffer} near the end of a title buffer's copy (kept); VICTORY_ROOT_CBV_REACH {reach}; \
+                     {tabled} made one-view tables sized by their copy, {short} of them holding less than 64 KiB \
+                     (reads past them give zeros), draws dropped for want of a view heap {no_heap}, of a dynamic slot \
+                     {no_slot}; VICTORY_ROOT_CBV_TABLES {tables}"
                 );
             }
             {

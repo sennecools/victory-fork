@@ -1453,6 +1453,12 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// The dynamic slots free now (tests: what a list took is given back).
+    #[cfg(test)]
+    pub(crate) fn free_dynamic(&self) -> u32 {
+        self.free.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
@@ -2309,6 +2315,32 @@ impl HostHeap {
         };
     }
 
+    /// Makes slot `index` (a dynamic one) a constant buffer view of `bytes`
+    /// bytes (whole 256s, at most 64 KiB) of `buffer` from host GPU address
+    /// `gpu` (on 256 bytes, the view inside the buffer): a root constant
+    /// buffer view with a size, whose reads past it give zeros instead of
+    /// reaching whatever the host placed after the buffer. The slot keeps
+    /// the buffer.
+    pub(crate) fn constant_view_at(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        gpu: u64,
+        bytes: u32,
+    ) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: constant_bytes(bytes),
+        };
+        // SAFETY: a slot of our heap; the range lies in the live buffer.
+        unsafe {
+            host.device
+                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+        };
+        self.keep(index, Some(buffer.clone()));
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
@@ -3010,6 +3042,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    shadow.handed(crate::shadow::Hand::View, address);
     Some(Some(shadow.buffer.clone()))
 }
 
@@ -3111,6 +3144,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
+    shadow.handed(crate::shadow::Hand::View, address);
     Some(Some(shadow.buffer.clone()))
 }
 
@@ -3278,6 +3312,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            shadow.handed(crate::shadow::Hand::View, address);
             Some(Some(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {

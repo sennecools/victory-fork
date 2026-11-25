@@ -372,6 +372,58 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
 }
 
+/// Whether the title's root constant buffer views are bound as one-view
+/// tables whose view holds only what the host copy has from the view's
+/// address on (at most 64 KiB), rather than as root descriptors (on by
+/// default; `VICTORY_ROOT_CBV_TABLES=0`: root descriptors, as before).
+///
+/// A root descriptor has no size, and a translated shader reads a constant
+/// buffer at byte offsets it computes: a scalar load with an offset
+/// register, a constant array indexed per lane, a descriptor the program
+/// builds at an offset from the root address (`victory_shader`'s
+/// `cbuffer_dword`: the row index of `cbufferLoadLegacy` is not cut at a
+/// constant buffer's 4,096 rows). Through a root descriptor such a read
+/// goes on past the host copy into whatever the host placed after it: the
+/// suspected cause of a run's device removal on a page fault 0xa5000 bytes
+/// from the start of a 0x38400-byte title buffer's copy, inside freed
+/// texture staging buffers (no other hand-out of a title buffer's copy
+/// reaches past it unbounded; not confirmed by a run). Through a table the
+/// view's size bounds the reads: past it they give zeros, as the bounded
+/// root shader resource views' do.
+///
+/// shortcut: a host constant buffer view holds at most 64 KiB, so a read
+/// further than that from the root address gives zeros even where the
+/// copy goes on (through a root descriptor it read the copy's bytes there,
+/// and the memory after the copy beyond its end). And a table needs a view
+/// heap: a draw whose title bound none is dropped, as with root shader
+/// resource views (counted in `crate::draw::ROOT_CBV_TABLED`; a root
+/// descriptor needed no heap).
+pub(crate) fn bounded_root_cbvs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_CBV_TABLES").is_none_or(|v| v != "0"))
+}
+
+/// Whether the title's root view at `slot` (`kind`: the root descriptor
+/// type it has on the console) is a one-view table in a host root
+/// signature, whose view's size bounds the reads (and a root UAV's
+/// writes), rather than a root descriptor, which has none
+/// ([`bounded_root_cbvs`], [`bounded_root_srvs`]). Ours, not the title's,
+/// stay root descriptors: the table of strides, the directory of title
+/// memory by address and its fault notes.
+pub(crate) fn tabled_root_view(kind: D3D12_ROOT_PARAMETER_TYPE, slot: u8) -> bool {
+    let ours = if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
+        slot == victory_shader::emit::SLOT_FAULTS
+    } else {
+        slot == victory_shader::emit::SLOT_STRIDES || slot == victory_shader::emit::SLOT_MEMORY
+    };
+    !ours
+        && if kind == D3D12_ROOT_PARAMETER_TYPE_CBV {
+            bounded_root_cbvs()
+        } else {
+            bounded_root_srvs()
+        }
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -532,16 +584,8 @@ impl HostPipeline {
             ] {
                 for &slot in slots {
                     let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
-                    // Ours, not the title's, stay root descriptors: the
-                    // table of strides, the directory of title memory by
-                    // address and its fault notes.
-                    let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS
-                    } else {
-                        slot == victory_shader::emit::SLOT_STRIDES
-                            || slot == victory_shader::emit::SLOT_MEMORY
-                    };
-                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    let constant = kind == D3D12_ROOT_PARAMETER_TYPE_CBV;
+                    if tabled_root_view(kind, slot) {
                         // A one-view table: the view's size bounds the
                         // reads (and a root UAV's writes), which a root
                         // descriptor leaves unbounded.
@@ -549,6 +593,8 @@ impl HostPipeline {
                         ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
                             RangeType: if uav {
                                 D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                            } else if constant {
+                                D3D12_DESCRIPTOR_RANGE_TYPE_CBV
                             } else {
                                 D3D12_DESCRIPTOR_RANGE_TYPE_SRV
                             },

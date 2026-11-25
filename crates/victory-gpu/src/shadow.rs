@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -77,6 +77,71 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// For device-removed reports ([`near`]): the ways the copy was handed
+    /// to the card ([`Hand`], one bit each), the last four of them (one
+    /// byte each, the newest lowest), and the offset in the copy of the
+    /// root view handed out last (`u64::MAX`: none).
+    hands: AtomicU32,
+    last_hands: AtomicU32,
+    root_at: AtomicU64,
+}
+
+/// A way a host copy is handed to the card ([`Shadow::handed`]): named in
+/// device-removed reports ([`near`]) for the copy just below a fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hand {
+    /// A root constant buffer view (a root descriptor, or a one-view table).
+    RootCbv = 1,
+    /// A root shader resource view.
+    RootSrv,
+    /// A root unordered access view.
+    RootUav,
+    /// A view in a slot of a view heap made from a title's view.
+    View,
+    Vertex,
+    Index,
+    /// Indirect arguments read by the argument clamp.
+    Arguments,
+    /// An indirect execution's count.
+    Count,
+    /// Indirect mesh records read by the clamp of a batch of them.
+    MeshBatch,
+    /// Title memory by address (`crate::memory`).
+    Memory,
+}
+
+impl Hand {
+    const ALL: [Hand; 10] = [
+        Hand::RootCbv,
+        Hand::RootSrv,
+        Hand::RootUav,
+        Hand::View,
+        Hand::Vertex,
+        Hand::Index,
+        Hand::Arguments,
+        Hand::Count,
+        Hand::MeshBatch,
+        Hand::Memory,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Hand::RootCbv => "root constant view",
+            Hand::RootSrv => "root resource view",
+            Hand::RootUav => "root unordered view",
+            Hand::View => "heap view",
+            Hand::Vertex => "vertex buffer",
+            Hand::Index => "index buffer",
+            Hand::Arguments => "indirect arguments",
+            Hand::Count => "indirect count",
+            Hand::MeshBatch => "mesh batch records",
+            Hand::Memory => "memory by address",
+        }
+    }
+
+    fn of(id: u32) -> Option<Hand> {
+        Hand::ALL.into_iter().find(|&hand| hand as u32 == id)
+    }
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2676,7 +2741,77 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            hands: AtomicU32::new(0),
+            last_hands: AtomicU32::new(0),
+            root_at: AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// The copy is handed to the card `hand`'s way, at title address
+    /// `address` (for [`near`]; cheap: an atomic or only for a way not
+    /// noted before).
+    pub(crate) fn handed(&self, hand: Hand, address: u64) {
+        let id = hand as u32;
+        if self.hands.load(Ordering::Relaxed) & 1 << id == 0 {
+            self.hands.fetch_or(1 << id, Ordering::Relaxed);
+        }
+        // Racy between recording threads; a report needs no more.
+        let last = self.last_hands.load(Ordering::Relaxed);
+        if last & 0xff != id {
+            self.last_hands.store(last << 8 | id, Ordering::Relaxed);
+        }
+        if matches!(hand, Hand::RootCbv | Hand::RootSrv | Hand::RootUav) {
+            self.root_at
+                .store(address.wrapping_sub(self.start), Ordering::Relaxed);
+        }
+    }
+
+    /// What kind of copy it is, by its own marks (`from`: what the table
+    /// it was found in holds).
+    fn kind(&self, from: &'static str) -> String {
+        let kind = if self.place.is_some() {
+            "title memory in place"
+        } else if self.window {
+            "window"
+        } else {
+            from
+        };
+        if self.card.is_some() {
+            format!("{kind} on the card")
+        } else {
+            kind.to_owned()
+        }
+    }
+
+    /// For [`near`]: the ways the copy was handed to the card, the last
+    /// ones, and where its last root view was.
+    fn hands_text(&self) -> String {
+        let names = |bits: u32| {
+            Hand::ALL
+                .into_iter()
+                .filter(|&hand| bits & 1 << hand as u32 != 0)
+                .map(Hand::name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let all = self.hands.load(Ordering::Relaxed);
+        if all == 0 {
+            return "handed to the card no way noted".into();
+        }
+        let last: Vec<&str> = self
+            .last_hands
+            .load(Ordering::Relaxed)
+            .to_le_bytes()
+            .into_iter()
+            .filter_map(|id| Hand::of(u32::from(id)))
+            .map(Hand::name)
+            .collect();
+        let mut text = format!("handed as {}; last as {}", names(all), last.join(", "));
+        let at = self.root_at.load(Ordering::Relaxed);
+        if at != u64::MAX {
+            text.push_str(&format!("; its last root view at offset {at:#x}"));
+        }
+        text
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -4440,6 +4575,50 @@ mod card_merge_tests {
         }
     }
 
+    /// A device-removed report names the copy below the fault (how far past
+    /// its end the fault is), its kind and the ways it was handed to the
+    /// card, the last ones newest first, with where its last root view
+    /// was; and the copy above it.
+    #[test]
+    fn a_removal_report_names_the_copy_below_and_how_it_was_handed() {
+        use super::{Arc, Hand, near_in};
+        let (Some(a), Some(b)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        let mut side = vec![0u8; 0x38400];
+        let below = Arc::new(Shadow::new(
+            a,
+            side.as_mut_ptr(),
+            0x10_0000_0000,
+            0x7d_0000_0000,
+            0x38400,
+        ));
+        let above = Arc::new(Shadow::new(
+            b,
+            side.as_mut_ptr(),
+            0x10_0150_0000,
+            0x7e_0000_0000,
+            0x40000,
+        ));
+        below.handed(Hand::View, 0x7d_0000_0000);
+        below.handed(Hand::RootCbv, 0x7d_0000_1200);
+        below.handed(Hand::Vertex, 0x7d_0000_0000);
+        let all = [
+            ("title buffer copy", below.clone()),
+            ("window", above.clone()),
+        ];
+        let text = near_in(0x10_000a_5000, &all);
+        assert_eq!(
+            text,
+            "; the nearest title memory copy below it: 0x7d00000000+0x38400 at host 0x1000000000, offset 0xa5000 \
+             (0x6cc00 past its end); a title buffer copy, handed as root constant view, heap view, vertex buffer; \
+             last as vertex buffer, root constant view, heap view; its last root view at offset 0x1200\
+             ; the nearest above: 0x7e00000000+0x40000 at host 0x1001500000, a window (2 copies in all)"
+        );
+        assert!(near_in(0x10_0000_0100, &all).contains("offset 0x100 (inside it)"));
+        drop((below, above));
+    }
+
     /// The mixed landing the fetch inside flights must survive, on a real
     /// copy in the card's memory and its merge (`Shadow::card_merge_relay`):
     /// flights 5, 6, 7 in the air; 5 lands the old way with the queue's
@@ -4497,31 +4676,64 @@ mod card_merge_tests {
 }
 
 /// For device-removed reports: the copy of title memory whose host range
-/// starts closest below host GPU address `va`, and where `va` is in it.
+/// starts closest below host GPU address `va`, and where `va` is in it,
+/// with its kind and the ways it was handed to the card ([`Hand`]); and
+/// the nearest copy above. Title buffers' copies, windows and copies of
+/// single views' bytes ([`exact`]).
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(&'static str, Arc<Shadow>)> = buffers()
         .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
+        .filter_map(|e| e.shadow.clone().map(|s| ("title buffer copy", s)))
         .collect();
     all.extend(
         LOOSE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .map(|s| ("window", s.clone())),
     );
-    let below = all.iter().filter(|c| c.0 <= va).max();
-    let above = all.iter().filter(|c| c.0 > va).min();
+    all.extend(
+        EXACT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .values()
+            .map(|(s, _)| ("view copy", s.clone())),
+    );
+    near_in(va, &all)
+}
+
+/// [`near`] among `all` (what kind of table each was found in, the copy).
+fn near_in(va: u64, all: &[(&'static str, Arc<Shadow>)]) -> String {
+    let below = all.iter().filter(|c| c.1.gpu <= va).max_by_key(|c| c.1.gpu);
+    let above = all.iter().filter(|c| c.1.gpu > va).min_by_key(|c| c.1.gpu);
     let mut text = match below {
-        Some(&(gpu, start, len)) => format!(
-            "; the nearest title memory copy below it: {start:#x}+{len:#x} at host {gpu:#x}, offset {:#x}",
-            va - gpu
-        ),
+        Some((from, s)) => {
+            // (`gpu` is where the title's first byte is, in place too.)
+            let offset = va - s.gpu;
+            let past = match offset.checked_sub(s.len) {
+                Some(past) => format!("{past:#x} past its end"),
+                None => "inside it".into(),
+            };
+            format!(
+                "; the nearest title memory copy below it: {:#x}+{:#x} at host {:#x}, offset {offset:#x} ({past}); \
+                 a {}, {}",
+                s.start,
+                s.len,
+                s.gpu,
+                s.kind(from),
+                s.hands_text()
+            )
+        }
         None => "; no title memory copy below it".into(),
     };
-    if let Some(&(gpu, start, len)) = above {
+    if let Some((from, s)) = above {
         text.push_str(&format!(
-            "; the nearest above: {start:#x}+{len:#x} at host {gpu:#x} ({} copies in all)",
+            "; the nearest above: {:#x}+{:#x} at host {:#x}, a {} ({} copies in all)",
+            s.start,
+            s.len,
+            s.gpu,
+            s.kind(from),
             all.len()
         ));
     }
