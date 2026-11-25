@@ -32,6 +32,8 @@ mod flip;
 pub mod frame;
 pub mod frametime;
 #[cfg(windows)]
+mod home;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -67,6 +69,11 @@ mod watch;
 #[cfg(windows)]
 pub mod window;
 
+#[cfg(windows)]
+pub use home::{
+    Committing, memory_core_on, title_memory_committing, title_memory_region, title_virtual_free,
+    title_virtual_protect,
+};
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

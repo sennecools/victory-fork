@@ -66,11 +66,15 @@ struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    /// Copy `n` is `copies[n - 1]`; `None` for a home the memory core let
+    /// go ([`forget`]): its number is not given again.
+    copies: Vec<Option<Arc<Shadow>>>,
+    /// The numbers let go (0-based), in the order they were.
+    forgotten: Vec<u32>,
+    /// Per host view heap (by address): the first slot of its run, how many
+    /// copies have their view there, and how many of `forgotten` have had
+    /// their view there made null.
+    heaps: HashMap<usize, (u32, u32, usize)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -109,6 +113,7 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
+            forgotten: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -153,10 +158,14 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+        let n = match self
+            .copies
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, &shadow)))
+        {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
+                self.copies.push(Some(shadow.clone()));
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -277,20 +286,33 @@ pub(crate) fn ready(
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
+    let (base, made, nulled) = match m.heaps.get(&key) {
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
             let base = heap.dynamic(COPIES + 1)?;
             heap.null_raw_uav_at(base);
-            (base, 0)
+            (base, 0, 0)
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        match shadow {
+            Some(shadow) => {
+                let (_, len) = shadow.span();
+                heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+            }
+            None => heap.null_raw_uav_at(base + 1 + n as u32),
+        }
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    // The view of a copy let go since holds its buffer (and so a home's
+    // heap): made null. The directory names it no more.
+    for &n in m.forgotten.iter().skip(nulled) {
+        if n < made {
+            heap.null_raw_uav_at(base + 1 + n);
+        }
+    }
+    m.heaps
+        .insert(key, (base, m.copies.len() as u32, m.forgotten.len()));
     // Each copy once per list, whichever list numbered it: the builder alone
     // dispatches hundreds of times a frame. The title records its lists on
     // several threads, so a copy can be numbered by another list (or by the
@@ -307,16 +329,20 @@ pub(crate) fn ready(
         if !list.first_use(READ_COPY - n) {
             break;
         }
-        let (start, len) = shadow.span();
-        shadow.refresh(list, start, len);
+        if let Some(shadow) = shadow {
+            let (start, len) = shadow.span();
+            shadow.refresh(list, start, len);
+        }
     }
     if writes {
         for (n, shadow) in m.copies.iter().enumerate().rev() {
             if !list.first_use(WRITE_COPY - n) {
                 break;
             }
-            let (start, len) = shadow.span();
-            shadow.gpu_writes(list, start, len);
+            if let Some(shadow) = shadow {
+                let (start, len) = shadow.span();
+                shadow.gpu_writes(list, start, len);
+            }
         }
     }
     if first_read {
@@ -328,6 +354,101 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// The memory core let `home` go (`crate::home::cpu_touched`): if it has a
+/// number, the directory's entries for it go back to empty and the number
+/// names nothing from now on (its views in the heaps' runs are made null at
+/// their next [`ready`]; until then they hold its buffer). Whether it had
+/// one.
+///
+/// A shader of a submission running meanwhile, or of a list recorded before
+/// and submitted after, that reads the home through the directory takes the
+/// fault path for its pages. So the core calls this at the sweep, when no
+/// submission runs ([`forget_homes_over`]), except for a title's
+/// protection, which cannot wait and is counted.
+pub(crate) fn forget(home: &Arc<Shadow>) -> bool {
+    let gone = {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = guard.as_mut() else {
+            return false;
+        };
+        let Some(n) = m
+            .copies
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, home)))
+        else {
+            return false;
+        };
+        m.forget_at(n)
+    };
+    // Dropped without the lock.
+    drop(gone);
+    true
+}
+
+/// [`forget`] for every home of the memory core with a number that lies
+/// over title memory `[start, end)`.
+pub(crate) fn forget_homes_over(start: u64, end: u64) {
+    let gone: Vec<Arc<Shadow>> = {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = guard.as_mut() else {
+            return;
+        };
+        let over: Vec<usize> = (m.copies.iter().enumerate())
+            .filter_map(|(n, c)| {
+                let c = c.as_ref()?;
+                let (first, len) = c.span();
+                (c.is_home() && first < end && start < first + len).then_some(n)
+            })
+            .collect();
+        over.into_iter().filter_map(|n| m.forget_at(n)).collect()
+    };
+    // Dropped without the lock.
+    drop(gone);
+}
+
+/// The view heaps whose slots still hold a home [`forget`] let go (made
+/// null at their next [`ready`]), for the core's ten-second line.
+///
+/// shortcut: a view heap the title no longer uses keeps the home's heap
+/// until it goes itself, and so a free of those pages waits (and is given
+/// up after a while) and a protection of them is refused.
+pub(crate) fn let_go_views_waiting() -> u64 {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_ref() else {
+        return 0;
+    };
+    m.heaps
+        .values()
+        .filter(|&&(_, made, nulled)| m.forgotten.iter().skip(nulled).any(|&n| n < made))
+        .count() as u64
+}
+
+impl Memory {
+    /// Copy `n` (0-based) is let go: the directory's entries for it go back
+    /// to empty, its number names nothing from now on.
+    fn forget_at(&mut self, n: usize) -> Option<Arc<Shadow>> {
+        let home = self.copies.get_mut(n)?.take()?;
+        // Every entry is a page the copy holds (`Memory::map`).
+        let (first, len) = home.span();
+        let mut at = first / PAGE * PAGE;
+        while at < first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+            // SAFETY: inside the directory's mapping.
+            let entry = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+            // SAFETY: as above. The number first: a shader that sees a
+            // number sees its offset.
+            unsafe {
+                if entry.read() == n as u32 + 1 {
+                    entry.write_volatile(0);
+                    entry.add(1).write_volatile(0);
+                }
+            }
+            at += PAGE;
+        }
+        self.forgotten.push(n as u32);
+        Some(home)
+    }
 }
 
 /// Evicts cached descriptor-run state for `heap` when its owning `Heap` is

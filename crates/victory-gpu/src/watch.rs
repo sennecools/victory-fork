@@ -325,6 +325,35 @@ fn wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
     }
 }
 
+/// The GPU wrote title memory `[at, at + len)` through a home of the memory
+/// core (`crate::home::after_wait`), which write watching cannot see: its
+/// pages count as written now, whether or not an asking stands, so that
+/// every copy over them takes them again at its next refresh. ([`wrote`]
+/// acts only while a submission's one asking stands.)
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    match epoch::on() {
+        Some(epochs) => epochs.gpu_wrote(at, len),
+        None => gpu_wrote_in(&JOURNAL, at, len),
+    }
+}
+
+/// [`gpu_wrote`] in `journal`.
+fn gpu_wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    // An asking that stands moves with it, as in `wrote_in`.
+    if !j.ahead.is_empty() {
+        j.ahead_asked = now;
+    }
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        j.written.insert(page, now);
+    }
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -888,6 +917,7 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    crate::home::cpu_touched(at, len, crate::home::Touch::Wrote);
 }
 
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
@@ -964,6 +994,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     // A placed texture there changed with no descriptor written.
     crate::descriptor::host::page_written(at, len);
+    crate::home::cpu_touched(at, len, crate::home::Touch::Wrote);
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -1157,7 +1188,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
-    crate::inplace::title_memory_freeing(at, len);
+    crate::home::cpu_touched(at, len, crate::home::Touch::Remapped);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();

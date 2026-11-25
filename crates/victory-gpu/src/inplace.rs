@@ -115,7 +115,7 @@ fn most() -> u64 {
 ///
 /// `len == 0` still asks for one byte, as the console's `[start, start)`
 /// spans did: one page.
-fn aligned_span(start: u64, len: u64) -> Option<(u64, u64)> {
+pub(crate) fn aligned_span(start: u64, len: u64) -> Option<(u64, u64)> {
     let at = start & !(K64 as u64 - 1);
     let end = start.checked_add(len.max(1))?;
     Some((at, end.checked_next_multiple_of(K64 as u64)? - at))
@@ -131,7 +131,7 @@ static RESERVED: AtomicU64 = AtomicU64::new(0);
 /// Reserves `bytes` of the budget [`most`] sets in one step: the check and
 /// the claim are the same operation, so two threads cannot each see room for
 /// their own placement. False when the reservation would pass `limit`.
-fn try_reserve_at(count: &AtomicU64, bytes: u64, limit: u64) -> bool {
+pub(crate) fn try_reserve_at(count: &AtomicU64, bytes: u64, limit: u64) -> bool {
     let mut reserved = count.load(Ordering::Relaxed);
     loop {
         let Some(next) = reserved.checked_add(bytes) else {
@@ -157,7 +157,7 @@ fn try_reserve(bytes: u64, limit: u64) -> bool {
 /// reservation for the rest of the run -- the feature silently off, which is
 /// the direction that looks healthy. So the subtraction is checked in every
 /// build, and a mismatch leaves the counter where it was and says so.
-fn release_at(count: &AtomicU64, bytes: u64) {
+pub(crate) fn release_at(count: &AtomicU64, bytes: u64) {
     if count
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(bytes))
         .is_err()
@@ -220,6 +220,9 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 struct Switches {
     level: u8,
     late: bool,
+    /// The memory core is on (`crate::home`): it places title memory
+    /// itself, and [`level`] is ignored.
+    core: bool,
 }
 
 impl Switches {
@@ -227,6 +230,7 @@ impl Switches {
         Switches {
             level: level(),
             late: crate::host::late(),
+            core: crate::home::on(),
         }
     }
 
@@ -249,6 +253,12 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 /// the environment normally decides.
 fn place_for_with(switches: Switches, start: u64, len: u64, window: bool) -> Option<Placed> {
     if switches.level < if window { 1 } else { 2 } {
+        return None;
+    }
+    // One path: with the memory core on, it alone places title memory.
+    if switches.core {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::warn!("VICTORY_INPLACE is ignored: VICTORY_MEMORY_CORE=1 places title memory itself"));
         return None;
     }
     // View memory: known from the runtime without asking Windows.
@@ -331,15 +341,21 @@ pub(crate) fn gone(window: bool, start: u64, len: u64) {
 /// Title memory `[at, at + len)` is about to show something else, or the
 /// title is about to decommit, free or protect it: what is in place there
 /// is let go (the tables forget it; its heap goes when the last list and
-/// slot that hold it do). Called for memory the runtime maps anew; for
-/// the runtime to call before the title's own `VirtualFree` once it takes
-/// that call over.
+/// slot that hold it do). A wrapper of [`crate::home::cpu_touched`], which
+/// the title's own `VirtualFree` reaches with the memory core on.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    crate::home::cpu_touched(at, len, crate::home::Touch::Freeing);
+}
+
+/// What [`place_for`] placed over `[at, at + len)` is let go (see
+/// [`title_memory_freeing`]): how many.
+pub(crate) fn let_go(at: usize, len: usize) -> u64 {
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
-        return;
+        return 0;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
     STATS[7].fetch_add(gone, Ordering::Relaxed);
+    gone
 }
 
 /// The line of what is in place, every ten seconds while [`level`] is on.
@@ -623,7 +639,7 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
 /// the host's submissions is touched.
-struct Rig {
+pub(crate) struct Rig {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -643,7 +659,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -690,7 +706,7 @@ impl Rig {
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
-    fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
+    pub(crate) fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
         self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
@@ -705,7 +721,7 @@ impl Rig {
     }
 
     /// The GPU writes `bytes` at `offset` of `resource` (a copy).
-    fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
+    pub(crate) fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
         let up = self.committed(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
@@ -1226,6 +1242,8 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
+    // The memory core's waiting frees and its line.
+    crate::home::tick();
     if level() > 0 {
         say();
     }
@@ -1418,7 +1436,7 @@ mod tests {
     /// counter assertions catch where the `None` alone would not.
     #[test]
     fn late_waits_refuse_every_placement_and_count_it() {
-        let switches = |level, late| Switches { level, late };
+        let switches = |level, late| Switches { level, late, core: false };
         assert!(switches(2, true).refuses_in_place());
         assert!(!switches(2, false).refuses_in_place());
         // The timeoutless low address holds nothing the runtime reported as a

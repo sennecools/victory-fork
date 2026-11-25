@@ -497,6 +497,12 @@ fn retire_as<T>(object: T, held: impl FnOnce(T) -> Retired) {
         .push((started, held(object)));
 }
 
+/// [`bury`] up to the last submission that finished, from any thread (the
+/// memory core, before it asks the host again for the title).
+pub(crate) fn bury_finished() {
+    bury(FINISHED.load(Ordering::Acquire));
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
     let done: Vec<(u64, Retired)> = {
@@ -7852,6 +7858,8 @@ impl Host {
             let _hand_back = crate::profile::span_args("hand_back", &[("shadows", back.len() as u64)]);
             hand_back(&back);
         }
+        // Copies over homes the shaders wrote take those bytes again.
+        crate::home::after_wait(&back);
         if let Some(card) = card {
             self.card_done(card);
         }

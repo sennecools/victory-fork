@@ -91,6 +91,8 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    // The console's words as given, for the memory core's region table.
+    let (title_kind, title_protect) = (kind, protect);
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -127,6 +129,13 @@ pub extern "system" fn XMemVirtualAlloc(
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
     // Address requirements apply to reservations at an address of our choice.
     let constrained = base.is_null();
+    // With the memory core on (`VICTORY_MEMORY_CORE=1`), pages committed
+    // again inside a reservation: a decommit of the title's that the core
+    // still holds back must not take them, from before the host's commit to
+    // after it.
+    let core = victory_gpu::memory_core_on();
+    let _committing = (core && !constrained && kind & MEM_COMMIT != 0 && kind & MEM_RESERVE == 0)
+        .then(|| victory_gpu::title_memory_committing(base as usize, size));
     if constrained {
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
@@ -161,6 +170,12 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    // With the memory core on: a new reservation that is not a placeholder
+    // is a region the core may give homes in, with the bits the host was not
+    // given kept as hints.
+    if core && !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER == 0 && kind & MEM_RESERVE != 0 {
+        victory_gpu::title_memory_region(at as usize, size, title_kind, flags, title_protect);
     }
     at
 }
@@ -318,7 +333,13 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // A region of `XMemVirtualAlloc`'s: through the memory core when
+            // it is on, which lets the homes in it go first.
+            if victory_gpu::memory_core_on() {
+                victory_gpu::title_virtual_free(address as usize, 0, MEM_RELEASE);
+            } else {
+                VirtualFree(address, 0, MEM_RELEASE);
+            }
             return;
         }
         let user = address.cast::<u8>();

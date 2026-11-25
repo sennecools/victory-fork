@@ -28,6 +28,8 @@ pub mod media;
 pub mod net;
 pub mod speech;
 pub mod storage;
+#[cfg(windows)]
+pub mod vmem;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
@@ -45,6 +47,16 @@ pub mod xuser;
 use crate::HleModule;
 
 pub(crate) fn all() -> Vec<HleModule> {
+    #[cfg(windows)]
+    let core = victory_gpu::memory_core_on();
+    #[cfg(not(windows))]
+    let core = false;
+    all_with(core)
+}
+
+/// The modules, with the memory core's hooks of the title's `VirtualFree`
+/// and `VirtualProtect` only if `core` (`VICTORY_MEMORY_CORE=1`, [`vmem`]).
+pub(crate) fn all_with(core: bool) -> Vec<HleModule> {
     let mut all = vec![
         kernel::module(),
         xgameruntime::module(),
@@ -70,5 +82,11 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(windows)]
+    if core {
+        all.push(vmem::module());
+    }
+    #[cfg(not(windows))]
+    let _ = core;
     all
 }

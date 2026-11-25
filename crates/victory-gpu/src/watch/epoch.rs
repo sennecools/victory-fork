@@ -537,6 +537,22 @@ impl Epochs {
         ahead.now = now;
     }
 
+    /// [`super::gpu_wrote`].
+    pub(super) fn gpu_wrote(&self, at: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut ahead = self.ahead_mut();
+        self.rebase_if_due();
+        let end = at.saturating_add(len);
+        let _held = self.lock(at / PAGE, end.div_ceil(PAGE));
+        let now = self.next();
+        self.mark(at, end, now);
+        if !ahead.ranges.is_empty() {
+            ahead.now = now;
+        }
+    }
+
     /// [`super::asked`].
     pub(super) fn asked(&self, start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
