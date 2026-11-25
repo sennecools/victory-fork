@@ -597,6 +597,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        list.end_mesh_batch();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -2178,7 +2179,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // It may write the arguments a window holds clamped.
+        // It may write the arguments a window or a batch holds clamped.
+        list.end_mesh_batch();
         self.window = None;
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2516,6 +2518,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        list.end_mesh_batch();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -2938,6 +2941,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        list.end_mesh_batch();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -3036,6 +3040,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        list.end_mesh_batch();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3172,14 +3177,47 @@ impl State {
         if !windowed || list.first_use(WINDOW_USE) {
             self.window = None;
         }
+        // A one-record mesh draw joins the list's batch of them
+        // (`crate::indirect::grouped`): its record is clamped with the
+        // batch's, by the clamp recorded before the batch's first draw.
+        // Any other execution ends the batch first.
+        let grouped = crate::indirect::grouped()
+            && kind == MESH
+            && max == 1
+            && count.is_none()
+            && stride == crate::indirect::MESH_STRIDE
+            && !p.stages.iter().any(|stage| stage.translated().stores)
+            && offset.is_multiple_of(4)
+            && offset <= u64::from(u32::MAX - stride);
+        let batched = if grouped {
+            args.refresh(list, arguments, len);
+            list.buffer_read(&args.buffer);
+            crate::indirect::grouped_mesh(list, args.id(), &args.buffer, offset as u32)
+        } else {
+            None
+        };
+        let in_batch = batched.is_some();
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
-        let hit_window = hit.is_some();
+        let hit = if let Some((bounded, at, opened)) = batched {
+            // The batch's clamp wrote the scratch buffer a window reads.
+            self.window = None;
+            if opened {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
+            Some((bounded, at))
+        } else {
+            list.end_mesh_batch();
+            self.window
+                .as_ref()
+                .filter(|w| same(w) && offset >= w.base)
+                .filter(|w| {
+                    (offset - w.base) % u64::from(w.step) == 0
+                        && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+                })
+                .map(|w| (w.scratch.clone(), offset - w.base))
+        };
+        let hit_window = hit.is_some() && !in_batch;
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -3255,7 +3293,8 @@ impl State {
             // implicit promotion would be a mismatched barrier. (A scratch
             // buffer the list keeps readable, `VICTORY_INDIRECT_READABLE=1`,
             // is in `INDIRECT_ARGUMENT` either way and `done` leaves it so.)
-            if !hit_window {
+            // A batch's draws leave that to the end of the batch.
+            if !hit_window && !in_batch {
                 crate::indirect::done(list, &bounded);
             }
             why("prepare failed");
@@ -3299,8 +3338,12 @@ impl State {
         // Back to the common state for the next call, unless the list
         // keeps the scratch buffer readable as arguments
         // (`VICTORY_INDIRECT_READABLE=1`): then the next draw of the window
-        // reads it with no barrier, and the next clamp moves it back.
-        crate::indirect::done(list, &bounded);
+        // reads it with no barrier, and the next clamp moves it back. A
+        // batch's draws read it in that state until the batch ends
+        // (`HostList::end_mesh_batch`), which does this once for them all.
+        if !in_batch {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

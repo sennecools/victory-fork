@@ -180,6 +180,17 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// [`host_list`] for a command that may write memory (a barrier, a copy, a
+/// clear, a value write, a pass of ours): the list's open batch of mesh
+/// draws ends before it (`VICTORY_GROUPED_MESH_CLAMP=1`,
+/// `crate::indirect::grouped`).
+#[cfg(windows)]
+fn recording_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = host_list(this)?;
+    list.end_mesh_batch();
+    Some(list)
+}
+
 /// The host side of a submitted list, taken from it: a queue that waits
 /// for a fence runs it later, and the title may reset the list meanwhile.
 /// With it go the upload memory and the dynamic descriptor slots its
@@ -779,7 +790,7 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_list(this)
         && !barriers.is_null()
     {
         // SAFETY: the title passes `count` barriers.
@@ -845,7 +856,7 @@ pub(crate) fn upscale(
     {
         return false;
     }
-    let Some(list) = host_list(this) else {
+    let Some(list) = recording_list(this) else {
         return false;
     };
     let (Some(to), Some(from)) = (
@@ -914,7 +925,7 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
@@ -942,7 +953,7 @@ fn unlike(dst: This, src: This) -> bool {
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        let Some(list) = host_list(this) else {
+        let Some(list) = recording_list(this) else {
             return;
         };
         if let (Some(to), Some(from)) = (
@@ -1016,7 +1027,7 @@ extern "system" fn copy_texture_region(
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
+            (recording_list(this), unsafe { dst.as_ref() }, unsafe {
                 src.as_ref()
             })
         else {
@@ -1237,7 +1248,7 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1314,7 +1325,8 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
+        let (Some(list), Some(record)) =
+            (recording_list(this), crate::descriptor::rtv_record(handle))
         else {
             return;
         };
@@ -1365,7 +1377,8 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
+        let (Some(list), Some(record)) =
+            (recording_list(this), crate::descriptor::dsv_record(handle))
         else {
             return;
         };
@@ -1402,7 +1415,7 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = recording_list(this)
         && dst != 0
         && src != 0
     {
@@ -2080,7 +2093,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(windows)]
     if count > 0
-        && let Some(list) = host_list(this)
+        && let Some(list) = recording_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
@@ -2174,7 +2187,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         return;
     }
     #[cfg(windows)]
-    if let Some(list) = host_list(this) {
+    if let Some(list) = recording_list(this) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
@@ -2354,6 +2367,54 @@ mod tests {
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// The title's barriers, value writes and other commands that may write
+    /// memory end the host list's batch of mesh draws
+    /// (`VICTORY_GROUPED_MESH_CLAMP=1`) before they are recorded
+    /// ([`recording_list`]), and so does the list's close.
+    #[cfg(windows)]
+    #[test]
+    fn commands_that_may_write_memory_end_a_mesh_batch() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let src = crate::host::host().and_then(|host| host.shared_buffer(256));
+        if let (Some(host), Some((src, data))) = (host_list(list), src) {
+            // SAFETY: the mapping holds 256 bytes.
+            unsafe { data.write_bytes(0, 256) };
+            let open = || crate::indirect::open_batch(host, &src);
+            let ended = || host.mesh_batch().is_none();
+            if open() {
+                barrier(list, 0, null.cast());
+                assert!(ended(), "a barrier");
+                let mut word = 0u32;
+                assert!(open());
+                write32(list, std::ptr::from_mut(&mut word) as u64, 1, 0, 0);
+                assert!(ended(), "a value write");
+                assert!(open());
+                barrier_groups(list, 1, null.cast());
+                assert!(ended(), "a barrier group");
+                assert!(open());
+            }
+        }
+        assert_eq!(close(list), S_OK);
+        assert!(
+            host_list(list).is_none_or(|host| host.mesh_batch().is_none()),
+            "the close"
+        );
+        assert_eq!(reset(list, allocator, null), S_OK);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }

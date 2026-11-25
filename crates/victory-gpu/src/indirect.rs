@@ -36,6 +36,16 @@
 //! summary: two more atomics per record, which `VICTORY_CLAMP_LEAN=1`
 //! ([`lean`]; off by default) leaves out.
 //!
+//! The title draws its meshes one record per call, and each such call
+//! takes a clamp of its own. With `VICTORY_GROUPED_MESH_CLAMP=1`
+//! ([`grouped`]; off by default) a run of up to [`MESH_BATCH`] of them,
+//! from one argument buffer with nothing between them that may write
+//! memory, takes one clamp ([`MeshBatch`], [`MESH_BATCH_SOURCE`]): it is
+//! recorded before the run's first draw, the offsets of the records drawn
+//! after it go to upload memory it reads when the list runs, and each draw
+//! reads its record from its own slot. Every record is bounded and charged
+//! as by a clamp of its own, in draw order.
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -412,6 +422,90 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 }
 "#;
 
+/// The clamp of a run of one-record mesh draws ([`MeshBatch`],
+/// `VICTORY_GROUPED_MESH_CLAMP=1`): one group of [`MESH_BATCH`] threads,
+/// one per record. The same root signature as [`SOURCE`]'s, whose
+/// constants it does not read; in the count buffer's place the batch's
+/// words: how many records it holds, then the byte offset of each in the
+/// argument buffer, written as the draws are recorded and read when the
+/// list runs. Record i goes to byte 12 i of the scratch buffer, bounded as
+/// [`SOURCE`] bounds a mesh record clamped alone, and the records are
+/// charged in draw order, each as a clamp of its own would charge it.
+/// Slots past the count read nothing and cost nothing.
+const MESH_BATCH_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define MOST 32
+ByteAddressBuffer src_args : register(t0);
+ByteAddressBuffer batch : register(t1);
+RWByteAddressBuffer dst_args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+groupshared uint costs[MOST];
+groupshared uint asked[MOST];
+groupshared uint fits[MOST];
+[RootSignature(RS)]
+[numthreads(MOST, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint n = min(batch.Load(0), uint(MOST));
+    uint3 g = uint3(0, 0, 0);
+    asked[lane] = 0;
+    if (lane < n) {
+        // Mesh dispatches: the console's are one-dimensional.
+        g = src_args.Load3(batch.Load(4 + lane * 4));
+        asked[lane] = g.x;
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+    }
+    costs[lane] = g.x * g.y * g.z * 128u;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane == 0 && n > 0) {
+        // Diagnostics, in the budget buffer's next words: the largest
+        // group count a record asked for, and the groups asked in all.
+        uint largest = 0;
+        uint all = 0;
+        for (uint i = 0; i < n; i++) {
+            largest = max(largest, asked[i]);
+            all += min(asked[i], 1u << 24);
+        }
+        uint was;
+        budget.InterlockedMax(4, largest, was);
+        budget.InterlockedAdd(8, all, was);
+        // What the records charge, from `before` on, in draw order: a
+        // record that does not fit whole runs empty and takes the rest.
+        uint before;
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint next = before;
+            for (uint j = 0; j < n; j++) {
+                uint c = costs[j];
+                if (c > 0 && next < BUDGET) {
+                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                }
+            }
+            if (next == before) break;
+            uint prev;
+            budget.InterlockedCompareExchange(0, before, next, prev);
+            if (prev == before) break;
+            before = prev;
+        }
+        uint at = before;
+        for (uint k = 0; k < n; k++) {
+            uint c = costs[k];
+            uint fit = 1;
+            if (c > 0) {
+                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+            }
+            fits[k] = fit;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < n) {
+        dst_args.Store3(lane * 12, fits[lane] != 0 ? g : uint3(0, 0, 0));
+    }
+}
+"#;
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -623,6 +717,8 @@ fn bound_as(
     spec: (u32, u32, u32),
     (how, keep): (u32, bool),
 ) -> Option<ID3D12Resource> {
+    // A batch's draws read the scratch buffer this clamp writes.
+    list.end_mesh_batch();
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let clamped = clamp_into(list, c, &dst, budget, src, count, spec, (how, keep));
@@ -702,6 +798,7 @@ pub(crate) const PART_BYTES: u64 = 12;
 /// they showed before.
 pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Option<ID3D12Resource> {
     let spec = (2, 12, 1);
+    list.end_mesh_batch();
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget()?);
     let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
@@ -807,6 +904,29 @@ fn record_clamp_as(
         has_count | how,
         count_offset,
     ];
+    record_gpu_clamp(
+        c,
+        l,
+        (dst, before),
+        constants,
+        [src_gpu, count_gpu, dst_gpu, budget],
+        records.div_ceil(64),
+    );
+    true
+}
+
+/// Records `groups` groups of clamp `c` with `constants` and the source,
+/// count, scratch and budget addresses, between the two waits for earlier
+/// shader writes, moving `dst` from `before` to unordered access and on to
+/// `INDIRECT_ARGUMENT` (no dispatch for none: the state changes only).
+fn record_gpu_clamp(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    constants: [u32; 6],
+    [src_gpu, count_gpu, dst_gpu, budget]: [u64; 4],
+    groups: u32,
+) {
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -837,7 +957,7 @@ fn record_clamp_as(
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
+        if groups > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
             l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -845,11 +965,10 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.Dispatch(groups, 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
     }
-    true
 }
 
 /// Whether an execution of at most `max` records runs nothing, whatever its
@@ -885,6 +1004,196 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// Whether runs of one-record mesh draws share one clamp
+/// (`VICTORY_GROUPED_MESH_CLAMP=1`; off by default; [`MeshBatch`]).
+///
+/// The title draws its meshes one record per call (3,460 a frame in
+/// gameplay), and each call's clamp is a compute dispatch of its own
+/// between two waits for every earlier shader write. With the switch,
+/// `crate::draw` gives a one-record mesh draw without a count buffer, whose
+/// shaders store to no buffer, to the list's open batch ([`grouped_mesh`]):
+/// the batch's clamp is recorded before its first draw and clamps the
+/// records of up to [`MESH_BATCH`] draws in one dispatch. Anything that may
+/// write memory or use the scratch buffer ends the batch first
+/// (`HostList::end_mesh_batch`): every other draw and dispatch, every other
+/// clamp, barriers, copies, clears, resolves, value writes, a change of
+/// targets, the list's close. A batch also ends at a draw from another
+/// argument buffer, and when it is full.
+///
+/// What a record is clamped to and charged is what a clamp of its own
+/// gives it, in the order the title draws; the budget is charged when the
+/// batch's clamp runs, before the draws, as a clamp of its own charges it
+/// before its draw. The scratch buffer is left as [`readable`] says, as
+/// after any clamp. Not tied to `VICTORY_INDIRECT_WINDOW=1`: with both, the
+/// mesh draws a batch takes leave no window open.
+pub(crate) fn grouped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUPED_MESH_CLAMP").is_some_and(|v| v == "1"))
+}
+
+/// The most records one batch clamps ([`MESH_BATCH_SOURCE`]'s `MOST`).
+pub(crate) const MESH_BATCH: u32 = 32;
+/// The bytes of a mesh record (the x, y and z groups) and of its slot in
+/// the scratch buffer.
+pub(crate) const MESH_STRIDE: u32 = 12;
+
+/// The clamp of [`MESH_BATCH_SOURCE`], made at the first batch. A host that
+/// does not make it is told once, and the draws take a clamp each.
+fn batch_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match make_from(device, MESH_BATCH_SOURCE, false) {
+                Ok(c) => {
+                    tracing::info!(
+                        records = MESH_BATCH,
+                        "runs of one-record mesh draws share a clamp (VICTORY_GROUPED_MESH_CLAMP=1)"
+                    );
+                    Some(c)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "no clamp for runs of mesh draws (VICTORY_GROUPED_MESH_CLAMP=1): \
+                         each draw is clamped alone"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// A run of one-record mesh draws in one recording that share a clamp
+/// (`HostList::mesh_batch`, [`grouped`]): the argument buffer's host copy
+/// they read (its number), the list's upload words the clamp reads when
+/// the list runs (the count, then each record's byte offset), how many
+/// draws it has, and the scratch buffer that holds their records clamped,
+/// the i-th at `i * MESH_STRIDE`.
+pub(crate) struct MeshBatch {
+    copy: u64,
+    words: usize,
+    used: u32,
+    bounded: ID3D12Resource,
+}
+
+impl MeshBatch {
+    /// Records the clamp of a new batch of records of `src` (host copy
+    /// `copy`) into `list`, from the state the list left its scratch
+    /// buffer in. `keep` ([`readable`]): the list then knows the buffer is
+    /// readable as indirect arguments, as after [`bound`]. None, with
+    /// nothing recorded, if the clamp, the budget, the scratch or upload
+    /// memory is not there, or an address does not fit the clamp.
+    fn open(list: &HostList, copy: u64, src: &ID3D12Resource, keep: bool) -> Option<Self> {
+        Self::open_with(list, batch_clamp()?, copy, src, keep)
+    }
+
+    fn open_with(
+        list: &HostList,
+        c: &Clamp,
+        copy: u64,
+        src: &ID3D12Resource,
+        keep: bool,
+    ) -> Option<Self> {
+        let budget = list.budget()?;
+        let bounded = list.indirect_scratch(u64::from(MESH_BATCH * MESH_STRIDE))?;
+        let (words_gpu, words) = list.scratch(u64::from(MESH_BATCH + 1) * 4)?;
+        // SAFETY: live D3D12 buffer resources.
+        let (src_gpu, dst_gpu) =
+            unsafe { (src.GetGPUVirtualAddress(), bounded.GetGPUVirtualAddress()) };
+        if !src_gpu.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+            return None;
+        }
+        // SAFETY: the list's own upload memory (256-byte aligned, alive
+        // until its reset). The count stays zero until a draw is added.
+        unsafe { words.cast::<u32>().write(0) };
+        let before = list.indirect_state(&bounded);
+        let addresses = [src_gpu, words_gpu, dst_gpu, budget];
+        record_gpu_clamp(c, &list.list, (&bounded, before), [0; 6], addresses, 1);
+        if keep {
+            list.indirect_readable(&bounded);
+        }
+        list.op(OpKind::Clamp, 0);
+        Some(Self {
+            copy,
+            words: words as usize,
+            used: 0,
+            bounded,
+        })
+    }
+
+    /// Whether a draw of a record of host copy `copy` can join.
+    fn accepts(&self, copy: u64) -> bool {
+        self.copy == copy && self.used < MESH_BATCH
+    }
+
+    /// Adds the record at byte `offset` of the copy: the scratch buffer and
+    /// where in it the draw reads the record clamped.
+    fn append(&mut self, offset: u32) -> (ID3D12Resource, u64) {
+        let at = self.used;
+        self.used += 1;
+        let words = self.words as *mut u32;
+        // SAFETY: the batch's upload words, MESH_BATCH + 1 of them, owned by
+        // the open list, which one thread records; `accepts` keeps `at`
+        // below MESH_BATCH. The card reads them when the list runs.
+        unsafe {
+            words.add(at as usize + 1).write(offset);
+            words.write(self.used);
+        }
+        (self.bounded.clone(), u64::from(at * MESH_STRIDE))
+    }
+
+    /// After the batch's last draw: what [`done`] does after an execution.
+    pub(crate) fn finish(self, list: &HostList) {
+        done(list, &self.bounded);
+    }
+}
+
+/// A one-record mesh draw of the record at byte `offset` of `src` (host
+/// copy `copy`) joins `list`'s open batch, or ends it and opens one
+/// ([`grouped`]): the scratch buffer, where in it the draw reads its record,
+/// and whether a clamp was recorded for it (which replaced the list's
+/// compute root signature and pipeline). None if no batch can be opened:
+/// the draw then takes a clamp of its own.
+pub(crate) fn grouped_mesh(
+    list: &HostList,
+    copy: u64,
+    src: &ID3D12Resource,
+    offset: u32,
+) -> Option<(ID3D12Resource, u64, bool)> {
+    grouped_mesh_as(list, copy, offset, |list| {
+        MeshBatch::open(list, copy, src, readable())
+    })
+}
+
+/// [`grouped_mesh`], with a new batch opened by `open`.
+fn grouped_mesh_as(
+    list: &HostList,
+    copy: u64,
+    offset: u32,
+    open: impl FnOnce(&HostList) -> Option<MeshBatch>,
+) -> Option<(ID3D12Resource, u64, bool)> {
+    let mut slot = list.mesh_batch();
+    let opened = !slot.as_ref().is_some_and(|batch| batch.accepts(copy));
+    if opened {
+        if let Some(batch) = slot.take() {
+            batch.finish(list);
+        }
+        *slot = open(list);
+    }
+    let (bounded, at) = slot.as_mut()?.append(offset);
+    Some((bounded, at, opened))
+}
+
+/// Tests: a draw of the record at the start of `src` opens a batch on
+/// `list`, whatever the switch says; false if the host makes no batch
+/// clamp.
+#[cfg(test)]
+pub(crate) fn open_batch(list: &HostList, src: &ID3D12Resource) -> bool {
+    grouped_mesh_as(list, 0, 0, |list| MeshBatch::open(list, 0, src, readable())).is_some()
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -2802,6 +3111,351 @@ void main() {
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// The clamp of a batch of mesh draws (`VICTORY_GROUPED_MESH_CLAMP=1`)
+    /// reads the records its words name, in that order, and no others:
+    /// each bounded as a mesh record clamped alone, charged in draw order
+    /// (the first fits, the second does not and takes the rest, the third
+    /// costs nothing), the notes of the three in the budget's next words.
+    /// The offsets are written after the clamp is recorded, before the list
+    /// runs, as the draws of a batch add them; the fourth offset, past the
+    /// count, names a slot of all ones that is never read.
+    #[test]
+    fn warp_mesh_batch_charges_only_requested_records_in_draw_order() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let clamp =
+            make_from(&warp.device, MESH_BATCH_SOURCE, false).expect("batch clamp must compile");
+        let (_src, src, src_gpu) = warp.shared_buffer(256);
+        let (_words, words, words_gpu) = warp.shared_buffer(256);
+        let (_budget, budget, budget_gpu) = warp.shared_buffer(256);
+        let (readback, output, _) = warp.shared_buffer(256);
+        let dst = warp.default_uav(512);
+        // SAFETY: mapped test buffers of 256 bytes; nothing runs yet.
+        unsafe {
+            std::ptr::write_bytes(src, 0xff, 256);
+            std::ptr::write_bytes(budget, 0, 256);
+            std::ptr::write_bytes(words, 0, 256);
+            src.add(16).cast::<[u32; 3]>().write([3, 1, 1]);
+            src.add(48).cast::<[u32; 3]>().write([2, 2, 2]);
+            src.add(80).cast::<[u32; 3]>().write([0, 0, 1]);
+            budget.cast::<u32>().write((1 << 27) - 3 * 128);
+        }
+        // SAFETY: a live buffer.
+        let dst_gpu = unsafe { dst.GetGPUVirtualAddress() };
+        let addresses = [src_gpu, words_gpu, dst_gpu, budget_gpu];
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        record_gpu_clamp(&clamp, &warp.list, (&dst, common), [0; 6], addresses, 1);
+        // SAFETY: the mapped words, written before the list runs; an open
+        // list, and the scratch buffer in INDIRECT_ARGUMENT after the clamp.
+        unsafe {
+            words.cast::<[u32; 5]>().write([3, 48, 16, 80, 0]);
+            done_on(&warp.list, &dst);
+            warp.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback, 0, &dst, 0, 48);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run; mapped buffers.
+        unsafe {
+            assert_eq!(
+                output.cast::<[u32; 12]>().read(),
+                [2, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+                "the records in draw order, the slot past the count untouched"
+            );
+            assert_eq!(
+                budget.cast::<[u32; 5]>().read(),
+                [1 << 27, 3, 5, 0, 0],
+                "spent, the largest group count asked for, the groups asked in all"
+            );
+        }
+    }
+
+    /// The mesh records of [`batches_match_single_clamps`]: 40 of them, 32
+    /// bytes apart as the title keeps them (the rest of each record ones):
+    /// full dispatches, slots of all ones, ones over 65,535 groups, small
+    /// ones and ones that cost nothing, so the budget runs out part way.
+    fn mesh_records() -> Vec<[u32; 3]> {
+        (0..40u32)
+            .map(|i| {
+                let x = match i % 5 {
+                    0 => 65_535,
+                    1 => u32::MAX,
+                    2 => 40_000 + i,
+                    3 => 3,
+                    _ => 70_000,
+                };
+                let y = if i % 7 == 6 { 0 } else { 1 + i % 3 };
+                [x, y, 1]
+            })
+            .collect()
+    }
+
+    /// What clamps of their own make of `records` in turn, from an empty
+    /// budget: each clamped record, and the budget's words after them
+    /// (spent; the largest group count asked for and the groups asked in
+    /// all; no compute notes).
+    fn clamped_alone(records: &[[u32; 3]]) -> (Vec<[u32; 3]>, [u32; 5]) {
+        const BUDGET: u32 = 1 << 27;
+        let (mut spent, mut largest, mut all) = (0u32, 0u32, 0u32);
+        let out = records
+            .iter()
+            .map(|&[x, y, z]| {
+                largest = largest.max(x);
+                all = all.wrapping_add(x.min(1 << 24));
+                let g = [x.min(65_535), y.min(1), z.min(1)];
+                let cost = g[0] * g[1] * g[2] * 128;
+                let fits = cost == 0 || (spent < BUDGET && BUDGET - spent >= cost);
+                if cost > 0 && spent < BUDGET {
+                    spent = if BUDGET - spent <= cost {
+                        BUDGET
+                    } else {
+                        spent + cost
+                    };
+                }
+                if fits { g } else { [0; 3] }
+            })
+            .collect();
+        (out, [spent, largest, all, 0, 0])
+    }
+
+    /// A batch of mesh draws (`VICTORY_GROUPED_MESH_CLAMP=1`) gives every
+    /// record what a clamp of its own gives it, and charges the budget as
+    /// those do, with each of the clamp's switches on and off: the scratch
+    /// buffer kept readable (`VICTORY_INDIRECT_READABLE=1`), the clamp that
+    /// charges once per thread group (`VICTORY_CLAMP_GROUP=1`), the budget
+    /// in the card's own memory (`VICTORY_INDIRECT_CARD_BUDGET=1`), and the
+    /// clamp without its compute notes (`VICTORY_CLAMP_LEAN=1`). 40 draws,
+    /// so a full batch ends and a second one opens; the budget runs out
+    /// part way, so later records run empty in both.
+    #[test]
+    fn host_list_mesh_batches_match_single_clamps_under_every_switch() {
+        let Some(host) = software_host() else {
+            return;
+        };
+        let batch = make_from(&host.device, MESH_BATCH_SOURCE, false).expect("batch clamp");
+        for keep in [false, true] {
+            for card in [false, true] {
+                for grouped_source in [false, true] {
+                    for notes in [true, false] {
+                        let source = if grouped_source { GROUP_SOURCE } else { SOURCE };
+                        let single = make_from(&host.device, source, notes).expect("clamp");
+                        let how = format!(
+                            "readable {keep}, card budget {card}, group clamp {grouped_source}, \
+                             notes {notes}"
+                        );
+                        batches_match_single_clamps(host, (&single, &batch), keep, card, &how);
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`host_list_mesh_batches_match_single_clamps_under_every_switch`]
+    /// with the single clamp `single`, the batch clamp `batch`, the scratch
+    /// buffer kept readable (`keep`) and the budget in the card's memory
+    /// (`card`).
+    fn batches_match_single_clamps(
+        host: &crate::host::Host,
+        (single, batch): (&Clamp, &Clamp),
+        keep: bool,
+        card: bool,
+        how: &str,
+    ) {
+        const KIND_MESH: u32 = 10;
+        const STEP: u32 = 32;
+        const COPY: u64 = 7;
+        let records = mesh_records();
+        let n = records.len();
+        let Some((src, src_ptr)) = host.shared_buffer(n as u64 * u64::from(STEP)) else {
+            return;
+        };
+        // SAFETY: a mapped buffer of this size; nothing runs yet.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0xff, n * STEP as usize);
+            for (i, record) in records.iter().enumerate() {
+                src_ptr
+                    .add(i * STEP as usize)
+                    .cast::<[u32; 3]>()
+                    .write_unaligned(*record);
+            }
+        }
+        // Runs `n` draws' clamps (`each`: the scratch buffer and where the
+        // draw reads its record) on a new list, copying every clamped
+        // record out as a draw would read it; the records and the budget's
+        // words once the list has run.
+        let run = |each: &dyn Fn(&HostList, u32) -> (ID3D12Resource, u64)| {
+            let list = host.new_list().expect("a host list");
+            if card {
+                assert!(list.force_card_budget(), "no budget in the card's memory");
+            }
+            let _ = host.log_messages();
+            let (out, out_ptr) = host
+                .shared_buffer(n as u64 * 12)
+                .expect("a read-back buffer");
+            let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            for i in 0..n as u32 {
+                let (bounded, at) = each(&list, i * STEP);
+                // SAFETY: an open list; the scratch buffer is in
+                // INDIRECT_ARGUMENT after a clamp (and through a batch),
+                // and goes back there; buffers held until the list ran.
+                unsafe {
+                    list.list
+                        .ResourceBarrier(&[transition(&bounded, args, copy)]);
+                    list.list
+                        .CopyBufferRegion(&out, u64::from(i) * 12, &bounded, at, 12);
+                    list.list
+                        .ResourceBarrier(&[transition(&bounded, copy, args)]);
+                }
+                list.keep(&bounded);
+            }
+            list.close();
+            assert!(
+                list.mesh_batch().is_none(),
+                "{how}: the close ended the batch"
+            );
+            assert_eq!(
+                host.log_messages(),
+                None,
+                "{how}: the debug layer found an error"
+            );
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; a mapped buffer of `n` records.
+            let clamped = unsafe {
+                std::slice::from_raw_parts(out_ptr.cast::<[u32; 3]>().cast_const(), n).to_vec()
+            };
+            let words = list.budget_words().expect("budget words");
+            (clamped, words, list.budget_on_card())
+        };
+        let alone = run(&|list, offset| {
+            let budget = list.budget().unwrap();
+            let dst = list.indirect_scratch(12).unwrap();
+            let src = (&src, u64::from(offset));
+            let spec = (KIND_MESH, crate::indirect::MESH_STRIDE, 1);
+            assert!(clamp_into(
+                list,
+                single,
+                &dst,
+                budget,
+                src,
+                None,
+                spec,
+                (0, keep)
+            ));
+            done(list, &dst);
+            (dst, 0)
+        });
+        let opened = std::cell::RefCell::new(Vec::new());
+        let grouped = run(&|list, offset| {
+            let (bounded, at, new) = grouped_mesh_as(list, COPY, offset, |list| {
+                MeshBatch::open_with(list, batch, COPY, &src, keep)
+            })
+            .expect("a batch");
+            opened.borrow_mut().push(new);
+            assert_eq!(
+                list.indirect_state(&bounded),
+                if keep {
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+                } else {
+                    D3D12_RESOURCE_STATE_COMMON
+                },
+                "{how}: the list's tracked state of the scratch buffer in a batch"
+            );
+            (bounded, at)
+        });
+        let (expected, words) = clamped_alone(&records);
+        assert!(
+            expected.contains(&[0; 3]) && expected.iter().any(|r| r[0] > 0),
+            "the records must both fit and run empty"
+        );
+        assert_eq!(alone.0, expected, "{how}: clamps of their own");
+        assert_eq!(grouped.0, expected, "{how}: a batch");
+        // On the card the spent word stays there; the notes come back.
+        let charged = if alone.2 {
+            [0, words[1], words[2], 0, 0]
+        } else {
+            words
+        };
+        assert_eq!(
+            alone.1[..5],
+            charged,
+            "{how}: the budget of clamps of their own"
+        );
+        assert_eq!(grouped.1, alone.1, "{how}: the budget of a batch");
+        assert_eq!(alone.2, grouped.2);
+        let opens: Vec<usize> = (opened.borrow().iter().enumerate())
+            .filter_map(|(i, &new)| new.then_some(i))
+            .collect();
+        assert_eq!(
+            opens,
+            [0, 32],
+            "{how}: a full batch ends and the next opens"
+        );
+    }
+
+    /// A batch of mesh draws takes the draws of one argument buffer, ends
+    /// before another clamp is recorded (which writes the scratch buffer
+    /// its draws read) and at the list's close, and leaves the scratch
+    /// buffer where the list's tracking expects it, readable or common.
+    #[test]
+    fn host_list_ends_a_mesh_batch_before_another_clamp() {
+        let Some(host) = software_host() else {
+            return;
+        };
+        let batch = make_from(&host.device, MESH_BATCH_SOURCE, false).expect("batch clamp");
+        let Some((src, src_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: the mapping holds 256 bytes.
+        unsafe { std::ptr::write_bytes(src_ptr, 0, 256) };
+        for keep in [false, true] {
+            let list = host.new_list().expect("a host list");
+            let _ = host.log_messages();
+            let join = |offset| {
+                grouped_mesh_as(&list, 1, offset, |list| {
+                    MeshBatch::open_with(list, &batch, 1, &src, keep)
+                })
+                .expect("a batch")
+            };
+            let (first, _, opened) = join(0);
+            assert!(opened);
+            let (_, at, opened) = join(12);
+            assert_eq!((at, opened), (12, false), "the next draw joins");
+            // Another copy's record opens a batch of its own.
+            let (_, at, opened) = grouped_mesh_as(&list, 2, 24, |list| {
+                MeshBatch::open_with(list, &batch, 2, &src, keep)
+            })
+            .expect("a batch");
+            assert_eq!((at, opened), (0, true), "another argument buffer");
+            // A clamp of its own ends it first.
+            let alone = bound_as(&list, (&src, 0), None, (10, 12, 1), (0, keep)).unwrap();
+            assert!(list.mesh_batch().is_none(), "the clamp ended the batch");
+            assert_eq!(alone.as_raw(), first.as_raw(), "one scratch buffer");
+            done(&list, &alone);
+            let rest = if keep {
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+            } else {
+                D3D12_RESOURCE_STATE_COMMON
+            };
+            assert_eq!(list.indirect_state(&alone), rest);
+            // One open at the close ends there, before the scratch buffer
+            // goes back to common.
+            join(36);
+            assert!(list.mesh_batch().is_some());
+            list.close();
+            assert!(list.mesh_batch().is_none(), "the close ended the batch");
+            assert_eq!(list.indirect_state(&alone), D3D12_RESOURCE_STATE_COMMON);
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+        }
     }
 
     /// The bytes of the dispatch records `groups`: three words each, `step`

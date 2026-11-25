@@ -1078,6 +1078,10 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// The run of one-record mesh draws whose records one clamp takes, while
+    /// the recording may add to it (`VICTORY_GROUPED_MESH_CLAMP=1`,
+    /// `crate::indirect::MeshBatch`).
+    mesh_batch: Mutex<Option<crate::indirect::MeshBatch>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// Names the list in the device-removed report's [`SENT_OPS`].
@@ -4374,6 +4378,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                mesh_batch: Mutex::default(),
                 _alive: Counted::new(),
                 id: LIST_IDS.fetch_add(1, Ordering::Relaxed),
                 ops: Mutex::new(Vec::with_capacity(if dred() == Dred::Off {
@@ -6541,6 +6546,8 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Before the scratch buffer goes back to common below.
+        self.end_mesh_batch();
         self.twins_to_depth();
         let scratch = self
             .indirect_args
@@ -6575,6 +6582,8 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        // A batch of a recording that was never closed goes with it.
+        *self.mesh_batch() = None;
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.buffer_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7441,6 +7450,27 @@ impl HostList {
     /// next clamp moves it back to unordered access.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
+    }
+
+    /// The list's open batch of mesh draws, if any
+    /// (`crate::indirect::grouped_mesh`).
+    pub(crate) fn mesh_batch(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<crate::indirect::MeshBatch>> {
+        self.mesh_batch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Ends the list's open batch of mesh draws, if any
+    /// (`VICTORY_GROUPED_MESH_CLAMP=1`): called before anything is recorded
+    /// that may write memory or use the scratch buffer, which must come
+    /// after the batch's last draw (every other draw and dispatch, every
+    /// other clamp, barriers, copies, clears, value writes, a change of
+    /// targets, the list's close). Records nothing without a batch.
+    pub(crate) fn end_mesh_batch(&self) {
+        let open = self.mesh_batch().take();
+        if let Some(batch) = open {
+            batch.finish(self);
+        }
     }
 
     /// Keeps `object` alive until the list is reset.
