@@ -126,6 +126,11 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// A compute program's dispatch settings (user SGPRs, LDS).
+    pub(crate) compute: Option<victory_shader::native::ComputeIo>,
+    /// Whether it reads its root parameters from a spilled user-data table,
+    /// as the structure builder's stages do ([`of_builder`]).
+    pub(crate) spilled: bool,
 }
 
 #[cfg(windows)]
@@ -184,6 +189,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let compute = programs.iter().find_map(|p| match p.io {
+        victory_shader::native::StageIo::Cs(io) => Some(io),
+        _ => None,
+    });
+    let spilled = programs.iter().any(victory_shader::spill::is_spilled);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -194,7 +204,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        compute,
+        spilled,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

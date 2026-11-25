@@ -29,13 +29,13 @@
 //! from the first loading screen, it gave up on the passes the title runs
 //! once while its world loads, and those never came back.
 //!
-//! While the ray-tracing structure builder is off, compute programs that
-//! read title memory by address (the builder's and those that walk or
-//! shade its structures) are not made at all ([`leaves_out`]).
+//! While the ray-tracing structure builder is off, the compute programs
+//! that shade ray-tracing hits and the builder's own stages are not made
+//! at all ([`leaves_out`]).
 //!
 //! The loading-time waits and the slow-driver cutoff come from the AMD
 //! fork of the fork (commit 4436f8f1, GPL-3.0), as does leaving the
-//! structures' readers out (there by their names, here by what they read).
+//! hit-shading programs out (there by their names, here by their shape).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -60,8 +60,8 @@ pub(crate) struct Pending {
     waited_us: AtomicU64,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
-    /// Not made by [`leaves_out`].
-    left_out: AtomicBool,
+    /// Why [`leaves_out`] did not make it, if it did not.
+    left_out: OnceLock<LeftOut>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -87,7 +87,7 @@ impl Pending {
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
             begun: OnceLock::new(),
-            left_out: AtomicBool::new(false),
+            left_out: OnceLock::new(),
         }
     }
 
@@ -121,13 +121,19 @@ impl Pending {
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
         self.made.get_or_init(|| {
-            if self.walks_dead_structures() {
-                self.left_out.store(true, Ordering::Relaxed);
-                let n = LEFT_OUT.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
+            if let Some(why) = self.left_out_while_dead() {
+                let _ = self.left_out.set(why);
+                let counter = match why {
+                    LeftOut::ShadesHits => &LEFT_OUT[0],
+                    LeftOut::Builds => &LEFT_OUT[1],
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                let [hit_shading, builder] = left_out_counts();
+                if (hit_shading + builder).is_power_of_two() {
                     tracing::info!(
-                        left_out = n,
-                        "compute pipelines that read title memory by address left out: the ray-tracing structure builder is off (VICTORY_RT_RESOLVE=1 makes them)"
+                        hit_shading,
+                        builder,
+                        "compute pipelines left out: the ray-tracing structure builder is off (VICTORY_RT_RESOLVE=1 makes them)"
                     );
                 }
                 return None;
@@ -139,27 +145,84 @@ impl Pending {
         done.notify_all();
     }
 
-    /// Whether it is a compute program that reads title memory by address
-    /// while nothing builds the structures such programs walk
-    /// ([`leaves_out`]). Translates it (a worker does, before the host
-    /// compile it saves).
-    fn walks_dead_structures(&self) -> bool {
+    /// Why it is not made while nothing builds the ray-tracing structures
+    /// ([`leaves_out`]), if it is not. Translates a compute program (a
+    /// worker does, before the host compile it saves).
+    fn left_out_while_dead(&self) -> Option<LeftOut> {
         let [shader] = self.shaders.as_slice() else {
-            return false;
+            return None;
         };
-        let reads_memory = || {
-            shader.translated().is_some_and(|t| {
-                t.host
-                    .root_srvs
-                    .contains(&victory_shader::emit::SLOT_MEMORY)
-            })
-        };
-        leaves_out(structures_dead(), shader.stage == "compute", reads_memory)
+        let shape = || shader.translated().map(Shape::of);
+        leaves_out(structures_dead(), shader.stage == "compute", shape)
     }
 }
 
-/// Compute pipelines left out by [`leaves_out`] so far.
-static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+/// Why a compute pipeline is left out while the structure builder is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftOut {
+    /// It shades what a ray hit ([`shades_hits`]).
+    ShadesHits,
+    /// It is a stage of the structure builder (`super::of_builder`).
+    Builds,
+}
+
+/// Compute pipelines left out by [`leaves_out`] so far: hit shading, the
+/// builder's stages.
+static LEFT_OUT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn left_out_counts() -> [u64; 2] {
+    LEFT_OUT.each_ref().map(|n| n.load(Ordering::Relaxed))
+}
+
+/// What [`leaves_out`] looks at in a translated compute program.
+#[derive(Debug, Clone, Copy)]
+struct Shape<'a> {
+    /// Root SRVs and UAVs the translation binds
+    /// ([`victory_shader::emit::HostShader`]).
+    root_srvs: &'a [u8],
+    root_uavs: &'a [u8],
+    /// User-data dwords it reads.
+    user_data: usize,
+    /// User SGPRs and LDS bytes of its dispatch settings.
+    user_sgprs: u8,
+    lds_bytes: u32,
+    /// It reads a spilled user-data table (the builder's stages).
+    spilled: bool,
+}
+
+impl Shape<'_> {
+    fn of(t: &super::Translated) -> Shape<'_> {
+        Shape {
+            root_srvs: &t.host.root_srvs,
+            root_uavs: &t.host.root_uavs,
+            user_data: t.host.user_data.len(),
+            // No dispatch settings: no shape that matches.
+            user_sgprs: t.compute.map_or(u8::MAX, |c| c.user_sgprs()),
+            lds_bytes: t.compute.map_or(u32::MAX, |c| c.lds_bytes()),
+            spilled: t.spilled,
+        }
+    }
+}
+
+/// Whether a compute program has the shape of the title's hit-shading
+/// programs: its only root view the heap's strides (`SLOT_STRIDES`: it
+/// picks buffer views from the heap), no root UAV, 4 user-data dwords, 12
+/// user SGPRs, no LDS. In an offline census of the title's compute
+/// programs this is all of the some 1,000 that shade ray-tracing hits and
+/// 3 of the other 1,600 (they match in every other respect too, so likely
+/// more of the same).
+///
+/// Never the programs that walk the structures (they must run, or rooms
+/// are left unlit): each reads title memory by address (`SLOT_MEMORY`),
+/// lists the pages it found no copy of (`SLOT_FAULTS`) and uses 2 KiB of
+/// LDS, and any one of those rules it out.
+fn shades_hits(s: &Shape) -> bool {
+    s.root_srvs == [victory_shader::emit::SLOT_STRIDES]
+        && s.root_uavs.is_empty()
+        && s.user_data == 4
+        && s.user_sgprs == 12
+        && s.lds_bytes == 0
+}
 
 /// Whether nothing builds the ray-tracing structures in this run: the
 /// structure builder's stages are off (`VICTORY_BVH_BUILDER` is not 1) and
@@ -171,22 +234,35 @@ fn structures_dead() -> bool {
     })
 }
 
-/// Whether a pipeline is left out: a compute program that reads title
-/// memory by raw address (`SLOT_MEMORY`) while the structures are `dead`.
-/// In the title only the ray-tracing structure builder and the programs
-/// that walk its structures, or shade what a ray walking them hit, read
-/// memory so ([`crate::memory`]); with the builder off there is nothing to
-/// walk or shade, and each of those programs took AMD's compiler 5 to 9 s.
-/// Some 340 of them, all asked for at the world's first frame, stood in
-/// the queue before the passes that make the picture, and the world drew
-/// half its draws or fewer for over two minutes. The builder's own stages
-/// are left out too: with the builder off they never run.
+/// Why a pipeline is left out while the structures are `dead`, if it is: a
+/// compute program (`shape`: its translation, `None` if it has none) that
+/// shades ray-tracing hits ([`shades_hits`]) or is a stage of the builder.
+/// With the builder off no ray hits anything there is to shade, and each
+/// hit-shading program takes AMD's compiler 5 to 9 s: some 1,000 of them,
+/// all asked for at the world's first frame, stood in the queue before
+/// the passes that make the picture. The builder's own stages never run
+/// with the builder off. The programs that walk the structures are made:
+/// left out, rooms were not lit.
 ///
 /// After the AMD fork of the fork (commit 4436f8f1), which leaves the
-/// hit-shading programs out by their names; here it is what the programs
-/// read that decides.
-fn leaves_out(dead: bool, compute: bool, reads_memory: impl FnOnce() -> bool) -> bool {
-    dead && compute && reads_memory()
+/// hit-shading programs out by a name in their containers; here their
+/// shape decides.
+fn leaves_out<'a>(
+    dead: bool,
+    compute: bool,
+    shape: impl FnOnce() -> Option<Shape<'a>>,
+) -> Option<LeftOut> {
+    if !dead || !compute {
+        return None;
+    }
+    let shape = shape()?;
+    if shape.spilled {
+        Some(LeftOut::Builds)
+    } else if shades_hits(&shape) {
+        Some(LeftOut::ShadesHits)
+    } else {
+        None
+    }
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -194,14 +270,18 @@ fn leaves_out(dead: bool, compute: bool, reads_memory: impl FnOnce() -> bool) ->
 /// has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
-    match p.made.get() {
-        Some(Some(_)) => None,
-        None => Some(format!("being made {:?}", p.shaders)),
-        Some(None) if p.left_out.load(Ordering::Relaxed) => Some(format!(
-            "reads title memory by address, left out while the ray-tracing structure builder is off {:?}",
+    match (p.made.get(), p.left_out.get()) {
+        (Some(Some(_)), _) => None,
+        (None, _) => Some(format!("being made {:?}", p.shaders)),
+        (Some(None), Some(why)) => Some(format!(
+            "{}, left out while the ray-tracing structure builder is off {:?}",
+            match why {
+                LeftOut::ShadesHits => "shades ray-tracing hits",
+                LeftOut::Builds => "a stage of the structure builder",
+            },
             p.shaders
         )),
-        Some(None) => {
+        (Some(None), None) => {
             let failed: Vec<String> = p
                 .shaders
                 .iter()
@@ -618,11 +698,13 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+        let [left_out_hit_shading, left_out_builder] = left_out_counts();
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
-            left_out = LEFT_OUT.load(Ordering::Relaxed),
+            left_out_hit_shading,
+            left_out_builder,
             "host pipelines all made"
         );
     }
@@ -714,18 +796,98 @@ mod tests {
         assert_eq!(past, ms(8 * 499 - 500));
     }
 
-    /// Only compute programs that read memory by address are left out,
-    /// and only while the structures are dead; the translation is not
-    /// looked at otherwise.
+    /// The shape of a hit-shading program, as the census found it, with
+    /// `change` made to it.
+    fn hit_shader(change: impl FnOnce(&mut Shape<'static>)) -> Shape<'static> {
+        let mut s = Shape {
+            root_srvs: &[victory_shader::emit::SLOT_STRIDES],
+            root_uavs: &[],
+            user_data: 4,
+            user_sgprs: 12,
+            lds_bytes: 0,
+            spilled: false,
+        };
+        change(&mut s);
+        s
+    }
+
+    /// The hit-shading shape is left out, and every way off it is made.
     #[test]
-    fn readers_of_dead_structures_are_left_out() {
-        let never = || -> bool { panic!("looked at the translation") };
-        assert!(leaves_out(true, true, || true));
-        assert!(!leaves_out(true, true, || false));
-        assert!(!leaves_out(false, true, never));
-        assert!(!leaves_out(true, false, never));
+    fn hit_shading_programs_are_told_by_their_shape() {
+        use victory_shader::emit::{SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES};
+        assert!(shades_hits(&hit_shader(|_| ())));
+        let off = [
+            hit_shader(|s| s.root_srvs = &[]),
+            hit_shader(|s| s.root_srvs = &[SLOT_MEMORY]),
+            hit_shader(|s| s.root_srvs = &[SLOT_MEMORY, SLOT_STRIDES]),
+            hit_shader(|s| s.root_srvs = &[SLOT_STRIDES, 0]),
+            hit_shader(|s| s.root_uavs = &[SLOT_FAULTS]),
+            hit_shader(|s| s.user_data = 3),
+            hit_shader(|s| s.user_data = 5),
+            hit_shader(|s| s.user_sgprs = 11),
+            hit_shader(|s| s.user_sgprs = 13),
+            hit_shader(|s| s.lds_bytes = 512),
+        ];
+        for s in off {
+            assert!(!shades_hits(&s), "{s:?}");
+        }
+    }
+
+    /// The programs that walk the structures are never left out: each
+    /// reads memory by address, reports faults and uses 2 KiB of LDS, and
+    /// any one of the three rules it out. The user data and SGPRs are
+    /// those the census found, and the hit shaders' ones.
+    #[test]
+    fn walkers_are_made() {
+        use victory_shader::emit::{SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES};
+        let srvs: [&[u8]; 2] = [&[SLOT_MEMORY], &[SLOT_MEMORY, SLOT_STRIDES]];
+        for root_srvs in srvs {
+            for (user_data, user_sgprs) in [(6, 6), (8, 7), (10, 8), (9, 12), (10, 12), (4, 12)] {
+                let walker = Shape {
+                    root_srvs,
+                    root_uavs: &[SLOT_FAULTS],
+                    user_data,
+                    user_sgprs,
+                    lds_bytes: 2048,
+                    spilled: false,
+                };
+                assert_eq!(leaves_out(true, true, || Some(walker)), None, "{walker:?}");
+            }
+            // A hit shader with one of the three as a walker has it.
+            let memory = hit_shader(|s| s.root_srvs = root_srvs);
+            let faults = hit_shader(|s| s.root_uavs = &[SLOT_FAULTS]);
+            let lds = hit_shader(|s| s.lds_bytes = 2048);
+            for s in [memory, faults, lds] {
+                assert!(!shades_hits(&s), "{s:?}");
+            }
+        }
+    }
+
+    /// Hit shaders and the builder's stages are left out, only while the
+    /// structures are dead and only as compute programs; the translation
+    /// is not looked at otherwise, and one that does not translate is not
+    /// left out (it is not made anyway).
+    #[test]
+    fn left_out_only_while_the_structures_are_dead() {
+        let never = || -> Option<Shape<'static>> { panic!("looked at the translation") };
+        let hit = hit_shader(|_| ());
+        let builder = hit_shader(|s| {
+            s.root_srvs = &[victory_shader::emit::SLOT_MEMORY];
+            s.user_data = 9;
+            s.user_sgprs = 2;
+            s.spilled = true;
+        });
+        let other = hit_shader(|s| s.user_data = 2);
+        let (hits, builds) = (Some(LeftOut::ShadesHits), Some(LeftOut::Builds));
+        assert_eq!(leaves_out(true, true, || Some(hit)), hits);
+        assert_eq!(leaves_out(true, true, || Some(builder)), builds);
+        assert_eq!(leaves_out(true, true, || Some(other)), None);
+        assert_eq!(leaves_out(true, true, || None), None);
+        // VICTORY_RT_RESOLVE=1 or VICTORY_BVH_BUILDER=1: all are made.
+        assert_eq!(leaves_out(false, true, never), None);
+        assert_eq!(leaves_out(true, false, never), None);
         // A pipeline without shaders is not one.
-        assert!(!Pending::new(Vec::new(), None).walks_dead_structures());
+        assert_eq!(Pending::new(Vec::new(), None).left_out_while_dead(), None);
     }
 
     /// No frame waits for a pipeline the driver has been at for over 3 s
