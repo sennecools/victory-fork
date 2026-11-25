@@ -872,30 +872,57 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
             }
         }
     }
+    solve_liveness(blocks, order, &uses, &defs)
+}
+
+/// Backwards dataflow to the least fixed point. Only predecessors of a
+/// changed live-in set need revisiting; a changed live-out set alone does
+/// not affect them. Keep unreachable blocks at zero, as in the old sweep.
+fn solve_liveness(
+    blocks: &[Block],
+    order: &[usize],
+    uses: &[RegSet],
+    defs: &[RegSet],
+) -> (Vec<RegSet>, Vec<RegSet>) {
+    use std::collections::VecDeque;
+
+    let empty = [0; REGS.div_ceil(64)];
     let mut live_in = vec![empty; blocks.len()];
     let mut live_out = vec![empty; blocks.len()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in order.iter().rev() {
-            let mut out = empty;
-            for s in blocks[b].exit.successors() {
-                for (o, i) in out.iter_mut().zip(&live_in[s]) {
-                    *o |= i;
+    let mut reachable = vec![false; blocks.len()];
+    for &b in order {
+        reachable[b] = true;
+    }
+    let mut queued = reachable.clone();
+    let mut work: VecDeque<usize> = order.iter().rev().copied().collect();
+    while let Some(b) = work.pop_front() {
+        queued[b] = false;
+        let mut out = empty;
+        for successor in blocks[b].exit.successors() {
+            for (o, i) in out.iter_mut().zip(&live_in[successor]) {
+                *o |= i;
+            }
+        }
+        let mut inn = empty;
+        for w in 0..inn.len() {
+            inn[w] = uses[b][w] | out[w] & !defs[b][w];
+        }
+        live_out[b] = out;
+        if inn != live_in[b] {
+            live_in[b] = inn;
+            for &p in &blocks[b].preds {
+                if reachable[p] && !queued[p] {
+                    queued[p] = true;
+                    work.push_back(p);
                 }
-            }
-            let mut inn = empty;
-            for w in 0..inn.len() {
-                inn[w] = uses[b][w] | out[w] & !defs[b][w];
-            }
-            if inn != live_in[b] || out != live_out[b] {
-                (live_in[b], live_out[b]) = (inn, out);
-                changed = true;
             }
         }
     }
     (live_in, live_out)
 }
+
+#[cfg(test)]
+mod liveness_tests;
 
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
