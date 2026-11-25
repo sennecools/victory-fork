@@ -60,6 +60,8 @@ pub(crate) struct Usage {
     pub wave_ops: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
+    /// A 64-bit float (`double`), as a result or an operand.
+    pub doubles: bool,
     /// A typed load of several components from a UAV.
     pub typed_uav_loads: bool,
     /// A handle from the view heap.
@@ -969,6 +971,7 @@ impl Module {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
+        let double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -997,7 +1000,12 @@ impl Module {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                u.doubles |= double(inst.ty);
+                for_each_operand(&inst.op, |v| {
+                    let ty = self.type_of(v);
+                    u.int64 |= wide(ty);
+                    u.doubles |= double(ty);
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };

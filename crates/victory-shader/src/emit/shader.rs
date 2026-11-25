@@ -480,6 +480,7 @@ impl Shader {
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
+                (flags::DOUBLES, used.doubles),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
@@ -896,5 +897,55 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::bitcode::Term;
+
+    #[test]
+    fn dead_doubles_clear_doubles_flag_and_pass_validation() {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.flags |= flags::WAVE_OPS | flags::DOUBLES;
+        let e = s.entry;
+        let f64t = s.m.double();
+        let lo = s.m.i32(0);
+        let hi = s.m.i32(0x3FF0_0000);
+        let d = s.op(e, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+        let k0 = s.m.i8(0);
+        let sum = s.op(e, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, k0]);
+        let split_ty = s.m.named_struct("dx.types.splitdouble", vec![s.t.i32, s.t.i32]);
+        let _split = s.op(e, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
+        s.m.terminate(e, Term::Ret);
+
+        // Before optimization, usage reports both doubles and wave ops.
+        let before = s.m.usage();
+        assert!(before.doubles);
+        assert!(before.wave_ops);
+
+        // After finish() runs module optimization, dead doubles are removed and
+        // SFI0 must not declare DOUBLES (bit 0).
+        let mut container = s.finish();
+        let count = u32::from_le_bytes(container[28..32].try_into().unwrap()) as usize;
+        let feature_bits = (0..count)
+            .find_map(|i| {
+                let off =
+                    u32::from_le_bytes(container[32 + i * 4..36 + i * 4].try_into().unwrap())
+                        as usize;
+                (&container[off..off + 4] == b"SFI0")
+                    .then(|| u64::from_le_bytes(container[off + 8..off + 16].try_into().unwrap()))
+            })
+            .expect("SFI0 chunk");
+        assert_eq!(feature_bits & 0x1, 0, "dead DOUBLES flag must be cleared in SFI0");
+
+        if let Ok(mut v) =
+            super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut container)
+                .expect("DXIL validator must accept shader after clearing dead DOUBLES");
+        }
     }
 }
