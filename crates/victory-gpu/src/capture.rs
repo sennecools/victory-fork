@@ -144,14 +144,24 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
-    // (small pictures of menus, loading screens and title cards).
-    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    // Two frames in a row each time: the title draws to two buffers in turn,
+    // and every 8th or 16th frame alone only ever showed one of them.
+    // Before the world, with `VICTORY_CAPTURE_WORLD` and
+    // `VICTORY_CAPTURE_MENUS=1`: every 16th frame too (small pictures of
+    // menus, loading screens and title cards). Asked for apart: saving them
+    // makes the menus and their music stutter.
+    static MENUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let menus =
+        *MENUS.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_MENUS").is_some_and(|v| v == "1"));
+    let before_world = menus
+        && world_on()
+        && n % 16 < 2
+        && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first) % 8 < 2;
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 

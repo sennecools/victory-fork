@@ -618,7 +618,10 @@ pub(crate) fn save(now: bool) {
             (size, added)
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // With what earlier runs listed: a run that asks for no title pipeline
+    // (an offline warm-up) wrote an empty list over theirs, and the next world
+    // began with every pipeline still to be asked for.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         library.added.fetch_sub(added, Ordering::Relaxed);
