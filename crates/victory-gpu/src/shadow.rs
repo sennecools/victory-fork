@@ -632,8 +632,7 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; on by default, `VICTORY_RELAY=0` turns it
-/// off; not with kept snapshots,
+/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
 /// [`keeps`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
@@ -649,12 +648,11 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // On by default (stage 2, `crate::host::relay_exact`); `VICTORY_RELAY=0`
-    // turns it off, `=1` asks for the first stage.
-    // The crate's own tests run without it unless they ask: several of
-    // them look at title memory right after a submission, which the
-    // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    // Off by default: with stage 2 on by default, an RX 9070 XT lost the
+    // device about 105 s into a run, at a page fault while a submission was
+    // sent ahead; the same build with it off ran stable. `=1` asks for the
+    // first stage, `=2` for the second (`crate::host::relay_exact`).
+    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
 }
 
 /// The submission being prepared (its number among those started): what

@@ -2162,10 +2162,10 @@ pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
 
-/// The relay's first stage (`VICTORY_RELAY=1`; without it the relay runs
-/// at its second stage, [`relay_exact`], and `VICTORY_RELAY=0` turns it
-/// off; it turns [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
-/// and is off with it, in the timing run and with kept snapshots).
+/// The relay's first stage (`VICTORY_RELAY=1`, off by default; `=2` asks for
+/// its second stage, [`relay_exact`]; it turns [`late`] on at stage 3 unless
+/// `VICTORY_LATE_WAIT` says another stage, and is off with it, in the timing
+/// run and with kept snapshots).
 ///
 /// With [`late`] alone every settle does three things on the thread that
 /// holds the submission lock: it waits for everything in the air, copies
@@ -2200,7 +2200,7 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
 }
 
-/// The relay's second stage (`VICTORY_RELAY=2`, the default): a submission
+/// The relay's second stage (`VICTORY_RELAY=2`): a submission
 /// that reads title memory a flight's shaders may write (a title buffer copy, a fill
 /// of upload memory, a texture) waits only until the flights that declared
 /// that memory have landed, not for everything in the air; and at
@@ -2208,10 +2208,10 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    // Stage 2 unless `VICTORY_RELAY=1` asks for the first one (the default
-    // since the walls of the first room were found drawn in every run with
-    // this set and in fewer than half without it).
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
+    // The walls of the first room were found drawn in every run with this
+    // set and in fewer than half with the first stage; it is not on by
+    // default since the relay is not (`crate::shadow::relay`).
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
