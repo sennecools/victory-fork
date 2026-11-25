@@ -167,8 +167,7 @@ static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
 fn structures_dead() -> bool {
     static DEAD: OnceLock<bool> = OnceLock::new();
     *DEAD.get_or_init(|| {
-        let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
-        !on("VICTORY_BVH_BUILDER") && !on("VICTORY_RT_RESOLVE")
+        !super::builder_allowed() && std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v != "1")
     })
 }
 
@@ -319,14 +318,23 @@ fn frame_allowance(
     budget.max(loading.min(total.saturating_sub(spent)))
 }
 
-/// What was waited past the frame's budget since the start, in
-/// milliseconds; graphics, then compute.
+/// What frames waited past their budget since the start, in microseconds;
+/// graphics, then compute.
 static PAST_BUDGET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// What of a wait of `waited` lies past the frame's `budget`, the frame's
+/// earlier waits of its kind having taken `before`: a frame whose waits
+/// are each below the budget may together be far past it.
+fn past_budget(before: Duration, waited: Duration, budget: Duration) -> Duration {
+    (before + waited)
+        .saturating_sub(budget)
+        .saturating_sub(before.saturating_sub(budget))
+}
 
 /// What a frame may wait for pipelines of `p`'s kind now.
 fn allowance(p: &Pending) -> Duration {
     let compute = p.computes();
-    let spent = Duration::from_millis(PAST_BUDGET[usize::from(compute)].load(Ordering::Relaxed));
+    let spent = Duration::from_micros(PAST_BUDGET[usize::from(compute)].load(Ordering::Relaxed));
     let loading = if compute {
         LOADING_FRAME_COMPUTE
     } else {
@@ -425,17 +433,18 @@ fn wait(p: &Pending, frame: u64, most: Duration, allowance: Duration) -> Duratio
     if allowance.is_zero() {
         return Duration::ZERO;
     }
-    // Per kind (graphics, compute): the frame the allowance belongs to, and
-    // what was waited of it (or is taken by a thread waiting now).
-    static SPENT: [Mutex<(u64, Duration)>; 2] =
-        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    // Per kind (graphics, compute): the frame the allowance belongs to, what
+    // was waited of it (or is taken by a thread waiting now), and what the
+    // waits that ended waited (for the gate).
+    static SPENT: [Mutex<(u64, Duration, Duration)>; 2] =
+        [const { Mutex::new((u64::MAX, Duration::ZERO, Duration::ZERO)) }; 2];
     let compute = p.computes();
     let frame_spent = &SPENT[usize::from(compute)];
     let shared = shared_budget();
     let left = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
+            *spent = (frame, Duration::ZERO, Duration::ZERO);
         }
         let left = allowance.saturating_sub(spent.1).min(most);
         if shared {
@@ -460,9 +469,7 @@ fn wait(p: &Pending, frame: u64, most: Duration, allowance: Duration) -> Duratio
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    let past = waited.saturating_sub(wait_budget());
-    PAST_BUDGET[usize::from(compute)].fetch_add(past.as_millis() as u64, Ordering::Relaxed);
-    {
+    let past = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
@@ -471,8 +478,16 @@ fn wait(p: &Pending, frame: u64, most: Duration, allowance: Duration) -> Duratio
             } else {
                 spent.1 += waited;
             }
+            let before = spent.2;
+            spent.2 += waited;
+            past_budget(before, waited, wait_budget())
+        } else {
+            past_budget(Duration::ZERO, waited, wait_budget())
         }
-    }
+    };
+    // A wait is at most a frame's allowance (seconds), so the sum in
+    // microseconds stays far below u64::MAX.
+    PAST_BUDGET[usize::from(compute)].fetch_add(past.as_micros() as u64, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -677,6 +692,26 @@ mod tests {
             frame_allowance(Duration::ZERO, s(12), s(120), Duration::ZERO),
             Duration::ZERO
         );
+    }
+
+    /// The gate counts what a frame's waits together spent past its
+    /// budget, not only single waits longer than the budget.
+    #[test]
+    fn the_gate_counts_a_frames_waits_together() {
+        let ms = Duration::from_millis;
+        let budget = ms(500);
+        assert_eq!(past_budget(Duration::ZERO, ms(400), budget), Duration::ZERO);
+        assert_eq!(past_budget(ms(400), ms(400), budget), ms(300));
+        assert_eq!(past_budget(ms(800), ms(400), budget), ms(400));
+        assert_eq!(past_budget(Duration::ZERO, ms(4000), budget), ms(3500));
+        // Eight waits of 499 ms: 3,492 ms past the budget.
+        let mut before = Duration::ZERO;
+        let mut past = Duration::ZERO;
+        for _ in 0..8 {
+            past += past_budget(before, ms(499), budget);
+            before += ms(499);
+        }
+        assert_eq!(past, ms(8 * 499 - 500));
     }
 
     /// Only compute programs that read memory by address are left out,
