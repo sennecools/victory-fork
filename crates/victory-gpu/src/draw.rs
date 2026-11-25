@@ -158,7 +158,10 @@ const SAMPLERS_OURS: usize = usize::MAX;
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
-/// their record there with no pass of ours, until one of these: a compute
+/// their record there with no pass of ours (and with
+/// `VICTORY_INDIRECT_READABLE=1` no barrier either: the scratch buffer
+/// then stays readable as arguments until the next clamp,
+/// `crate::indirect`), until one of these: a compute
 /// dispatch, a direct draw, an indirect call with a count buffer or more
 /// than one record, a draw whose shaders can store to buffers, a record
 /// outside the window, another host list.
@@ -3249,7 +3252,9 @@ impl State {
             // A window hit did not run `bound`/`bound_ahead`, so `bounded` is
             // still in `COMMON` (from the previous draw's `done`); emitting
             // `done` (`INDIRECT_ARGUMENT -> COMMON`) without an `ExecuteIndirect`
-            // implicit promotion would be a mismatched barrier.
+            // implicit promotion would be a mismatched barrier. (A scratch
+            // buffer the list keeps readable, `VICTORY_INDIRECT_READABLE=1`,
+            // is in `INDIRECT_ARGUMENT` either way and `done` leaves it so.)
             if !hit_window {
                 crate::indirect::done(list, &bounded);
             }
@@ -3291,6 +3296,10 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
+        // Back to the common state for the next call, unless the list
+        // keeps the scratch buffer readable as arguments
+        // (`VICTORY_INDIRECT_READABLE=1`): then the next draw of the window
+        // reads it with no barrier, and the next clamp moves it back.
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);

@@ -8,6 +8,16 @@
 //! shader with its root signature inside), leaving the title's argument and
 //! count buffers untouched.
 //!
+//! Each execution is followed by a move of the scratch buffer back to the
+//! common state, and the next clamp moves it from common to unordered
+//! access. With `VICTORY_INDIRECT_READABLE=1` ([`readable`]; off by
+//! default) the scratch buffer is left readable as indirect arguments after
+//! a clamp and stays so until the next clamp into it, which moves it
+//! straight back to unordered access; it goes back to the common state
+//! once, when the list closes. The executions that read it then record no
+//! barrier of their own, so draws that read records clamped together
+//! (`crate::draw`'s windows) follow each other with nothing between them.
+//!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
 //! tail slots. Each list has a budget (2^27 vertex instances or threads,
@@ -271,7 +281,8 @@ fn validate_layout(
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
-/// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
+/// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`
+/// (until [`done`], or with [`readable`] until the next clamp into it).
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp or alignment is not available.
 pub(crate) fn bound(
@@ -280,10 +291,53 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    bound_as(list, src, count, spec, (0, readable()))
+}
+
+/// [`bound`] (`how` 0) and [`bound_ahead`] (`how` [`AHEAD`]); `keep`:
+/// whether the scratch buffer stays readable afterwards ([`readable`]).
+fn bound_as(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    (how, keep): (u32, bool),
+) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    let clamped = record_clamp(c, &list.list, &dst, budget, src, count, spec);
+    let clamped = clamp_into(list, c, &dst, budget, src, count, spec, (how, keep));
     clamped.then(|| noted(list, spec, dst))
+}
+
+/// Whether a list's scratch buffer stays readable as indirect arguments
+/// between executions (`VICTORY_INDIRECT_READABLE=1`; off by default).
+///
+/// Every indirect execution is followed by a move of the list's clamped
+/// arguments back to the common state ([`done`]), and the next clamp moves
+/// them from common to unordered access. Drivers may treat a barrier into
+/// or out of the common state as a full wait, so even the window path
+/// (`VICTORY_INDIRECT_WINDOW=1`), whose draws skip the clamp, records one
+/// barrier between every two draws.
+///
+/// With the switch the list remembers that a clamp left its scratch buffer
+/// readable as indirect arguments (`HostList::indirect_state`): executions
+/// read it with no barrier of their own, the next clamp moves it straight
+/// back to unordered access, and it returns to common once, when the list
+/// closes or a bigger buffer replaces it. The waits for earlier shader
+/// writes around the clamp are the same either way. Said once in the log,
+/// when the first clamp asks.
+fn readable() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INDIRECT_READABLE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "the indirect scratch buffer stays readable between executions \
+                 (VICTORY_INDIRECT_READABLE=1)"
+            );
+        }
+        on
+    })
 }
 
 /// A clamp just recorded on `list`: noted as its op if it dispatched.
@@ -309,10 +363,7 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    let clamped = record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD);
-    clamped.then(|| noted(list, spec, dst))
+    bound_as(list, src, None, spec, (AHEAD, readable()))
 }
 
 /// The parts [`bound_split`] makes of a dispatch, the most groups of each,
@@ -334,7 +385,8 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget()?);
     let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    let clamped = record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS);
+    let how = (IN_PARTS, readable());
+    let clamped = clamp_into(list, c, &dst, budget, src, None, spec, how);
     clamped.then(|| noted(list, spec, dst))
 }
 
@@ -342,26 +394,42 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
 
-fn record_clamp(
+/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
+/// the list left it in. `how`: [`AHEAD`], [`IN_PARTS`], or 0. `keep`
+/// ([`readable`]): afterwards the list knows the buffer is readable as
+/// indirect arguments, [`done`] leaves it so, and the next clamp starts
+/// from there. Without it nothing is remembered: the buffer starts every
+/// clamp common, where [`done`] returns it after the execution.
+#[allow(clippy::too_many_arguments)]
+fn clamp_into(
+    list: &HostList,
     c: &Clamp,
-    l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
     budget: u64,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    (how, keep): (u32, bool),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, 0)
+    let before = list.indirect_state(dst);
+    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, how);
+    if recorded && keep {
+        list.indirect_readable(dst);
+    }
+    recorded
 }
 
-/// [`record_clamp`]; `how`: [`AHEAD`], the records are a window clamped
-/// ahead of their draws ([`bound_ahead`]); [`IN_PARTS`], one dispatch in
-/// parts ([`bound_split`]).
+/// Records the clamp into `dst`, which is in state `before` (common, or
+/// indirect arguments after an earlier clamp into it that the list kept
+/// readable), and leaves `dst` in `INDIRECT_ARGUMENT`. `how`: [`AHEAD`],
+/// the records are a window clamped ahead of their draws ([`bound_ahead`]);
+/// [`IN_PARTS`], one dispatch in parts ([`bound_split`]). False, with
+/// nothing recorded, if the layout or the addresses do not fit the clamp.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -422,7 +490,9 @@ fn record_clamp_as(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
+    // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
+    // earlier execution's reads of the scratch buffer; nothing else writes it.
     // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
@@ -433,11 +503,7 @@ fn record_clamp_as(
     let waits = true;
     let first = [
         uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
     let second = [
         uav_barrier(),
@@ -479,7 +545,14 @@ pub(crate) fn executes_nothing(max: u32) -> bool {
 
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
+/// Records nothing for a scratch buffer the list keeps readable as
+/// indirect arguments ([`readable`]): the next execution reads it as it
+/// is, the next clamp moves it back to unordered access, and the list
+/// returns it to common when it closes.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+    if list.indirect_state(scratch) == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
+        return;
+    }
     done_on(&list.list, scratch);
 }
 
@@ -664,24 +737,7 @@ void main() {
         }
 
         fn signature(&self, kind: u32, stride: u32) -> ID3D12CommandSignature {
-            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
-                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-                ..Default::default()
-            };
-            let desc = D3D12_COMMAND_SIGNATURE_DESC {
-                ByteStride: stride,
-                NumArgumentDescs: 1,
-                pArgumentDescs: &arg,
-                NodeMask: 0,
-            };
-            let mut sig: Option<ID3D12CommandSignature> = None;
-            // SAFETY: valid single-argument command signature description.
-            unsafe {
-                self.device
-                    .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
-                    .unwrap();
-            }
-            sig.unwrap()
+            signature_of(&self.device, kind, stride)
         }
 
         fn submit_and_wait(&mut self) {
@@ -700,6 +756,58 @@ void main() {
                 self.list.Reset(&self.allocator, None).unwrap();
             }
         }
+    }
+
+    /// A command signature of one record of `kind` (PC argument numbering)
+    /// and `stride` bytes.
+    fn signature_of(device: &ID3D12Device, kind: u32, stride: u32) -> ID3D12CommandSignature {
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: valid single-argument command signature description.
+        unsafe {
+            device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
+                .unwrap();
+        }
+        sig.unwrap()
+    }
+
+    /// The name of `device`'s adapter, and whether it is a software one
+    /// (unnamed and not, if the adapter does not say).
+    pub(super) fn adapter_of(device: &ID3D12Device) -> (String, bool) {
+        // SAFETY: plain DXGI adapter queries.
+        unsafe {
+            let luid = device.GetAdapterLuid();
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                .and_then(|a| a.GetDesc1())
+                .map(|d| {
+                    let name = String::from_utf16_lossy(&d.Description)
+                        .trim_end_matches('\0')
+                        .to_owned();
+                    (name, d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+                })
+                .unwrap_or_else(|_| ("an unnamed adapter".to_owned(), false))
+        }
+    }
+
+    /// The host, if it is on a software adapter (`VICTORY_D3D12_WARP=1` in
+    /// a diagnostics build): for the tests that force on what a switch
+    /// records. A plain `cargo test` runs the host's tests on the card,
+    /// and what the switches keep off there by default (a scratch buffer
+    /// moved from arguments straight to unordered access, the first
+    /// `WriteBufferImmediate`) must not reach it through a test either.
+    fn software_host() -> Option<&'static crate::host::Host> {
+        super::host().filter(|host| adapter_of(&host.device).1)
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
@@ -954,6 +1062,23 @@ void main() {
     ///     records into `dst_args` at offset `0`.
     #[test]
     fn warp_count_buffer_ignores_garbage_tail_and_preserves_source() {
+        two_clamps_in_one_list(false);
+    }
+
+    /// The same two calls with the scratch buffer kept readable
+    /// (`VICTORY_INDIRECT_READABLE=1`): no return to the common state after
+    /// an execution, and the second clamp takes the scratch buffer straight
+    /// from indirect arguments back to unordered access. Every record runs
+    /// and is charged as without the switch.
+    #[test]
+    fn warp_second_clamp_takes_a_readable_scratch_buffer_straight_back() {
+        two_clamps_in_one_list(true);
+    }
+
+    /// Two counted calls in one list on WARP; `keep`:
+    /// the scratch buffer stays readable as arguments between them, as a
+    /// list records them with `VICTORY_INDIRECT_READABLE=1`.
+    fn two_clamps_in_one_list(keep: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1028,14 +1153,21 @@ void main() {
         // Record Call #1 (`eff_count = 3` out of `MAX = 4096`), copy the first
         // 5 records of `dst_buf` out for inspection, then record Call #2
         // (`eff_count = 2` out of `MAX = 4096`) reusing `dst_buf` in the same list!
-        assert!(record_clamp(
+        // Where the scratch buffer rests between the calls.
+        let rest = if keep {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
             budget_gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            0,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -1051,15 +1183,18 @@ void main() {
                 COUNT_OFFSET_1 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        if !keep {
+            done_on(&warp.list, &dst_buf);
+        }
 
-        // Snapshot `dst_buf` after Call #1 (from `COMMON`, copy 5 * STRIDE bytes,
-        // then return `dst_buf` to `COMMON` before Call #2).
-        // SAFETY: open command list; `dst_buf` returned to `COMMON` by `done_on`.
+        // Snapshot `dst_buf` after Call #1 (from where it rests, copy
+        // 5 * STRIDE bytes, then return `dst_buf` there before Call #2).
+        // SAFETY: open command list; `dst_buf` returned to `COMMON` by
+        // `done_on`, or left in `INDIRECT_ARGUMENT` by the clamp.
         unsafe {
             warp.list.ResourceBarrier(&[transition(
                 &dst_buf,
-                D3D12_RESOURCE_STATE_COMMON,
+                rest,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             warp.list
@@ -1067,20 +1202,23 @@ void main() {
             warp.list.ResourceBarrier(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
+                rest,
             )]);
         }
 
         // Call #2 in the SAME command list (`eff_count = 2` -> records 0 and 1:
         // 6 + 5 = 11 groups). Would run empty if Call #1's tail blew `BUDGET`!
-        assert!(record_clamp(
+        // Kept readable, the scratch buffer goes straight from arguments
+        // back to unordered access.
+        assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, rest),
             budget_gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            0,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -1096,7 +1234,9 @@ void main() {
                 COUNT_OFFSET_2 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        if !keep {
+            done_on(&warp.list, &dst_buf);
+        }
 
         warp.submit_and_wait();
 
@@ -1183,7 +1323,7 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
@@ -1244,7 +1384,7 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
@@ -1334,14 +1474,15 @@ void main() {
             std::ptr::write_bytes(readback_ptr, 0, total_bytes);
         }
 
-        assert!(record_clamp(
+        assert!(record_clamp_as(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
             budget_gpu,
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
+            0,
         ));
         done_on(&warp.list, &dst_buf);
 
@@ -1402,9 +1543,29 @@ void main() {
     /// and `HostList::reset` end-to-end on the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
-        let Some(host) = super::host() else {
+        scratch_across_submissions(false);
+    }
+
+    /// The same with the scratch buffer kept readable
+    /// (`VICTORY_INDIRECT_READABLE=1`): the list's tracked state of it
+    /// across clamps, growth and a reset.
+    #[test]
+    fn host_list_keeps_its_scratch_readable_across_clamps_growth_and_reset() {
+        scratch_across_submissions(true);
+    }
+
+    /// Clamps into a host list's scratch buffer, grows it, and runs the
+    /// list twice. `keep`: the scratch buffer stays readable as arguments
+    /// after a clamp (`VICTORY_INDIRECT_READABLE=1`); otherwise each
+    /// execution's [`done`] returns it to the common state.
+    fn scratch_across_submissions(keep: bool) {
+        // Forced on, the switch's barriers run on a software adapter only.
+        let host = if keep { software_host() } else { super::host() };
+        let Some(host) = host else {
             return;
         };
+        // What earlier tests left in the debug layer's queue, if it is on.
+        let _ = host.log_messages();
         let Ok(list) = host.new_list() else {
             return;
         };
@@ -1419,45 +1580,311 @@ void main() {
             std::ptr::write_bytes(src_ptr, 0x7F, 256 << 10);
             (count_ptr as *mut u32).write_volatile(2);
         }
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        // Where a clamp and the end of its execution leave the buffer.
+        let rest = if keep {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            common
+        };
+        let clamped = |at: u64, spec: (u32, u32, u32)| {
+            let count = Some((&count_buf, 0));
+            let scratch = bound_as(&list, (&src_buf, at), count, spec, (0, keep)).unwrap();
+            done(&list, &scratch);
+            scratch
+        };
 
         // First two calls fit inside the initial 64 KiB scratch buffer and
-        // must reuse the exact same `ID3D12Resource`.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-        done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        done(&list, &b2);
+        // must reuse the exact same `ID3D12Resource`, which with `keep`
+        // stays readable as arguments between them.
+        let b1 = clamped(0, (0, 16, 64));
+        assert_eq!(
+            list.indirect_state(&b1),
+            rest,
+            "where a clamp and its execution leave the scratch buffer"
+        );
+        let b2 = clamped(64, (1, 20, 128));
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
             "scratch buffer within capacity must be reused"
         );
+        assert_eq!(list.indirect_state(&b2), rest);
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
-        // `b1` alive until reset.
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        done(&list, &b3);
+        // `b1` alive until reset. The new buffer starts out common.
+        let grown = list.indirect_scratch(5000 * 20).unwrap();
+        assert_eq!(
+            list.indirect_state(&grown),
+            common,
+            "a new scratch buffer is common"
+        );
+        let b3 = clamped(0, (1, 20, 5000));
+        assert_eq!(b3.as_raw(), grown.as_raw());
         assert_ne!(
             b3.as_raw(),
             b1.as_raw(),
             "larger request must grow scratch buffer"
         );
+        assert_eq!(list.indirect_state(&b3), rest);
+        assert_eq!(
+            list.indirect_state(&b1),
+            common,
+            "the replaced buffer went back to common"
+        );
 
         list.close();
+        assert_eq!(
+            list.indirect_state(&b3),
+            common,
+            "a closed list leaves its scratch buffer common"
+        );
+        // With the debug layer on (`VICTORY_D3D12_DEBUG=1`, diagnostics):
+        // every barrier recorded named the state the buffer was in. Read
+        // before the submission, which moves the messages to the log.
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
         host.execute(&[&list]);
         list.reset();
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
-        // zero new allocations.
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        done(&list, &b4);
+        // zero new allocations, from the common state again.
+        assert_eq!(
+            list.indirect_state(&b3),
+            common,
+            "a reset list starts with a common scratch buffer"
+        );
+        let b4 = clamped(0, (1, 20, 4096));
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
             "grown scratch buffer must persist across reset"
         );
+        assert_eq!(list.indirect_state(&b4), rest);
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+    }
+
+    /// A command signature of one dispatch record of `stride` bytes.
+    fn dispatch_signature(device: &ID3D12Device, stride: u32) -> ID3D12CommandSignature {
+        signature_of(
+            device,
+            D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
+            stride,
+        )
+    }
+
+    /// [`bound`], [`bound_ahead`] and [`bound_split`] take the mode from the
+    /// switch ([`readable`]): unset, every clamp's execution ends with the
+    /// scratch buffer common; with `VICTORY_INDIRECT_READABLE=1` in the
+    /// test's environment it stays readable until the list closes.
+    #[test]
+    fn host_list_clamps_follow_the_switch() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src_buf, src_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: the mapping holds 256 bytes.
+        unsafe { std::ptr::write_bytes(src_ptr, 0, 256) };
+        let rest = if readable() {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        // Each clamp, then what follows its execution.
+        let executed = |scratch: Option<ID3D12Resource>| {
+            let scratch = scratch.unwrap();
+            done(&list, &scratch);
+            assert_eq!(list.indirect_state(&scratch), rest);
+        };
+        executed(bound(&list, (&src_buf, 0), None, (2, 12, 1)));
+        executed(bound_ahead(&list, (&src_buf, 0), (10, 32, 4)));
+        executed(bound_split(&list, (&src_buf, 0)));
         list.close();
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// The bytes of the dispatch records `groups`: three words each, `step`
+    /// bytes apart, the rest of each record ones.
+    fn dispatch_bytes(groups: &[u32], step: u32) -> Vec<u8> {
+        let mut bytes = vec![0xffu8; groups.len() * step as usize];
+        for (i, &g) in groups.iter().enumerate() {
+            for (w, word) in [g, 1, 1].into_iter().enumerate() {
+                let at = i * step as usize + w * 4;
+                bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// Records the dispatch records `groups` ([`dispatch_bytes`]) into a
+    /// fresh mapped buffer of `warp`'s device.
+    fn dispatch_records(warp: &WarpHarness, groups: &[u32], step: u32) -> ID3D12Resource {
+        let bytes = dispatch_bytes(groups, step);
+        let (buffer, ptr, _) = warp.shared_buffer(bytes.len() as u64);
+        // SAFETY: the mapping holds the records' bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        buffer
+    }
+
+    /// Two windows in one list, as `crate::draw` records them with
+    /// `VICTORY_INDIRECT_READABLE=1`: each clamps its records ahead, then
+    /// one execution per record reads the scratch buffer with no barrier
+    /// between them; the second clamp moves the scratch buffer straight
+    /// from arguments back to unordered access. Every record runs once,
+    /// with the group count it asked for.
+    #[test]
+    fn warp_window_executions_read_their_records_with_no_barrier_between() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        // The title names 12 bytes and keeps its records 32 apart.
+        const STRIDE: u32 = 12;
+        const STEP: u32 = 32;
+        let windows: [&[u32]; 2] = [&[1, 2, 3, 4], &[10, 11, 12, 13]];
+        let sources: Vec<ID3D12Resource> = windows
+            .iter()
+            .map(|g| dispatch_records(&warp, g, STEP))
+            .collect();
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+        let dst_buf = warp.default_uav(u64::from(STEP) * 4);
+        let sig = warp.signature(KIND_DISPATCH, STRIDE);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+        }
+        let mut state = D3D12_RESOURCE_STATE_COMMON;
+        for (groups, src) in windows.iter().zip(&sources) {
+            assert!(record_clamp_as(
+                &warp.clamp,
+                &warp.list,
+                (&dst_buf, state),
+                budget_gpu,
+                (src, 0),
+                None,
+                (KIND_DISPATCH, STEP, groups.len() as u32),
+                AHEAD,
+            ));
+            state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            // SAFETY: an open list; the worker's root signature and
+            // pipeline; the scratch buffer is readable as arguments.
+            unsafe {
+                warp.list.SetComputeRootSignature(&warp.worker.root);
+                warp.list.SetPipelineState(&warp.worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                for i in 0..groups.len() as u64 {
+                    let at = i * u64::from(STEP);
+                    warp.list.ExecuteIndirect(&sig, 1, &dst_buf, at, None, 0);
+                }
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (hits, spent) = unsafe {
+            (
+                (hits_ptr as *const u32).read_volatile(),
+                (budget_ptr as *const u32).read_volatile(),
+            )
+        };
+        let expected: u32 = windows.iter().flat_map(|g| g.iter()).sum();
+        assert_eq!(hits, expected, "every record of both windows runs once");
+        assert_eq!(spent, expected * 64, "and is charged what it asked for");
+    }
+
+    /// The windows of `warp_window_executions_read_their_records_with_no_barrier_between`
+    /// through a host list (`bound_ahead` with the scratch buffer kept
+    /// readable, the list's tracked scratch state, `Host::execute`), twice:
+    /// on the first recording the scratch buffer starts common, on the
+    /// second (after the reset) it starts common again. With the debug
+    /// layer on (`VICTORY_D3D12_DEBUG=1` in a diagnostics build) no barrier
+    /// names a state the buffer is not in. On a software adapter only
+    /// ([`software_host`]): the switch is forced on here.
+    #[test]
+    fn host_list_window_executions_need_no_barrier_of_their_own() {
+        let Some(host) = software_host() else {
+            return;
+        };
+        // What earlier tests left in the debug layer's queue, if it is on.
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        const STEP: u32 = 32;
+        let signature = dispatch_signature(&host.device, STRIDE);
+        let windows: [&[u32]; 2] = [&[1, 2, 3, 4], &[10, 11, 12, 13]];
+        let mut sources = Vec::new();
+        for groups in windows {
+            let bytes = dispatch_bytes(groups, STEP);
+            let Some((buffer, ptr)) = host.shared_buffer(bytes.len() as u64) else {
+                return;
+            };
+            // SAFETY: the mapping holds the records' bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+            sources.push(buffer);
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        let expected: u32 = windows.iter().flat_map(|g| g.iter()).sum();
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        for _ in 0..2 {
+            // SAFETY: the mapping holds 256 bytes; nothing runs.
+            unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+            for (groups, src) in windows.iter().zip(&sources) {
+                let spec = (KIND_DISPATCH, STEP, groups.len() as u32);
+                let scratch = bound_as(&list, (src, 0), None, spec, (AHEAD, true)).unwrap();
+                assert_eq!(
+                    list.indirect_state(&scratch),
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+                );
+                // SAFETY: an open list; the worker's root signature and
+                // pipeline; buffers the test holds until the list has run.
+                unsafe {
+                    list.list.SetComputeRootSignature(&worker.root);
+                    list.list.SetPipelineState(&worker.pso);
+                    list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                }
+                for i in 0..groups.len() as u64 {
+                    let at = i * u64::from(STEP);
+                    // SAFETY: as above; the scratch buffer is readable as
+                    // arguments.
+                    unsafe {
+                        list.list
+                            .ExecuteIndirect(&signature, 1, &scratch, at, None, 0)
+                    };
+                    // What `State::execute_indirect` records after an
+                    // execution: nothing, for a buffer kept readable.
+                    done(&list, &scratch);
+                }
+                assert_eq!(
+                    list.indirect_state(&scratch),
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+                );
+            }
+            list.close();
+            // With the debug layer on: nothing it objects to was recorded.
+            // Read before the submission, which moves the messages to the log.
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; a mapped buffer.
+            let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+            assert_eq!(hits, expected, "every record of both windows runs once");
+        }
     }
 }
 
