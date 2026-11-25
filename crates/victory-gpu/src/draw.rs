@@ -2138,8 +2138,11 @@ impl State {
 
     /// What a draw or dispatch runs, for the device-removed report
     /// (diagnostics): the pipeline, then per stage the user data it gets
-    /// (with the view at that heap index, if one is), the host addresses
-    /// of its root views and the views its tables name.
+    /// (`table` values with the view the table starts at; `const` values
+    /// with the view at that heap index, if one is, since dynamic resources
+    /// may index the heap with one, though most are plain numbers; `host`
+    /// values, which VIctory computes, with none), the host addresses of
+    /// its root views and the views its tables name.
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
@@ -2184,10 +2187,23 @@ impl State {
                     RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
                     _ => self.user_value(compute, u.slot, u.root, u.dword),
                 };
-                let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
-                if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
-                    let _ = write!(text, " [heap {index}: {slot}]");
+                // A host word is an address VIctory computes, not a heap
+                // index: it gets no view.
+                let (root, index) = match u.root {
+                    RootType::Table => ("table", Some(v / 32)),
+                    RootType::Other(_) => ("host", None),
+                    _ => ("const", Some(v)),
+                };
+                let _ = write!(text, " u{}={v:#x} {root}", u.index);
+                if let Some(index) = index
+                    && let Some(slot) = views.and_then(|h| h.describe_slot(index))
+                {
+                    let at = if root == "table" {
+                        "heap"
+                    } else {
+                        "as heap index"
+                    };
+                    let _ = write!(text, " [{at} {index}: {slot}]");
                 }
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
