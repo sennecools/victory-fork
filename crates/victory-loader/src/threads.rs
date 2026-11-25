@@ -107,27 +107,34 @@ extern "C" fn detach_all() {
     // needs the heap and the log writer's lock.
     // Its thread id, set when it runs its own code; 0 until then.
     static WATCHDOG: AtomicU32 = AtomicU32::new(0);
-    drop(std::thread::spawn(|| {
-        // SAFETY: a plain query of the calling thread.
-        let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-        WATCHDOG.store(id, Ordering::SeqCst);
-        std::thread::sleep(DETACH_DEADLINE);
-        end_process();
-    }));
-    // Its start (loader notices, Rust's thread set-up) is done only when
-    // it runs its own code. The loader notices need the loader lock. This
-    // thread can hold it, or a thread that waits for this thread can hold
-    // it. Then the watchdog does not start, so this wait has the same
-    // deadline.
-    let waiting = Instant::now();
-    let watchdog = loop {
-        match WATCHDOG.load(Ordering::SeqCst) {
-            0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(),
-            0 => std::thread::yield_now(),
-            id => break id,
-        }
-    };
-    end_other_threads(&[watchdog]);
+    let mut keep = [0; 1];
+    let mut keep_len = 0;
+    if std::thread::Builder::new()
+        .spawn(|| {
+            // SAFETY: a plain query of the calling thread.
+            let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            WATCHDOG.store(id, Ordering::SeqCst);
+            std::thread::sleep(DETACH_DEADLINE);
+            end_process();
+        })
+        .is_ok()
+    {
+        // Its start (loader notices, Rust's thread set-up) is done only when
+        // it runs its own code. The loader notices need the loader lock. This
+        // thread can hold it, or a thread that waits for this thread can hold
+        // it. Then the watchdog does not start, so this wait has the same
+        // deadline.
+        let waiting = Instant::now();
+        keep[0] = loop {
+            match WATCHDOG.load(Ordering::SeqCst) {
+                0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(),
+                0 => std::thread::yield_now(),
+                id => break id,
+            }
+        };
+        keep_len = 1;
+    }
+    end_other_threads(&keep[..keep_len]);
     for image in dlls.iter().chain(&exes) {
         // SAFETY: attached images are bound. A non-null third argument
         // tells the entry points the process is ending.
@@ -435,5 +442,33 @@ mod tests {
             out.status.success() && text.contains("ENDED KEPT"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn exit_process_runs_detach_all_without_panic() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "threads::tests::exit_process_child",
+                "--nocapture",
+            ])
+            .env("VICTORY_EXIT_PROCESS_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn exit_process_child() {
+        if std::env::var_os("VICTORY_EXIT_PROCESS_CHILD").is_none() {
+            return;
+        }
+        super::attached(0);
+        // SAFETY: ends the process gracefully, running atexit functions.
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(0) };
     }
 }
