@@ -1116,8 +1116,37 @@ fn effects(
             } else if let Some(d) = &v.dst {
                 if dst_indexed {
                     indexed(d, &mut w)?;
+                    indexed(d, &mut r)?;
                 } else {
                     regs(d, &mut w)?;
+                    let reads_dst = matches!(
+                        name,
+                        "v_fmac_f32"
+                            | "v_mac_f32"
+                            | "v_mac_legacy_f32"
+                            | "v_fmac_f16"
+                            | "v_mac_f16"
+                            | "v_pk_fmac_f16"
+                            | "v_dot2c_f32_f16"
+                            | "v_dot4c_i32_i8"
+                            | "v_writelane_b32"
+                    ) || (matches!(name, "v_permlane16_b32" | "v_permlanex16_b32")
+                        && v.opsel & 2 == 0)
+                        || v.opsel & 8 != 0
+                        || matches!(
+                            v.dpp,
+                            Some(gfx10::Dpp::Row {
+                                row_mask,
+                                bank_mask,
+                                bound_ctrl,
+                                ..
+                            }) if row_mask != 0xF || bank_mask != 0xF || !bound_ctrl
+                        )
+                        || matches!(v.sdwa, Some(sd) if sd.dst_unused == 2 && sd.dst_sel < 6)
+                        || (v.sdwa.is_none_or(|sd| sd.dst_unused == 2) && valu_writes_half(name));
+                    if reads_dst {
+                        regs(d, &mut r)?;
+                    }
                 }
             }
             if let Some(c) = &v.carry {
@@ -1132,9 +1161,6 @@ fn effects(
                 }
                 "v_swaprel_b32" => {
                     indexed(&v.src[0], &mut w)?;
-                    if let Some(d) = &v.dst {
-                        indexed(d, &mut r)?;
-                    }
                 }
                 "v_div_fmas_f32" | "v_div_fmas_f64" => r.extend(mask(VCC)),
                 _ => {}
@@ -1146,6 +1172,9 @@ fn effects(
         Fields::Vintrp { dst, src, .. } => {
             regs(src, &mut r)?;
             r.push(Reg::S(M0));
+            if name == "v_interp_p2_f32" {
+                regs(dst, &mut r)?;
+            }
             regs(dst, &mut w)?;
         }
         Fields::Ds {
@@ -1159,6 +1188,9 @@ fn effects(
                 regs(o, &mut r)?;
             }
             if let Some(d) = dst {
+                if name.contains("_d16") {
+                    regs(d, &mut r)?;
+                }
                 regs(d, &mut w)?;
             }
             if *gds
@@ -1191,6 +1223,9 @@ fn effects(
             if let Some(d) = data {
                 if name.contains("_load_") {
                     if !lds {
+                        if load_preserves_half(name) {
+                            regs(d, &mut r)?;
+                        }
                         regs(d, &mut w)?;
                     }
                 } else if name.contains("_store_") {
@@ -1210,6 +1245,8 @@ fn effects(
             addr,
             rsrc,
             sampler,
+            dmask,
+            d16,
             cache,
             ..
         } => {
@@ -1224,6 +1261,9 @@ fn effects(
                     regs(&atomic_result(data, name), &mut w)?;
                 }
             } else {
+                if *d16 && !name.starts_with("image_gather4") && dmask.count_ones() % 2 == 1 {
+                    regs(data, &mut r)?;
+                }
                 regs(data, &mut w)?;
             }
         }
@@ -1238,6 +1278,9 @@ fn effects(
                 regs(o, &mut r)?;
             }
             if let Some(d) = dst {
+                if name.contains("_load_") && load_preserves_half(name) {
+                    regs(d, &mut r)?;
+                }
                 regs(d, &mut w)?;
             }
         }
@@ -1257,6 +1300,45 @@ fn effects(
         new
     });
     Ok(Some((r, w)))
+}
+
+/// Whether a VALU opcode writes a single 16-bit half of its destination VGPR
+/// (preserving the other 16-bit half on GFX10 unless overridden by SDWA).
+fn valu_writes_half(name: &str) -> bool {
+    if name.starts_with("v_cmp")
+        || name.starts_with("v_pk_")
+        || name.starts_with("v_pack_")
+        || name.starts_with("v_cvt_pk")
+        || name.starts_with("v_sad_")
+        || name.starts_with("v_dot")
+        || matches!(
+            name,
+            "v_mad_u32_u16" | "v_mad_i32_i16" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16"
+        )
+    {
+        return false;
+    }
+    if let Some(rest) = name.strip_prefix("v_cvt_") {
+        return rest.starts_with("f16_")
+            || rest.starts_with("u16_")
+            || rest.starts_with("i16_")
+            || rest.starts_with("norm_i16_")
+            || rest.starts_with("norm_u16_");
+    }
+    name.ends_with("_f16")
+        || name.ends_with("_u16")
+        || name.ends_with("_i16")
+        || name.ends_with("_b16")
+}
+
+/// Whether a D16 memory load writes an odd number of 16-bit halves, preserving
+/// the untouched half of its final destination VGPR.
+fn load_preserves_half(name: &str) -> bool {
+    name.ends_with("_d16")
+        || name.ends_with("_d16_hi")
+        || name.ends_with("_d16_x")
+        || name.ends_with("_d16_hi_x")
+        || name.ends_with("_d16_xyz")
 }
 
 /// Scalar ALU opcodes that set SCC (carry, overflow, comparison, or "result
@@ -1543,5 +1625,55 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn operand_reads_includes_implicit_destination_reads_for_rmw_and_partial_writes() {
+        let words: &[u32] = &[
+            0x560A_0401, // 0: v_fmac_f32 v5, s1, v2 (reads accumulator v5)
+            0x060A_0401, // 1: v_add_f32 v5, s1, v2 (overwrites v5)
+            0xD761_0005,
+            0x0001_0001, // 2: v_writelane_b32 v5, s1, 0 (keeps other lanes of v5)
+            0xC815_0001, // 3: v_interp_p2_f32 v5, v1, attr0.x (accumulates into v5)
+            0xC814_0001, // 4: v_interp_p1_f32 v5, v1, attr0.x (overwrites v5)
+            0x640A_0401, // 5: v_add_f16 v5, s1, v2 (preserves high half of v5)
+            0x7E0A_02FA,
+            0xFF00_1101, // 6: v_mov_b32 v5, v1 row_shr:1 bound_ctrl:0 (preserves v5 on OOB)
+            0x7E0A_02FA,
+            0xFF08_1101, // 7: v_mov_b32 v5, v1 row_shr:1 bound_ctrl:1 (writes all active lanes)
+            0xD778_0005,
+            0x0201_0101, // 8: v_permlanex16_b32 v5, v1, 0, 0 (BOUND_CTRL=0 preserves v5)
+            0xD778_1005,
+            0x0201_0101, // 9: v_permlanex16_b32 v5, v1, 0, 0 bound_ctrl:1 (overwrites active lanes)
+            0x7E0A_02F9,
+            0x0606_1401, // 10: v_mov_b32_sdwa v5, v1 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+            0x7E0A_02F9,
+            0x0606_0401, // 11: v_mov_b32_sdwa v5, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD
+            0xDA98_0000,
+            0x0500_0001, // 12: ds_read_u16_d16 v5, v1 (preserves high half of v5)
+            0xD8D8_0000,
+            0x0500_0001, // 13: ds_read_b32 v5, v1 (overwrites v5)
+            S_ENDPGM,
+        ];
+        let p = build_words(words, false);
+        let insts = &p.blocks[0].insts;
+        let reads_v5 = |idx: usize, expected_name: &str| {
+            assert_eq!(insts[idx].name(), expected_name);
+            operand_reads(&p, &insts[idx]).contains(&Reg::V(5))
+        };
+        assert!(reads_v5(0, "v_fmac_f32"));
+        assert!(!reads_v5(1, "v_add_f32"));
+        assert!(reads_v5(2, "v_writelane_b32"));
+        assert!(reads_v5(3, "v_interp_p2_f32"));
+        assert!(!reads_v5(4, "v_interp_p1_f32"));
+        assert!(reads_v5(5, "v_add_f16"));
+        assert!(reads_v5(6, "v_mov_b32"));
+        assert!(!reads_v5(7, "v_mov_b32"));
+        assert!(reads_v5(8, "v_permlanex16_b32"));
+        assert!(!reads_v5(9, "v_permlanex16_b32"));
+        assert!(reads_v5(10, "v_mov_b32"));
+        assert!(!reads_v5(11, "v_mov_b32"));
+        assert!(reads_v5(12, "ds_read_u16_d16"));
+        assert!(!reads_v5(13, "ds_read_b32"));
     }
 }
