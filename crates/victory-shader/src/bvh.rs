@@ -196,8 +196,10 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        // A box whose minimum x is NaN is switched off, as is an absent
+        // child (NONE): an absent child must never get a finite sort key,
+        // or it can sort ahead of a real hit.
+        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -425,6 +427,20 @@ pub(crate) mod tests {
         // Backwards: nothing.
         let back = Ray::new([0.0; 3], [-1.0, 0.0, 0.0], 1000.0);
         assert_eq!(intersect(&node, 5, &back, true), [NONE; 4]);
+    }
+
+    #[test]
+    fn sorted_boxes_put_absent_children_after_real_hits() {
+        let bounds = [
+            [-1.0, -1.0, 1.0, 1.0, 1.0, 2.0],
+            [-1.0, -1.0, 3.0, 1.0, 1.0, 4.0],
+            [0.0; 6],
+            [0.0; 6],
+        ];
+        let ids = [NONE, 8, NONE, NONE];
+        let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 10.0);
+        assert_eq!(boxes(&ids, &bounds, &ray, true), [8, NONE, NONE, NONE]);
+        assert_eq!(boxes(&ids, &bounds, &ray, false), ids);
     }
 
     #[test]
