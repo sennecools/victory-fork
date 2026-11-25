@@ -51,6 +51,14 @@
 //! twice per clamp. `VICTORY_CLAMP_PRECISE=1` ([`precise`]; off by default)
 //! keeps only the waits the clamp needs ([`Waits`]).
 //!
+//! With `VICTORY_CLAMP_BATCH=1` ([`batch`]; off by default) the indirect
+//! executions of a list between two commands that may write their
+//! arguments share one clamp ([`ClampBatch`], [`BATCH_SOURCE`]): it is
+//! recorded before the first of them, with its waits, and the records of
+//! each execution recorded after it go to a slot of their own in the
+//! batch's scratch buffer, which the clamp reads the list of from upload
+//! memory when the list runs.
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -59,7 +67,7 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D_SHADER_MACRO, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, OpKind, host, transition};
 
@@ -606,10 +614,10 @@ pub(crate) fn lean() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_LEAN").is_some_and(|v| v == "1"))
 }
 
-/// The clamp for `device` compiled from `source` ([`SOURCE`] or
-/// [`GROUP_SOURCE`]); `notes`: with the atomics that note what indirect
-/// compute records asked for (`NOTE_COMPUTE` in the source; without them
-/// with [`lean`]).
+/// The clamp for `device` compiled from `source` ([`SOURCE`],
+/// [`GROUP_SOURCE`], [`MESH_BATCH_SOURCE`] or [`BATCH_SOURCE`]); `notes`:
+/// with the atomics that note what indirect compute records asked for
+/// (`NOTE_COMPUTE` in the source; without them with [`lean`]).
 fn make_from(device: &ID3D12Device, source: &str, notes: bool) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -1091,14 +1099,37 @@ fn record_gpu_clamp(
     [src_gpu, count_gpu, dst_gpu, budget]: [u64; 4],
     groups: u32,
 ) {
-    // SAFETY: an open list; our root signature and pipeline; live source,
-    // count, scratch destination, and budget buffers. `src` and `count` stay
-    // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
-    // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
-    // earlier execution's reads of the scratch buffer, and its move back
-    // orders them before the execution that reads them; nothing else
-    // writes it. Diagnostics: counted.
+    let launch = (groups > 0).then_some(|| {
+        // SAFETY: an open list with `c`'s root signature and pipeline set;
+        // live source, count, scratch destination, and budget buffers.
+        // `src` and `count` stay in `COMMON` / `GENERIC_READ` via implicit
+        // buffer promotion.
+        unsafe {
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, count_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.Dispatch(groups, 1, 1);
+        }
+    });
+    record_clamp_between(c, l, waits, (dst, before), launch);
+}
+
+/// Records clamp `c` between `waits`, moving `dst` from `before` to
+/// unordered access and on to `INDIRECT_ARGUMENT`: `launch`, if given, binds
+/// the clamp's inputs and runs it, after `c`'s root signature and pipeline
+/// are set (none: the state changes only). Counted as one clamp
+/// (`C::IndirectBounded`, `Count::Clamps`), whatever it bounds. Shared by
+/// a clamp of its own ([`record_gpu_clamp`]) and a batch's
+/// ([`record_batch_clamp`]).
+fn record_clamp_between(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    waits: Waits<'_>,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    launch: Option<impl FnOnce()>,
+) {
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     let wait = match waits.before {
@@ -1128,18 +1159,19 @@ fn record_gpu_clamp(
         count(Count::UavClampFirst, u64::from(waits.before == Wait::All));
         count(Count::UavClampSecond, u64::from(waits.after));
     }
+    // SAFETY: an open list; our root signature and pipeline; `dst`, a live
+    // buffer, transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // Moving it out of `INDIRECT_ARGUMENT` orders this clamp's writes after
+    // every earlier execution's reads of the scratch buffer, and its move
+    // back orders them before the executions that read them; nothing else
+    // writes it.
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip_first..]);
-        if groups > 0 {
+        if let Some(launch) = launch {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(groups, 1, 1);
+            launch();
         }
         l.ResourceBarrier(&second[skip_second..]);
     }
@@ -1379,6 +1411,659 @@ fn grouped_mesh_as(
 #[cfg(test)]
 pub(crate) fn open_batch(list: &HostList, src: &ID3D12Resource) -> bool {
     grouped_mesh_as(list, 0, 0, |list| MeshBatch::open(list, 0, src, readable())).is_some()
+}
+
+/// The clamp of a batch of indirect executions ([`ClampBatch`],
+/// `VICTORY_CLAMP_BATCH=1`): [`GROUP_SOURCE`]'s bounds and charge, for the
+/// records of every execution of the batch in one dispatch. In the place of
+/// the constants, the batch's list of executions in upload memory (`calls`,
+/// written as they are recorded, read when the list runs): the dispatch's
+/// own arguments (the groups in x, 1, 1), how many executions, then
+/// [`BATCH_ENTRY`] bytes for each: its kind, stride, records and argument
+/// offset as [`SOURCE`] takes them; the count and split bits, the count's
+/// offset, where its slot starts in the scratch buffer and its first group;
+/// whether its count lies in the argument buffer (else in `count_buf`).
+/// Each group clamps records of one execution, 64 at a time, into that
+/// execution's slot, as [`GROUP_SOURCE`] clamps them into a scratch buffer
+/// of their own. The groups of different executions charge the budget in
+/// the order the card runs them, as the groups of one execution do.
+const BATCH_SOURCE: &str = r#"
+#define RS "SRV(t0), SRV(t1), SRV(t2), UAV(u0), UAV(u1)"
+ByteAddressBuffer src_args : register(t0);
+ByteAddressBuffer count_buf : register(t1);
+ByteAddressBuffer calls : register(t2);
+RWByteAddressBuffer dst_args : register(u0);
+// The list's work so far (vertex instances, threads): past the budget,
+// records run empty.
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+// Groups of one dispatch; more run empty.
+static const uint GROUPS = 1u << 20;
+static const uint SPLIT = 2;
+// The list's layout (BATCH_HEAD, BATCH_ENTRY and ClampBatch::append in Rust):
+// where the head keeps the count of executions, and where in an entry its
+// slot and first group are and whether its count lies in the arguments.
+static const uint HEAD = 16;
+static const uint ENTRY = 48;
+static const uint EXECUTIONS_AT = 12;
+static const uint PLACE_AT = 16;
+static const uint FIRST_GROUP_AT = 28;
+static const uint IN_ARGS_AT = 32;
+groupshared uint costs[64];
+groupshared uint fits[64];
+// What the group's mesh records asked for: the largest group count, and
+// the groups in all.
+groupshared uint largest_asked;
+groupshared uint all_asked;
+#ifdef NOTE_COMPUTE
+// Diagnostics (left out with VICTORY_CLAMP_LEAN=1), of the group's compute
+// records: the largest x asked for, and the records that asked for more
+// groups in x than one dispatch runs.
+groupshared uint widest_asked;
+groupshared uint cut_asked;
+#endif
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint gi : SV_GroupIndex) {
+    // The execution whose records the group clamps: the last one whose
+    // first group is at or before it (the same for every thread).
+    uint executions = calls.Load(EXECUTIONS_AT);
+    uint lo = 0;
+    uint hi = executions;
+    while (hi - lo > 1) {
+        uint mid = (lo + hi) / 2;
+        if (calls.Load(HEAD + mid * ENTRY + FIRST_GROUP_AT) <= group.x) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    uint entry = HEAD + lo * ENTRY;
+    uint4 shape = calls.Load4(entry);
+    uint4 place = calls.Load4(entry + PLACE_AT);
+    uint kind = shape.x;
+    uint stride = shape.y;
+    uint records = shape.z;
+    uint args_offset = shape.w;
+    uint has_count = place.x;
+    uint count_offset = place.y;
+    uint dst_base = place.z;
+    uint first_group = place.w;
+    bool count_in_args = calls.Load(entry + IN_ARGS_AT) != 0;
+    uint eff_count = records;
+    bool split = (has_count & 4u) != 0;
+    if ((has_count & 1u) != 0) {
+        uint counted = count_in_args ? src_args.Load(count_offset) : count_buf.Load(count_offset);
+        eff_count = min(eff_count, counted);
+    }
+    // The record of the execution this thread clamps.
+    uint first = (group.x - first_group) * 64u;
+    uint rec = first + gi;
+    // Threads past the records take part in the group's charge (cost 0)
+    // and store nothing.
+    bool active = executions > 0 && rec < eff_count;
+    uint src_at = args_offset + rec * stride;
+    uint dst_at = dst_base + rec * stride;
+    uint cost = 0;
+    uint asked = 0;
+    uint2 draw_counts = uint2(0, 0);
+    uint3 groups = uint3(0, 0, 0);
+    if (gi == 0) {
+        largest_asked = 0;
+        all_asked = 0;
+#ifdef NOTE_COMPUTE
+        widest_asked = 0;
+        cut_asked = 0;
+#endif
+    }
+    if (active && kind <= 1) {
+        // Draws: vertex or index count, then instances.
+        uint2 want = src_args.Load2(src_at);
+        uint count = min(want.x, 1u << 24);
+        uint instances = min(want.y, (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        draw_counts = uint2(count, instances);
+    } else if (active && kind == 2) {
+        uint3 wanted = src_args.Load3(src_at);
+#ifdef NOTE_COMPUTE
+        // Not the garbage of a slot nothing wrote.
+        if (wanted.x <= (1u << 24) && wanted.y <= 64u && wanted.z <= 64u) {
+            asked = wanted.x;
+        }
+#endif
+        uint3 g = min(wanted, uint3(65535u, 65535u, 65535u));
+        // In parts: one dimension, and not the garbage of an argument
+        // nothing wrote.
+        if (split && g.y <= 1u && g.z <= 1u && wanted.x <= SPLIT * 65535u) {
+            g.x = wanted.x;
+        }
+        // x * y fits 32 bits; the whole count may not.
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64u;
+        groups = g;
+    } else if (active) {
+        // Mesh dispatches: the console's are one-dimensional.
+        uint3 g = src_args.Load3(src_at);
+        asked = g.x;
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z * 128u;
+        groups = g;
+    }
+    costs[gi] = cost;
+    GroupMemoryBarrierWithGroupSync();
+    if (active && kind > 2) {
+        uint was;
+        InterlockedMax(largest_asked, asked, was);
+        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+    }
+#ifdef NOTE_COMPUTE
+    if (active && kind == 2) {
+        uint was;
+        InterlockedMax(widest_asked, asked, was);
+        if (asked > 65535u) {
+            InterlockedAdd(cut_asked, 1u, was);
+        }
+    }
+#endif
+    // The group's own records; none past a count buffer's count, which
+    // touches the budget not at all.
+    uint n = (executions > 0 && eff_count > first) ? min(64u, eff_count - first) : 0u;
+    if (gi == 0 && n > 0) {
+        // What the records charge, from `before` on, in lane order: a
+        // record that does not fit whole runs empty and takes the rest.
+        uint before;
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint next = before;
+            for (uint j = 0; j < n; j++) {
+                uint c = costs[j];
+                if (c > 0 && next < BUDGET) {
+                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                }
+            }
+            if (next == before) break;
+            uint prev;
+            budget.InterlockedCompareExchange(0, before, next, prev);
+            if (prev == before) break;
+            before = prev;
+        }
+        uint at = before;
+        for (uint k = 0; k < n; k++) {
+            uint c = costs[k];
+            uint fit = 1;
+            if (c > 0) {
+                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+            }
+            fits[k] = fit;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0 && kind > 2 && n > 0) {
+        uint was;
+        budget.InterlockedMax(4, largest_asked, was);
+        budget.InterlockedAdd(8, all_asked, was);
+    }
+#ifdef NOTE_COMPUTE
+    if (gi == 0 && kind == 2 && n > 0) {
+        uint was;
+        budget.InterlockedMax(12, widest_asked, was);
+        budget.InterlockedAdd(16, cut_asked, was);
+    }
+#endif
+    if (!active) {
+        return;
+    }
+    bool over = fits[gi] == 0;
+    if (kind <= 1) {
+        if (over) {
+            draw_counts = uint2(0, 0);
+        }
+        dst_args.Store2(dst_at, draw_counts);
+        for (uint off = 8; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    } else {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        if (split) {
+            for (uint part = 0; part < SPLIT; part++) {
+                uint before = part * 65535u;
+                uint x = groups.x > before ? min(groups.x - before, 65535u) : 0u;
+                dst_args.Store3(dst_base + part * 12u, uint3(x, groups.yz));
+            }
+            return;
+        }
+        dst_args.Store3(dst_at, groups);
+        for (uint off = 12; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    }
+}
+"#;
+
+/// Whether the indirect executions of a list share clamps
+/// (`VICTORY_CLAMP_BATCH=1`; off by default; [`ClampBatch`]).
+///
+/// Each indirect execution takes a clamp of its own: a compute dispatch
+/// between two waits for every earlier shader write (one with
+/// `VICTORY_CLAMP_PRECISE=1`), thousands a frame. With the switch,
+/// `crate::draw` gives an execution (not one of a window of
+/// `VICTORY_INDIRECT_WINDOW=1`, nor a mesh draw a batch of
+/// `VICTORY_GROUPED_MESH_CLAMP=1` takes) to the list's open batch
+/// ([`bound_batched`]): the batch's clamp is recorded before its first
+/// execution, with the waits a clamp of its own has, and clamps the records
+/// of every execution of the batch, each into a slot of its own. An
+/// execution joins the open batch only if nothing recorded since its clamp
+/// may have written memory (`HostList::may_write`: a draw or dispatch whose
+/// shaders store, a title barrier, copy, clear or value write, a buffer
+/// moved to be written), no state change was recorded since then for its
+/// argument or count buffer (the clamp read them as they were), its
+/// arguments lie in the batch's argument buffer and its count in that or
+/// the batch's count buffer, and it fits ([`BATCH_CALLS`] executions,
+/// [`BATCH_BYTES`] of records; the bytes also keep the dispatch's groups far
+/// below what one dispatch runs, [`BATCH_GROUPS`]); otherwise it opens the
+/// next batch, after what was recorded. One whose records alone are more
+/// than a batch holds takes a clamp of its own. The batch's scratch buffer
+/// stays readable as indirect arguments until the next batch's clamp, and
+/// goes back to common when the list closes ([`close_batch`]).
+///
+/// What a record is clamped to is what a clamp of its own gives it. The
+/// budget is charged when the batch's clamp runs, before its first
+/// execution, so for every execution of the batch at once; which records
+/// of a list past its budget still fit is then the order the card runs the
+/// batch's groups in, not the order of the executions. The batch charges
+/// once per group, as [`GROUP_SOURCE`] does (`VICTORY_CLAMP_GROUP=1`).
+///
+/// The batch takes on `VICTORY_CLAMP_PRECISE`'s risk even with that switch
+/// off: a later execution of the batch has its records read when the
+/// batch's clamp runs, so a shader write its translation does not know of
+/// (no `may_write`), recorded after the batch's clamp, is no longer waited
+/// for: the execution runs on the records as they were before that write.
+pub(crate) fn batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// The most executions one batch clamps.
+pub(crate) const BATCH_CALLS: u32 = 128;
+/// The bytes of a batch's scratch buffer: of the records of all its
+/// executions, each slot starting at a multiple of 16 bytes.
+pub(crate) const BATCH_BYTES: u64 = 256 << 10;
+/// The most groups a batch's dispatch can have (in x), which no check needs:
+/// every record takes at least 12 bytes of [`BATCH_BYTES`] (`min_stride`),
+/// and each execution adds at most one group that is not full.
+const BATCH_GROUPS: u32 = (BATCH_BYTES / 12 / 64) as u32 + BATCH_CALLS;
+/// The bytes of [`BATCH_SOURCE`]'s list before the first execution, and of
+/// each execution (`HEAD` and `ENTRY` there; [`ClampBatch::append`] writes
+/// an entry as 12 words).
+const BATCH_HEAD: u64 = 16;
+const BATCH_ENTRY: u64 = 48;
+const _: () = assert!(BATCH_GROUPS <= 65_535 && BATCH_ENTRY == 12 * 4);
+
+/// The clamp of [`BATCH_SOURCE`], made at the first batch. A host that
+/// does not make it is told once, and the executions take a clamp each.
+fn clamp_of_batches() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let device = &host()?.device;
+            match make_from(device, BATCH_SOURCE, !lean()) {
+                Ok(c) => {
+                    tracing::info!(
+                        executions = BATCH_CALLS,
+                        "indirect executions share clamps (VICTORY_CLAMP_BATCH=1)"
+                    );
+                    Some(c)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "no clamp for batches of indirect executions (VICTORY_CLAMP_BATCH=1): \
+                         each execution is clamped alone"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// A list's batch of clamps ([`batch`]): the open batch, if any, the
+/// scratch buffer batches clamp into (made at the list's first batch, kept
+/// with the list), and whether a batch's clamp in this recording left it
+/// readable as indirect arguments.
+#[derive(Default)]
+pub(crate) struct BatchSlot {
+    open: Option<ClampBatch>,
+    scratch: Option<ID3D12Resource>,
+    readable: bool,
+}
+
+impl BatchSlot {
+    /// The list was reset: the batch of a recording that was never closed
+    /// goes with it, and the scratch buffer is common again.
+    pub(crate) fn reset(&mut self) {
+        self.open = None;
+        self.readable = false;
+    }
+
+    /// The scratch buffer, made if the list has none yet.
+    fn scratch(&mut self) -> Option<ID3D12Resource> {
+        if self.scratch.is_none() {
+            let buffer = host()?.uav_buffer(BATCH_BYTES)?;
+            crate::host::name(&buffer, || "indirect arguments of batches".to_owned());
+            self.scratch = Some(buffer);
+        }
+        self.scratch.clone()
+    }
+}
+
+/// The list closes: the open batch ends, and the scratch buffer goes back
+/// to common if a batch left it readable (the list ends as it begins).
+pub(crate) fn close_batch(list: &HostList) {
+    let mut slot = list.clamp_batch();
+    slot.open = None;
+    if std::mem::take(&mut slot.readable)
+        && let Some(scratch) = &slot.scratch
+    {
+        done_on(&list.list, scratch);
+    }
+}
+
+/// An open batch of clamps ([`batch`], `HostList::clamp_batch`): what the
+/// list had recorded when its clamp was ([`HostList::writes`], and
+/// [`HostList::buffer_changes`] of the argument and the count buffer), the
+/// argument and count buffers the clamp reads (the count buffer is the
+/// argument buffer if the first execution has none), the list of executions
+/// in upload memory, how many there are, their groups, and the bytes of the
+/// scratch buffer their slots take.
+pub(crate) struct ClampBatch {
+    writes: u64,
+    changes: (u64, u64),
+    args: ID3D12Resource,
+    counts: ID3D12Resource,
+    calls_list: usize,
+    calls: u32,
+    groups: u32,
+    used: u64,
+}
+
+/// One execution as a batch takes it: its words in the batch's list (all
+/// but its slot and its first group), its argument buffer and count
+/// buffer, the bytes of its slot and its groups.
+struct Execution<'a> {
+    words: [u32; 6],
+    args: &'a ID3D12Resource,
+    counts: Option<&'a ID3D12Resource>,
+    bytes: u64,
+    groups: u32,
+}
+
+impl<'a> Execution<'a> {
+    /// The execution of `spec` records at `src`, bounded by the count at
+    /// `count` if given (`how`: 0, or [`IN_PARTS`] for one dispatch in parts),
+    /// if a batch can take it: its layout is one the clamp takes, it has
+    /// records, its slot fits in a batch, and the offsets of its arguments
+    /// and count fit the clamp's 32 bits.
+    fn of(
+        src: (&'a ID3D12Resource, u64),
+        count: Option<(&'a ID3D12Resource, u64)>,
+        (kind, stride, records): (u32, u32, u32),
+        how: u32,
+    ) -> Option<Self> {
+        let read = validate_layout((kind, stride, records), src.1, count.map(|(_, off)| off))?;
+        let bytes = if how & IN_PARTS != 0 {
+            u64::from(SPLIT) * PART_BYTES
+        } else {
+            read
+        };
+        let fits = |off: u64, len: u64| {
+            off.checked_add(len)
+                .is_some_and(|end| end <= u64::from(u32::MAX))
+        };
+        if records == 0
+            || bytes > BATCH_BYTES
+            || !fits(src.1, read)
+            || count.is_some_and(|(_, off)| !fits(off, 4))
+        {
+            return None;
+        }
+        let has_count = u32::from(count.is_some());
+        let words = [
+            kind,
+            stride,
+            records,
+            src.1 as u32,
+            has_count | how,
+            count.map_or(0, |(_, off)| off as u32),
+        ];
+        Some(Self {
+            words,
+            args: src.0,
+            counts: count.map(|(buffer, _)| buffer),
+            bytes,
+            groups: records.div_ceil(64),
+        })
+    }
+}
+
+impl ClampBatch {
+    /// Records the clamp of a new batch whose first execution is `first`
+    /// into `list`, from the state the list left `slot`'s scratch buffer
+    /// in, and leaves the buffer readable as indirect arguments. None, with
+    /// nothing recorded, if the clamp's budget, scratch buffer, upload
+    /// memory or command signature is not there, or an address does not fit
+    /// the clamp.
+    fn open(list: &HostList, c: &Clamp, slot: &mut BatchSlot, first: &Execution) -> Option<Self> {
+        let budget = list.budget()?;
+        let scratch = slot.scratch()?;
+        let signature = crate::draw::host_signature(2, 12)?;
+        let table_bytes = BATCH_HEAD + u64::from(BATCH_CALLS) * BATCH_ENTRY;
+        let (table, table_at, table_gpu, words) = list.scratch_in(table_bytes)?;
+        let counts = first.counts.unwrap_or(first.args).clone();
+        // SAFETY: live D3D12 buffer resources.
+        let (args_gpu, counts_gpu, dst_gpu) = unsafe {
+            (
+                first.args.GetGPUVirtualAddress(),
+                counts.GetGPUVirtualAddress(),
+                scratch.GetGPUVirtualAddress(),
+            )
+        };
+        if ![args_gpu, counts_gpu, dst_gpu, budget]
+            .iter()
+            .all(|a| a.is_multiple_of(4))
+        {
+            return None;
+        }
+        // SAFETY: the list's own upload memory (256-byte aligned, alive
+        // until its reset). No execution until one is added: no groups.
+        unsafe { words.cast::<[u32; 4]>().write([0, 1, 1, 0]) };
+        let before = if slot.readable {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        let waits = Waits::for_list(list);
+        record_batch_clamp(
+            c,
+            &list.list,
+            waits,
+            (&scratch, before),
+            [args_gpu, counts_gpu, table_gpu, dst_gpu, budget],
+            (&signature, &table, table_at),
+        );
+        waits.noted(list, true);
+        slot.readable = true;
+        list.op(OpKind::Clamp, 0);
+        Some(Self {
+            writes: list.writes(),
+            changes: (
+                list.buffer_changes(first.args),
+                list.buffer_changes(&counts),
+            ),
+            args: first.args.clone(),
+            counts,
+            calls_list: words as usize,
+            calls: 0,
+            groups: 0,
+            used: 0,
+        })
+    }
+
+    /// Whether `e` can join: its buffers are the ones the clamp reads; it
+    /// fits; nothing that may write memory was recorded since the batch's
+    /// clamp, nor a change of its buffers' states. A buffer moved to be
+    /// written already ends the batch as a write; the change count also
+    /// ends it at a move between read states (to `COPY_SOURCE` and back,
+    /// say), so the batch's executions read their buffers in the states the
+    /// clamp read them in, whatever `HostList::buffer_state` counts as a
+    /// write.
+    fn accepts(&self, list: &HostList, e: &Execution) -> bool {
+        let same = |a: &ID3D12Resource, b: &ID3D12Resource| a.as_raw() == b.as_raw();
+        let kept = |buffer: &ID3D12Resource, then: u64| list.buffer_changes(buffer) == then;
+        self.calls < BATCH_CALLS
+            && self.used + e.bytes <= BATCH_BYTES
+            && same(e.args, &self.args)
+            && e.counts
+                .is_none_or(|c| same(c, &self.args) || same(c, &self.counts))
+            && list.writes() == self.writes
+            && kept(e.args, self.changes.0)
+            && e.counts.is_none_or(|c| {
+                let then = if same(c, &self.args) {
+                    self.changes.0
+                } else {
+                    self.changes.1
+                };
+                kept(c, then)
+            })
+    }
+
+    /// Adds `e`: where in the scratch buffer its records are clamped to.
+    fn append(&mut self, e: &Execution) -> u64 {
+        let at = self.used;
+        let in_args = e.counts.is_some_and(|c| c.as_raw() == self.args.as_raw());
+        let [kind, stride, records, args_offset, flags, count_offset] = e.words;
+        let entry: [u32; 12] = [
+            kind,
+            stride,
+            records,
+            args_offset,
+            flags,
+            count_offset,
+            at as u32,
+            self.groups,
+            u32::from(in_args),
+            0,
+            0,
+            0,
+        ];
+        let words = self.calls_list as *mut u8;
+        // SAFETY: the batch's list in the open list's upload memory, room
+        // for BATCH_CALLS executions after its head; `accepts` keeps
+        // `calls` below that. One thread records the list; the card reads
+        // the words when the list runs.
+        unsafe {
+            let slot = words.add((BATCH_HEAD + u64::from(self.calls) * BATCH_ENTRY) as usize);
+            slot.cast::<[u32; 12]>().write(entry);
+        }
+        self.calls += 1;
+        self.groups += e.groups;
+        debug_assert!(self.groups <= BATCH_GROUPS, "BATCH_BYTES bounds the groups");
+        self.used = (at + e.bytes).next_multiple_of(16);
+        // SAFETY: as above: the head, the dispatch's groups and the count.
+        unsafe {
+            words
+                .cast::<[u32; 4]>()
+                .write([self.groups, 1, 1, self.calls])
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ClampBatchCalls, 1);
+        crate::profile::count(crate::profile::Count::ClampBatchCalls, 1);
+        at
+    }
+}
+
+/// [`bound`] for an execution a batch of clamps takes ([`batch`]): `spec`
+/// records at `src`, bounded by the count at `count` if given, or one
+/// dispatch in parts (`parts`, as [`bound_split`] clamps it). It joins
+/// `list`'s open batch or opens one: the batch's scratch buffer, where the
+/// execution reads its records there (the parts of a dispatch follow each
+/// other [`PART_BYTES`] apart), and whether a clamp was recorded for it
+/// (which replaced the list's compute root signature and pipeline). None
+/// if no batch takes it: it then takes a clamp of its own.
+pub(crate) fn bound_batched(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    parts: bool,
+) -> Option<(ID3D12Resource, u64, bool)> {
+    bound_batched_with(list, clamp_of_batches()?, src, count, spec, parts)
+}
+
+fn bound_batched_with(
+    list: &HostList,
+    c: &Clamp,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    parts: bool,
+) -> Option<(ID3D12Resource, u64, bool)> {
+    let (spec, how) = if parts {
+        ((2, 12, 1), IN_PARTS)
+    } else {
+        (spec, 0)
+    };
+    let e = Execution::of(src, count, spec, how)?;
+    let mut slot = list.clamp_batch();
+    let joins = slot.open.as_ref().is_some_and(|b| b.accepts(list, &e));
+    if !joins {
+        slot.open = None;
+        let opened = ClampBatch::open(list, c, &mut slot, &e)?;
+        slot.open = Some(opened);
+    }
+    let scratch = slot.scratch.clone()?;
+    let at = slot.open.as_mut()?.append(&e);
+    Some((scratch, at, !joins))
+}
+
+/// Records `c`, a batch's clamp ([`BATCH_SOURCE`]), with the argument,
+/// count, list, scratch and budget addresses, between `waits`, moving
+/// `dst` from `before` to unordered access and on to `INDIRECT_ARGUMENT`.
+/// Its groups are read when the list runs, from the head of the list in
+/// upload memory: `signature` dispatches them from `table` at `at`.
+fn record_batch_clamp(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    waits: Waits<'_>,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    [args_gpu, counts_gpu, list_gpu, dst_gpu, budget]: [u64; 5],
+    (signature, table, at): (&ID3D12CommandSignature, &ID3D12Resource, u64),
+) {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ClampBatches, 1);
+    let launch = || {
+        // SAFETY: an open list with `c`'s root signature and pipeline set;
+        // live argument, count, scratch and budget buffers, and the list's
+        // upload memory for the batch's list (in `GENERIC_READ`, which holds
+        // `INDIRECT_ARGUMENT`, as upload memory always is). The argument and
+        // count buffers are where the list moved them to be read, or common
+        // (promoted).
+        unsafe {
+            l.SetComputeRootShaderResourceView(0, args_gpu);
+            l.SetComputeRootShaderResourceView(1, counts_gpu);
+            l.SetComputeRootShaderResourceView(2, list_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.ExecuteIndirect(signature, 1, table, at, None, 0);
+        }
+    };
+    record_clamp_between(c, l, waits, (dst, before), Some(launch));
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -3665,6 +4350,664 @@ void main() {
             host.execute(&[&list]);
             list.reset();
         }
+    }
+
+    /// PC argument kinds, for [`batch_calls`].
+    const KIND_DRAW: u32 = 0;
+    const KIND_INDEXED: u32 = 1;
+    const KIND_DISPATCH: u32 = 2;
+    const KIND_MESH: u32 = 10;
+
+    /// Where an execution of [`batch_calls`] finds its count, if it has
+    /// one: at a byte offset of the count buffer or of the argument buffer.
+    #[derive(Clone, Copy)]
+    enum Counted {
+        No,
+        InCounts(u64),
+        InArgs(u64),
+    }
+
+    /// An execution of [`batch_calls`]: its records' offset in the argument
+    /// buffer, kind, stride and records, its count, whether it is one
+    /// dispatch in parts, and the count's value.
+    struct Call {
+        offset: u64,
+        spec: (u32, u32, u32),
+        count: Counted,
+        parts: bool,
+        counted: u32,
+    }
+
+    impl Call {
+        /// The bytes an execution reads of its clamped records.
+        fn read(&self) -> usize {
+            if self.parts {
+                return (SPLIT as usize) * PART_BYTES as usize;
+            }
+            let (_, stride, records) = self.spec;
+            let active = match self.count {
+                Counted::No => records,
+                _ => records.min(self.counted),
+            };
+            (stride * active) as usize
+        }
+    }
+
+    /// Synthetic executions of mixed kinds, strides and counts, with
+    /// records the clamp must bound (out of range, or more than the host
+    /// runs), written into `args` and `counts` (mapped): the executions.
+    /// Every record fits the list's budget, so what each is clamped to
+    /// does not depend on the order the card charges them in.
+    fn batch_calls(args: *mut u8, counts: *mut u8) -> Vec<Call> {
+        let mut calls = Vec::new();
+        let mut at = 0u64;
+        let put = |calls: &mut Vec<Call>, call: Call, words: &[u32]| {
+            // SAFETY: the mapped buffers hold 8 KiB and 256 bytes, which
+            // these executions stay within.
+            unsafe {
+                let to = args.add(call.offset as usize).cast::<u32>();
+                for (i, w) in words.iter().enumerate() {
+                    to.add(i).write_unaligned(*w);
+                }
+                match call.count {
+                    Counted::No => {}
+                    Counted::InCounts(off) => counts
+                        .add(off as usize)
+                        .cast::<u32>()
+                        .write_unaligned(call.counted),
+                    Counted::InArgs(off) => args
+                        .add(off as usize)
+                        .cast::<u32>()
+                        .write_unaligned(call.counted),
+                }
+            }
+            calls.push(call);
+        };
+        let mut next = |len: u64| {
+            let here = at;
+            at = (at + len).next_multiple_of(16);
+            here
+        };
+        // Draws, three records, two counted (in the count buffer).
+        let offset = next(48);
+        put(
+            &mut calls,
+            Call {
+                offset,
+                spec: (KIND_DRAW, 16, 3),
+                count: Counted::InCounts(0),
+                parts: false,
+                counted: 2,
+            },
+            &[3, 1, 0, 0, 0xffff_ffff, 0, 5, 6, 9, 9, 9, 9],
+        );
+        // Indexed draws: an index count past 2^24, then instances past
+        // what 2^26 vertex instances allow.
+        let offset = next(40);
+        put(
+            &mut calls,
+            Call {
+                offset,
+                spec: (KIND_INDEXED, 20, 2),
+                count: Counted::No,
+                parts: false,
+                counted: 0,
+            },
+            &[0xffff_ffff, 0, 1, 2, 3, 100, 1 << 30, 4, 5, 6],
+        );
+        // Dispatches, 70 records (two groups of the clamp): wide, too
+        // many groups in all, and plain.
+        let offset = next(70 * 12);
+        let mut words = Vec::new();
+        for i in 0..70u32 {
+            words.extend_from_slice(match (i, i % 3) {
+                (0, _) => &[70_000, 1, 1],
+                (_, 1) => &[65_535, 65_535, 65_535],
+                (_, 2) => &[0xffff_ffff, 0xffff_ffff, 0xffff_ffff],
+                _ => &[3, 2, 1],
+            });
+        }
+        put(
+            &mut calls,
+            Call {
+                offset,
+                spec: (KIND_DISPATCH, 12, 70),
+                count: Counted::No,
+                parts: false,
+                counted: 0,
+            },
+            &words,
+        );
+        // One mesh record of all ones (a slot nothing wrote).
+        let offset = next(32);
+        put(
+            &mut calls,
+            Call {
+                offset,
+                spec: (KIND_MESH, 32, 1),
+                count: Counted::No,
+                parts: false,
+                counted: 0,
+            },
+            &[0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 7, 7, 7, 7, 7],
+        );
+        // Dispatches 16 bytes apart, counted in the argument buffer.
+        let offset = next(64);
+        let count_at = next(4);
+        put(
+            &mut calls,
+            Call {
+                offset,
+                spec: (KIND_DISPATCH, 16, 4),
+                count: Counted::InArgs(count_at),
+                parts: false,
+                counted: 3,
+            },
+            &[1, 2, 3, 11, 70_000, 2, 1, 12, 4, 5, 6, 13, 7, 8, 9, 14],
+        );
+        // One dispatch in parts, past one dispatch's groups.
+        let offset = next(12);
+        put(
+            &mut calls,
+            Call {
+                offset,
+                spec: (KIND_DISPATCH, 12, 1),
+                count: Counted::No,
+                parts: true,
+                counted: 0,
+            },
+            &[100_000, 1, 1],
+        );
+        // Draws counted past their records (in the count buffer).
+        let offset = next(32);
+        put(
+            &mut calls,
+            Call {
+                offset,
+                spec: (KIND_DRAW, 16, 2),
+                count: Counted::InCounts(4),
+                parts: false,
+                counted: 5,
+            },
+            &[1 << 25, 1, 0, 0, 6, 1000, 0, 0],
+        );
+        calls
+    }
+
+    /// Executions that run the list's budget out, written into `args`
+    /// (mapped) from byte `from` on: two dispatches of 1,024 by 1,023
+    /// groups leave 131,072 vertex instances of the budget, then draws of
+    /// 65,536, 65,536 and one (the last runs empty) and a dispatch (empty).
+    fn spending_calls(args: *mut u8, from: u64) -> Vec<Call> {
+        let plain = |offset: u64, spec: (u32, u32, u32)| Call {
+            offset,
+            spec,
+            count: Counted::No,
+            parts: false,
+            counted: 0,
+        };
+        let calls = [
+            (plain(from, (KIND_DISPATCH, 12, 1)), &[1024, 1023, 1][..]),
+            (plain(from + 16, (KIND_DISPATCH, 12, 1)), &[1024, 1023, 1]),
+            (
+                plain(from + 32, (KIND_DRAW, 16, 3)),
+                &[65_536, 1, 0, 0, 65_536, 1, 0, 0, 1, 1, 0, 0],
+            ),
+            (plain(from + 80, (KIND_DISPATCH, 12, 1)), &[3, 2, 1]),
+        ];
+        calls
+            .into_iter()
+            .map(|(call, words)| {
+                // SAFETY: the mapped buffer holds 8 KiB; these executions
+                // stay within 128 bytes of `from`, which the caller keeps
+                // below that.
+                unsafe {
+                    let to = args.add(call.offset as usize).cast::<u32>();
+                    for (i, w) in words.iter().enumerate() {
+                        to.add(i).write_unaligned(*w);
+                    }
+                }
+                call
+            })
+            .collect()
+    }
+
+    /// How a test clamps an execution of [`batch_calls`]: the scratch buffer,
+    /// where the execution reads its records there, and whether a clamp was
+    /// recorded for it.
+    type Each<'a> = dyn Fn(&HostList, &Call) -> (ID3D12Resource, u64, bool) + 'a;
+
+    /// The executions of [`batch_calls`] clamped in one batch give every
+    /// record what clamps of their own give it, and charge the budget the
+    /// same: against [`SOURCE`] and [`GROUP_SOURCE`], with and without the
+    /// clamps' notes (`VICTORY_CLAMP_LEAN=1` builds the batch's clamp
+    /// without), with the budget in mapped words and in the card's memory,
+    /// with both waits and with `VICTORY_CLAMP_PRECISE=1`. One clamp is
+    /// recorded for them all, each reads its own slot, and the debug layer
+    /// stays silent. The executions of [`spending_calls`], each in a batch
+    /// of its own (a note that what follows may write before each), run the
+    /// budget out as [`GROUP_SOURCE`]'s clamps of their own do, in the order
+    /// of the executions.
+    #[test]
+    fn host_list_batched_clamps_match_clamps_of_their_own() {
+        let Some(host) = software_host() else {
+            return;
+        };
+        let (Some((args, args_ptr)), Some((counts, counts_ptr))) =
+            (host.shared_buffer(8 << 10), host.shared_buffer(256))
+        else {
+            return;
+        };
+        // SAFETY: mapped buffers of these sizes; nothing runs yet.
+        unsafe {
+            std::ptr::write_bytes(args_ptr, 0, 8 << 10);
+            std::ptr::write_bytes(counts_ptr, 0, 256);
+        }
+        let calls = batch_calls(args_ptr, counts_ptr);
+        let spending = spending_calls(args_ptr, 4 << 10);
+        let count_of = |call: &Call| match call.count {
+            Counted::No => None,
+            Counted::InCounts(off) => Some((&counts, off)),
+            Counted::InArgs(off) => Some((&args, off)),
+        };
+        let from_to = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // Runs the clamps of `calls` on a new list (`each`: the scratch
+        // buffer and where the execution reads its records; `apart`: a note
+        // that what follows may write before each), copying what each
+        // execution reads out; those bytes, the budget's words and whether
+        // a clamp was recorded for each.
+        let run = |calls: &[Call], apart: bool, card: bool, precise: bool, each: &Each<'_>| {
+            let total: usize = calls.iter().map(|c| c.read().next_multiple_of(16)).sum();
+            with_precise(precise, || {
+                let list = host.new_list().expect("a host list");
+                if card {
+                    assert!(list.force_card_budget(), "no budget in the card's memory");
+                }
+                let _ = host.log_messages();
+                let (out, out_ptr) = host
+                    .shared_buffer(total as u64)
+                    .expect("a read-back buffer");
+                // As `State::execute_indirect` does before a clamp.
+                list.buffer_read(&args);
+                list.buffer_read(&counts);
+                let mut opened = Vec::new();
+                let mut to = 0u64;
+                for call in calls {
+                    if apart {
+                        list.may_write();
+                    }
+                    let (bounded, at, new) = each(&list, call);
+                    opened.push(new);
+                    // SAFETY: an open list; the scratch buffer is in
+                    // INDIRECT_ARGUMENT after a clamp, and goes back there;
+                    // buffers held until the list ran.
+                    unsafe {
+                        list.list
+                            .ResourceBarrier(&[transition(&bounded, from_to, copy)]);
+                        list.list
+                            .CopyBufferRegion(&out, to, &bounded, at, call.read() as u64);
+                        list.list
+                            .ResourceBarrier(&[transition(&bounded, copy, from_to)]);
+                    }
+                    list.keep(&bounded);
+                    to += call.read().next_multiple_of(16) as u64;
+                }
+                list.close();
+                let how = format!("card budget {card}, precise {precise}");
+                assert_eq!(
+                    host.log_messages(),
+                    None,
+                    "{how}: the debug layer found an error"
+                );
+                host.execute(&[&list]);
+                list.reset();
+                // SAFETY: the list has run; a mapped buffer of `total` bytes.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(out_ptr.cast_const(), total).to_vec() };
+                (bytes, list.budget_words().expect("budget words"), opened)
+            })
+        };
+        let word =
+            |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        for grouped in [false, true] {
+            for notes in [true, false] {
+                let source = if grouped { GROUP_SOURCE } else { SOURCE };
+                let single = make_from(&host.device, source, notes).expect("clamp");
+                let batched = make_from(&host.device, BATCH_SOURCE, notes).expect("batch clamp");
+                let alone = |list: &HostList, call: &Call| {
+                    let budget = list.budget().unwrap();
+                    let (spec, how, bytes) = if call.parts {
+                        (
+                            (KIND_DISPATCH, 12, 1),
+                            IN_PARTS,
+                            u64::from(SPLIT) * PART_BYTES,
+                        )
+                    } else {
+                        let (_, stride, records) = call.spec;
+                        (call.spec, 0, u64::from(stride * records))
+                    };
+                    let dst = list.indirect_scratch(bytes).unwrap();
+                    let src = (&args, call.offset);
+                    let count = count_of(call);
+                    assert!(clamp_into(
+                        list,
+                        &single,
+                        &dst,
+                        budget,
+                        src,
+                        count,
+                        spec,
+                        (how, true)
+                    ));
+                    (dst, 0, true)
+                };
+                let together = |list: &HostList, call: &Call| {
+                    let src = (&args, call.offset);
+                    let count = count_of(call);
+                    bound_batched_with(list, &batched, src, count, call.spec, call.parts)
+                        .expect("a batch takes the execution")
+                };
+                for card in [false, true] {
+                    for precise in [false, true] {
+                        let expected = run(&calls, false, card, precise, &alone);
+                        let got = run(&calls, false, card, precise, &together);
+                        let how = format!(
+                            "group clamp {grouped}, notes {notes}, card budget {card}, precise \
+                             {precise}"
+                        );
+                        assert_eq!(got.0, expected.0, "{how}: the records clamped");
+                        assert_eq!(got.1, expected.1, "{how}: the budget's words");
+                        let mut once = vec![false; calls.len()];
+                        once[0] = true;
+                        assert_eq!(got.2, once, "{how}: one clamp for every execution");
+                    }
+                }
+                // The budget run out, in the order of the executions: per
+                // group, as GROUP_SOURCE charges.
+                if grouped {
+                    for card in [false, true] {
+                        let expected = run(&spending, true, card, false, &alone);
+                        let got = run(&spending, true, card, false, &together);
+                        let how = format!("spent budget, notes {notes}, card budget {card}");
+                        assert_eq!(got.0, expected.0, "{how}: the records clamped");
+                        assert_eq!(got.1, expected.1, "{how}: the budget's words");
+                        // (The card's copy of the budget hands back only
+                        // its notes.)
+                        if !card {
+                            assert_eq!(got.1[0], 1 << 27, "{how}: the budget is spent");
+                        }
+                        assert_eq!(got.2, vec![true; spending.len()], "{how}: a batch each");
+                        let draws: Vec<u32> = (0..12).map(|i| word(&got.0, 32 + i * 4)).collect();
+                        assert_eq!(
+                            draws,
+                            [65_536, 1, 0, 0, 65_536, 1, 0, 0, 0, 0, 0, 0],
+                            "{how}: the draw past the budget runs empty"
+                        );
+                        let last: Vec<u32> = (0..3).map(|i| word(&got.0, 80 + i * 4)).collect();
+                        assert_eq!(last, [0, 0, 0], "{how}: the dispatch past the budget");
+                    }
+                }
+                // The bounds themselves, for a few records: an index count
+                // past 2^24, instances past 2^26 vertex instances, groups
+                // past what a dispatch runs, a mesh record of all ones, the
+                // parts of 100,000 groups.
+                let got = run(&calls, false, false, false, &together).0;
+                let word = |at: usize| word(&got, at);
+                let start = |i: usize| -> usize {
+                    calls[..i]
+                        .iter()
+                        .map(|c| c.read().next_multiple_of(16))
+                        .sum()
+                };
+                assert_eq!([word(start(1)), word(start(1) + 4)], [1 << 24, 0]);
+                assert_eq!(
+                    [word(start(1) + 20), word(start(1) + 24)],
+                    [100, (1 << 26) / 100]
+                );
+                let dispatch = start(2);
+                assert_eq!(
+                    [word(dispatch), word(dispatch + 4), word(dispatch + 8)],
+                    [65_535, 1, 1]
+                );
+                let tail = (12..24).step_by(4).map(|off| word(dispatch + off));
+                assert!(tail.eq([0, 0, 0]), "too many groups: empty");
+                assert_eq!(
+                    [word(start(3)), word(start(3) + 4), word(start(3) + 8)],
+                    [65_535, 1, 1]
+                );
+                let parts = start(5);
+                assert_eq!(
+                    [word(parts), word(parts + 12)],
+                    [65_535, 100_000 - 65_535],
+                    "a dispatch in parts"
+                );
+            }
+        }
+    }
+
+    /// A batch of clamps takes executions until something may have written
+    /// their arguments: moving the argument buffer to be written (for a
+    /// dispatch that stores to it) ends it, and the next execution opens a
+    /// batch whose clamp, recorded after that dispatch, reads what it
+    /// wrote; so does a note that what follows may write, and a move of the
+    /// argument buffer between read states with no such note (to
+    /// `COPY_SOURCE` and back). An execution counted in another buffer than
+    /// the batch's opens one too, and one whose records are more than a
+    /// batch holds takes none. The debug layer stays silent.
+    #[test]
+    fn host_list_batch_ends_where_the_arguments_may_be_written() {
+        const WRITER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer args : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    args.Store(32, 9);
+}
+"#;
+        let Some(host) = software_host() else {
+            return;
+        };
+        let batched = make_from(&host.device, BATCH_SOURCE, true).expect("batch clamp");
+        let writer = compile_cs(&host.device, WRITER_CS).expect("writer shader");
+        let (Some((args, args_ptr)), Some((counts, counts_ptr))) =
+            (host.shared_buffer(256), host.shared_buffer(256))
+        else {
+            return;
+        };
+        // SAFETY: mapped buffers of 256 bytes; nothing runs yet. Mesh
+        // records at 0 and 32, a count at 64 of the count buffer.
+        unsafe {
+            std::ptr::write_bytes(args_ptr, 0, 256);
+            std::ptr::write_bytes(counts_ptr, 0, 256);
+            args_ptr.cast::<[u32; 3]>().write([5, 1, 1]);
+            args_ptr.add(32).cast::<[u32; 3]>().write([7, 1, 1]);
+            counts_ptr.add(64).cast::<u32>().write(1);
+        }
+        let list = host.new_list().expect("a host list");
+        let _ = host.log_messages();
+        let (out, out_ptr) = host.shared_buffer(256).expect("a read-back buffer");
+        let from_to = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let spec = (KIND_MESH, MESH_STRIDE, 1);
+        let mut copied = 0u64;
+        let mut clamp = |offset: u64, count: Option<(&ID3D12Resource, u64)>| {
+            let (bounded, at, opened) =
+                bound_batched_with(&list, &batched, (&args, offset), count, spec, false)
+                    .expect("a batch takes the execution");
+            // SAFETY: an open list; the scratch buffer is in
+            // INDIRECT_ARGUMENT after a batch's clamp, and goes back there;
+            // buffers held until the list ran.
+            unsafe {
+                list.list
+                    .ResourceBarrier(&[transition(&bounded, from_to, copy)]);
+                list.list.CopyBufferRegion(&out, copied, &bounded, at, 12);
+                list.list
+                    .ResourceBarrier(&[transition(&bounded, copy, from_to)]);
+            }
+            copied += 16;
+            opened
+        };
+        list.buffer_read(&args);
+        assert!(clamp(0, None), "the first execution opens a batch");
+        assert!(!clamp(32, None), "the next one joins");
+        // A dispatch that stores to the argument buffer: moving the buffer
+        // to be written already ends the batch (`HostList::may_write`).
+        list.buffer_uav(&args);
+        // SAFETY: an open list; the writer's root signature and pipeline,
+        // and a buffer held until the list ran.
+        unsafe {
+            list.list.SetComputeRootSignature(&writer.root);
+            list.list.SetPipelineState(&writer.pso);
+            list.list
+                .SetComputeRootUnorderedAccessView(0, args.GetGPUVirtualAddress());
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.buffer_read(&args);
+        assert!(clamp(32, None), "after the write, a new batch");
+        assert!(!clamp(0, None), "which the next one joins");
+        list.may_write();
+        assert!(clamp(0, None), "after what may write, a new batch");
+        list.buffer_read(&counts);
+        assert!(
+            clamp(0, Some((&counts, 64))),
+            "a count in a buffer the batch's clamp does not read"
+        );
+        assert!(
+            !clamp(32, Some((&counts, 64))),
+            "counted in the same buffer"
+        );
+        // A move between read states, which notes no write: only the
+        // argument buffer's change count ends the batch.
+        let writes = list.writes();
+        list.buffer_state(&args, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list.buffer_read(&args);
+        assert_eq!(list.writes(), writes, "no write noted");
+        assert!(
+            clamp(0, None),
+            "after the buffer's state changed, a new batch"
+        );
+        assert!(!clamp(32, None), "which the next one joins");
+        // More records than a batch holds: none takes them.
+        let big = (KIND_MESH, MESH_STRIDE, (BATCH_BYTES / 12 + 1) as u32);
+        assert!(bound_batched_with(&list, &batched, (&args, 0), None, big, false).is_none());
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: the list has run; a mapped buffer of 256 bytes.
+        let got: Vec<u32> = (0..9)
+            .map(|i| unsafe { out_ptr.add(i * 16).cast::<u32>().read_volatile() })
+            .collect();
+        assert_eq!(
+            got,
+            [5, 7, 9, 5, 5, 5, 9, 5, 9],
+            "each execution's record as it was when it ran"
+        );
+    }
+
+    /// A batch takes [`BATCH_CALLS`] executions with nothing that may write
+    /// between them, and the next one opens a batch; the last slot gets its
+    /// execution's record. An execution whose slot ends exactly at
+    /// [`BATCH_BYTES`] joins, and the next one opens a batch. The debug
+    /// layer stays silent.
+    #[test]
+    fn host_list_batch_fills_to_its_bounds() {
+        let Some(host) = software_host() else {
+            return;
+        };
+        let batched = make_from(&host.device, BATCH_SOURCE, false).expect("batch clamp");
+        // The bytes of the execution that fills a batch after one of a
+        // single record (its slot rounded to 16 bytes).
+        let rest = BATCH_BYTES - 16;
+        let records = (rest / 12) as u32;
+        assert_eq!(u64::from(records) * 12, rest, "a whole number of records");
+        let len = 4096 + rest;
+        let (Some((args, args_ptr)), Some((out, out_ptr))) =
+            (host.shared_buffer(len), host.shared_buffer(256))
+        else {
+            return;
+        };
+        // SAFETY: mapped buffers of these sizes; nothing runs yet. Mesh
+        // records 16 bytes apart, the i-th asking for i + 1 groups; the
+        // filling execution's last record asks for 7.
+        unsafe {
+            std::ptr::write_bytes(args_ptr, 0, len as usize);
+            for i in 0..=BATCH_CALLS {
+                let at = args_ptr.add(i as usize * 16).cast::<[u32; 3]>();
+                at.write([i + 1, 1, 1]);
+            }
+            let last = 4096 + rest - 12;
+            args_ptr
+                .add(last as usize)
+                .cast::<[u32; 3]>()
+                .write([7, 1, 1]);
+        }
+        let list = host.new_list().expect("a host list");
+        let _ = host.log_messages();
+        list.buffer_read(&args);
+        let from_to = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let mut copied = 0u64;
+        let mut clamp = |offset: u64, spec: (u32, u32, u32), read: Option<u64>| {
+            let (bounded, at, opened) =
+                bound_batched_with(&list, &batched, (&args, offset), None, spec, false)
+                    .expect("a batch takes the execution");
+            if let Some(read) = read {
+                // SAFETY: an open list; the scratch buffer is in
+                // INDIRECT_ARGUMENT after a batch's clamp, and goes back
+                // there; buffers held until the list ran.
+                unsafe {
+                    list.list
+                        .ResourceBarrier(&[transition(&bounded, from_to, copy)]);
+                    list.list
+                        .CopyBufferRegion(&out, copied, &bounded, at + read, 12);
+                    list.list
+                        .ResourceBarrier(&[transition(&bounded, copy, from_to)]);
+                }
+                copied += 16;
+            }
+            (opened, at)
+        };
+        let one = (KIND_MESH, MESH_STRIDE, 1);
+        let mut opened = Vec::new();
+        for i in 0..=BATCH_CALLS {
+            let read = (i >= BATCH_CALLS - 1).then_some(0);
+            let (new, at) = clamp(u64::from(i) * 16, one, read);
+            if i == BATCH_CALLS - 1 {
+                assert_eq!(at, u64::from(BATCH_CALLS - 1) * 16, "the last slot");
+            }
+            opened.push(new);
+        }
+        let mut once = vec![false; opened.len()];
+        once[0] = true;
+        once[BATCH_CALLS as usize] = true;
+        assert_eq!(
+            opened, once,
+            "a batch opens at the first execution and the 129th"
+        );
+        // A slot that ends exactly at BATCH_BYTES.
+        list.may_write();
+        assert!(clamp(0, one, None).0, "after what may write, a new batch");
+        let fill = (KIND_MESH, MESH_STRIDE, records);
+        let (joined, at) = clamp(4096, fill, Some(rest - 12));
+        assert!(!joined, "a slot ending at BATCH_BYTES joins");
+        assert_eq!(at + rest, BATCH_BYTES, "the slot ends at BATCH_BYTES");
+        assert!(clamp(0, one, None).0, "a full batch takes no more");
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: the list has run; a mapped buffer of 256 bytes.
+        let got: Vec<[u32; 3]> = (0..3)
+            .map(|i| unsafe { out_ptr.add(i * 16).cast::<[u32; 3]>().read_volatile() })
+            .collect();
+        assert_eq!(
+            got,
+            [[BATCH_CALLS, 1, 1], [BATCH_CALLS + 1, 1, 1], [7, 1, 1]],
+            "the last slot of a full batch, the next batch's first, the last record of a full slot"
+        );
     }
 
     /// Runs `f` with [`precise`] `on` on this thread.

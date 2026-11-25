@@ -542,9 +542,11 @@ pub(crate) enum Count {
     UavClampSecond,
     UavCard,
     /// Indirect argument clamps recorded, and of them those that open a
-    /// batch of mesh draws.
+    /// batch of mesh draws; the indirect executions batches of clamps
+    /// clamped (`VICTORY_CLAMP_BATCH=1`, each batch one clamp).
     Clamps,
     MeshBatches,
+    ClampBatchCalls,
     /// Refreshes of host copies and texture staging ([`refresh_scope`];
     /// thread time, summed over the threads that refresh): clock ticks in
     /// the kernel's write-watch askings and the bytes they asked about, clock
@@ -595,6 +597,7 @@ const GROUPS: &[(&str, &[(&str, Count, Unit)])] = &[
             ("card", Count::UavCard, Unit::Plain),
             ("clamps", Count::Clamps, Unit::Plain),
             ("mesh_batches", Count::MeshBatches, Unit::Plain),
+            ("clamp_batch_calls", Count::ClampBatchCalls, Unit::Plain),
         ],
     ),
     (

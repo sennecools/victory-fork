@@ -3534,9 +3534,13 @@ impl State {
                 .map(|w| (w.scratch.clone(), offset - w.base))
         };
         let hit_window = hit.is_some() && !in_batch;
+        // Whether a batch of clamps took the execution
+        // (`crate::indirect::batch`): its scratch buffer stays as the batch
+        // left it.
+        let mut clamp_batched = false;
         let (bounded, at) = match hit {
             Some(hit) => hit,
-            None => {
+            None => 'bounded: {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
@@ -3564,10 +3568,34 @@ impl State {
                     s.refresh(list, *at, 4);
                     list.buffer_read(&s.buffer);
                 }
-                // Bounded first: the clamp binds a compute pipeline of its
-                // own and copies clamped active records into a scratch
-                // buffer at offset 0.
+                // Bounded first: a clamp binds a compute pipeline of its own
+                // and copies clamped active records into a scratch buffer, at
+                // offset 0 for a clamp of the execution's own, at the
+                // execution's slot for a batch of clamps.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                // The list's batch of clamps takes it, or opens with it
+                // (`crate::indirect::batch`); not a window's.
+                let batched = (crate::indirect::batch() && !windowed)
+                    .then(|| {
+                        let src = (&args.buffer, offset);
+                        crate::indirect::bound_batched(
+                            list,
+                            src,
+                            count_arg,
+                            (kind, step, records),
+                            parts.is_some(),
+                        )
+                    })
+                    .flatten();
+                if let Some((scratch, at, opened)) = batched {
+                    if opened {
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                    }
+                    self.window = None;
+                    clamp_batched = true;
+                    break 'bounded (scratch, at);
+                }
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if parts.is_some() {
@@ -3610,7 +3638,7 @@ impl State {
             // buffer the list keeps readable, `VICTORY_INDIRECT_READABLE=1`,
             // is in `INDIRECT_ARGUMENT` either way and `done` leaves it so.)
             // A batch's draws leave that to the end of the batch.
-            if !hit_window && !in_batch {
+            if !hit_window && !in_batch && !clamp_batched {
                 crate::indirect::done(list, &bounded);
             }
             why("prepare failed");
@@ -3633,7 +3661,7 @@ impl State {
             if let Some(((param, dword), signature)) = &parts {
                 for part in 0..crate::indirect::SPLIT {
                     list.list.SetComputeRoot32BitConstant(*param, part * crate::indirect::PART, *dword);
-                    let at = u64::from(part) * crate::indirect::PART_BYTES;
+                    let at = at + u64::from(part) * crate::indirect::PART_BYTES;
                     list.list.ExecuteIndirect(signature, 1, &bounded, at, None, 0);
                 }
                 list.list.SetComputeRoot32BitConstant(*param, 0, *dword);
@@ -3656,8 +3684,10 @@ impl State {
         // (`VICTORY_INDIRECT_READABLE=1`): then the next draw of the window
         // reads it with no barrier, and the next clamp moves it back. A
         // batch's draws read it in that state until the batch ends
-        // (`HostList::end_mesh_batch`), which does this once for them all.
-        if !in_batch {
+        // (`HostList::end_mesh_batch`), which does this once for them all,
+        // and a batch of clamps keeps its scratch buffer readable until the
+        // next one's clamp or the list's close.
+        if !in_batch && !clamp_batched {
             crate::indirect::done(list, &bounded);
         }
         if kind == DISPATCH {
@@ -3710,7 +3740,7 @@ fn rect_vertex_span(v: VertexView, first: u32, count: u32, rects: u64) -> Option
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());

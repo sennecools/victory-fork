@@ -1368,9 +1368,10 @@ mod tests {
 /// `ExecuteCommandLists`, so state tracking is strictly local to each list.
 #[derive(Default)]
 struct BufferStates {
-    /// Raw `ID3D12Resource` pointer -> `(current state, live handle)`.
-    /// Holding a clone keeps the COM address unique until `HostList::reset`.
-    entries: std::collections::HashMap<usize, (D3D12_RESOURCE_STATES, ID3D12Resource)>,
+    /// Raw `ID3D12Resource` pointer -> `(current state, live handle, the
+    /// changes of its state recorded)`. Holding a clone keeps the COM
+    /// address unique until `HostList::reset`.
+    entries: std::collections::HashMap<usize, (D3D12_RESOURCE_STATES, ID3D12Resource, u64)>,
 }
 
 impl BufferStates {
@@ -1379,17 +1380,13 @@ impl BufferStates {
         buffer: &ID3D12Resource,
         wanted: D3D12_RESOURCE_STATES,
     ) -> Option<D3D12_RESOURCE_STATES> {
-        let key = buffer.as_raw() as usize;
-        match self.entries.entry(key) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, buffer.clone()));
-                (wanted != D3D12_RESOURCE_STATE_COMMON).then_some(D3D12_RESOURCE_STATE_COMMON)
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().0, wanted);
-                (before != wanted).then_some(before)
-            }
-        }
+        let entry = self
+            .entries
+            .entry(buffer.as_raw() as usize)
+            .or_insert_with(|| (D3D12_RESOURCE_STATE_COMMON, buffer.clone(), 0));
+        let before = std::mem::replace(&mut entry.0, wanted);
+        entry.2 += u64::from(before != wanted);
+        (before != wanted).then_some(before)
     }
 
     fn clear(&mut self) {
@@ -1475,6 +1472,10 @@ pub(crate) struct HostList {
     /// earlier shader write ([`SinceWait`] as a byte): what a clamp waits for
     /// with `VICTORY_CLAMP_PRECISE=1` (`crate::indirect::precise`).
     since_wait: std::sync::atomic::AtomicU8,
+    /// Calls of [`HostList::may_write`], and the list's batch of indirect
+    /// clamps (`VICTORY_CLAMP_BATCH=1`, `crate::indirect::batch`).
+    writes: std::sync::atomic::AtomicU64,
+    clamp_batch: Mutex<crate::indirect::BatchSlot>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// Names the list in the device-removed report's [`SENT_OPS`].
@@ -5928,6 +5929,8 @@ impl Host {
                 indirect_args: Mutex::default(),
                 mesh_batch: Mutex::default(),
                 since_wait: std::sync::atomic::AtomicU8::new(SinceWait::Anything as u8),
+                writes: std::sync::atomic::AtomicU64::new(0),
+                clamp_batch: Mutex::default(),
                 _alive: Counted::new(),
                 id: LIST_IDS.fetch_add(1, Ordering::Relaxed),
                 ops: Mutex::new(Vec::with_capacity(if dred() == Dred::Off {
@@ -8272,6 +8275,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         // Before the scratch buffer goes back to common below.
         self.end_mesh_batch();
+        crate::indirect::close_batch(self);
         self.twins_to_depth();
         let scratch = self
             .indirect_args
@@ -8308,6 +8312,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         // A batch of a recording that was never closed goes with it.
         *self.mesh_batch() = None;
+        self.clamp_batch().reset();
         self.may_write();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.buffer_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -8964,17 +8969,37 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let (_, _, gpu, data) = self.scratch_with(len, false)?;
+        Some((gpu, data))
+    }
+
+    /// [`HostList::scratch`], with the upload buffer the bytes lie in and
+    /// their offset there (for a command that names a buffer and an
+    /// offset, such as an indirect execution's arguments).
+    pub(crate) fn scratch_in(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
+        let (buffer, at, gpu, data) = self.scratch_with(len, true)?;
+        Some((buffer?, at, gpu, data))
+    }
+
+    /// The bytes of [`HostList::scratch`], and with `buffer` the upload
+    /// buffer they lie in (a clone only then), their offset there.
+    fn scratch_with(
+        &self,
+        len: u64,
+        buffer: bool,
+    ) -> Option<(Option<ID3D12Resource>, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            label(&buffer, "list scratch big", len);
-            name(&buffer, || format!("list scratch {len:#x}"));
+            let (big, data) = host.upload_buffer(len)?;
+            label(&big, "list scratch big", len);
+            name(&big, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            let gpu = unsafe { big.GetGPUVirtualAddress() };
+            let named = buffer.then(|| big.clone());
+            self.deferred().hold_upload(big, len);
+            return Some((named, 0, gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -8991,10 +9016,11 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
         let at = s.used;
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let chunk = &s.chunks[s.current].0;
+        let (gpu, data) = (chunk.gpu + at, (chunk.data + at as usize) as *mut u8);
+        Some((buffer.then(|| chunk.buffer.clone()), at, gpu, data))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -9272,6 +9298,29 @@ impl HostList {
     pub(crate) fn may_write(&self) {
         self.since_wait
             .store(SinceWait::Anything as u8, Ordering::Relaxed);
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How often [`HostList::may_write`] was called, and how many changes of
+    /// `buffer`'s state the list recorded: a batch of clamps takes
+    /// executions only while both stay as they were at its clamp
+    /// (`crate::indirect::ClampBatch`).
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn buffer_changes(&self, buffer: &ID3D12Resource) -> u64 {
+        let states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .entries
+            .get(&(buffer.as_raw() as usize))
+            .map_or(0, |e| e.2)
+    }
+
+    /// The list's batch of indirect clamps (`VICTORY_CLAMP_BATCH=1`,
+    /// `crate::indirect::bound_batched`).
+    pub(crate) fn clamp_batch(&self) -> std::sync::MutexGuard<'_, crate::indirect::BatchSlot> {
+        self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A wait for every earlier shader write was just recorded.

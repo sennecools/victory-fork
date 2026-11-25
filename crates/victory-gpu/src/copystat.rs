@@ -123,7 +123,10 @@ pub(crate) enum C {
     /// Waits for every earlier shader write recorded into host lists: for
     /// the title's barrier groups, for its barriers on buffers, and the
     /// indirect commands bounded (each a dispatch of ours between two such
-    /// waits).
+    /// waits). `IndirectBounded` counts clamp dispatches, not executions: a
+    /// window's clamp (`VICTORY_INDIRECT_WINDOW`), a grouped mesh batch's
+    /// (`VICTORY_GROUPED_MESH_CLAMP`) and a batch of clamps'
+    /// (`VICTORY_CLAMP_BATCH`) bound several executions and count once.
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
@@ -132,6 +135,12 @@ pub(crate) enum C {
     /// writes alone recorded in place of one.
     ClampWaitsLeftOut,
     ClampBudgetWaits,
+    /// Of the clamp dispatches counted in `IndirectBounded`, the batches of
+    /// clamps (`VICTORY_CLAMP_BATCH=1`: one dispatch of ours for several
+    /// indirect executions), and the indirect executions those batches
+    /// clamped.
+    ClampBatches,
+    ClampBatchCalls,
     /// `watch::writes` kernel askings that failed (the range is not
     /// write-watched: view memory or not watchable).
     WatchFailed,
@@ -1294,6 +1303,17 @@ pub(crate) fn log(frames: f64) {
         c[C::ClampBudgetWaits as usize],
         barrier_test()
     );
+    if c[C::ClampBatches as usize] > 0.0 {
+        tracing::info!(
+            "  batches of indirect clamps, per frame (VICTORY_CLAMP_BATCH=1): {:.0} of the {:.0} clamp \
+             dispatches, which clamped {:.0} indirect executions; {:.0} other clamp dispatches (one \
+             execution each, or a window or grouped mesh batch each)",
+            c[C::ClampBatches as usize],
+            c[C::IndirectBounded as usize],
+            c[C::ClampBatchCalls as usize],
+            c[C::IndirectBounded as usize] - c[C::ClampBatches as usize],
+        );
+    }
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
