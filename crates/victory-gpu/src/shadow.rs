@@ -871,7 +871,8 @@ fn word_runs(address: usize, read: &[u8], merged: &[u8], mut put: impl FnMut(usi
 
 /// Whether the merges that write a stretch of title memory back
 /// ([`Shadow::relay_merge`], [`Shadow::card_merge`],
-/// [`Shadow::card_merge_relay`]) look, right before that write, for title
+/// [`Shadow::card_merge_relay`], and each write of
+/// [`Shadow::copy_back_with`]) look, right before that write, for title
 /// bytes it is about to put back to older values (`VICTORY_MERGE_RACE=1`;
 /// off by default). Logging only: [`merge_race`].
 fn merge_race_on() -> bool {
@@ -880,8 +881,11 @@ fn merge_race_on() -> bool {
 }
 
 /// [`merge_race`]'s sums. Of frame `frame`, and in `total` since the
-/// start: stretches written back, their bytes, title bytes put back to
-/// older values, bytes the title and the card both changed, stretches with
+/// start: stretches written back (for [`Shadow::copy_back_with`], `pc`,
+/// each write is one, so their count follows `VICTORY_BACK_BRIDGE` and
+/// only the byte sums compare across its settings), their bytes, title
+/// bytes put back to older values, bytes the title and the card both
+/// changed, stretches with
 /// either, the runs a write of the card's words alone makes
 /// ([`word_runs`]) and their bytes. `said`: the frame's first stretches
 /// with either. `quiet`: frames since the last line.
@@ -1633,11 +1637,41 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// Since the last frame-rate line, of [`Shadow::copy_back_with`] (the
+/// waited write-back of copies in the PC's memory): pieces merged into
+/// title memory, runs of the GPU's bytes in them, writes made (the runs
+/// after [`back_bridge`] joined them), the GPU's bytes (the runs' bytes,
+/// unjoined); and microseconds spent reading title memory, merging and
+/// finding the runs, opening its guards ([`crate::watch::writing`]) and
+/// writing it. They tell whether the writes or the guard opens cost the
+/// time of the write-back. The times leave out [`merge_race`]'s checks
+/// (`VICTORY_MERGE_RACE=1`), which read every write's bytes once more.
+static BACK_SPLIT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
-/// window outside buffers cannot as the code stands.
+/// window outside buffers cannot as the code stands. Then where the
+/// write-back of copies in the PC's memory spends its time ([`BACK_SPLIT`]).
 pub(crate) fn back_line(frames: f64) {
+    let s: Vec<f64> = BACK_SPLIT.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if s.iter().any(|&v| v != 0.0) {
+        let ms = |us: f64| us / 1000.0;
+        tracing::info!(
+            "shader writes put back on the PC per frame: {:.0} pieces merged, {:.0} runs of the GPU's bytes ({:.1} MB) in \
+             {:.0} writes (VICTORY_BACK_BRIDGE={}); {:.1} ms reading title memory, {:.1} ms merging, {:.1} ms opening \
+             guards, {:.1} ms writing",
+            s[0],
+            s[1],
+            s[3] / (1 << 20) as f64,
+            s[2],
+            back_bridge(),
+            ms(s[4]),
+            ms(s[5]),
+            ms(s[6]),
+            ms(s[7]),
+        );
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -1740,6 +1774,56 @@ mod wide_tests {
     }
 }
 
+/// The gap under which [`Shadow::copy_back_with`] joins two runs of the
+/// GPU's bytes into one write of title memory (`VICTORY_BACK_BRIDGE`;
+/// unset or 0: every run is a write of its own, as upstream #2009 has
+/// it): [`parse_back_bridge`].
+///
+/// Each write is a call into the kernel, and a piece whose shader stored
+/// scattered words was hundreds of them. The bytes of a gap are the
+/// title's as read, so writing them changes nothing unless the title
+/// writes there between the read and the write, a window the card's
+/// merges ([`Shadow::card_merge`]) and the relay's
+/// ([`Shadow::relay_merge`]) already accept for their whole stretch.
+fn back_bridge() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        let value = std::env::var("VICTORY_BACK_BRIDGE").ok();
+        let gap = parse_back_bridge(value.as_deref());
+        if gap == 0 && value.as_deref().is_some_and(|v| v.trim() != "0") {
+            tracing::warn!("VICTORY_BACK_BRIDGE={value:?} is not page or a number: runs are written one by one");
+        }
+        gap
+    })
+}
+
+/// `VICTORY_BACK_BRIDGE`'s value as a gap in bytes: `page` joins runs
+/// less than 4 KiB apart (such a gap cannot hold a whole 4 KiB page, so no
+/// page is written that the runs alone leave unwritten, and a 64 KiB
+/// piece is at most 16 writes); a number N joins runs less than N bytes
+/// apart, up to [`PIECE`] (one write per stretch, as [`Shadow::card_merge`]
+/// does). Unset, 0 or anything else: 0, every run on its own.
+fn parse_back_bridge(value: Option<&str>) -> usize {
+    match value.map(str::trim) {
+        Some("page") => 4 << 10,
+        Some(v) => v.parse::<usize>().map_or(0, |n| n.min(PIECE)),
+        None => 0,
+    }
+}
+
+/// Joins runs (offset, bytes; in order and apart, as [`back_piece`] finds
+/// them) that are less than `gap` bytes apart, in place: a run then spans
+/// from the first's start to the last's end. A gap of 0 joins none.
+fn bridge_runs(runs: &mut Vec<(usize, usize)>, gap: usize) {
+    runs.dedup_by(|next, prev| {
+        let joined = next.0 - (prev.0 + prev.1) < gap;
+        if joined {
+            prev.1 = next.0 + next.1 - prev.0;
+        }
+        joined
+    });
+}
+
 /// What [`Shadow::copy_back`] does with a piece that differs from the
 /// snapshot: `host` is the copy's bytes there, `old` the snapshot's. From
 /// the first byte that differs to the last, title memory is read into
@@ -1751,7 +1835,8 @@ mod wide_tests {
 /// whose bytes are the GPU's and differ from the title's as read: only
 /// those are to be written, so a title write that lands between the read
 /// and the write elsewhere in the stretch stays (upstream VIctory #2009).
-/// `mask` is scratch.
+/// `mask` takes, byte by byte, the result xor title memory as read, so
+/// `title ^ mask` is the stretch as read.
 fn back_piece(
     host: &mut [u8],
     old: &[u8],
@@ -1861,7 +1946,184 @@ fn changed_runs_limited(now: &[u8], was: &[u8], limit: usize) -> Option<Vec<(usi
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs, changed_runs_limited};
+    use super::{PIECE, back_piece, bridge_runs, changed_runs, changed_runs_limited, parse_back_bridge};
+
+    /// A small generator for the tests' random bytes (xorshift64).
+    struct Bits(u64);
+
+    impl Bits {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Runs of changed bytes in a stretch of `len`: a few runs anywhere,
+    /// some close together, some far apart.
+    fn random_runs(bits: &mut Bits, len: usize) -> Vec<(usize, usize)> {
+        let mut changed = vec![0u8; len];
+        for _ in 0..1 + bits.below(40) {
+            let at = bits.below(len);
+            let most = if bits.below(4) == 0 { 300 } else { 8 };
+            let n = 1 + bits.below(most);
+            changed[at..(at + n).min(len)].fill(1);
+        }
+        changed_runs(&changed, &vec![0u8; len])
+    }
+
+    /// The 4 KiB pages of title memory at `address` that `runs` write.
+    fn pages(address: usize, runs: &[(usize, usize)]) -> Vec<usize> {
+        let mut pages: Vec<usize> =
+            runs.iter().flat_map(|&(at, n)| (address + at) >> 12..=(address + at + n - 1) >> 12).collect();
+        pages.dedup();
+        pages
+    }
+
+    #[test]
+    fn the_bridge_switch_reads_page_a_number_or_nothing() {
+        assert_eq!(parse_back_bridge(None), 0);
+        assert_eq!(parse_back_bridge(Some("0")), 0);
+        assert_eq!(parse_back_bridge(Some("page")), 4096);
+        assert_eq!(parse_back_bridge(Some(" page ")), 4096);
+        assert_eq!(parse_back_bridge(Some("64")), 64);
+        assert_eq!(parse_back_bridge(Some("65536")), PIECE);
+        assert_eq!(parse_back_bridge(Some("65537")), PIECE);
+        assert_eq!(parse_back_bridge(Some("99999999999999999999999")), 0);
+        for garbage in ["", "pages", "4k", "-1", "0x1000", "1.5"] {
+            assert_eq!(parse_back_bridge(Some(garbage)), 0, "{garbage:?}");
+        }
+    }
+
+    /// No gap joins nothing; runs join below the gap and not at it.
+    #[test]
+    fn runs_join_below_the_gap_only() {
+        let runs = vec![(0, 1), (5, 2), (8, 1), (4000, 3)];
+        let mut same = runs.clone();
+        bridge_runs(&mut same, 0);
+        assert_eq!(same, runs);
+        for gap in [1usize, 2, 64, 4096, PIECE] {
+            let mut joined = vec![(10, 3), (13 + gap - 1, 2)];
+            bridge_runs(&mut joined, gap);
+            assert_eq!(joined, [(10, 3 + gap - 1 + 2)], "a gap of {} under {gap}", gap - 1);
+            let mut apart = vec![(10, 3), (13 + gap, 2)];
+            bridge_runs(&mut apart, gap);
+            assert_eq!(apart, [(10, 3), (13 + gap, 2)], "a gap of {gap} under {gap}");
+        }
+        let mut chain = vec![(0, 1), (2, 1), (4, 1), (100, 1), (102, 1)];
+        bridge_runs(&mut chain, 2);
+        assert_eq!(chain, [(0, 5), (100, 3)]);
+        let mut one = vec![(7, 9)];
+        bridge_runs(&mut one, PIECE);
+        assert_eq!(one, [(7, 9)]);
+        let mut none = Vec::new();
+        bridge_runs(&mut none, PIECE);
+        assert!(none.is_empty());
+    }
+
+    /// Joined runs are in order and apart, every gap between them is at
+    /// least the threshold, and every run lies in one of them, for random
+    /// runs.
+    #[test]
+    fn joined_runs_cover_every_run() {
+        let mut bits = Bits(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..2000 {
+            let len = 1 + bits.below(PIECE);
+            let runs = random_runs(&mut bits, len);
+            for gap in [1usize, 3, 64, 4096, PIECE] {
+                let mut joined = runs.clone();
+                bridge_runs(&mut joined, gap);
+                assert!(joined.windows(2).all(|w| w[1].0 - (w[0].0 + w[0].1) >= gap));
+                for &(at, n) in &runs {
+                    assert!(joined.iter().any(|&(j, m)| j <= at && at + n <= j + m), "{at},{n} under {gap}");
+                }
+                // Each starts where a run starts and ends where one ends.
+                assert!(
+                    joined
+                        .iter()
+                        .all(|&(j, m)| runs.iter().any(|r| r.0 == j) && runs.iter().any(|r| r.0 + r.1 == j + m))
+                );
+            }
+        }
+    }
+
+    /// With `page`, the writes touch exactly the 4 KiB pages the runs touch
+    /// (no page is dirtied that the runs leave clean), wherever title
+    /// memory's pages start, and a stretch in one 64 KiB piece is at most
+    /// 16 writes.
+    #[test]
+    fn page_bridging_dirties_no_new_page() {
+        let mut bits = Bits(0x0123_4567_89ab_cdef);
+        for _ in 0..2000 {
+            let piece = 0xd_b790_0000 + PIECE * bits.below(64);
+            let first = bits.below(PIECE);
+            let len = 1 + bits.below(PIECE - first);
+            let runs = random_runs(&mut bits, len);
+            let mut joined = runs.clone();
+            bridge_runs(&mut joined, parse_back_bridge(Some("page")));
+            let address = piece + first;
+            assert_eq!(pages(address, &joined), pages(address, &runs));
+            assert!(joined.len() <= 16, "{} writes", joined.len());
+            // Wherever the pages start.
+            for shift in [1usize, 17, 2048, 4095] {
+                assert_eq!(pages(address + shift, &joined), pages(address + shift, &runs));
+            }
+        }
+    }
+
+    /// Writing the joined runs of a merged stretch over title memory as it
+    /// was read gives the same bytes as writing the runs one by one: the
+    /// gaps are the title's bytes as read (`title ^ mask`).
+    #[test]
+    fn joined_writes_give_the_same_bytes() {
+        let mut bits = Bits(0xfeed_f00d_dead_beef);
+        let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..500 {
+            let len = 1 + bits.below(PIECE);
+            let old: Vec<u8> = (0..len).map(|_| bits.next() as u8).collect();
+            // The GPU and the title each change a few runs, some the same
+            // bytes.
+            let (mut host, mut title_memory) = (old.clone(), old.clone());
+            for (at, n) in random_runs(&mut bits, len) {
+                for b in &mut host[at..at + n] {
+                    *b ^= 1 + bits.below(255) as u8;
+                }
+            }
+            for (at, n) in random_runs(&mut bits, len) {
+                for b in &mut title_memory[at..at + n] {
+                    *b ^= 1 + bits.below(255) as u8;
+                }
+            }
+            let read = |first: usize, into: &mut [u8]| {
+                into.copy_from_slice(&title_memory[first..first + into.len()]);
+                true
+            };
+            let Some((first, n)) = back_piece(&mut host, &old, &mut title, &mut mask, &mut runs, read) else {
+                continue;
+            };
+            let as_read: Vec<u8> = title.iter().zip(&mask).map(|(t, m)| t ^ m).collect();
+            assert!(as_read == title_memory[first..first + n]);
+            let mut one_by_one = as_read.clone();
+            for &(off, len) in &runs {
+                one_by_one[off..off + len].copy_from_slice(&title[off..off + len]);
+            }
+            assert!(one_by_one == title);
+            for gap in [1usize, 64, 4096, PIECE] {
+                let mut joined = runs.clone();
+                bridge_runs(&mut joined, gap);
+                let mut put = as_read.clone();
+                for &(off, len) in &joined {
+                    put[off..off + len].copy_from_slice(&title[off..off + len]);
+                }
+                assert!(put == one_by_one, "under {gap}");
+            }
+        }
+    }
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -2600,24 +2862,69 @@ impl Shadow {
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
             let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            let bridge = back_bridge();
+            // For `BACK_SPLIT`: pieces, runs, writes, the GPU's bytes; time
+            // reading, merging, opening guards and writing.
+            let mut counts = [0u64; 4];
+            let mut times = [std::time::Duration::ZERO; 4];
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                let mut reading = std::time::Duration::ZERO;
+                let read = |first: usize, title: &mut [u8]| {
+                    let read_at = std::time::Instant::now();
+                    let mapped = crate::host::read_into((start + at + first) as *const u8, title);
+                    reading = read_at.elapsed();
+                    mapped
+                };
+                let merging = std::time::Instant::now();
+                let piece = back_piece(host, old, &mut title, &mut mask, &mut runs, read);
+                times[0] += reading;
+                let Some((first, n)) = piece else {
+                    times[1] += merging.elapsed().saturating_sub(reading);
                     continue;
                 };
                 let at = at + first;
+                counts[0] += 1;
+                counts[1] += runs.len() as u64;
+                counts[3] += runs.iter().map(|&(_, len)| len as u64).sum::<u64>();
+                // Only the GPU's bytes (upstream #2009): a title write
+                // landing elsewhere in the stretch since the read stays.
+                // With `VICTORY_BACK_BRIDGE` the short gaps between them go
+                // too: they are the title's bytes as read, so only such a
+                // late title write in a gap is put back.
+                bridge_runs(&mut runs, bridge);
+                counts[2] += runs.len() as u64;
+                times[1] += merging.elapsed().saturating_sub(reading);
+                // The stretch as read, for `merge_race`; its checks stay out
+                // of the times.
+                let as_read = merge_race_on().then(|| title.iter().zip(&mask).map(|(t, m)| t ^ m).collect::<Vec<u8>>());
+                let guarding = std::time::Instant::now();
                 crate::watch::writing(start + at, n);
-                // Only the GPU's bytes (upstream #2009): the rest of the
-                // stretch is the title's as read, and a title write landing
-                // there since stays.
+                let writing = std::time::Instant::now();
+                times[2] += writing - guarding;
+                let mut racing = std::time::Duration::ZERO;
                 for &(off, len) in &runs {
+                    if let Some(as_read) = &as_read {
+                        let race_at = std::time::Instant::now();
+                        merge_race(
+                            Some(&as_read[off..off + len]),
+                            (self.start, self.len),
+                            start + at + off,
+                            &title[off..off + len],
+                            "pc",
+                        );
+                        racing += race_at.elapsed();
+                    }
                     crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
                     written += len;
                 }
+                times[3] += writing.elapsed().saturating_sub(racing);
+            }
+            for (i, v) in counts.into_iter().chain(times.map(|t| t.as_micros() as u64)).enumerate() {
+                BACK_SPLIT[i].fetch_add(v, Ordering::Relaxed);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
