@@ -1494,37 +1494,51 @@ pub(crate) fn host_made<'a>(
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
 /// by this process is under nine tenths of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// cap on those copies' bytes while still respecting the system's budget
+/// when available). Past the budget the system moves the card's memory into
+/// the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        mb.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|mb| mb.saturating_mul(1 << 20))
     });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
-        return filled < limit;
-    }
-    if filled < FLOOR {
-        return true;
-    }
-    match crate::host::host().and_then(|h| h.video_memory()) {
+    texture_room(filled, limit, room_percent(), || {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
-        }
-        None => filled < WITHOUT_BUDGET,
+        crate::host::host().and_then(|h| h.video_memory()).map(|[budget, used, a, b]| {
+            [budget, used + crate::shadow::card_room_kept() + targets_room_kept(), a, b]
+        })
+    })
+}
+
+#[cfg(any(windows, test))]
+fn texture_room(
+    filled: u64,
+    limit: Option<u64>,
+    percent: u64,
+    memory: impl FnOnce() -> Option<[u64; 4]>,
+) -> bool {
+    const FLOOR: u64 = 2 << 30;
+    const WITHOUT_BUDGET: u64 = 4 << 30;
+    let below_budget = |[budget, used, ..]: [u64; 4]| used < budget / 100 * percent;
+    if let Some(limit) = limit {
+        return filled < limit && memory().is_none_or(below_budget);
     }
+    if filled < FLOOR {
+        return true;
+    }
+    memory().map_or(filled < WITHOUT_BUDGET, below_budget)
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2917,6 +2931,33 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn manual_texture_limit_respects_adapter_video_memory_budget() {
+        const MIB: u64 = 1 << 20;
+        let limit = Some(6144 * MIB);
+        let below_limit = 4096 * MIB;
+        let budget = 8192 * MIB;
+
+        // Without DXGI telemetry, the manual cap decides on its own.
+        assert!(texture_room(below_limit, limit, 90, || None));
+        // Below both the manual cap and 90% of the DXGI budget (~7372 MiB).
+        assert!(texture_room(below_limit, limit, 90, || {
+            Some([budget, 7000 * MIB, 0, 0])
+        }));
+        // Below the 6144 MiB texture cap, but total process VRAM exceeds 90% of the DXGI budget.
+        assert!(!texture_room(below_limit, limit, 90, || {
+            Some([budget, 7800 * MIB, 0, 0])
+        }));
+        // Custom room_percent is honored alongside the manual cap.
+        assert!(texture_room(below_limit, limit, 96, || {
+            Some([budget, 7800 * MIB, 0, 0])
+        }));
+        // Once the manual cap is reached, no DXGI query is needed.
+        assert!(!texture_room(6144 * MIB, limit, 90, || {
+            panic!("should not query video memory once manual cap is reached")
+        }));
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
