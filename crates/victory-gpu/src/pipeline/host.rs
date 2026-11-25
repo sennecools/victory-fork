@@ -810,6 +810,19 @@ impl HostPipeline {
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
+/// Zeroes the gaps between a subobject's type and its description, and
+/// after it: the library compares a loaded pipeline's stream byte for byte.
+fn zero_gaps<T>(sub: &mut Sub<T>) {
+    let at = std::mem::offset_of!(Sub<T>, 1);
+    let end = at + size_of::<T>();
+    let bytes = (&raw mut *sub).cast::<u8>();
+    // SAFETY: padding bytes of `sub`, inside it.
+    unsafe {
+        bytes.add(4).write_bytes(0, at - 4);
+        bytes.add(end).write_bytes(0, size_of::<Sub<T>>() - end);
+    }
+}
+
 /// A pipeline from a stream of subobjects, through the library under `name`
 /// (`None`: made outside it).
 fn stream_pipeline<S>(
@@ -887,6 +900,24 @@ fn graphics_depth_bounds_pipeline(
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, d.DSVFormat),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, d.SampleDesc),
     };
+    // Zero padding, as the other pipelines have (`zero_padding`): the
+    // title's blend description is copied whole.
+    let mut base = base;
+    zero_blend_padding(&mut base.blend.1);
+    zero_depth1_padding(&mut base.depth.1);
+    zero_gaps(&mut base.root);
+    zero_gaps(&mut base.vs);
+    zero_gaps(&mut base.ps);
+    zero_gaps(&mut base.blend);
+    zero_gaps(&mut base.mask);
+    zero_gaps(&mut base.raster);
+    zero_gaps(&mut base.depth);
+    zero_gaps(&mut base.input);
+    zero_gaps(&mut base.strip_cut);
+    zero_gaps(&mut base.topology);
+    zero_gaps(&mut base.targets);
+    zero_gaps(&mut base.dsv);
+    zero_gaps(&mut base.samples);
     if d.GS.pShaderBytecode.is_null() {
         let mut stream = base;
         stream_pipeline(device, &mut stream, Some(name))
@@ -895,6 +926,7 @@ fn graphics_depth_bounds_pipeline(
             base,
             gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, d.GS),
         };
+        zero_gaps(&mut stream.gs);
         stream_pipeline(device, &mut stream, Some(name))
     }
 }
@@ -936,17 +968,6 @@ fn mesh_pipeline(
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
-    }
-    // The gaps between a subobject's type and its description, and after it.
-    fn zero_gaps<T>(sub: &mut Sub<T>) {
-        let at = std::mem::offset_of!(Sub<T>, 1);
-        let end = at + size_of::<T>();
-        let bytes = (&raw mut *sub).cast::<u8>();
-        // SAFETY: padding bytes of `sub`, inside it.
-        unsafe {
-            bytes.add(4).write_bytes(0, at - 4);
-            bytes.add(end).write_bytes(0, size_of::<Sub<T>>() - end);
-        }
     }
     fn zero_stream_gaps<D>(stream: &mut Stream<D>) {
         zero_gaps(&mut stream.root);
