@@ -29,8 +29,13 @@
 //! from the first loading screen, it gave up on the passes the title runs
 //! once while its world loads, and those never came back.
 //!
+//! While the ray-tracing structure builder is off, compute programs that
+//! read title memory by address (the builder's and those that walk or
+//! shade its structures) are not made at all ([`leaves_out`]).
+//!
 //! The loading-time waits and the slow-driver cutoff come from the AMD
-//! fork of the fork (commit 4436f8f1, GPL-3.0).
+//! fork of the fork (commit 4436f8f1, GPL-3.0), as does leaving the
+//! structures' readers out (there by their names, here by what they read).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -55,6 +60,8 @@ pub(crate) struct Pending {
     waited_us: AtomicU64,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// Not made by [`leaves_out`].
+    left_out: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -80,6 +87,7 @@ impl Pending {
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
             begun: OnceLock::new(),
+            left_out: AtomicBool::new(false),
         }
     }
 
@@ -112,21 +120,88 @@ impl Pending {
 
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            if self.walks_dead_structures() {
+                self.left_out.store(true, Ordering::Relaxed);
+                let n = LEFT_OUT.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(
+                        left_out = n,
+                        "compute pipelines that read title memory by address left out: the ray-tracing structure builder is off (VICTORY_RT_RESOLVE=1 makes them)"
+                    );
+                }
+                return None;
+            }
+            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+
+    /// Whether it is a compute program that reads title memory by address
+    /// while nothing builds the structures such programs walk
+    /// ([`leaves_out`]). Translates it (a worker does, before the host
+    /// compile it saves).
+    fn walks_dead_structures(&self) -> bool {
+        let [shader] = self.shaders.as_slice() else {
+            return false;
+        };
+        let reads_memory = || {
+            shader.translated().is_some_and(|t| {
+                t.host
+                    .root_srvs
+                    .contains(&victory_shader::emit::SLOT_MEMORY)
+            })
+        };
+        leaves_out(structures_dead(), shader.stage == "compute", reads_memory)
+    }
+}
+
+/// Compute pipelines left out by [`leaves_out`] so far.
+static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether nothing builds the ray-tracing structures in this run: the
+/// structure builder's stages are off (`VICTORY_BVH_BUILDER` is not 1) and
+/// `VICTORY_RT_RESOLVE=1` does not ask for their readers all the same.
+fn structures_dead() -> bool {
+    static DEAD: OnceLock<bool> = OnceLock::new();
+    *DEAD.get_or_init(|| {
+        let on = |name| std::env::var_os(name).is_some_and(|v| v == "1");
+        !on("VICTORY_BVH_BUILDER") && !on("VICTORY_RT_RESOLVE")
+    })
+}
+
+/// Whether a pipeline is left out: a compute program that reads title
+/// memory by raw address (`SLOT_MEMORY`) while the structures are `dead`.
+/// In the title only the ray-tracing structure builder and the programs
+/// that walk its structures, or shade what a ray walking them hit, read
+/// memory so ([`crate::memory`]); with the builder off there is nothing to
+/// walk or shade, and each of those programs took AMD's compiler 5 to 9 s.
+/// Some 340 of them, all asked for at the world's first frame, stood in
+/// the queue before the passes that make the picture, and the world drew
+/// half its draws or fewer for over two minutes. The builder's own stages
+/// are left out too: with the builder off they never run.
+///
+/// After the AMD fork of the fork (commit 4436f8f1), which leaves the
+/// hit-shading programs out by their names; here it is what the programs
+/// read that decides.
+fn leaves_out(dead: bool, compute: bool, reads_memory: impl FnOnce() -> bool) -> bool {
+    dead && compute && reads_memory()
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// not translate, else "refused", "left out" or "being made"; `None` if it
+/// has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some(format!("being made {:?}", p.shaders)),
+        Some(None) if p.left_out.load(Ordering::Relaxed) => Some(format!(
+            "reads title memory by address, left out while the ray-tracing structure builder is off {:?}",
+            p.shaders
+        )),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -532,6 +607,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            left_out = LEFT_OUT.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
@@ -601,6 +677,20 @@ mod tests {
             frame_allowance(Duration::ZERO, s(12), s(120), Duration::ZERO),
             Duration::ZERO
         );
+    }
+
+    /// Only compute programs that read memory by address are left out,
+    /// and only while the structures are dead; the translation is not
+    /// looked at otherwise.
+    #[test]
+    fn readers_of_dead_structures_are_left_out() {
+        let never = || -> bool { panic!("looked at the translation") };
+        assert!(leaves_out(true, true, || true));
+        assert!(!leaves_out(true, true, || false));
+        assert!(!leaves_out(false, true, never));
+        assert!(!leaves_out(true, false, never));
+        // A pipeline without shaders is not one.
+        assert!(!Pending::new(Vec::new(), None).walks_dead_structures());
     }
 
     /// No frame waits for a pipeline the driver has been at for over 3 s
