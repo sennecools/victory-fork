@@ -38,15 +38,16 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies the translation, besides the container: the shader
-/// crate's fingerprint (its source, every switch it reads, the host facts the
-/// device gave it, the loop limit, barrier waits and clean-up passes) and
+/// crate's fingerprint (its source, every switch it reads, the host fact the
+/// device gave it (the view heap limit), the loop limit, barrier waits and
+/// clean-up passes) and
 /// this file's encoding of the result. Not the whole executable any more: a
 /// rebuild that leaves the translator alone keeps its translations (each new
 /// build used to translate the title's thousands of shaders again, which kept
 /// the first minutes of every test run short of pipelines).
 /// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
 /// Worked out per lookup, so a translation made before the device said its
-/// wave size is never filed under the later key.
+/// view heap limit is never filed under the later key.
 fn build() -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
@@ -82,7 +83,7 @@ fn build() -> [u8; 32] {
 
 /// The offline warm-up (`victory translate --warm`): `container` is
 /// translated into the cache unless it is there already. `Ok(true)`: it
-/// was translated now. Needs [`use_shader_cache`] and the same host facts
+/// was translated now. Needs [`use_shader_cache`] and the same host fact
 /// the run will have (`victory_shader::emit::translation_fingerprint`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
