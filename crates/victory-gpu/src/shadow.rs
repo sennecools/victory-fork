@@ -1761,6 +1761,12 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    changed_runs_limited(now, was, usize::MAX).expect("unlimited run count")
+}
+
+/// The exact same runs, but stop at the first run beyond the caller's
+/// budget. No partial result may be applied by the caller.
+fn changed_runs_limited(now: &[u8], was: &[u8], limit: usize) -> Option<Vec<(usize, usize)>> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -1775,18 +1781,21 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         if i >= n {
             break;
         }
+        if runs.len() == limit {
+            return None;
+        }
         let first = i;
         while i < n && now[i] != was[i] {
             i += 1;
         }
         runs.push((first, i - first));
     }
-    runs
+    Some(runs)
 }
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs};
+    use super::{PIECE, back_piece, changed_runs, changed_runs_limited};
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -1872,6 +1881,46 @@ mod merge_tests {
         assert_eq!(scratch, [20, 3, 44, 50], "the title's byte where both changed");
         assert_eq!(host[1..5], [20, 3, 44, 50], "the copy takes the result");
         assert_eq!(runs, [(0, 1), (3, 1)], "the GPU's bytes only");
+    }
+
+    #[test]
+    fn bounded_runs_match_exact_runs_for_every_small_mask() {
+        let was = [0u8; 12];
+        for mask in 0..(1u32 << 12) {
+            let now: [u8; 12] = std::array::from_fn(|i| ((mask >> i) & 1) as u8);
+            // Independent reference: transitions at each byte boundary.
+            let mut expected = Vec::new();
+            let mut start = None;
+            for (i, &byte) in now.iter().enumerate() {
+                match (byte != 0, start) {
+                    (true, None) => start = Some(i),
+                    (false, Some(at)) => {
+                        expected.push((at, i - at));
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(at) = start {
+                expected.push((at, now.len() - at));
+            }
+            for limit in 0..8 {
+                let result = changed_runs_limited(&now, &was, limit);
+                assert_eq!(result, (expected.len() <= limit).then(|| expected.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_runs_handles_fragmentation_and_exact_budget() {
+        let was = vec![0; 64 << 10];
+        let now: Vec<u8> = (0..was.len()).map(|i| (i % 2 == 0) as u8).collect();
+        assert!(changed_runs_limited(&now, &was, 512).is_none());
+        let exact = changed_runs_limited(&now, &was, 32768).unwrap();
+        assert_eq!(exact.len(), 32768);
+        assert!(exact.iter().enumerate().all(|(i, &run)| run == (2 * i, 1)));
+        assert_eq!(changed_runs_limited(&was, &was, 0), Some(Vec::new()));
+        assert_eq!(changed_runs_limited(&[1, 0, 1], &[0, 0], 1), Some(vec![(0, 1)]));
     }
 
     /// The runs hold exactly the bytes that differ: putting them into the
@@ -2846,10 +2895,9 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
-                    if runs.len() > *runs_left {
+                    let Some(runs) = changed_runs_limited(title, held, *runs_left) else {
                         return true;
-                    }
+                    };
                     *runs_left -= runs.len();
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
