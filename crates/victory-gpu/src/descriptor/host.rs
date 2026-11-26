@@ -116,6 +116,17 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// With `VICTORY_HEAP_PASS_TABLED=1`, per title slot: the frame (plus
+    /// one; 0: never) in which a draw last read it through a table or made
+    /// a table it lies in, for the heap buffer pass alone
+    /// ([`HostHeap::buffer_slot_tabled_lately`], [`TABLED_BUFFER_FRAMES`]).
+    /// Apart from `tabled`, which the heap sync and the queue of textures
+    /// picked by index read with their [`TABLED_FRAMES`] window: a buffer
+    /// slot a table held is not left by the sync for 240 frames, so a
+    /// record the title copies into it still reaches the set of changes,
+    /// and the pass makes it once no table held it for a few frames.
+    /// Made on the first mark; never with the switch off.
+    buffer_tabled: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>>,
     /// What the heap buffer pass keeps of this heap from pass to pass
     /// (`crate::draw::HeapRanges`) with `VICTORY_HEAP_SWEEP_OWN=1`: under a
     /// lock of its own, not the one of every heap's, and let go with the
@@ -1473,6 +1484,7 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            buffer_tabled: std::sync::OnceLock::new(),
             buffer_sweep: Mutex::new(crate::draw::HeapRanges::new()),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
@@ -2444,7 +2456,28 @@ impl HostHeap {
     /// ([`HostHeap::buffer_slot_tabled_lately`]; `VICTORY_HEAP_PASS_TABLED=1`
     /// alone calls this).
     pub(crate) fn buffer_slot_tabled(&self, index: u32) {
-        self.tabled_in(index, false, crate::frame::current());
+        self.buffer_tabled_in(index, crate::frame::current());
+    }
+
+    /// [`HostHeap::buffer_slot_tabled`] in frame `frame`: in
+    /// [`HostHeap::buffer_tabled`], not in `tabled`.
+    pub(crate) fn buffer_tabled_in(&self, index: u32, frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler || index >= self.count {
+            return;
+        }
+        let stamps = self.buffer_tabled.get_or_init(|| {
+            (0..self.count)
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect()
+        });
+        let Some(stamp) = stamps.get(index as usize) else {
+            return;
+        };
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        if stamp.load(Relaxed) != now {
+            stamp.store(now, Relaxed);
+        }
     }
 
     /// Whether title slot `index` was a table's within the last
@@ -2452,7 +2485,11 @@ impl HostHeap {
     /// leaves it to the draws that read it through their tables
     /// (`VICTORY_HEAP_PASS_TABLED=1`). Not asked with the switch off.
     pub(crate) fn buffer_slot_tabled_lately(&self, index: u32, frame: u64) -> bool {
-        let stamp = self.tabled_stamp(index) & !TABLED_READ;
+        let stamp = self
+            .buffer_tabled
+            .get()
+            .and_then(|stamps| stamps.get(index as usize))
+            .map_or(0, |s| s.load(std::sync::atomic::Ordering::Relaxed));
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         stamp != 0 && now.wrapping_sub(stamp) & !TABLED_READ <= TABLED_BUFFER_FRAMES
     }
@@ -6462,8 +6499,11 @@ mod tests {
 
     /// A slot of a draw's table is left to the draws by the heap buffer
     /// pass (`VICTORY_HEAP_PASS_TABLED=1`) for [`TABLED_BUFFER_FRAMES`]
-    /// frames after the last table that held it, read or not, and a slot
-    /// never a table's is not. (After cool_fox 1f1a433's `copied_tabled`.)
+    /// frames after the last table that held it, and a slot never a
+    /// table's is not. The marks are the pass's alone: the heap sync and
+    /// the queue of textures picked by index ([`TABLED_FRAMES`]) do not
+    /// see them, and a texture table's mark is not one. (After cool_fox
+    /// 1f1a433's `copied_tabled`.)
     #[test]
     fn a_table_s_buffer_slot_is_left_to_its_draws_for_some_frames() {
         let Some(heap) = HostHeap::new(false, 8) else {
@@ -6471,17 +6511,25 @@ mod tests {
         };
         let frame = 1000;
         assert!(!heap.buffer_slot_tabled_lately(3, frame), "never a table's");
-        heap.tabled_in(3, false, frame);
-        heap.tabled_in(4, true, frame);
+        heap.buffer_tabled_in(3, frame);
+        heap.buffer_tabled_in(4, frame);
         for at in frame..=frame + u64::from(TABLED_BUFFER_FRAMES) {
             assert!(heap.buffer_slot_tabled_lately(3, at), "frame {at}");
-            assert!(heap.buffer_slot_tabled_lately(4, at), "read, frame {at}");
+            assert!(heap.buffer_slot_tabled_lately(4, at), "frame {at}");
+            assert!(!heap.tabled_lately(3, at), "not the sync's, frame {at}");
         }
         let after = frame + u64::from(TABLED_BUFFER_FRAMES) + 1;
         assert!(!heap.buffer_slot_tabled_lately(3, after));
         assert!(!heap.buffer_slot_tabled_lately(4, after));
+        // A texture table's mark is the sync's and the queue's, not the
+        // pass's.
+        heap.tabled_in(5, true, frame);
+        heap.tabled_in(6, false, frame);
+        assert!(heap.tabled_lately(5, frame + 1) && heap.tabled_lately(6, frame + 1));
+        assert!(!heap.buffer_slot_tabled_lately(5, frame + 1));
+        assert!(!heap.buffer_slot_tabled_lately(6, frame + 1));
         // A table again: the frames count from it.
-        heap.tabled_in(3, false, after);
+        heap.buffer_tabled_in(3, after);
         assert!(heap.buffer_slot_tabled_lately(3, after + 1));
         assert!(!heap.buffer_slot_tabled_lately(2, after), "another slot");
         // Past the heap's slots: never.

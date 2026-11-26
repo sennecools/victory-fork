@@ -4230,9 +4230,12 @@ fn heap_pass_threads() -> usize {
 /// what its table holds and brings what it reads up to date itself
 /// (`table_entry`, `tables`), so for the title's per-draw tables the pass
 /// did the same work again. With the switch on, the draws mark the buffer
-/// slots of their tables too, not only the texture slots, which the heap
-/// sync and the queue of textures picked by index then also count as a
-/// table's ([`crate::descriptor::host::HostHeap::buffer_slot_tabled`]).
+/// slots of their tables too, not only the texture slots, in marks of the
+/// pass's own: the heap sync and the queue of textures picked by index do
+/// not read them, so a record the title copies into such a slot still
+/// reaches the set of changes, and the pass makes it once no table held
+/// the slot for a few frames
+/// ([`crate::descriptor::host::HostHeap::buffer_slot_tabled`]).
 fn heap_pass_tabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_TABLED").is_some_and(|v| v == "1"))
@@ -4966,6 +4969,19 @@ void main() {
         for (index, range) in &tabled[0].found {
             assert_eq!(range.is_none(), *index == 700, "slot {index}");
         }
+        // A slot of a table made afresh, then no table for nine frames:
+        // left to the draw at first, then made by the pass.
+        let first = frame + 100;
+        views.buffer_tabled_in(701, first);
+        let walk = |at: u64| walk_spread(views, &slots, &handles, 4, Some(at), false, true);
+        let shown = |w: &SpreadWalk| {
+            w.found
+                .iter()
+                .find(|&&(i, _)| i == 701)
+                .map(|(_, r)| r.is_some())
+        };
+        assert_eq!(shown(&walk(first)), Some(false), "left to the draw");
+        assert_eq!(shown(&walk(first + 9)), Some(true), "made by the pass");
     }
 
     #[test]
