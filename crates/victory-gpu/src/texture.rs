@@ -595,10 +595,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// ms, the texture's own lock 0).
 ///
 /// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
+/// runtime has it, the texture is read by the safe copy (`crate::safecopy`)
+/// instead, which needs no lock: it reports a page that is not there
+/// instead of faulting, and then the texture is left as it is and read at
+/// its next refresh, a frame later. (When that read went through the
+/// kernel it cost about 0.6 ms a megabyte against 0.3 in place.)
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
@@ -608,7 +609,7 @@ fn no_wait() -> bool {
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
+/// by the safe copy because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -676,22 +677,24 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     })
 }
 
-/// Whether a texture all of whose memory is mapped is read through the
-/// kernel's copy instead of in place (`VICTORY_TEXTURE_COPY=1`; off by
-/// default). Round 3 of the memory work read every such texture that way
-/// to be safe from pages taken away under the read; it cost 0.6 ms per MB
-/// against 0.3 in place (90-105 ms a frame while the world streams in, runs
-/// 72 and 73, against 20-40), and both runs with it lost the graphics
-/// device, for a reason not found. The read in place is safe now for
-/// another reason (`crate::watch::title_memory_reading`); this switch is
-/// left to tell whether the copy was what lost the device.
+/// Whether a texture all of whose memory is mapped is read by the safe copy
+/// (`crate::safecopy`) instead of in place (`VICTORY_TEXTURE_COPY=1`; off by
+/// default). Round 3 of the memory work read every such texture through the
+/// kernel's copy (`ReadProcessMemory`, since deleted) to be safe from pages
+/// taken away under the read; it cost 0.6 ms per MB against 0.3 in place
+/// (90-105 ms a frame while the world streams in, runs 72 and 73, against
+/// 20-40), and both runs with it lost the graphics device, for a reason
+/// not found. The read in place is safe now for another reason
+/// (`crate::watch::title_memory_reading`); this switch now compares the
+/// safe copy with the read in place.
 fn through_copy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
-/// Calls `f` with the `size` bytes of title memory at `memory`, read
-/// through the kernel into this thread's read buffer; pages that are not
+/// Calls `f` with the `size` bytes of title memory at `memory`, read by the
+/// safe copy (`crate::safecopy`), which reports a page that is not there
+/// instead of faulting, into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     with_read(size, |read| {
@@ -1958,7 +1961,7 @@ impl Staging {
         // 74).
         let _mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
+            // texture is read by the safe copy instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now(self.memory as usize, size) else {
                 return self.refresh_unlocked(last, size);
@@ -2029,8 +2032,9 @@ impl Staging {
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
-    /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
+    /// the texture is read by the safe copy (`crate::safecopy`), which
+    /// reports a page of it that is not there at this moment instead of
+    /// faulting. Then nothing is taken and the texture
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
     /// Returns the bytes read.
@@ -2230,8 +2234,10 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of it up to
 /// 48 KiB, else of twelve pieces of 4 KiB spread evenly over it, the first
-/// and the last included. Read through the kernel, so pages not there count
-/// as zeros. (A texture whose change falls between the pieces is missed.)
+/// and the last included. Read by the safe copy (`crate::safecopy`), which
+/// reports a page that is not there instead of faulting, so pages not there
+/// count as zeros. (A texture whose change falls between the pieces is
+/// missed.)
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     const PIECE: usize = 4 << 10;
     const PIECES: usize = 12;
@@ -2368,7 +2374,8 @@ fn by_query() -> bool {
 /// that cannot. One question to the kernel for up to 256 pages at once
 /// (`QueryWorkingSetEx`: the state of each page asked about, no walk); a
 /// page not in the working set may still be there (never touched, or
-/// trimmed), and a one-byte read through the kernel says.
+/// trimmed), and a one-byte read by the safe copy (`crate::safecopy`),
+/// which reports a page that is not there instead of faulting, says.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
@@ -2476,9 +2483,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // By 64 KiB block, one page asked of each: the title's memory is
         // mapped in blocks of that size (the console's page), and the
         // answer is a measure of how much of a texture has arrived, not a
-        // promise that every byte can be read (the upload reads through the
-        // kernel). By page, a texture half there cost a failed kernel read
-        // for each of its missing pages, every frame it stayed due: 1,663
+        // promise that every byte can be read (the upload reads by the safe
+        // copy, which reports a missing page). By page, a texture half there
+        // cost a failed kernel read (when reads went through the kernel) for
+        // each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
         const BLOCK: usize = 64 << 10;
@@ -3562,7 +3570,7 @@ pub(crate) mod staging_warp_tests {
         );
         // All zero, and the second page gone.
         // SAFETY: the fixture's memory; the decommitted page is not read
-        // but through the kernel's copy, which stands it.
+        // but by the safe copy (`crate::safecopy`), which stands it.
         unsafe {
             std::ptr::write_bytes(f.memory, 0, size);
             assert_ne!(VirtualFree(second.cast(), PAGE, MEM_DECOMMIT), 0);

@@ -810,9 +810,9 @@ fn create() -> windows::core::Result<Host> {
 /// (`D3D12_FEATURE_D3D12_OPTIONS16`: memory on the card the CPU maps, which
 /// a discrete card offers only with resizable BAR and a runtime that knows
 /// the heap), for moving upload memory and host copies there later. If it
-/// has, 64 KiB written into such a buffer by the kernel's copy of process
-/// memory (`ReadProcessMemory`, as title memory reaches host copies) are
-/// copied on the card into read-back memory and compared. Logging only.
+/// has, 64 KiB written into such a buffer by the copy that brings title
+/// memory into host copies (`read`) are copied on the card into read-back
+/// memory and compared. Logging only.
 fn gpu_upload_probe(device: &ID3D12Device, queue: &ID3D12CommandQueue) {
     let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
     // SAFETY: a plain query into a structure of its size.
@@ -828,10 +828,10 @@ fn gpu_upload_probe(device: &ID3D12Device, queue: &ID3D12CommandQueue) {
     }
     match gpu_upload_self_test(device, queue) {
         Ok(true) => tracing::info!(
-            "GPU upload heap: supported; 64 KiB written into one by the kernel's copy of process memory reached the card intact"
+            "GPU upload heap: supported; 64 KiB written into one by our copy of title memory (rep movsb) reached the card intact"
         ),
         Ok(false) => tracing::warn!(
-            "GPU upload heap: supported, but 64 KiB written into one by the kernel's copy of process memory did not reach the card intact"
+            "GPU upload heap: supported, but 64 KiB written into one by our copy of title memory (rep movsb) did not reach the card intact"
         ),
         Err(e) => tracing::warn!(error = %e, "GPU upload heap: supported, but its self-test could not run"),
     }
@@ -5582,13 +5582,14 @@ mod lift_tests {
 /// in its list becomes one step with it (`VICTORY_JOIN_COPIES=1`; off by
 /// default).
 ///
-/// Each copy is done at submission through the kernel, which reports a
-/// page that is not there instead of faulting (`copy_mapped`), tells the
-/// write watch and the guards, and ends the refreshes gathered so far: a
-/// call into the kernel for some 480 bytes, 14,042 times a frame in run 86
-/// (6.8 MB; "moves 19 ms" with the refreshes' own reads). How many of them
-/// continue the one before is counted either way and said on its own line
-/// with the frame rate; the switch is worth that many kernel calls.
+/// Each copy is done at submission by the safe copy (`crate::safecopy`),
+/// which reports a page that is not there instead of faulting
+/// (`copy_mapped`), tells the write watch and the guards, and ends the
+/// refreshes gathered so far: a copy of some 480 bytes, 14,042 times a
+/// frame in run 86 (6.8 MB; "moves 19 ms" with the refreshes' own reads,
+/// when each was a call into the kernel). How many of them continue the
+/// one before is counted either way and said on its own line with the
+/// frame rate; the switch is worth that many copies.
 ///
 /// Joined, the same bytes move: [`continues`] joins only copies whose
 /// ranges, taken together, do not overlap, and nothing is recorded between
@@ -9818,8 +9819,10 @@ impl HostList {
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
-/// for and read through the kernel into the copy. That is the frame line's
-/// "copies", 45-50 ms a frame, and the copies have nothing to do with one
+/// for and read into the copy by the safe copy (`crate::safecopy`), which
+/// reports a page that is not there instead of faulting. That was the
+/// frame line's "copies", 45-50 ms a frame (when the reads went through
+/// the kernel), and the copies have nothing to do with one
 /// another: each refresh writes its own copy and its own notes, and reads
 /// title memory. With the switch the copies of a flush (four or more) are
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
@@ -10106,13 +10109,11 @@ impl Batch {
 /// them (tiled memory, page mappings), which read as zeros here; a title
 /// destination (`title_dst`) that is not all mapped is left alone.
 ///
-/// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
+/// The copy is one `rep movsb` whose faults the write watch's handler turns
+/// into a failure (`crate::safecopy`), so an unmapped page is reported
+/// instead of faulting, with no kernel call. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
-/// `VICTORY_SAFE_COPY=1` copies with one `rep movsb` instead, whose faults
-/// the write watch's handler turns into the same failure
-/// (`crate::safecopy`).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -10134,8 +10135,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
     // milliseconds a copy, and it was a seventh of the submitting thread's
-    // time in gameplay (run 60: 71 of 500 looks). The kernel's copy below
-    // says the same when it fails, so the question is only asked then.
+    // time in gameplay (run 60: 71 of 500 looks). The copy below says the
+    // same when it fails, so the question is only asked then.
     // `VICTORY_COPY_ASK=1` asks first, as before.
     static ASK: OnceLock<bool> = OnceLock::new();
     let ask_first = title_dst
@@ -10144,7 +10145,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     if title_dst {
-        // The kernel writes the destination: it must not be guarded.
+        // Our write into title memory: its guards are opened and the
+        // runtime's other notes of it made (`crate::watch::writing`).
         crate::watch::writing(dst as usize, len);
     }
     #[cfg(feature = "diagnostics")]
@@ -10156,7 +10158,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     // The copy failed: a source page is not there, or the destination is
-    // not all mapped. Then the destination stays as it is (the kernel may
+    // not all mapped. Then the destination stays as it is (the copy may
     // have written its first pages).
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
         return;
@@ -10233,76 +10235,25 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// readable: one `rep movsb`, no kernel call (`crate::safecopy`).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if crate::safecopy::on() {
-        // `VICTORY_SAFE_COPY=1`: one `rep movsb`, no kernel call.
-        // SAFETY: the destination is mapped writable memory of `len` bytes
-        // (or title memory whose guards the write watch's handler opens); a
-        // source page that is not there fails the copy.
-        return unsafe { crate::safecopy::copy(dst, src, len) };
-    }
-    let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
-}
-
-#[link(name = "ntdll", kind = "raw-dylib")]
-unsafe extern "system" {
-    /// The kernel's write into a process's memory, `(process, address,
-    /// bytes, length, written out)`: an NTSTATUS, negative when a page of
-    /// the range is not there or not writable. It changes no protection.
-    fn NtWriteVirtualMemory(
-        process: *mut std::ffi::c_void,
-        base: *mut std::ffi::c_void,
-        buffer: *const std::ffi::c_void,
-        size: usize,
-        written: *mut usize,
-    ) -> i32;
-}
-
-/// Whether title memory is written with the kernel's own call
-/// (`NtWriteVirtualMemory`) and not `WriteProcessMemory`, which first asks
-/// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
-/// title's big pools, see [`copy_mapped`]): putting back what shaders wrote
-/// cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever their size
-/// (run 24). On by default; `VICTORY_DIRECT_WRITES=0` writes as before.
-fn direct_writes() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+    // SAFETY: the destination is mapped writable memory of `len` bytes (or
+    // title memory whose guards the write watch's handler opens); a source
+    // page that is not there fails the copy.
+    unsafe { crate::safecopy::copy(dst, src, len) }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
+/// wrote), leaving pages that are not mapped alone: one `rep movsb` per
+/// piece, no kernel call (`crate::safecopy`).
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
-        if crate::safecopy::on() {
-            // `VICTORY_SAFE_COPY=1`: one `rep movsb`, no kernel call. A block
-            // guarded again since the caller opened it is opened by the write
-            // watch's handler and the copy goes on.
-            // SAFETY: the source is our mapped host copy; a destination page
-            // that is not there, or not writable, fails the copy.
-            return unsafe { crate::safecopy::copy(at as *mut u8, from, n) };
-        }
-        let mut done = 0;
-        if direct {
-            // SAFETY: as below; the kernel checks the destination and
-            // writes nothing it cannot (the caller opened its guards:
-            // `crate::watch::writing`).
-            return unsafe {
-                NtWriteVirtualMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) >= 0
-            };
-        }
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        // A block guarded again since the caller opened it is opened by the
+        // write watch's handler and the copy goes on.
+        // SAFETY: the source is our mapped host copy; a destination page
+        // that is not there, or not writable, fails the copy.
+        unsafe { crate::safecopy::copy(at as *mut u8, from, n) }
     };
     if len == 0 || write(dst as usize, len) {
         return;
@@ -10596,7 +10547,7 @@ impl Meter {
         if through + left > 0.0 {
             tracing::info!(
                 "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                 {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                 {through:.1} read by the safe copy, {left:.1} left for the next refresh (a page was not there)"
             );
         }
         {

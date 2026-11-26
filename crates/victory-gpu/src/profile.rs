@@ -551,7 +551,7 @@ pub(crate) enum Count {
     /// thread time, summed over the threads that refresh): clock ticks in
     /// the kernel's write-watch askings and the bytes they asked about, clock
     /// ticks in the journal's own work (its lock, its map, the copies'
-    /// page stamps), clock ticks copying title memory (`ReadProcessMemory`),
+    /// page stamps), clock ticks copying title memory (`crate::safecopy`),
     /// and the 4 KiB pages the askings found written with the distinct
     /// 64 KiB pages they lie in.
     AskTicks,

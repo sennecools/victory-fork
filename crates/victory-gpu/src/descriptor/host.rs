@@ -3163,9 +3163,10 @@ impl HostHeap {
     /// or a pass uses it): the texture queue's entry for the slot would
     /// start again, and the buffer pass would look at 2,048 slots for one
     /// that changed.
-    /// `record`: the record's bytes as the caller read them (through the
-    /// kernel, which fails on a page the title unmapped meanwhile where a
-    /// read in place would fault: the title unmaps heap pages too).
+    /// `record`: the record's bytes as the caller read them (by the safe
+    /// copy, `crate::safecopy`, which reports a page the title unmapped
+    /// meanwhile where a read in place would fault: the title unmaps heap
+    /// pages too).
     pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
         if index >= self.count {
             return false;

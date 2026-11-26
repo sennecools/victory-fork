@@ -1948,9 +1948,9 @@ impl ValueWait {
     /// functions' (1 never .. 8 always, value against reference); one not
     /// known counts as met, and so does memory that is not mapped.
     ///
-    /// The value is read through the kernel, which reports memory that is
-    /// not there instead of faulting (as the copies of title memory are
-    /// read, `crate::host::copy_mapped`). Asking Windows first whether the
+    /// The value is read by the safe copy (`crate::safecopy`), which reports
+    /// memory that is not there instead of faulting (as the copies of title
+    /// memory are read, `crate::host::copy_mapped`). Asking Windows first whether the
     /// memory is committed (`VirtualQuery`) walks the page tables to the
     /// end of the region: the title keeps these values in a 1.1 GB
     /// allocation (0xd00000000), where one question took about 8 ms, and a

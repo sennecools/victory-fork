@@ -28,8 +28,11 @@ All cool_fox commits named here have the author `local`.
 > fixed at 3 ms). The journal is `crates/victory-gpu/src/watch/stamps.rs`;
 > the ordered-map journal and the epoch tables (`VICTORY_EPOCH_JOURNAL`)
 > were deleted. `guard_switched` and `open_together` became `guard_blocks`
-> and `open`. Of the switches below only `VICTORY_SAFE_COPY` remains. The
-> rest of this file is the record of the port as it was.
+> and `open`. Since step S8 `VICTORY_SAFE_COPY` is gone too: every copy
+> between our memory and the title's is the `rep movsb` of
+> `crates/victory-gpu/src/safecopy.rs` (no `ReadProcessMemory`, no
+> `NtWriteVirtualMemory`, and so no `VICTORY_DIRECT_WRITES`). The rest of
+> this file is the record of the port as it was.
 
 All off by default. Each is read once per process (`OnceLock`), so every
 combination needs its own process: a separate `cargo test` run or a
@@ -79,12 +82,15 @@ untouched code was left as it was.
 > fixed at 3 ms). The journal is `crates/victory-gpu/src/watch/stamps.rs`;
 > the ordered-map journal and the epoch tables (`VICTORY_EPOCH_JOURNAL`)
 > were deleted. `guard_switched` and `open_together` became `guard_blocks`
-> and `open`. Of the switches below only `VICTORY_SAFE_COPY` remains. The
-> rest of this file is the record of the port as it was.
+> and `open`. Since step S8 `VICTORY_SAFE_COPY` is gone too: every copy
+> between our memory and the title's is the `rep movsb` of
+> `crates/victory-gpu/src/safecopy.rs` (no `ReadProcessMemory`, no
+> `NtWriteVirtualMemory`, and so no `VICTORY_DIRECT_WRITES`). The rest of
+> this file is the record of the port as it was.
 
 The per-switch runs and the "only with `VICTORY_*`" notes below are
-historical: today every test runs the one behaviour, and only
-`VICTORY_SAFE_COPY` still changes a run.
+historical: today every test runs the one behaviour, and no switch of
+this lane changes a run.
 
 Unit tests added:
 

@@ -370,8 +370,9 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         unsafe { *out = std::ptr::null() };
     }
     if calls <= 4 || calls.is_power_of_two() {
-        // Sixteen 64-bit words at `at`, read through the kernel: neither
-        // pointer is known to be mapped.
+        // Sixteen 64-bit words at `at`, read by the safe copy
+        // (`crate::safecopy`), which reports a page that is not there
+        // instead of faulting: neither pointer is known to be mapped.
         #[cfg(windows)]
         let words = |at: usize| -> Option<Vec<u64>> {
             let mut bytes = [0u8; 128];

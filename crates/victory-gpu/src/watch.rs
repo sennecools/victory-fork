@@ -1806,8 +1806,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's. It is the first vectored handler in the process
 /// and also the one that takes the faults of our own copies
-/// (`crate::safecopy`, `VICTORY_SAFE_COPY=1`), which register it through
-/// here.
+/// (`crate::safecopy`, every copy between our memory and the title's),
+/// which register it through here.
 pub(crate) fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -1820,8 +1820,7 @@ pub(crate) fn install() {
         const WRITE: usize = 1;
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from its
-        // failing exit. Never so for any other instruction, so with
-        // `VICTORY_SAFE_COPY` off (no such copy runs) this is as before.
+        // failing exit. Never so for any other instruction.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
         // SAFETY: the system passes the context of the fault.
         let context = unsafe { (*info).ContextRecord };

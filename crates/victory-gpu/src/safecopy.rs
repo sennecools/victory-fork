@@ -1,26 +1,22 @@
 //! Copies between our memory and the title's that fail instead of faulting.
 //!
 //! Title memory may be unmapped, remapped or made read-only by the title's
-//! other threads while we copy it, so copies go through the kernel
-//! (`ReadProcessMemory`, `NtWriteVirtualMemory`, in `crate::host`), which
-//! reports a missing page instead of faulting. Each such call locks the
-//! pages it copies: cool_fox measured some 35,000 calls a frame and 39 ms of
-//! kernel time on the submitting thread alone; ours is most of the flush's
-//! copy part (15.1 ms, `r5-batch-flush.md`).
+//! other threads while we copy it, so a copy must report a missing page
+//! instead of faulting. Copies once went through the kernel
+//! (`ReadProcessMemory`, `NtWriteVirtualMemory`), which does, but each call
+//! locks the pages it copies: cool_fox measured some 35,000 calls a frame
+//! and 39 ms of kernel time on the submitting thread alone; ours was most
+//! of the flush's copy part (15.1 ms, `r5-batch-flush.md`).
 //!
-//! [`copy`] is one `rep movsb`. A fault in it is taken by the handler of
-//! [`crate::watch`] (`on_write`, the first vectored handler in the process),
-//! which opens a block we guard ourselves and lets the copy go on, and
-//! otherwise sends it to its failing exit ([`failing_exit`]).
-//!
-//! `VICTORY_SAFE_COPY=1` copies so ([`on`]); unset or anything else, through
-//! the kernel, as before.
+//! [`copy`] is one `rep movsb`, and every copy between our memory and the
+//! title's (`crate::host`) is made with it. A fault in it is taken by the
+//! handler of [`crate::watch`] (`on_write`, the first vectored handler in
+//! the process), which opens a block we guard ourselves and lets the copy
+//! go on, and otherwise sends it to its failing exit ([`failing_exit`]).
 //!
 //! Ported from cool_fox 66afb2b (local). Its other helper there (the AVX2
 //! store of changed dwords) belongs to the landing of shader writes and is
 //! not taken.
-
-use std::sync::OnceLock;
 
 std::arch::global_asm!(
     ".globl victory_safe_copy",
@@ -57,31 +53,18 @@ unsafe extern "system" {
     fn victory_safe_copy_failed();
 }
 
-/// Whether copies of title memory are made here and not by the kernel.
-/// `VICTORY_SAFE_COPY=1`: here (and the write watch's handler, which takes
-/// their faults, is registered); unset or anything else: by the kernel.
-pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_SAFE_COPY").is_some_and(|v| v == "1");
-        if on {
-            crate::watch::install();
-        }
-        on
-    })
-}
-
 /// Copies `len` bytes. False if a page of the source cannot be read or one
 /// of the destination cannot be written; then some of the bytes may have
-/// been copied.
+/// been copied. The first copy registers the write watch's handler, which
+/// takes the faults.
 ///
 /// # Safety
 /// Of the two ranges, what is not title memory must be valid, and no Rust
-/// reference may cover the destination. The write watch's handler must be
-/// registered ([`on`] said yes, or `crate::watch::install` ran).
+/// reference may cover the destination.
 pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
-    // SAFETY: a fault on either side leaves through the failing exit
-    // ([`failing_exit`]); the rest is the caller's.
+    crate::watch::install();
+    // SAFETY: the handler is registered, so a fault on either side leaves
+    // through the failing exit ([`failing_exit`]); the rest is the caller's.
     unsafe { victory_safe_copy(dst, src, len) != 0 }
 }
 
@@ -135,22 +118,8 @@ mod tests {
         }
     }
 
-    /// The handler is registered whatever `VICTORY_SAFE_COPY` says: the
-    /// tests run the copy itself.
-    fn ready() {
-        crate::watch::install();
-    }
-
-    #[test]
-    fn the_switch_is_off_by_default() {
-        if std::env::var_os("VICTORY_SAFE_COPY").is_none() {
-            assert!(!on());
-        }
-    }
-
     #[test]
     fn copies_every_length_and_alignment() {
-        ready();
         let (a, b) = (Pages::new(1 << 16), Pages::new(1 << 16));
         a.fill();
         for len in [0usize, 1, 3, 4, 8, 31, 64, 255, 4095, 4096, 4097, 60_000] {
@@ -172,7 +141,6 @@ mod tests {
     /// and the process goes on.
     #[test]
     fn faults_are_failures() {
-        ready();
         let (a, b) = (Pages::new(3 << 12), Pages::new(3 << 12));
         a.fill();
         let mut old = 0;
@@ -215,7 +183,6 @@ mod tests {
     fn copy_costs() {
         use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        ready();
         const N: usize = 128 << 20;
         let from = Pages::new(N);
         from.fill();

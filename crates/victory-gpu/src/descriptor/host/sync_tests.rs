@@ -251,7 +251,7 @@ fn page_against_one_by_one(skip: bool) {
                 page.mirror(s, base + u64::from(s) * step, true);
             }
         }
-        // The page as read through the kernel.
+        // The page as the safe copy (`crate::safecopy`) reads it.
         // SAFETY: `records` is `SLOTS` records of `step` bytes.
         let bytes = unsafe {
             std::slice::from_raw_parts(base as *const u8, (u64::from(SLOTS) * step) as usize)

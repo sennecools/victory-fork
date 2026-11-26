@@ -307,9 +307,10 @@ pub(crate) fn sync_heaps() {
             while page < range_end {
                 let from = page.max(range_from);
                 let to = (page + crate::watch::PAGE).min(range_end);
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
+                // The page's records are read by the safe copy
+                // (`crate::safecopy`), into a copy: a page the title unmaps
+                // meanwhile fails the read where 2,048 reads in place would
+                // fault.
                 page_bytes.resize(to - from, 0);
                 let reading = crate::profile::stamp();
                 let read = crate::host::read_into(from as *const u8, &mut page_bytes);
@@ -427,8 +428,8 @@ pub(crate) fn let_go_slots(
 
 /// [`sync_heaps`] of one heap with [`host::sync_parted`]: the pages of the
 /// changed ranges `taken` of the title heap at `start` (records of `step`
-/// bytes, the first `mirrored_count` with host slots) are read through the
-/// kernel, compared with what was last seen and sorted
+/// bytes, the first `mirrored_count` with host slots) are read by the safe
+/// copy (`crate::safecopy`), compared with what was last seen and sorted
 /// ([`host::HostHeap::sort_copied_page`]), [`host::SYNC_PAGES`] a job; then
 /// the slots found with new records are mirrored, [`host::SYNC_SLOTS`] a
 /// job. With [`host::sync_threads`] above 1 the jobs run on that many
@@ -472,9 +473,10 @@ fn sync_parted_heap(
         let mut part = host::SyncPart::default();
         let mut page_bytes: Vec<u8> = Vec::new();
         for &(from, to) in jobs[n] {
-            // The page's records are read through the kernel, into a copy:
-            // a page the title unmaps meanwhile fails the read where 2,048
-            // reads in place would fault.
+            // The page's records are read by the safe copy
+            // (`crate::safecopy`), into a copy: a page the title unmaps
+            // meanwhile fails the read where 2,048 reads in place would
+            // fault.
             page_bytes.resize(to - from, 0);
             let reading = crate::profile::stamp();
             let read = crate::host::read_into(from as *const u8, &mut page_bytes);
