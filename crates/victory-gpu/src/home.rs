@@ -954,8 +954,9 @@ pub(crate) enum Found {
     New(New),
     /// The card took a copy: the copy path, with the card side it made.
     Card,
-    /// Today's copy.
-    Copy,
+    /// Today's copy, and why ([`Why::Off`]: the core was not asked, or the
+    /// range is none it can place).
+    Copy(Why),
 }
 
 /// A new home, opened and placed, not yet in the tables.
@@ -999,7 +1000,7 @@ pub(crate) fn resolve(
     // a leak, not a fault: no submission runs then, and the home keeps its
     // heap and claim, counted as `claims_left` or `chunks_held`.)
     if crate::release::released() {
-        return Found::Copy;
+        return Found::Copy(Why::Off);
     }
     resolve_with(Gate::process(), start, len, window, big, card)
 }
@@ -1014,10 +1015,10 @@ fn resolve_with(
     card: &mut dyn FnMut() -> bool,
 ) -> Found {
     let Some(end) = start.checked_add(len.max(1)) else {
-        return Found::Copy;
+        return Found::Copy(Why::Off);
     };
     let Some((at, bytes)) = crate::inplace::aligned_span(start, len) else {
-        return Found::Copy;
+        return Found::Copy(Why::Off);
     };
     let mut ask = LiveAsk {
         start,
@@ -1034,7 +1035,7 @@ fn resolve_with(
             if why != Why::Off {
                 turned_down(why);
             }
-            Found::Copy
+            Found::Copy(why)
         }
         Class::Card => {
             MADE[3].fetch_add(1, Ordering::Relaxed);
@@ -1069,12 +1070,21 @@ fn resolve_with(
                 let went_busy = core()
                     .region_at(ask.base)
                     .is_none_or(|(base, region)| base != ask.base || region.busy > 0);
-                match error {
-                    _ if went_busy => turned_down(Why::Busy),
-                    Some(error) => refused(&error, start, len),
-                    None => turned_down(Why::Refused),
-                }
-                Found::Copy
+                let why = match error {
+                    _ if went_busy => {
+                        turned_down(Why::Busy);
+                        Why::Busy
+                    }
+                    Some(error) => {
+                        refused(&error, start, len);
+                        Why::Refused
+                    }
+                    None => {
+                        turned_down(Why::Refused);
+                        Why::Refused
+                    }
+                };
+                Found::Copy(why)
             }
         },
     }
@@ -3134,7 +3144,7 @@ pub(crate) mod tests {
         let found = resolve_with(gate, region.base + K64, K64, false, false, &mut || {
             panic!("the card is not asked")
         });
-        assert!(matches!(found, Found::Copy));
+        assert!(matches!(found, Found::Copy(Why::Late)));
         assert_eq!(turned(Why::Late), before + 1);
         region.release();
     }
@@ -3363,6 +3373,103 @@ pub(crate) mod tests {
         unregister(0xc0de_5401, start);
         drop((home, copy));
         let _ = region;
+    }
+
+    /// [`warp_r5_x_refresh_over_flight_written_home_waits`]'s submission
+    /// waits for H2 behind `flights_ahead` flights that write the home (each
+    /// landed on its own while it waits), refreshing a buffer view's own copy
+    /// whose buffer's copy is the home. What this thread counted
+    /// (`crate::frame_budget::take_seen`): the H2 waits and their classes.
+    /// `None`: no WARP device that opens heaps on title memory.
+    fn h2_wait_over_home(flights_ahead: usize) -> Option<Vec<crate::frame_budget::Seen>> {
+        let host = warp13()?;
+        let (_core, flights) = r5_on();
+        let region = TestRegion::new(8 * K64 as usize);
+        let (start, len) = (region.base + K64, 4 * K64);
+        register(0xc0de_5402, start, len);
+        let home = find(start, len).expect("a home");
+        let (view, bytes) = (start + 0x3000, 0x800u64);
+        let copy = crate::shadow::exact_of(view, bytes, &home).expect("an exact copy");
+        assert!(!copy.is_home());
+        fill(start, len, 9);
+        copy.update(view as usize, bytes as usize);
+        let new = [0xc3u8; 0x800];
+        let from = source(host, &new);
+        let hold = QueueHold::new(host);
+        let ahead: Vec<_> = (0..flights_ahead)
+            .map(|_| {
+                let one = writer(host, &home, view, &from, bytes);
+                host.send_for_test(&one);
+                one
+            })
+            .collect();
+        let two = host.new_list().unwrap();
+        copy.refresh(&two, view, bytes);
+        two.close();
+        assert!(crate::host::flights::refresh_waits(&[&two]));
+        let _ = crate::frame_budget::take_seen();
+        let released = hold.released().after(200);
+        host.send_for_test(&two);
+        released.join().unwrap();
+        let seen = crate::frame_budget::take_seen();
+        flights.land_all();
+        for list in ahead.iter().chain([&two]) {
+            list.reset();
+        }
+        drop((ahead, two, hold));
+        unregister(0xc0de_5402, start);
+        drop((home, copy));
+        let _ = region;
+        Some(seen)
+    }
+
+    /// An H2 wait for a refresh of a buffer view's own copy whose buffer's
+    /// copy is a home is class C1a, with the refresh's bytes over the home.
+    #[test]
+    fn h2_class_names_exact_copy_over_home() {
+        use crate::frame_budget::{H2Class, Seen};
+        let Some(seen) = h2_wait_over_home(1) else {
+            return;
+        };
+        let classes: Vec<(H2Class, u64)> = seen
+            .iter()
+            .filter_map(|s| match *s {
+                Seen::H2Class { class, bytes, .. } => Some((class, bytes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(classes, vec![(H2Class::C1a, 0x800)], "{seen:?}");
+    }
+
+    /// Three flights ahead, each landed while the submission waits (the
+    /// wait's predicate is asked at each landing): the wait and its class
+    /// are counted once, and the class has the wait's whole time.
+    #[test]
+    fn h2_counted_once_per_wait() {
+        use crate::frame_budget::{Seen, Wait};
+        let Some(seen) = h2_wait_over_home(3) else {
+            return;
+        };
+        let waits: Vec<u64> = seen
+            .iter()
+            .filter_map(|s| match *s {
+                Seen::Wait {
+                    kind: Wait::H2,
+                    total,
+                    ..
+                } => Some(total),
+                _ => None,
+            })
+            .collect();
+        let classes: Vec<u64> = seen
+            .iter()
+            .filter_map(|s| match *s {
+                Seen::H2Class { us, .. } => Some(us),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits.len(), 1, "{seen:?}");
+        assert_eq!(classes, waits, "{seen:?}");
     }
 
     /// The title frees a home's pages while a flight's list holds the home:

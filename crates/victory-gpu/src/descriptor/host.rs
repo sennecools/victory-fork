@@ -3892,7 +3892,7 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
         && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
         && let Some(whole) = crate::shadow::find(base, width)
         && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
-        && let Some(own) = crate::shadow::exact(start, bytes)
+        && let Some(own) = crate::shadow::exact_of(start, bytes, &whole)
     {
         return Some((own, start, bytes));
     }
@@ -4299,7 +4299,7 @@ fn buffer_srv(
             b.StructureByteStride,
             unknown,
         )
-        .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
+        .and_then(|(start, bytes)| crate::shadow::exact_of(start, bytes, &shadow))
         {
             Some(own) => {
                 desc.Anonymous.Buffer.FirstElement = 0;
@@ -4411,7 +4411,7 @@ fn buffer_uav(
             b.StructureByteStride,
             unknown,
         )
-        .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
+        .and_then(|(start, bytes)| crate::shadow::exact_of(start, bytes, &shadow))
         {
             Some(own) => {
                 desc.Anonymous.Buffer.FirstElement = 0;

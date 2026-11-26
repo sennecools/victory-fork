@@ -495,7 +495,7 @@ mod tests {
         let memory = vec![0u8; 4 * K64 as usize];
         assert!(matches!(
             crate::home::resolve(memory.as_ptr() as u64, K64, false, false, &mut || false),
-            crate::home::Found::Copy
+            crate::home::Found::Copy(_)
         ));
         let list = host.new_list().expect("a host list");
         let heap = crate::descriptor::host::HostHeap::new(false, 4).expect("a host heap");

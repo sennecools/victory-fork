@@ -7704,7 +7704,7 @@ impl Host {
             if refresh_over_flight_homes(&homes, runs) && !late_lift::lift_refreshes(&homes, runs) {
                 let stamp = crate::profile::stamp();
                 let args = late_lift::wait_args(runs, true);
-                if let Some(us) = budget::h2_wait(&args, runs) {
+                if let Some(us) = budget::h2_wait(&args, &homes, runs) {
                     R5_STATS[0].fetch_add(1, Ordering::Relaxed);
                     R5_STATS[late_lift::R5_H2_US].fetch_add(us, Ordering::Relaxed);
                     if waiting == 0 {
