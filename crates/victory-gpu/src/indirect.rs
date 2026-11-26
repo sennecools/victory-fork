@@ -1198,6 +1198,9 @@ pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
     if list.indirect_state(scratch) == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
         return;
     }
+    // Not a guard: after an execution `crate::list` marks what follows,
+    // and a batch's end holds the kind around it (`crate::spans`).
+    list.span(crate::spans::Span::Clamp);
     done_on(&list.list, scratch);
 }
 
@@ -1319,6 +1322,9 @@ impl MeshBatch {
         let before = list.indirect_state(&bounded);
         let addresses = [src_gpu, words_gpu, dst_gpu, budget];
         let waits = Waits::for_list(list);
+        // Where the batch's clamp is recorded (`crate::spans`; counted at
+        // its op below).
+        list.span(crate::spans::Span::Clamp);
         record_gpu_clamp(
             c,
             &list.list,

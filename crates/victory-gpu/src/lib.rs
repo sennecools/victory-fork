@@ -75,6 +75,8 @@ mod shadow;
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod spans;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod texture_pool;

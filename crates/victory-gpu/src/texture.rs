@@ -529,6 +529,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !first && before.is_none() {
         return true;
     }
+    let _span = list.spanned(crate::spans::Span::Texture);
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
@@ -1315,6 +1316,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_texture(staging, false);
         return;
     }
+    let _span = list.spanned(crate::spans::Span::Texture);
     // A texture cut from a block (`crate::texture_pool`) may lie where
     // another did: what the card holds of that one is done with before the
     // first upload into this one, and before its transition below (a use).

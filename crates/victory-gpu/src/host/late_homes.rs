@@ -367,19 +367,31 @@ impl<T> Ring<T> {
     /// oldest such); `None` if every one is still in use. Of the others that
     /// finished, at most [`RING_SPARE`] are kept: a burst of flights made
     /// more than the queue holds afterwards.
+    #[cfg(test)]
     pub(crate) fn take(&mut self, finished: u64) -> Option<T> {
+        self.take_with(finished, drop)
+    }
+
+    /// [`Ring::take`], handing each one it lets go of (past the spare) to
+    /// `dropped` first.
+    pub(crate) fn take_with(&mut self, finished: u64, mut dropped: impl FnMut(T)) -> Option<T> {
         let at = (0..self.held.len())
             .filter(|&i| self.held[i].0 <= finished)
             .min_by_key(|&i| self.held[i].0)?;
         let taken = self.held.swap_remove(at).1;
         let mut spare = 0;
-        self.held.retain(|&(number, _)| {
+        for (number, item) in std::mem::take(&mut self.held) {
             if number > finished {
-                return true;
+                self.held.push((number, item));
+                continue;
             }
             spare += 1;
-            spare <= RING_SPARE
-        });
+            if spare <= RING_SPARE {
+                self.held.push((number, item));
+            } else {
+                dropped(item);
+            }
+        }
         Some(taken)
     }
 

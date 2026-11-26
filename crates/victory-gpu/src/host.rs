@@ -1356,6 +1356,11 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_SPANS=1`: a timestamp where the kind of its
+    /// commands changes, its prelude's and its lifted reads' too
+    /// ([`crate::spans`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) spans: crate::spans::ListSpans,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -5980,6 +5985,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                spans: Default::default(),
             })
         }
     }
@@ -6269,6 +6276,7 @@ impl Host {
                     // From the CPU side: the staging buffer, or the home
                     // that is title memory itself (`crate::card_home`).
                     let copies = |shadow: &crate::shadow::Shadow, ranges: &[(usize, usize)]| {
+                        crate::spans::mark(list, crate::spans::Span::Upload);
                         let bytes = shadow.card_upload(list, ranges);
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
@@ -6318,6 +6326,7 @@ impl Host {
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
+                        crate::spans::mark(list, crate::spans::Span::CardHash);
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&work.pso);
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
@@ -6346,6 +6355,7 @@ impl Host {
                             }
                         }
                     }
+                    crate::spans::end(list);
                     list.Close()?;
                     self.run_lists(&[Some(list.cast()?)]);
                     Ok(())
@@ -6444,6 +6454,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::spans::mark(list, crate::spans::Span::CardHash);
                     // What the submission's shaders wrote, first.
                     crate::profile::count(crate::profile::Count::UavCard, 1);
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
@@ -6488,6 +6499,7 @@ impl Host {
                     // every compare of the list, the pieces they flagged go
                     // to slots in the PC's memory.
                     if flown && let Some(inflight) = &work.inflight {
+                        crate::spans::mark(list, crate::spans::Span::Fetch);
                         crate::profile::count(crate::profile::Count::UavCard, 1);
                         list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                             Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -6531,6 +6543,7 @@ impl Host {
                         Some((&*r.shadow, &r.span, r.reference.as_ref()?, r.compared.then_some(r.at * 4)))
                     });
                     crate::card_home::record_merges(list, &work.differs.0, homed);
+                    crate::spans::end(list);
                     list.Close()?;
                     list.cast()
                 })()
@@ -6566,6 +6579,7 @@ impl Host {
             return;
         };
         for (check, list) in plan.lists {
+            crate::spans::ran(&list.1);
             if check { work.check.push(list) } else { work.sync.push(list) }
         }
         work.out = work.out.saturating_sub(1);
@@ -6717,9 +6731,11 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                crate::spans::mark(&list, crate::spans::Span::Fetch);
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
+                crate::spans::end(&list);
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
@@ -6732,6 +6748,7 @@ impl Host {
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
+                crate::spans::ran(&list);
                 Ok(after)
             })()
         };
@@ -7176,9 +7193,11 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    crate::spans::mark(list, crate::spans::Span::Fetch);
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    crate::spans::end(list);
                     list.Close()?;
                     self.run_lists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -7190,6 +7209,7 @@ impl Host {
                     WaitForSingleObject(self.event, INFINITE);
                     stood(waiting);
                     working(was_working);
+                    crate::spans::ran(list);
                     Ok(())
                 })()
             };
@@ -8084,6 +8104,12 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        // The time of what ran, by kind (crate::spans; those sent ahead
+        // when they are settled).
+        #[cfg(feature = "diagnostics")]
+        if !unwaited {
+            HostList::spans_waited(runs);
+        }
         // (Not waited for: the card may still resolve into its slot, which
         // stays taken.)
         if let Some((_, plan)) = stamped
@@ -8494,6 +8520,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.spans_closing();
         // Before the scratch buffer goes back to common below.
         self.end_mesh_batch();
         crate::indirect::close_batch(self);
@@ -8507,6 +8534,7 @@ impl HostList {
             self.indirect_common(&scratch);
         }
         self.card_budget_out();
+        self.spans_end();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -8560,6 +8588,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.spans_reopened();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -8636,7 +8665,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -8728,6 +8757,7 @@ impl HostList {
         }
         drop(twins);
         if copy {
+            let _span = self.spanned(crate::spans::Span::DepthTwin);
             self.twin_copy(&depth, &twin, colour);
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
@@ -8804,6 +8834,11 @@ impl HostList {
             })
             .collect();
         drop(twins);
+        // Each records a copy or a plane pass (only before the list closes:
+        // nothing follows to give the kind back to).
+        if !written.is_empty() {
+            self.span(crate::spans::Span::DepthTwin);
+        }
         for (depth, twin, copy) in &written {
             if *copy {
                 self.twin_copy(depth, twin, false);
@@ -8849,13 +8884,17 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                use crate::spans::{Own, Span};
+                first.own_mark(Own::Lifts, list, Span::TitleCopy);
                 record_lifts(list, &lifted);
+                first.own_end(Own::Lifts, list);
                 list.Close()
             })
         };
         if let Err(e) = recorded {
             fail(format_args!("a list of lifted reads did not record ({e})"));
         }
+        first.own_sent(crate::spans::Own::Lifts);
         list.cast().ok()
     }
 
@@ -8975,21 +9014,27 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                use crate::spans::{Own, Span};
                 if !to_copy.is_empty() {
+                    self.own_mark(Own::Prelude, list, Span::DepthTwin);
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
+                    self.own_mark(Own::Prelude, list, Span::DepthTwin);
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
                 if !barriers.is_empty() {
+                    self.own_mark(Own::Prelude, list, Span::Prelude);
                     list.ResourceBarrier(&barriers);
                 }
+                self.own_end(Own::Prelude, list);
                 list.Close()
             })
         };
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
+        self.own_sent(crate::spans::Own::Prelude);
         list.cast().ok()
     }
 
@@ -9044,6 +9089,7 @@ impl HostList {
     /// every one recorded on the list (the report pairs the k-th such
     /// breadcrumb with the k-th op).
     pub(crate) fn op(&self, kind: OpKind, pipeline: u64) {
+        self.span_op(kind);
         if dred() != Dred::Off {
             self.ops
                 .lock()
@@ -9386,6 +9432,7 @@ impl HostList {
     /// list's other buffers ([`HostList::buffer_state`]): common at the
     /// start of every recording.
     fn zero_card_budget(&self, card: &ID3D12Resource, list: &ID3D12GraphicsCommandList2) {
+        let _span = self.spanned(crate::spans::Span::Clamp);
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
         let zeros: [_; BUDGET_WORDS] =
@@ -9415,6 +9462,8 @@ impl HostList {
         else {
             return;
         };
+        // Only before the list closes: a plain mark.
+        self.span(crate::spans::Span::Clamp);
         // The words after the budget.
         let notes = 4 * (BUDGET_WORDS as u64 - 1);
         self.buffer_state(card, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -9496,6 +9545,7 @@ impl HostList {
             }
             deferred.indirect_readable = 0;
         }
+        let _span = self.spanned(crate::spans::Span::Clamp);
         let barrier = transition(
             scratch,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
@@ -9544,6 +9594,8 @@ impl HostList {
     pub(crate) fn end_mesh_batch(&self) {
         let open = self.mesh_batch().take();
         if let Some(batch) = open {
+            // It marks what it records (`crate::indirect::done`).
+            let _span = self.span_held();
             batch.finish(self);
         }
     }
@@ -10853,6 +10905,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                crate::spans::log();
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
