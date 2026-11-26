@@ -6,7 +6,7 @@
 //! [`line`] says them once a second beside the frame lines.
 //!
 //! [`wave1_line`] says, beside it, what decides which of wave 1's steps are
-//! needed: H2 waits by class.
+//! needed: H2 waits by class, and why card copies keep staging buffers.
 //!
 //! Each counting site is one relaxed atomic add, but for these: the relay's
 //! clock at a phase change is a few atomic stores under a sequence number,
@@ -563,6 +563,63 @@ pub(crate) fn first_overlap(ranges: &[(usize, usize)], from: usize, to: usize) -
     ranges.get(at).filter(|r| r.0 < to).map(|r| r.0.max(from))
 }
 
+/// Why a card copy kept its staging buffer (`crate::card_home::kept`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Staging {
+    Misaligned,
+    View,
+    NotRegion,
+    Overlap,
+    Budget,
+    Other,
+}
+
+impl Staging {
+    const ALL: [Staging; 6] = [
+        Staging::Misaligned,
+        Staging::View,
+        Staging::NotRegion,
+        Staging::Overlap,
+        Staging::Budget,
+        Staging::Other,
+    ];
+
+    pub(crate) fn of(kept: crate::shadow::Kept) -> Staging {
+        use crate::home::Why;
+        use crate::shadow::Kept;
+        match kept {
+            Kept::Misaligned => Staging::Misaligned,
+            Kept::Why(Why::View) => Staging::View,
+            Kept::Why(Why::NotRegion) => Staging::NotRegion,
+            Kept::Why(Why::Overlap) => Staging::Overlap,
+            Kept::Why(Why::Budget) => Staging::Budget,
+            Kept::Why(_) => Staging::Other,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Staging::Misaligned => "misaligned",
+            Staging::View => "view memory",
+            Staging::NotRegion => "not a region",
+            Staging::Overlap => "partly in a home",
+            Staging::Budget => "over budget",
+            Staging::Other => "other",
+        }
+    }
+}
+
+/// Per [`Staging`]: card copies, and their title bytes.
+static STAGING: [[AtomicU64; 2]; Staging::ALL.len()] =
+    [const { [const { AtomicU64::new(0) }; 2] }; Staging::ALL.len()];
+
+/// A card copy of `bytes` kept its staging buffer for `reason`.
+pub(crate) fn staging_kept(reason: Staging, bytes: u64) {
+    STAGING[reason as usize][0].fetch_add(1, Ordering::Relaxed);
+    STAGING[reason as usize][1].fetch_add(bytes, Ordering::Relaxed);
+    seen!(Seen::Kept { reason, bytes });
+}
+
 /// What was counted on this thread, in order (tests: the process's counters
 /// are shared with every other test).
 #[cfg(test)]
@@ -579,6 +636,10 @@ pub(crate) enum Seen {
         class: H2Class,
         bytes: u64,
         us: u64,
+    },
+    Kept {
+        reason: Staging,
+        bytes: u64,
     },
 }
 
@@ -723,13 +784,25 @@ pub(crate) fn wave1_line(frames: f64) {
             })
         })
         .collect();
-    tracing::info!(
-        "frame budget for wave 1 per frame: H2 by class {}",
-        if classes.is_empty() {
+    let staging: Vec<String> = Staging::ALL
+        .iter()
+        .filter_map(|&reason| {
+            let s: [u64; 2] =
+                std::array::from_fn(|i| STAGING[reason as usize][i].swap(0, Ordering::Relaxed));
+            (s[0] > 0).then(|| format!("{} {:.2} ({:.2} MB)", reason.name(), per(s[0]), mb(s[1])))
+        })
+        .collect();
+    let none = |v: Vec<String>| {
+        if v.is_empty() {
             "none".to_owned()
         } else {
-            classes.join(", ")
-        },
+            v.join(", ")
+        }
+    };
+    tracing::info!(
+        "frame budget for wave 1 per frame: H2 by class {}; card copies kept staging: {}",
+        none(classes),
+        none(staging),
     );
 }
 
@@ -987,6 +1060,24 @@ mod tests {
         ];
         for (origin, carded, in_home, class) in cases {
             assert_eq!(H2Class::of(origin, carded, in_home), class, "{origin:?}");
+        }
+    }
+
+    #[test]
+    fn staging_reasons_name_the_cores_reasons() {
+        use crate::home::Why;
+        use crate::shadow::Kept;
+        let cases = [
+            (Kept::Misaligned, Staging::Misaligned),
+            (Kept::Why(Why::View), Staging::View),
+            (Kept::Why(Why::NotRegion), Staging::NotRegion),
+            (Kept::Why(Why::Overlap), Staging::Overlap),
+            (Kept::Why(Why::Budget), Staging::Budget),
+            (Kept::Why(Why::Busy), Staging::Other),
+            (Kept::Why(Why::Off), Staging::Other),
+        ];
+        for (kept, reason) in cases {
+            assert_eq!(Staging::of(kept), reason, "{kept:?}");
         }
     }
 

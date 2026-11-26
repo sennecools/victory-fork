@@ -5002,7 +5002,7 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
                 return publish(key, len, shadow, true).map(Some);
             }
             Err(why) => {
-                crate::card_home::kept();
+                crate::card_home::kept(why, len);
                 kept = why;
             }
         }
