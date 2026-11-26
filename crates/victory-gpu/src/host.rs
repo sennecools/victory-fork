@@ -527,7 +527,10 @@ pub(crate) fn sweep_walk<K: Copy, V>(
 /// The number of the newest submission begun, and of the newest of which
 /// all before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
-    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
+    (
+        STARTED.load(Ordering::Acquire),
+        FINISHED.load(Ordering::Acquire),
+    )
 }
 
 /// Drops `object` once every submission running now has finished: at once
