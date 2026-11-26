@@ -53,6 +53,8 @@ pub mod release;
 pub mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

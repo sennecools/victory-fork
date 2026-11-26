@@ -49,8 +49,8 @@ All off by default: unset is exactly r5-s1. Each is read once per process
 
 | Switch | Default | Values | What it does | Depends on |
 |---|---|---|---|---|
-| `VICTORY_TEXTURE_POOL` | off | `1` both halves; `texture`; `staging` | Host textures (1 sample, 1 plane, no clear value, no XOR layout) placed in 64 MiB default-heap blocks; staging buffers as pieces of 64 MiB upload blocks. A piece rests 2.5 s before reuse. Up to 64 empty blocks kept below 85 % of budget, else 2 (staging at most 8). After a refused block, none asked for 500 ms. | Staging half: only the non-transient path (not with `VICTORY_TEXTURE_STAGING_TRANSIENT=1`) |
-| `VICTORY_RIPE_BLOCKS` | 12 while the texture half is on; 0 otherwise | `<n>`; `0` = none | n blocks made ahead; textures cut from blocks older than every running submission | Texture half of the pool; no effect with it off |
+| `VICTORY_TEXTURE_POOL` | off | `1` both halves; `texture`; `staging` | Host textures (1 sample, 1 plane, no clear value, no XOR layout) placed in owned 64 MiB DEFAULT-heap pages (`residency/pages.rs`, `ALLOW_ONLY_NON_RT_DS_TEXTURES`, `CreatePlacedResource`); staging buffers as pieces of 64 MiB upload pages. A piece rests 2.5 s before reuse. Texture pieces come only from ripe pages (older than every running submission); the spare pages are the pages made ahead: 12 below 85 % of budget, else 2. With no ripe page that has room the texture is not placed (an allocation of its own instead) and the unplaced-texture counter goes up. A texture over 64 MiB gets a heap of its own size, let go with it. Staging keeps 8 empty pages below 85 % of budget, else 2. After a refused page, none asked for 500 ms. | Staging half: only the non-transient path (not with `VICTORY_TEXTURE_STAGING_TRANSIENT=1`) |
+| `VICTORY_RIPE_BLOCKS` (removed: ripe pages are the constant pair 12/2 in `residency/pages.rs`) | none | none | Was: n blocks made ahead | none |
 | `VICTORY_TEXTURE_KEEP` (removed: a measured loser, host copies go by idle time alone) | off | `1` | `host::vram_keep`: host copies stay 10 min while use (less the pool's empty blocks, plus the kept room) is under 88 % of budget; above it the longest idle go first down to 85 % (5 s idle, 1.5 s from 95 %), in one unsliced sorted pass | Uses `texture_pool::texture_room` when the pool is on |
 | `VICTORY_TEXTURE_AWAY_MS` | off | `<ms>`; `0` = off; cool_fox 3000 | A slot keeps its view until its memory has been unmapped that long, instead of null at the first look | None |
 | `VICTORY_TEXTURE_DIGEST` | off (blake3) | `1` | cool_fox's 128-bit digest for the in-memory change hash and the recheck fingerprint. Nothing on disk uses these hashes. | None |
@@ -88,12 +88,12 @@ commit:
 
 ```powershell
 # 1. No switches: all must pass as on r5-s1.
-cargo test -p victory-gpu --lib -- texture_pool:: digest_tests title_memory_tests textures_are_kept_while_the_card_has_room
+cargo test -p victory-gpu --lib -- texture_pool:: residency::pages::tests digest_tests title_memory_tests textures_are_kept_while_the_card_has_room
 cargo test -p victory-hle --lib -- dstorage::
 
 # 2. The pool on WARP, one thread.
 $env:VICTORY_D3D12_WARP=1
-cargo test -p victory-gpu --lib --features diagnostics -- texture_pool::d3d::tests::warp_a_texture_gives_its_piece_back_when_it_goes --test-threads=1 --nocapture
+cargo test -p victory-gpu --lib --features diagnostics -- residency::pages::d3d::tests texture_pool::d3d::tests --test-threads=1 --nocapture
 Remove-Item Env:VICTORY_D3D12_WARP
 
 # 3. The existing texture and descriptor tests (staging, transient, guards,
@@ -106,16 +106,26 @@ $env:VICTORY_BENCH_FILE="D:\some\big\file"; cargo test -p victory-hle --lib --re
 
 Added tests:
 
-- `texture_pool::tests`: `ranges_are_cut_aligned_and_join_again`,
-  `empty_blocks_stay_while_the_card_has_room`,
-  `a_failed_block_is_not_retried_for_each_small_upload`,
-  `a_reclaim_lets_idle_blocks_go_without_reusing_live_or_resting_pieces`,
+- `residency::pages::tests` (pure logic): `ranges_are_cut_aligned_and_join_again`,
+  `the_card_is_pressed_from_85_percent_of_its_budget`,
+  `a_failed_page_is_not_retried_for_each_small_upload`,
+  `a_reclaim_lets_idle_pages_go_without_reusing_live_or_resting_pieces`,
   `pieces_never_overlap_and_rest_before_they_are_used_again`,
-  `pieces_come_from_blocks_older_than_the_lists_that_run` (pure logic).
-- `texture_pool::d3d::tests::warp_a_texture_gives_its_piece_back_when_it_goes`
-  (WARP; calls the pool directly, ignoring the switch). With no host
-  device it returns at once and passes without checking: set both
+  `pieces_come_only_from_pages_older_than_the_lists_that_run`,
+  `a_piece_larger_than_a_page_has_a_heap_of_its_own_let_go_with_it`,
+  `pages_made_ahead_are_the_spares_and_never_go_and_come_back`,
+  `a_compaction_empties_the_emptiest_page`,
+  `a_compaction_moves_nothing_that_has_nowhere_to_go_or_is_not_ripe`.
+- `residency::pages::d3d::tests` (WARP): `warp_a_texture_gives_its_piece_back_when_it_goes`
+  (places in a ripe page directly, ignoring the switch),
+  `warp_pages_let_go_return_their_commit` (full pages emptied and let go
+  lower the commit by at least a page each) and
+  `warp_only_evict_alone_keeps_the_commit` (WARP only: documents the
+  measured card fact, proves nothing about the card). With no host device
+  they return at once and pass without checking: set both
   `VICTORY_D3D12_WARP=1` and `--features diagnostics`.
+- `texture_pool::tests::empty_staging_pages_stay_while_the_card_has_room`
+  and `texture_pool::d3d::tests::warp_a_staging_piece_begins_as_zeros`.
 - `digest_tests::a_digest_tells_bytes_apart` (DIGEST).
 - `title_memory_tests::a_watched_detiling_forgets_what_the_staging_buffer_held` (SAME fix).
 - `textures_are_kept_while_the_card_has_room` (KEEP).
@@ -150,7 +160,7 @@ What to measure (frametime CSV columns and log lines):
 
 | Switch | Look at |
 |---|---|
-| POOL | `textures_ms`, `prep`, `frame_ms_max` (fewer allocation spikes); log "textures cut from blocks made while lists ran that still run" (should stay 0 with ripe blocks) |
+| POOL | `textures_ms`, `prep`, `frame_ms_max` (fewer allocation spikes); log "textures not placed in a page (no ripe page with room, or the page was refused)" (each such texture is an allocation of its own; should stay small) |
 | KEEP | `textures_mb` and `textures_ms` (fewer re-uploads), `card_*`, VRAM use against budget |
 | AWAY | `heap_ms`, `heap_passes`; black flashes after unmaps |
 | DIGEST | `texture_refresh_ms`, `heap_ms` |
@@ -160,16 +170,21 @@ What to measure (frametime CSV columns and log lines):
 
 ## Risks to check on the PC
 
-- **Ripe blocks and device loss.** cool_fox's pool (9fea743) lost the
+- **Ripe pages and device loss.** cool_fox's pool (9fea743) lost the
   device to page faults in the first texture of a block made that
-  instant; 3b73cb0 fixed it with ripe blocks (12, now our default with the
-  pool on). `VICTORY_RIPE_BLOCKS=0` with the pool on is that known
-  device-loss setup. cool_fox's waits until new memory is resident
-  (0322b39, f1d3eb2) are not ported: first suspect on a device loss.
-- **Pool spares and room.** Up to 64 empty blocks (4 GiB) plus ripe
-  blocks stay allocated. `room()`, the idle tiers and KEEP now take them
-  off `used`. Check host textures are not turned down earlier than with
-  the pool off.
+  instant; 3b73cb0 fixed it with ripe blocks. Pages follow that rule
+  strictly: a texture is never cut from an unripe page (it becomes an
+  allocation of its own instead, counted in the log). The one exception
+  is a texture over 64 MiB, whose heap of its own is used at once, as a
+  committed resource would be. cool_fox's waits until new memory is
+  resident (0322b39, f1d3eb2) are not ported: first suspect on a device
+  loss.
+- **Pool spares and room.** Up to 12 empty pages (768 MiB) stay allocated
+  below 85 % of budget, 2 above it; they are the pages made ahead. The
+  spare count is applied at the next piece even when the sweep found the
+  pages busy. `room()`, the idle tiers and KEEP take them off `used`.
+  Check host textures are not turned down earlier than with the pool off,
+  and that the unplaced-texture count stays small in load bursts.
 - **Stale texels.** A pooled texture first written by a host copy is
   zeroed in `card_writes`; if no upload buffer is free it warns and keeps
   the old texels. A pooled texture never fully uploaded (transient staging
