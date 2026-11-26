@@ -3194,9 +3194,9 @@ struct CardRange {
     compared: bool,
     /// For a copy whose CPU side is a home (`crate::card_home`): where the
     /// range's card bytes from before the lists lie in the reference the
-    /// merge on the card takes. Such a range is merged on the card, not
-    /// fetched.
-    reference: Option<u32>,
+    /// merge on the card takes (the room, or the copy's kept reference).
+    /// Such a range is merged on the card, not fetched.
+    reference: Option<crate::card_home::Place>,
 }
 
 /// What a submission does for copies in the card's memory.
@@ -6197,6 +6197,7 @@ impl Host {
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
         if declared.is_empty() && dirty.is_empty() {
+            crate::card_home::idle();
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -6325,7 +6326,7 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: Vec::new(),
             lists: used,
             sent_as,
             inflight: false,
@@ -6366,27 +6367,36 @@ impl Host {
         work.taken = at;
         // Copies whose CPU side is a home (`crate::card_home`): their ranges'
         // card bytes, once the changes went up, are set aside ahead of the
-        // lists (a list of ours, run now) for the merge after them.
+        // lists (a list of ours, run now) for the merge after them, and kept
+        // references take what went up to their copies.
         let homed: Vec<usize> = (0..plan.ranges.len())
             .filter(|&i| plan.ranges[i].shadow.card_homed().is_some())
             .collect();
-        if !homed.is_empty() {
+        let uploaded = dirty
+            .iter()
+            .any(|(s, r)| !r.is_empty() && s.card_homed().is_some());
+        if !homed.is_empty() || uploaded {
             let spans: Vec<_> = homed
                 .iter()
                 .map(|&i| &plan.ranges[i])
-                .map(|r| (&*r.shadow, r.span.from, r.span.to))
+                .map(|r| (&r.shadow, r.span.from, r.span.to))
                 .collect();
-            let Some((list, places)) = crate::card_home::before(self, &spans) else {
+            let Some((list, places)) = crate::card_home::before(self, &spans, &dirty) else {
                 fail(format_args!(
                     "no memory for, or no list to record, what card copies held before a submission"
                 ));
             };
-            // SAFETY: a closed list of ours; it goes ahead of the lists.
-            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+            if let Some(list) = list {
+                // SAFETY: a closed list of ours; it goes ahead of the lists.
+                unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+            }
             for (&i, place) in homed.iter().zip(places) {
                 plan.ranges[i].reference = Some(place);
             }
+        } else {
+            crate::card_home::idle();
         }
+        plan._synced = dirty.into_iter().map(|(shadow, _)| shadow).collect();
         if plan.ranges.iter().any(|r| r.compared || r.reference.is_some()) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
@@ -6477,7 +6487,7 @@ impl Host {
                     // Copies whose CPU side is a home: what the shaders
                     // wrote is merged into it behind the compares.
                     let homed = plan.ranges.iter().filter_map(|r| {
-                        Some((&*r.shadow, &r.span, r.reference?, r.compared.then_some(r.at * 4)))
+                        Some((&*r.shadow, &r.span, r.reference.as_ref()?, r.compared.then_some(r.at * 4)))
                     });
                     crate::card_home::record_merges(list, &work.differs.0, homed);
                     list.Close()?;

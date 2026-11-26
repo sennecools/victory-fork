@@ -61,7 +61,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::{ID3D12Heap, ID3D12Resource};
 
@@ -135,10 +135,78 @@ struct Opened {
     buffer: ID3D12Resource,
     /// The buffer's GPU address.
     gpu: u64,
+    /// Once its chunk took it: whether the buffer has a place in
+    /// [`CHUNK_BUFFERS`] (else it is counted in [`CHUNK_BUFFERS_OVER`]).
+    listed: Option<bool>,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Opened {}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        use windows::core::Interface;
+        // Out of the set before the buffer is let go: a buffer made later at
+        // the same address is no chunk's.
+        match self.listed {
+            Some(true) => unlist(self.buffer.as_raw() as usize),
+            Some(false) => {
+                CHUNK_BUFFERS_OVER.fetch_sub(1, Ordering::SeqCst);
+            }
+            None => {}
+        }
+    }
+}
+
+/// The opened chunks' placed buffers (their COM pointers; 0: an empty
+/// place), so that [`is_chunk_buffer`], asked for every view heap slot made
+/// with the pool on, takes no lock. 1,024 chunks of 256 MiB are 256 GiB.
+static CHUNK_BUFFERS: [AtomicUsize; 1024] = [const { AtomicUsize::new(0) }; 1024];
+
+/// Opened chunks' buffers that found no place in [`CHUNK_BUFFERS`]: while
+/// there are any, [`is_chunk_buffer`] looks in the chunks' table too.
+static CHUNK_BUFFERS_OVER: AtomicUsize = AtomicUsize::new(0);
+
+/// One past the last place of [`CHUNK_BUFFERS`] ever taken: the places
+/// looked at.
+static CHUNK_BUFFERS_TOP: AtomicUsize = AtomicUsize::new(0);
+
+/// The places of [`CHUNK_BUFFERS`] that may hold a buffer.
+fn listed() -> &'static [AtomicUsize] {
+    &CHUNK_BUFFERS[..CHUNK_BUFFERS_TOP.load(Ordering::SeqCst)]
+}
+
+/// Puts `raw` in [`CHUNK_BUFFERS`]; whether there was a place. Done before
+/// the buffer is handed to anyone (under the chunks' lock), so whoever has
+/// it finds it.
+fn list(raw: usize) -> bool {
+    let Some(i) = CHUNK_BUFFERS.iter().position(|place| {
+        place
+            .compare_exchange(0, raw, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+    }) else {
+        return false;
+    };
+    CHUNK_BUFFERS_TOP.fetch_max(i + 1, Ordering::SeqCst);
+    true
+}
+
+/// Whether `raw` is in [`CHUNK_BUFFERS`].
+fn is_listed(raw: usize) -> bool {
+    listed()
+        .iter()
+        .any(|place| place.load(Ordering::SeqCst) == raw)
+}
+
+/// Takes `raw` out of [`CHUNK_BUFFERS`].
+fn unlist(raw: usize) {
+    if let Some(place) = listed()
+        .iter()
+        .find(|place| place.load(Ordering::SeqCst) == raw)
+    {
+        place.store(0, Ordering::SeqCst);
+    }
+}
 
 /// A chunk of the pool, as `xmem` made it.
 struct Chunk {
@@ -148,7 +216,14 @@ struct Chunk {
     opened: Option<Opened>,
     /// The host refused to open it: never asked again.
     refused: bool,
+    /// Which chunk made at this handle it is ([`MADE_CHUNKS`]): an opening
+    /// made with the lock let go goes in only if the chunk is still the one
+    /// it was made for ([`home`]).
+    serial: u64,
 }
+
+/// Chunks made so far.
+static MADE_CHUNKS: AtomicU64 = AtomicU64::new(0);
 
 /// The chunks by their section's handle. Taken after every other lock of
 /// the runtime's that is held when a home is resolved (the shadow tables);
@@ -267,6 +342,7 @@ pub fn title_memory_pool_chunk(section: usize, bytes: u64, how: PoolChunk) {
         committed: how == PoolChunk::Committed,
         opened: None,
         refused: false,
+        serial: MADE_CHUNKS.fetch_add(1, Ordering::Relaxed),
     };
     let old = chunks().insert(section, chunk);
     drop(old);
@@ -302,68 +378,143 @@ pub fn memory_pool_homes_possible() -> bool {
 /// The home of `len` title bytes that are the bytes from `offset` on of the
 /// chunk with section `section`: a buffer over the whole chunk, with the
 /// title bytes at `offset` in it. The chunk is opened now if no home was
-/// wanted in it before.
+/// wanted in it before, with the chunks' lock let go meanwhile: the opening
+/// takes the host's own time. (Two threads that open one chunk at once both
+/// open it; the first opening to go in is the chunk's, the other is let go.)
 pub(crate) fn home(section: usize, offset: u64, len: u64) -> Result<crate::inplace::Placed, Why> {
-    let mut chunks = chunks();
-    let Some(chunk) = chunks.get_mut(&section) else {
-        return Err(Why::NotPool);
-    };
-    if !chunk.committed {
-        return Err(Why::ReservedChunk);
-    }
-    if chunk.refused {
-        return Err(Why::ChunkRefused);
-    }
-    // A run lies inside its section (`crate::inplace::cover`): one past it
-    // is the census and the chunk table telling different sizes.
-    if offset
-        .checked_add(len.max(1))
-        .is_none_or(|end| end > chunk.bytes)
-    {
-        return Err(Why::PastChunk);
-    }
-    if chunk.opened.is_none() {
-        let Some(host) = crate::host::host() else {
-            return Err(Why::ChunkRefused);
-        };
-        // Not latched: asked again once the budget has room.
-        if !shared_room(host, chunk.bytes) {
-            COUNTS[at::OVER_BUDGET].fetch_add(1, Ordering::Relaxed);
-            return Err(Why::OverBudget);
-        }
-        let begun = std::time::Instant::now();
-        let opened = crate::inplace::open(&host.device, crate::inplace::From::Section(section))
-            .and_then(|heap| {
-                crate::inplace::place(&host.device, &heap, 0, chunk.bytes)
-                    .map(|buffer| (heap, buffer))
-            });
-        let took = begun.elapsed().as_micros() as u64;
-        COUNTS[at::OPEN_US].fetch_add(took, Ordering::Relaxed);
-        COUNTS[at::OPEN_MOST_US].fetch_max(took, Ordering::Relaxed);
-        match opened {
-            Ok((heap, buffer)) => {
-                COUNTS[at::OPENED].fetch_add(1, Ordering::Relaxed);
-                crate::host::name(&buffer, || format!("page pool chunk {section:#x} in place"));
-                // SAFETY: a live buffer.
-                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-                chunk.opened = Some(Opened { heap, buffer, gpu });
-            }
-            Err(error) => {
-                chunk.refused = true;
-                if COUNTS[at::OPEN_REFUSED].fetch_add(1, Ordering::Relaxed) < 8 {
-                    tracing::warn!(bytes = chunk.bytes, %error, "memory pool: a chunk was not opened as a heap; its views keep their copies");
-                }
-                return Err(Why::ChunkRefused);
-            }
-        }
-    }
-    let opened = chunk.opened.as_ref().ok_or(Why::ChunkRefused)?;
-    Ok(crate::inplace::Placed {
+    let placed = |opened: &Opened| crate::inplace::Placed {
         buffer: opened.buffer.clone(),
         heap: opened.heap.clone(),
         gpu: opened.gpu + offset,
         bias: offset,
-    })
+    };
+    let (bytes, serial) = {
+        let chunks = chunks();
+        let Some(chunk) = chunks.get(&section) else {
+            return Err(Why::NotPool);
+        };
+        if !chunk.committed {
+            return Err(Why::ReservedChunk);
+        }
+        if chunk.refused {
+            return Err(Why::ChunkRefused);
+        }
+        // A run lies inside its section (`crate::inplace::cover`): one past
+        // it is the census and the chunk table telling different sizes.
+        if offset
+            .checked_add(len.max(1))
+            .is_none_or(|end| end > chunk.bytes)
+        {
+            return Err(Why::PastChunk);
+        }
+        if let Some(opened) = &chunk.opened {
+            return Ok(placed(opened));
+        }
+        (chunk.bytes, chunk.serial)
+    };
+    let Some(host) = crate::host::host() else {
+        return Err(Why::ChunkRefused);
+    };
+    // Not latched: asked again once the budget has room.
+    if !shared_room(host, bytes) {
+        COUNTS[at::OVER_BUDGET].fetch_add(1, Ordering::Relaxed);
+        return Err(Why::OverBudget);
+    }
+    // The opening goes through a handle of its own, taken while the chunk
+    // is known: `xmem` may close the chunk's handle meanwhile (and a section
+    // made then may get the same number).
+    let Some(own) = ({
+        let chunks = chunks();
+        match chunks.get(&section) {
+            Some(chunk) if chunk.serial == serial => duplicate(section),
+            _ => return Err(Why::NotPool),
+        }
+    }) else {
+        return Err(Why::ChunkRefused);
+    };
+    let begun = std::time::Instant::now();
+    let opened =
+        crate::inplace::open(&host.device, crate::inplace::From::Section(own)).and_then(|heap| {
+            crate::inplace::place(&host.device, &heap, 0, bytes).map(|buffer| (heap, buffer))
+        });
+    // SAFETY: the handle is ours (`duplicate`); the heap holds the section
+    // itself.
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(own as _) };
+    let opened = opened.map(|(heap, buffer)| {
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Opened {
+            heap,
+            buffer,
+            gpu,
+            listed: None,
+        }
+    });
+    let took = begun.elapsed().as_micros() as u64;
+    COUNTS[at::OPEN_US].fetch_add(took, Ordering::Relaxed);
+    COUNTS[at::OPEN_MOST_US].fetch_max(took, Ordering::Relaxed);
+    // An opening that does not go in is let go once the lock is.
+    let mut spare = None;
+    let found = {
+        let mut chunks = chunks();
+        match chunks.get_mut(&section) {
+            // Closed meanwhile (and perhaps made anew at the same handle).
+            None => Err(Why::NotPool),
+            Some(chunk) if chunk.serial != serial => Err(Why::NotPool),
+            Some(chunk) => match (opened, &chunk.opened) {
+                (opened, Some(theirs)) => {
+                    spare = opened.ok();
+                    Ok(placed(theirs))
+                }
+                (Ok(mut opened), None) => {
+                    use windows::core::Interface;
+                    COUNTS[at::OPENED].fetch_add(1, Ordering::Relaxed);
+                    crate::host::name(&opened.buffer, || {
+                        format!("page pool chunk {section:#x} in place")
+                    });
+                    let listed = list(opened.buffer.as_raw() as usize);
+                    if !listed {
+                        CHUNK_BUFFERS_OVER.fetch_add(1, Ordering::SeqCst);
+                    }
+                    opened.listed = Some(listed);
+                    let found = placed(&opened);
+                    chunk.opened = Some(opened);
+                    Ok(found)
+                }
+                (Err(error), None) => {
+                    chunk.refused = true;
+                    if COUNTS[at::OPEN_REFUSED].fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::warn!(bytes, %error, "memory pool: a chunk was not opened as a heap; its views keep their copies");
+                    }
+                    Err(Why::ChunkRefused)
+                }
+            },
+        }
+    };
+    drop(spare);
+    found
+}
+
+/// A handle of our own to the section with handle `section`, with the same
+/// access; `None` if Windows gives none. The caller closes it.
+fn duplicate(section: usize) -> Option<usize> {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut own = std::ptr::null_mut();
+    // SAFETY: a handle of this process, known to the pool while its lock is
+    // held; the out pointer is ours.
+    let done = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            section as _,
+            GetCurrentProcess(),
+            &mut own,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    (done != 0).then_some(own as usize)
 }
 
 /// A C-pool home of `len` bytes was made.
@@ -391,16 +542,22 @@ pub(crate) fn slots_made_anew(n: u64) {
 }
 
 /// Whether `buffer` is the buffer placed over a chunk of the pool (the
-/// buffer of every C-pool home in it). Takes the chunks' lock, the last.
+/// buffer of every C-pool home in it). Takes no lock ([`CHUNK_BUFFERS`])
+/// unless an opened chunk's buffer found no place there; then the chunks'
+/// lock, the last.
 pub(crate) fn is_chunk_buffer(buffer: &ID3D12Resource) -> bool {
     use windows::core::Interface;
     let raw = buffer.as_raw();
-    chunks().values().any(|chunk| {
-        chunk
-            .opened
-            .as_ref()
-            .is_some_and(|o| o.buffer.as_raw() == raw)
-    })
+    if is_listed(raw as usize) {
+        return true;
+    }
+    CHUNK_BUFFERS_OVER.load(Ordering::SeqCst) != 0
+        && chunks().values().any(|chunk| {
+            chunk
+                .opened
+                .as_ref()
+                .is_some_and(|o| o.buffer.as_raw() == raw)
+        })
 }
 
 /// The slots made anew ([`slots_made_anew`]) and the ranges told to the
@@ -488,6 +645,24 @@ pub(crate) fn line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunk buffers' set finds what it holds and nothing else, and lets
+    /// a buffer go. (Odd numbers: no COM pointer of another test's chunk is
+    /// one. Which place a buffer takes is not asked: a test beside it may
+    /// open a chunk.)
+    #[test]
+    fn the_chunk_buffers_set_finds_what_it_holds() {
+        let [a, b, c] = [0x5f01usize, 0x5f03, 0x5f05];
+        assert!(list(a) && list(b));
+        assert!(is_listed(a) && is_listed(b) && !is_listed(c));
+        unlist(a);
+        assert!(!is_listed(a) && is_listed(b), "only the one let go");
+        assert!(list(c));
+        assert!(is_listed(c));
+        unlist(b);
+        unlist(c);
+        assert!(!is_listed(b) && !is_listed(c));
+    }
 
     /// A chunk is opened only if the shared budget keeps its margin after
     /// it; a budget of 0 (none reported) stops nothing.

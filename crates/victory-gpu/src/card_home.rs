@@ -27,6 +27,16 @@
 //!   a byte. After the wait the merged pieces go up again from the home with
 //!   their hashes made anew, and copies of the same bytes elsewhere are told
 //!   (`Shadow::card_merged`).
+//! - A copy whose declared ranges cover half of it or more (a copy the
+//!   shaders reach through `crate::memory`'s directory is declared written
+//!   whole for every list with writes) has its reference **kept** between
+//!   submissions instead ([`Kept`]): a buffer of the copy's size in the
+//!   card's memory that holds what the card side held before the lists. Its
+//!   card side only changes where something went up to it (the title's
+//!   writes, and the pieces merged after the last submission), so only those
+//!   ranges are copied into the kept reference, behind the upload, and the
+//!   declared ranges themselves are not copied at all. A kept reference
+//!   nothing declared for [`KEPT_IDLE`] submissions is let go.
 //! - A free or protection of the title's that lets the home go lets the copy
 //!   go too (`crate::shadow::let_go_homes`): it holds the home's heap.
 //!
@@ -40,14 +50,22 @@
 //! What it assumes is what the core assumes: every submission is waited for
 //! (the core gives no home with late waits or the relay).
 //!
+//! shortcut: a kept reference follows the card side through what went up
+//! and what was merged; a shader's write to a copy that no list declared
+//! changes the card side behind it. Where a later declared range of the copy
+//! is flagged, such bytes differ from the kept reference and are merged into
+//! the home as the shaders' (a per-submission reference would have taken
+//! them for the bytes from before, and left them on the card side only).
+//!
 //! shortcut: the merge's read of a home's word and its store of the merged
 //! word are two steps; a title byte written to the same word in between is
 //! put back to what the merge read. The CPU's merge has the same window
 //! (`Shadow::card_merge`), longer, but there the race log (`merge_race`)
 //! can see it; nothing sees it here.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -121,6 +139,22 @@ const STEPS_PER_DISPATCH: u64 = 65_535 * 64;
 /// The most bytes of reference kept in the card's memory; a submission that
 /// needs more has it in the PC's memory.
 const REFERENCE_CARD_MOST: u64 = 512 << 20;
+
+/// Submissions in a row whose reference would fit the card again before a
+/// reference in the PC's memory goes back to the card's ([`room_move`]).
+const ROOM_BACK_AFTER: u32 = 16;
+
+/// The most bytes of kept references ([`Kept`]), all copies together.
+const KEPT_MOST: u64 = 512 << 20;
+
+/// Submissions with no declared range of its copy after which a kept
+/// reference is let go: it costs a copy of what goes up to the copy, which
+/// a reference made per submission does not.
+const KEPT_IDLE: u64 = 64;
+
+/// Submissions after the card's budget or the card turned a kept reference
+/// down before another as big or bigger is tried.
+const KEPT_RETRY: u64 = 16;
 
 /// `VICTORY_MEMORY_CARDS=1` with the memory core on (`crate::home::on`), and
 /// the merge's pipeline made: copies in the card's memory get a home as
@@ -283,10 +317,47 @@ struct Room {
     on_card: bool,
 }
 
-/// The reference, and the list of ours that copies into it, reused by
-/// every submission (each is waited for before the next is prepared).
+/// A copy's reference kept between submissions: what its card side held
+/// before the lists, at the copy's own offsets. Brought up to date with
+/// what goes up to the card side, behind the upload ([`before`]). Kept by
+/// the copy's address ([`Before::kept`]), which the weak hold keeps from
+/// being given to another copy.
+struct Kept {
+    copy: Weak<Shadow>,
+    buffer: ID3D12Resource,
+    bytes: u64,
+    /// The last submission ([`Before::submissions`]) that declared a range
+    /// of the copy.
+    used: u64,
+}
+
+/// Where the card side's bytes of a declared range from before the lists
+/// lie, for its merge ([`record_merge`]).
+#[derive(Clone)]
+pub(crate) struct Place {
+    /// The copy's kept reference, or `None`: the submission's room.
+    kept: Option<ID3D12Resource>,
+    /// Where the range's first step lies in it.
+    at: u32,
+}
+
+/// The reference, the kept ones, and the list of ours that copies into
+/// them, reused by every submission (each is waited for before the next is
+/// prepared).
 struct Before {
     room: Option<Room>,
+    /// Submissions in a row since the room went to the PC's memory whose
+    /// reference would have fit the card's ([`room_move`]).
+    small: u32,
+    kept: BTreeMap<usize, Kept>,
+    kept_bytes: u64,
+    /// No kept reference of `.1` bytes or more is made before submission
+    /// `.0`: the card's budget or the card turned one of `.1` bytes down
+    /// ([`KEPT_RETRY`], [`backed_off`]).
+    retry: (u64, u64),
+    /// Submissions prepared so far that had card copies' references to set
+    /// aside or kept references to age ([`before`], [`idle`]).
+    submissions: u64,
     list: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
 }
 
@@ -295,69 +366,319 @@ unsafe impl Send for Before {}
 
 static BEFORE: Mutex<Before> = Mutex::new(Before {
     room: None,
+    small: 0,
+    kept: BTreeMap::new(),
+    kept_bytes: 0,
+    retry: (0, 0),
+    submissions: 0,
     list: None,
 });
+
+/// What [`room`] does with the reference there is for a submission that
+/// needs `need` bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomMove {
+    /// It holds them where it is.
+    Keep,
+    /// A bigger one (or the first).
+    Grow,
+    /// It is in the PC's memory and the need fit the card's for
+    /// [`ROOM_BACK_AFTER`] submissions in a row: it is made in the card's
+    /// memory again.
+    Back,
+}
+
+/// [`RoomMove`] for a room of `room` bytes (`on_card`: in the card's
+/// memory), `small` submissions in a row having fit the card's before this
+/// one. Also returns the new count.
+fn room_move(room: Option<(u64, bool)>, need: u64, small: u32) -> (RoomMove, u32) {
+    let Some((bytes, on_card)) = room else {
+        return (RoomMove::Grow, 0);
+    };
+    if bytes < need {
+        return (RoomMove::Grow, 0);
+    }
+    if on_card || need > REFERENCE_CARD_MOST {
+        return (RoomMove::Keep, 0);
+    }
+    let small = small + 1;
+    if small >= ROOM_BACK_AFTER {
+        (RoomMove::Back, 0)
+    } else {
+        (RoomMove::Keep, small)
+    }
+}
+
+/// Whether the card's budget has room for `bytes` more.
+fn card_has_room(host: &crate::host::Host, bytes: u64) -> bool {
+    host.video_memory()
+        .is_none_or(|[budget, used, ..]| used + bytes <= budget / 100 * 97)
+}
 
 /// A buffer of at least `need` bytes for the reference: the one there is,
 /// or a bigger one (in the card's memory while it is at most
 /// [`REFERENCE_CARD_MOST`] and the card has room, else in the PC's memory).
+/// One in the PC's memory goes back to the card's once the need shrank
+/// ([`room_move`]); if the card has no room then, it stays.
 fn room<'a>(host: &crate::host::Host, before: &'a mut Before, need: u64) -> Option<&'a Room> {
-    if before.room.as_ref().is_none_or(|room| room.bytes < need) {
-        // The old one is no longer read: its last submission was waited for.
-        before.room = None;
-        let bytes = need.next_multiple_of(16 << 20);
-        let card_room = host
-            .video_memory()
-            .is_none_or(|[budget, used, ..]| used + bytes <= budget / 100 * 97);
-        let on_card = (bytes <= REFERENCE_CARD_MOST && card_room)
-            .then(|| host.uav_buffer(bytes))
-            .flatten();
-        let room = match on_card {
-            Some(buffer) => Room {
-                buffer,
-                bytes,
-                on_card: true,
-            },
-            // Not mapped by us: the card writes and reads it, nothing else.
-            None => Room {
-                buffer: host.shared_buffer(bytes)?.0,
-                bytes,
-                on_card: false,
-            },
-        };
-        crate::host::label(&room.buffer, "card home merge reference", bytes);
-        crate::host::name(&room.buffer, || {
-            "card copies' bytes before the lists, for the merge into their homes".into()
-        });
-        ROOM_BYTES.store(bytes | u64::from(room.on_card) << 63, Ordering::Relaxed);
-        before.room = Some(room);
+    let (step, small) = room_move(
+        before.room.as_ref().map(|r| (r.bytes, r.on_card)),
+        need,
+        before.small,
+    );
+    before.small = small;
+    match step {
+        RoomMove::Keep => {}
+        RoomMove::Back => {
+            let bytes = need.next_multiple_of(16 << 20);
+            if card_has_room(host, bytes)
+                && let Some(buffer) = host.uav_buffer(bytes)
+            {
+                // The old one is no longer read: its last submission was
+                // waited for.
+                ROOM_MOVES.fetch_add(1, Ordering::Relaxed);
+                set_room(
+                    before,
+                    Room {
+                        buffer,
+                        bytes,
+                        on_card: true,
+                    },
+                );
+            }
+        }
+        RoomMove::Grow => {
+            // The old one is no longer read: its last submission was waited for.
+            before.room = None;
+            let bytes = need.next_multiple_of(16 << 20);
+            let on_card = (bytes <= REFERENCE_CARD_MOST && card_has_room(host, bytes))
+                .then(|| host.uav_buffer(bytes))
+                .flatten();
+            let room = match on_card {
+                Some(buffer) => Room {
+                    buffer,
+                    bytes,
+                    on_card: true,
+                },
+                // Not mapped by us: the card writes and reads it, nothing else.
+                None => Room {
+                    buffer: host.shared_buffer(bytes)?.0,
+                    bytes,
+                    on_card: false,
+                },
+            };
+            set_room(before, room);
+        }
     }
     before.room.as_ref()
 }
 
+/// `room` is the reference from now on.
+fn set_room(before: &mut Before, room: Room) {
+    crate::host::label(&room.buffer, "card home merge reference", room.bytes);
+    crate::host::name(&room.buffer, || {
+        "card copies' bytes before the lists, for the merge into their homes".into()
+    });
+    ROOM_BYTES.store(
+        room.bytes | u64::from(room.on_card) << 63,
+        Ordering::Relaxed,
+    );
+    before.room = Some(room);
+}
+
+/// The kept reference of `copy` (made now if it has none, its declared
+/// steps `declared` bytes are half of it or more, and the kept references
+/// and the card have room), marked used by submission `now`; and whether it
+/// was made now (it is then filled whole).
+fn kept_for(
+    host: &crate::host::Host,
+    before: &mut Before,
+    copy: &Arc<Shadow>,
+    declared: u64,
+    now: u64,
+) -> Option<(ID3D12Resource, bool)> {
+    let key = Arc::as_ptr(copy) as usize;
+    if let Some(kept) = before.kept.get_mut(&key) {
+        kept.used = now;
+        return Some((kept.buffer.clone(), false));
+    }
+    let (.., bytes) = copy.card_homed()?;
+    if declared * 2 < bytes
+        || before.kept_bytes + bytes > KEPT_MOST
+        || backed_off(before.retry, now, bytes)
+    {
+        return None;
+    }
+    // Asking the card's budget, or a buffer it turns down, is not done every
+    // submission for one as big; a smaller one may still fit.
+    let Some(buffer) = card_has_room(host, bytes)
+        .then(|| host.uav_buffer(bytes))
+        .flatten()
+    else {
+        before.retry = (now + KEPT_RETRY, bytes);
+        return None;
+    };
+    crate::host::label(&buffer, "card home kept reference", bytes);
+    crate::host::name(&buffer, || {
+        "a card copy's bytes before the lists, kept, for the merge into its home".into()
+    });
+    before.kept.insert(
+        key,
+        Kept {
+            copy: Arc::downgrade(copy),
+            buffer: buffer.clone(),
+            bytes,
+            used: now,
+        },
+    );
+    before.kept_bytes += bytes;
+    KEPT[0].fetch_add(1, Ordering::Relaxed);
+    Some((buffer, true))
+}
+
+/// Whether no kept reference of `bytes` is asked for at submission `now`:
+/// one as big or bigger was turned down ([`Before::retry`]) less than
+/// [`KEPT_RETRY`] submissions ago.
+fn backed_off((until, refused): (u64, u64), now: u64, bytes: u64) -> bool {
+    now < until && bytes >= refused
+}
+
+/// Lets go the kept references of copies that are gone or that nothing
+/// declared for [`KEPT_IDLE`] submissions. (A submission that still reads
+/// one holds its buffer, [`Place`].)
+fn let_go_kept(before: &mut Before) {
+    let now = before.submissions;
+    let mut freed = 0;
+    before.kept.retain(|_, k| {
+        let keep = k.copy.strong_count() > 0 && now - k.used <= KEPT_IDLE;
+        if !keep {
+            freed += k.bytes;
+        }
+        keep
+    });
+    if freed != 0 {
+        before.kept_bytes -= freed;
+        KEPT[1].fetch_add(1, Ordering::Relaxed);
+    }
+    KEPT_BYTES.store(before.kept_bytes, Ordering::Relaxed);
+}
+
+/// A submission that needs no [`before`] (`Host::card_before`): while there
+/// are kept references, it counts towards letting go those nothing
+/// declares, and those of copies that are gone are let go now.
+pub(crate) fn idle() {
+    if KEPT_BYTES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
+    before.submissions += 1;
+    let_go_kept(&mut before);
+}
+
 /// Before a submission's lists, once what changed went up to the card sides
-/// (`Host::card_before`): records a list of ours that copies the card side's
-/// bytes of each range in `spans` (a copy whose CPU side is a home, and the
-/// range's offsets in it) aside, into the reference [`record_merge`] takes.
-/// Returns the closed list, to run ahead of the lists, and where each range
-/// lies in the reference; `None` if there is no memory for it.
+/// (`Host::card_before`): records a list of ours that sets aside the card
+/// side's bytes of each range in `spans` (a copy whose CPU side is a home,
+/// and the range's offsets in it) for the merge [`record_merge`] makes.
+///
+/// A copy with a kept reference ([`Kept`]), or one made now (its ranges are
+/// half of it or more), has nothing of its ranges copied: its kept reference
+/// takes `uploads`' ranges of it (what just went up to its card side), or
+/// all of it when made now. The others' ranges are copied into the room.
+///
+/// Returns the closed list, to run ahead of the lists (`None`: nothing to
+/// copy), and where each range lies; `None` if there is no memory for it.
 pub(crate) fn before(
     host: &crate::host::Host,
-    spans: &[(&Shadow, u32, u32)],
-) -> Option<(ID3D12CommandList, Vec<u32>)> {
+    spans: &[(&Arc<Shadow>, u32, u32)],
+    uploads: &[(Arc<Shadow>, Vec<(usize, usize)>)],
+) -> Option<(Option<ID3D12CommandList>, Vec<Place>)> {
+    let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
+    before.submissions += 1;
+    let now = before.submissions;
+    // The copies, each once, and the bytes of their declared steps.
+    let mut declared: HashMap<usize, (&Arc<Shadow>, u64)> = HashMap::new();
+    for &(copy, from, to) in spans {
+        let (from, to) = steps(from, to);
+        declared
+            .entry(Arc::as_ptr(copy) as usize)
+            .or_insert((copy, 0))
+            .1 += u64::from(to - from);
+    }
+    // In one order from run to run (the room for kept references goes to
+    // the most declared first), not the map's; copies of one span alike.
+    let mut declared: Vec<(usize, (&Arc<Shadow>, u64))> = declared.into_iter().collect();
+    declared.sort_unstable_by_key(|&(_, (copy, bytes))| (std::cmp::Reverse(bytes), copy.span()));
+    // The kept references still declared are used now; then those let go
+    // leave their room to the copies that may get one now.
+    for (key, _) in &declared {
+        if let Some(kept) = before.kept.get_mut(key) {
+            kept.used = now;
+        }
+    }
+    let_go_kept(&mut before);
+    // Per copy, its kept reference and whether it is filled now.
+    let copies: HashMap<usize, (&Arc<Shadow>, Option<(ID3D12Resource, bool)>)> = declared
+        .into_iter()
+        .map(|(key, (copy, bytes))| (key, (copy, kept_for(host, &mut before, copy, bytes, now))))
+        .collect();
+    KEPT_BYTES.store(before.kept_bytes, Ordering::Relaxed);
+    let kept_of = |copy: &Arc<Shadow>| {
+        copies
+            .get(&(Arc::as_ptr(copy) as usize))
+            .and_then(|(_, k)| k.as_ref())
+    };
     let mut places = Vec::with_capacity(spans.len());
     let mut need = 0u64;
-    for &(_, from, to) in spans {
+    let mut skipped = 0u64;
+    for &(copy, from, to) in spans {
         let (from, to) = steps(from, to);
-        // A submission's ranges lie in copies of at most 1 GiB each, and
-        // each copy's ranges are apart (`Host::card_before` joins them).
-        places.push(u32::try_from(need).ok()?);
-        need += u64::from(to - from);
+        match kept_of(copy) {
+            Some((buffer, _)) => {
+                places.push(Place {
+                    kept: Some(buffer.clone()),
+                    at: from,
+                });
+                skipped += u64::from(to - from);
+            }
+            None => {
+                // A submission's ranges lie in copies of at most 1 GiB each,
+                // and each copy's ranges are apart (`Host::card_before` joins
+                // them).
+                places.push(Place {
+                    kept: None,
+                    at: u32::try_from(need).ok()?,
+                });
+                need += u64::from(to - from);
+            }
+        }
     }
     if need > u64::from(u32::MAX) {
         return None;
     }
-    let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
+    // What goes into kept references: copies filled now, whole; the others
+    // kept, what went up to them.
+    let mut fills: Vec<(ID3D12Resource, &ID3D12Resource, u64, u64)> = Vec::new();
+    for (copy, kept) in copies.values() {
+        if let (Some((buffer, true)), Some((.., bytes))) = (kept, copy.card_homed()) {
+            fills.push((buffer.clone(), &copy.buffer, 0, bytes));
+        }
+    }
+    for (copy, ranges) in uploads {
+        let key = Arc::as_ptr(copy) as usize;
+        if kept_of(copy).is_some_and(|(_, filled)| *filled) {
+            continue;
+        }
+        let Some(kept) = before.kept.get(&key) else {
+            continue;
+        };
+        for &(a, b) in ranges {
+            fills.push((kept.buffer.clone(), &copy.buffer, a as u64, (b - a) as u64));
+        }
+    }
+    if need == 0 && fills.is_empty() {
+        FLOW[flow::SKIPPED].fetch_add(skipped, Ordering::Relaxed);
+        return Some((None, places));
+    }
     if before.list.is_none() {
         // SAFETY: plain object creation.
         let made = unsafe {
@@ -377,31 +698,43 @@ pub(crate) fn before(
         };
         before.list = made.ok();
     }
-    let room = room(host, &mut before, need)?.buffer.clone();
+    let room = match need {
+        0 => None,
+        _ => Some(room(host, &mut before, need)?.buffer.clone()),
+    };
     let (allocator, list) = before.list.as_ref()?;
     // SAFETY: the list's last run finished (its submission was waited for
     // before this one was prepared); live buffers, the ranges inside both
-    // (the steps lie in the copy's buffer and the room holds `need`).
+    // (the steps lie in the copy's buffer and the room holds `need`; a kept
+    // reference has its copy's size, and what went up lies in the copy).
     let recorded = unsafe {
         (|| -> windows::core::Result<ID3D12CommandList> {
             allocator.Reset()?;
             list.Reset(allocator, None)?;
-            for (&(copy, from, to), &at) in spans.iter().zip(&places) {
+            for (&(copy, from, to), place) in spans.iter().zip(&places) {
+                let (Some(room), None) = (&room, &place.kept) else {
+                    continue;
+                };
                 let (from, to) = steps(from, to);
                 list.CopyBufferRegion(
-                    &room,
-                    u64::from(at),
+                    room,
+                    u64::from(place.at),
                     &copy.buffer,
                     u64::from(from),
                     u64::from(to - from),
                 );
             }
+            for (kept, card, at, bytes) in &fills {
+                list.CopyBufferRegion(kept, *at, *card, *at, *bytes);
+            }
             list.Close()?;
             list.cast()
         })()
     };
-    FLOW[1].fetch_add(need, Ordering::Relaxed);
-    recorded.ok().map(|list| (list, places))
+    FLOW[flow::REFERENCE].fetch_add(need, Ordering::Relaxed);
+    FLOW[flow::KEPT].fetch_add(fills.iter().map(|f| f.3).sum(), Ordering::Relaxed);
+    FLOW[flow::SKIPPED].fetch_add(skipped, Ordering::Relaxed);
+    recorded.ok().map(|list| (Some(list), places))
 }
 
 /// A barrier on every buffer's unordered access.
@@ -436,7 +769,7 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 pub(crate) unsafe fn record_merges<'a>(
     list: &ID3D12GraphicsCommandList,
     differs: &ID3D12Resource,
-    ranges: impl Iterator<Item = (&'a Shadow, &'a CardSpan, u32, Option<u32>)>,
+    ranges: impl Iterator<Item = (&'a Shadow, &'a CardSpan, &'a Place, Option<u32>)>,
 ) {
     let mut ranges = ranges.peekable();
     if ranges.peek().is_none() {
@@ -476,7 +809,8 @@ pub(crate) unsafe fn record_merges<'a>(
 /// Records into `list`, behind the compare whose results are `differs`, the
 /// merge of declared range `span` of `copy` (a copy whose CPU side is a
 /// home) into the home: `reference` is where [`before`] put the range's
-/// bytes from before the lists, `flags` the dword of its first piece in
+/// bytes from before the lists (the room, or the copy's kept reference),
+/// `flags` the dword of its first piece in
 /// `differs` (in bytes) if the compare looked at it (else every piece is
 /// merged). Nothing for a copy without a home; whether it was recorded.
 /// [`record_merges`] records the merges of a submission.
@@ -489,24 +823,31 @@ unsafe fn record_merge(
     list: &ID3D12GraphicsCommandList,
     copy: &Shadow,
     span: &CardSpan,
-    reference: u32,
+    reference: &Place,
     flags: Option<u32>,
     differs: &ID3D12Resource,
 ) -> bool {
     let (Some((home, bias, _)), Some(merge)) = (copy.card_homed(), merge()) else {
         return false;
     };
-    let Some(room) = BEFORE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .room
-        .as_ref()
-        .map(|r| r.buffer.clone())
-    else {
-        return false;
+    let room = match &reference.kept {
+        Some(kept) => kept.clone(),
+        None => {
+            let Some(room) = BEFORE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .room
+                .as_ref()
+                .map(|r| r.buffer.clone())
+            else {
+                return false;
+            };
+            room
+        }
     };
+    let reference = reference.at;
     let (from, to) = steps(span.from, span.to);
-    FLOW[2].fetch_add(1, Ordering::Relaxed);
+    FLOW[flow::RANGES].fetch_add(1, Ordering::Relaxed);
     // SAFETY: the caller's; root views of live buffers, and every step the
     // shader takes lies in the copy's card side, the reference and the home
     // (`steps`). The home is bound at the copy's first byte (`bias`, a
@@ -545,7 +886,7 @@ unsafe fn record_merge(
 /// into piece `[from, to)` of `copy` (or may have); see
 /// `Shadow::card_merged`.
 pub(crate) fn merged(copy: &Shadow, from: usize, to: usize) {
-    FLOW[3].fetch_add(1, Ordering::Relaxed);
+    FLOW[flow::PIECES].fetch_add(1, Ordering::Relaxed);
     copy.card_merged(from, to);
 }
 
@@ -560,7 +901,7 @@ pub(crate) fn stored() -> u64 {
     // run (their submission was waited for) and the next is not prepared.
     let now = unsafe { merge.seen_data.read_volatile() };
     let bytes = now.wrapping_sub(merge.taken.swap(now, Ordering::Relaxed));
-    FLOW[4].fetch_add(u64::from(bytes), Ordering::Relaxed);
+    FLOW[flow::STORED].fetch_add(u64::from(bytes), Ordering::Relaxed);
     u64::from(bytes)
 }
 
@@ -570,12 +911,41 @@ pub(crate) fn stored() -> u64 {
 /// they would have started off a 16-byte step in.
 static CARDS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-/// Since the last line: bytes that went up from homes to card sides,
-/// reference bytes copied, ranges merged, pieces merged, bytes stored.
-static FLOW: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// [`FLOW`]'s counters.
+mod flow {
+    /// Bytes that went up from homes to card sides.
+    pub(super) const UPLOADED: usize = 0;
+    /// Bytes of declared ranges copied into the room.
+    pub(super) const REFERENCE: usize = 1;
+    /// Ranges merged into homes on the card.
+    pub(super) const RANGES: usize = 2;
+    /// Pieces of them merged.
+    pub(super) const PIECES: usize = 3;
+    /// Bytes the merges stored into homes.
+    pub(super) const STORED: usize = 4;
+    /// Bytes copied into kept references (what went up to their copies, and
+    /// the copies whose kept reference was made, whole).
+    pub(super) const KEPT: usize = 5;
+    /// Bytes of declared ranges not copied: their merge reads a kept
+    /// reference.
+    pub(super) const SKIPPED: usize = 6;
+    pub(super) const ALL: usize = 7;
+}
+
+/// Since the last line: see [`flow`].
+static FLOW: [AtomicU64; flow::ALL] = [const { AtomicU64::new(0) }; flow::ALL];
 
 /// The reference's bytes, with bit 63 set when it is in the card's memory.
 static ROOM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Times the room went back from the PC's memory to the card's.
+static ROOM_MOVES: AtomicU64 = AtomicU64::new(0);
+
+/// Since the start: kept references made, and times some were let go.
+static KEPT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The kept references' bytes now.
+static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A card copy of `size` bytes was made with a home as its CPU side.
 pub(crate) fn made(size: u64) {
@@ -605,7 +975,7 @@ pub(crate) fn misaligned() {
 
 /// `bytes` went up from homes to card sides.
 pub(crate) fn uploaded(bytes: u64) {
-    FLOW[0].fetch_add(bytes, Ordering::Relaxed);
+    FLOW[flow::UPLOADED].fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// The core's ten-second line's part for card copies (`crate::home`), with
@@ -616,12 +986,14 @@ pub(crate) fn line() -> Option<String> {
         return None;
     }
     let cards: Vec<u64> = CARDS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    let flow: Vec<u64> = FLOW.iter().map(|f| f.swap(0, Ordering::Relaxed)).collect();
+    let moved: Vec<u64> = FLOW.iter().map(|f| f.swap(0, Ordering::Relaxed)).collect();
     let room = ROOM_BYTES.load(Ordering::Relaxed);
     Some(format!(
         "memory core cards: {} copies in the card's memory have their home as the CPU side ({} made), {} MB of staging not in the PC's memory; \
          {} kept a staging buffer ({} for their alignment in the home){}; in the last ten seconds {} MB went up from homes, {} MB of reference \
-         copied on the card, {} ranges merged into homes on the card ({} pieces, {} KB stored); reference {} MB in the {} memory",
+         copied on the card, {} MB into kept references, {} MB of declared ranges not copied (their merge read a kept reference), \
+         {} ranges merged into homes on the card ({} pieces, {} KB stored); reference {} MB in the {} memory ({} times back to the card's), \
+         {} MB of kept references ({} made, let go {} times)",
         cards[1],
         cards[0],
         cards[2] >> 20,
@@ -632,13 +1004,19 @@ pub(crate) fn line() -> Option<String> {
         } else {
             ""
         },
-        flow[0] >> 20,
-        flow[1] >> 20,
-        flow[2],
-        flow[3],
-        flow[4] >> 10,
+        moved[flow::UPLOADED] >> 20,
+        moved[flow::REFERENCE] >> 20,
+        moved[flow::KEPT] >> 20,
+        moved[flow::SKIPPED] >> 20,
+        moved[flow::RANGES],
+        moved[flow::PIECES],
+        moved[flow::STORED] >> 10,
         (room & !(1 << 63)) >> 20,
         if room >> 63 == 1 { "card's" } else { "PC's" },
+        ROOM_MOVES.load(Ordering::Relaxed),
+        KEPT_BYTES.load(Ordering::Relaxed) >> 20,
+        KEPT[0].load(Ordering::Relaxed),
+        KEPT[1].load(Ordering::Relaxed),
     ))
 }
 
@@ -867,8 +1245,11 @@ mod tests {
             )
             .unwrap();
         let (from, to) = (span.from as usize, span.to as usize);
-        let (list, places) = before(host, &[(&*copy, span.from, span.to)]).expect("a reference");
-        rig.run_closed(&list).unwrap();
+        let (list, places) =
+            before(host, &[(&copy, span.from, span.to)], &[]).expect("a reference");
+        assert!(places[0].kept.is_none(), "a quarter of the copy: the room");
+        rig.run_closed(&list.expect("a copy into the room"))
+            .unwrap();
         let held = rig.fetch(&copy.buffer, 0, len as usize).unwrap();
         let room = BEFORE
             .lock()
@@ -880,7 +1261,7 @@ mod tests {
         let (a, b) = steps(span.from, span.to);
         let (a, b) = (a as usize, b as usize);
         assert_eq!(
-            rig.fetch(&room, u64::from(places[0]), b - a).unwrap(),
+            rig.fetch(&room, u64::from(places[0].at), b - a).unwrap(),
             held[a..b],
             "the reference holds the card side's steps"
         );
@@ -912,7 +1293,7 @@ mod tests {
             record_merges(
                 list,
                 &flags.0,
-                std::iter::once((&*copy, &span, places[0], None)),
+                std::iter::once((&*copy, &span, &places[0], None)),
             );
         })
         .unwrap();
@@ -951,7 +1332,7 @@ mod tests {
             record_merges(
                 list,
                 &flags.0,
-                std::iter::once((&*copy, &span, places[0], Some(0))),
+                std::iter::once((&*copy, &span, &places[0], Some(0))),
             );
         })
         .unwrap();
@@ -1164,6 +1545,177 @@ mod tests {
         unregister(0xca4d_0502, inner);
         unregister(0xca4d_0501, outer);
         drop((home, a, b, rig, source));
+        region.release();
+    }
+
+    /// The room goes back to the card's memory once the need fit it for
+    /// [`ROOM_BACK_AFTER`] submissions in a row, and grows when it is short.
+    #[test]
+    fn the_room_goes_back_to_the_card_when_the_need_shrinks() {
+        const MB: u64 = 1 << 20;
+        assert_eq!(room_move(None, 8 * MB, 0), (RoomMove::Grow, 0));
+        assert_eq!(
+            room_move(Some((16 * MB, true)), 32 * MB, 3),
+            (RoomMove::Grow, 0)
+        );
+        assert_eq!(
+            room_move(Some((16 * MB, true)), 8 * MB, 0),
+            (RoomMove::Keep, 0)
+        );
+        assert_eq!(
+            room_move(Some((1024 * MB, false)), 600 * MB, 7),
+            (RoomMove::Keep, 0),
+            "past the card's most: it stays, and the count starts again"
+        );
+        let mut small = 0;
+        for n in 1..ROOM_BACK_AFTER {
+            let (step, now) = room_move(Some((1024 * MB, false)), 8 * MB, small);
+            assert_eq!((step, now), (RoomMove::Keep, n));
+            small = now;
+        }
+        assert_eq!(
+            room_move(Some((1024 * MB, false)), REFERENCE_CARD_MOST, small),
+            (RoomMove::Back, 0)
+        );
+    }
+
+    /// A kept reference turned down holds back only those as big or bigger,
+    /// for [`KEPT_RETRY`] submissions.
+    #[test]
+    fn a_refused_kept_reference_holds_back_only_those_as_big() {
+        const MB: u64 = 1 << 20;
+        assert!(!backed_off((0, 0), 1, 64 * MB), "nothing refused yet");
+        let retry = (10 + KEPT_RETRY, 64 * MB);
+        assert!(backed_off(retry, 11, 64 * MB));
+        assert!(backed_off(retry, 11, 128 * MB));
+        assert!(!backed_off(retry, 11, 32 * MB), "a smaller one is tried");
+        assert!(backed_off(retry, 10 + KEPT_RETRY - 1, 64 * MB));
+        assert!(!backed_off(retry, 10 + KEPT_RETRY, 64 * MB), "tried again");
+    }
+
+    /// FLOW's counters now.
+    fn flow_now() -> [u64; flow::ALL] {
+        std::array::from_fn(|i| FLOW[i].load(Ordering::Relaxed))
+    }
+
+    /// A copy declared written whole (as `crate::memory` declares the copies
+    /// it numbered) keeps its reference: the first submission fills it whole
+    /// and copies nothing into the room; the next copies into it only what
+    /// went up (a page the title wrote and the piece merged before), and its
+    /// merge still keeps a byte the title wrote while the card ran over one
+    /// that went up before. Nothing declared for a while, it is let go.
+    #[test]
+    fn warp_cards_a_whole_declaration_keeps_its_reference() {
+        let Some(host) = warp() else { return };
+        let _on = Switched::on();
+        let region = Region::new(8 * BIG as usize);
+        let (start, len) = (region.base + K64, 2 * BIG + K64);
+        fill(start, len, 7);
+        let a = card_copy(0xca4d_0601, start, len);
+        let (home, _, size) = a.card_homed().expect("its CPU side is a home");
+        let home = home.clone();
+        let original = title(start, len);
+        let bytes = [0xc1u8, 0xc2, 0x6b];
+        let (source, data) = host.shared_buffer(256).unwrap();
+        // SAFETY: the mapping holds 256 bytes; the card does not use it yet.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
+        let made = KEPT[0].load(Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        list.defer_refresh(&a, start as usize, len as usize);
+        // SAFETY: an open list of the host's; live buffers, the ranges in them.
+        unsafe { list.list.CopyBufferRegion(&a.buffer, 0x2002, &source, 0, 2) };
+        list.defer_gpu_write(&a, start as usize, len as usize);
+        list.close();
+        let was = flow_now();
+        host.execute(&[&list]);
+        let now = flow_now();
+        assert_eq!(
+            KEPT[0].load(Ordering::Relaxed),
+            made + 1,
+            "a kept reference made"
+        );
+        assert_eq!(
+            now[flow::REFERENCE] - was[flow::REFERENCE],
+            0,
+            "nothing into the room"
+        );
+        assert_eq!(now[flow::KEPT] - was[flow::KEPT], size, "filled whole");
+        assert_eq!(
+            now[flow::SKIPPED] - was[flow::SKIPPED],
+            len,
+            "the declared range not copied"
+        );
+        let mut expected = original.clone();
+        expected[0x2002..0x2004].copy_from_slice(&bytes[..2]);
+        assert!(
+            title(start, len) == expected,
+            "the shaders' bytes and nothing else"
+        );
+        // The title writes a byte of page 3 between the submissions; the next
+        // submission's shaders write the word beside it, and the title writes
+        // that byte again while the card runs (through the home, as another
+        // view of its memory would).
+        // SAFETY: committed memory of the test's own.
+        unsafe { ((start + 0x3_0010) as *mut u8).write(0x5a) };
+        list.reset();
+        list.defer_refresh(&a, start as usize, len as usize);
+        // SAFETY: as above.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&a.buffer, 0x3_0000, &source, 0, 1);
+            list.list
+                .CopyBufferRegion(&home.buffer, home.offset(start + 0x3_0010), &source, 2, 1);
+        }
+        list.defer_gpu_write(&a, start as usize, len as usize);
+        list.close();
+        let was = flow_now();
+        host.execute(&[&list]);
+        let now = flow_now();
+        let up = now[flow::UPLOADED] - was[flow::UPLOADED];
+        assert!(
+            (2 * K64..size / 4).contains(&up),
+            "the merged piece and the title's page went up, not the copy: {up}"
+        );
+        assert_eq!(
+            now[flow::KEPT] - was[flow::KEPT],
+            up,
+            "only those into the kept reference"
+        );
+        assert_eq!(now[flow::REFERENCE] - was[flow::REFERENCE], 0);
+        assert_eq!(KEPT[0].load(Ordering::Relaxed), made + 1, "the same one");
+        expected[0x3_0000] = 0xc1;
+        expected[0x3_0010] = 0x6b;
+        let after = title(start, len);
+        assert_eq!(
+            after[0x3_0010], 0x6b,
+            "the title's write while the card ran stays"
+        );
+        assert_eq!(after[0x3_0000], 0xc1, "the shader's byte is merged");
+        assert!(after == expected, "nothing else of title memory changed");
+        list.reset();
+        drop(list);
+        // Nothing declared: let go after `KEPT_IDLE` submissions, those that
+        // need no `before` (`idle`) counted too.
+        let bytes_kept = KEPT_BYTES.load(Ordering::Relaxed);
+        assert!(bytes_kept >= size);
+        let (list, places) = before(host, &[], &[]).expect("nothing to do");
+        assert!(list.is_none() && places.is_empty());
+        for _ in 1..KEPT_IDLE {
+            idle();
+        }
+        assert_eq!(
+            KEPT_BYTES.load(Ordering::Relaxed),
+            bytes_kept,
+            "kept for `KEPT_IDLE` submissions"
+        );
+        idle();
+        assert_eq!(
+            KEPT_BYTES.load(Ordering::Relaxed),
+            bytes_kept - size,
+            "let go"
+        );
+        unregister(0xca4d_0601, start);
+        drop((home, a, source));
         region.release();
     }
 }

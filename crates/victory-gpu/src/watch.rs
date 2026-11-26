@@ -64,6 +64,12 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// Big ranges the GPU wrote ([`gpu_wrote`]): first page, end page, and
+    /// the asking they count as written by. A page's asking is the highest
+    /// of its entry in `written` and of the ranges over it
+    /// ([`Journal::pages`]); at most [`GPU_RANGES`] of them, the oldest
+    /// folded into `written` beyond that.
+    gpu: Vec<(usize, usize, u64)>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -82,6 +88,7 @@ impl Journal {
         Self {
             asked: 0,
             written: BTreeMap::new(),
+            gpu: Vec::new(),
             found: Vec::new(),
             ahead: Vec::new(),
             ahead_asked: 0,
@@ -89,6 +96,64 @@ impl Journal {
         }
     }
 }
+
+impl Journal {
+    /// The pages of `[first, last)` written since tracking began, with the
+    /// asking that last found each written, in page order.
+    fn pages(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        let written = self.written.range(first..last).map(|(&p, &w)| (p, w));
+        if !self.gpu.iter().any(|&(a, b, _)| a < last && b > first) {
+            return written.collect();
+        }
+        let mut pages: Vec<(usize, u64)> = self
+            .gpu
+            .iter()
+            .flat_map(|&(a, b, w)| (a.max(first)..b.min(last)).map(move |p| (p, w)))
+            .chain(written)
+            .collect();
+        // Per page the highest: sorted by page, then asking, the last one.
+        pages.sort_unstable();
+        pages.dedup_by(|later, kept| {
+            let same = later.0 == kept.0;
+            if same {
+                kept.1 = later.1;
+            }
+            same
+        });
+        pages
+    }
+
+    /// Notes pages `[first, last)` written by asking `now`, the newest: one
+    /// entry per page, or one for them all if they are [`GPU_RANGE_PAGES`]
+    /// or more.
+    fn mark(&mut self, first: usize, last: usize, now: u64) {
+        if last - first < GPU_RANGE_PAGES {
+            for page in first..last {
+                self.written.insert(page, now);
+            }
+            return;
+        }
+        // Those inside it count as written by it from now on.
+        self.gpu.retain(|&(a, b, _)| a < first || b > last);
+        self.gpu.push((first, last, now));
+        if self.gpu.len() > GPU_RANGES {
+            let (a, b, w) = self.gpu.remove(0);
+            for page in a..b {
+                let entry = self.written.entry(page).or_insert(w);
+                *entry = (*entry).max(w);
+            }
+        }
+    }
+}
+
+/// GPU-written ranges of at least this many pages (1 MiB) are noted as one
+/// range in the journal ([`Journal::mark`]).
+const GPU_RANGE_PAGES: usize = 16;
+
+/// The most ranges noted so ([`Journal::gpu`]). The same ranges come back
+/// submission after submission (a range inside a newer one goes), so these
+/// are the distinct ones of the last while.
+const GPU_RANGES: usize = 256;
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal::new());
 
@@ -349,9 +414,7 @@ fn gpu_wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
     if !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
-    }
+    j.mark(at / PAGE, at.saturating_add(len).div_ceil(PAGE), now);
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -439,7 +502,7 @@ fn asked_in(
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.pages(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -469,13 +532,7 @@ fn writes_in(
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.ahead_asked, j.pages(first, last)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -540,13 +597,7 @@ fn writes_in(
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, j.pages(first, last)))
 }
 
 impl Tracked {
@@ -1902,5 +1953,89 @@ mod wrote_tests {
             now >= w,
             "writes() returned now={now} < written timestamp w={w} after wrote()"
         );
+    }
+}
+
+#[cfg(test)]
+mod gpu_range_tests {
+    use super::{GPU_RANGE_PAGES, GPU_RANGES, Journal, PAGE, gpu_wrote_in};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// GPU writes noted as ranges answer as noting every page would: the
+    /// newest asking per page, whatever the sizes and overlaps, past the
+    /// most ranges kept (the oldest folded into the pages), and mixed with
+    /// pages the kernel reported.
+    #[test]
+    fn gpu_ranges_answer_as_pages_would() {
+        let journal = Mutex::new(Journal::new());
+        // The model: one entry per page, as before.
+        let mut model: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut asked = 0u64;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        const SPACE: usize = 4096;
+        for step in 0..4000 {
+            if next(4) == 0 {
+                // A page the kernel reported, noted as `writes_in` does.
+                let page = next(SPACE);
+                let mut j = journal.lock().unwrap();
+                j.asked += 1;
+                let now = j.asked;
+                j.written.insert(page, now);
+                asked = now;
+                model.insert(page, now);
+            } else {
+                // Mostly small, now and then big, writes of the GPU.
+                let pages = if next(3) == 0 {
+                    GPU_RANGE_PAGES + next(400)
+                } else {
+                    1 + next(GPU_RANGE_PAGES)
+                };
+                let first = next(SPACE);
+                let at = first * PAGE + next(PAGE);
+                let len = (pages - 1) * PAGE + 1;
+                gpu_wrote_in(&journal, at, len);
+                asked += 1;
+                for page in at / PAGE..(at + len).div_ceil(PAGE) {
+                    model.insert(page, asked);
+                }
+            }
+            let j = journal.lock().unwrap();
+            assert_eq!(j.asked, asked);
+            assert!(j.gpu.len() <= GPU_RANGES, "step {step}: ranges kept");
+            let (a, b) = (next(SPACE + 600), next(SPACE + 600));
+            let (first, last) = (a.min(b), a.max(b) + 1);
+            let want: Vec<(usize, u64)> = model.range(first..last).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(
+                j.pages(first, last),
+                want,
+                "step {step}: pages {first}..{last}"
+            );
+        }
+        let all: Vec<(usize, u64)> = model.iter().map(|(&p, &w)| (p, w)).collect();
+        assert_eq!(journal.lock().unwrap().pages(0, usize::MAX / PAGE), all);
+        // The same big ranges again and again, as submissions write them:
+        // nothing more page by page, and as many ranges as there are.
+        let entries = journal.lock().unwrap().written.len();
+        for round in 0..2000 {
+            let first = SPACE + 1000 + (round % 8) * 300;
+            gpu_wrote_in(&journal, first * PAGE, 200 * PAGE);
+            asked += 1;
+            for page in first..first + 200 {
+                model.insert(page, asked);
+            }
+        }
+        let j = journal.lock().unwrap();
+        assert_eq!(j.written.len(), entries, "not noted page by page");
+        let ours = |&(a, _, _): &(usize, usize, u64)| a >= SPACE + 1000;
+        assert_eq!(j.gpu.iter().filter(|r| ours(r)).count(), 8);
+        let all: Vec<(usize, u64)> = model.iter().map(|(&p, &w)| (p, w)).collect();
+        assert_eq!(j.pages(0, usize::MAX / PAGE), all);
     }
 }
