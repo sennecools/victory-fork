@@ -1354,8 +1354,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
-/// of the crash reporter's.
-fn install() {
+/// of the crash reporter's. It is the first vectored handler in the process
+/// and also the one that takes the faults of our own copies
+/// (`crate::safecopy`, `VICTORY_SAFE_COPY=1`), which register it through
+/// here.
+pub(crate) fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -1365,11 +1368,27 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
+        // A fault of our own copies (`crate::safecopy`): whatever it is, if
+        // it is not a block we guard, the copy fails and goes on from its
+        // failing exit. Never so for any other instruction, so with
+        // `VICTORY_SAFE_COPY` off (no such copy runs) this is as before.
+        let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
+        // SAFETY: the system passes the context of the fault.
+        let context = unsafe { (*info).ContextRecord };
+        let fail = move |exit: usize| {
+            // SAFETY: the context the system passes, to go on from: the
+            // copy's own failing exit, in the same leaf.
+            unsafe { (*context).Rip = exit as u64 };
+            EXCEPTION_CONTINUE_EXECUTION
+        };
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
         {
-            return EXCEPTION_CONTINUE_SEARCH;
+            return match ours {
+                Some(exit) => fail(exit),
+                None => EXCEPTION_CONTINUE_SEARCH,
+            };
         }
         let at = r.ExceptionInformation[1];
         // Held across both checks: another thread may have opened the block
@@ -1383,9 +1402,11 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        match ours {
+            Some(exit) => fail(exit),
+            None => EXCEPTION_CONTINUE_SEARCH,
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1498,6 +1519,62 @@ mod tests {
         );
         // SAFETY: our view.
         unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+        title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// Our own copy (`crate::safecopy`) into a guarded view block faults
+    /// into the handler, which opens the block and lets the copy go on: it
+    /// lands and the block counts as written. Into a read-only page not
+    /// guarded by us it fails, and the process goes on.
+    #[test]
+    fn safe_copies_into_guarded_blocks_open_them() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
+            VirtualProtect,
+        };
+        install();
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        let bytes = b"from our copy";
+        // SAFETY: 13 bytes of our view, nothing else refers to them.
+        assert!(unsafe {
+            crate::safecopy::copy((view + 100) as *mut u8, bytes.as_ptr(), bytes.len())
+        });
+        // SAFETY: the bytes just copied.
+        let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
+        assert_eq!(landed, bytes);
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
+        // Read-only for some other reason: the copy fails.
+        let (block, len) = (view + BLOCK, bytes.len());
+        let mut old = 0;
+        // SAFETY: a block of our view; the guards were taken off it first.
+        unsafe {
+            open(&mut guards(), view, view + 2 * BLOCK);
+            VirtualProtect(block as *const _, BLOCK, PAGE_READONLY, &mut old);
+            let copied = crate::safecopy::copy(block as *mut u8, bytes.as_ptr(), len);
+            assert!(!copied);
             UnmapViewOfFile(
                 windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: view as *mut _,

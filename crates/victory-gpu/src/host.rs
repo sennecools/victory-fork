@@ -10084,6 +10084,9 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+/// `VICTORY_SAFE_COPY=1` copies with one `rep movsb` instead, whose faults
+/// the write watch's handler turns into the same failure
+/// (`crate::safecopy`).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -10208,6 +10211,13 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if crate::safecopy::on() {
+        // `VICTORY_SAFE_COPY=1`: one `rep movsb`, no kernel call.
+        // SAFETY: the destination is mapped writable memory of `len` bytes
+        // (or title memory whose guards the write watch's handler opens); a
+        // source page that is not there fails the copy.
+        return unsafe { crate::safecopy::copy(dst, src, len) };
+    }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
@@ -10247,6 +10257,14 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        if crate::safecopy::on() {
+            // `VICTORY_SAFE_COPY=1`: one `rep movsb`, no kernel call. A block
+            // guarded again since the caller opened it is opened by the write
+            // watch's handler and the copy goes on.
+            // SAFETY: the source is our mapped host copy; a destination page
+            // that is not there, or not writable, fails the copy.
+            return unsafe { crate::safecopy::copy(at as *mut u8, from, n) };
+        }
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and
