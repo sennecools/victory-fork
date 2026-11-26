@@ -23,7 +23,9 @@
 //!    submission that began before step 1 still holds the submission lock
 //!    (it may still send lists), nothing is let go (a heap freed under a
 //!    running list is a page fault, and a device removal the run's tooling
-//!    counts);
+//!    counts).
+//!    A heap sync pass still running (the ahead helper's) is waited for
+//!    too, under the same deadline; later passes do nothing;
 //! 3. the flights of the relay and their lists go, with what they would do
 //!    once landed;
 //! 4. the view heap slots that name a home's or a chunk's buffer let it go;
@@ -235,6 +237,14 @@ fn release(until: Instant) -> Released {
         tracing::warn!(
             ms = released.ms,
             "memory release: the card was still busy at the deadline; nothing released"
+        );
+        return released;
+    }
+    if !crate::descriptor::sync_quiet(until) {
+        released.ms = begun.elapsed().as_millis() as u64;
+        tracing::warn!(
+            ms = released.ms,
+            "memory release: a heap sync pass still ran at the deadline; nothing released"
         );
         return released;
     }
@@ -538,6 +548,40 @@ mod tests {
         );
         assert_eq!(second.join().expect("the second caller"), (true, true));
         drop(hold);
+        close_chunk(handle);
+    }
+
+    /// A heap sync pass still running at the deadline (the ahead helper's,
+    /// which a refused submission does not wait for): nothing is let go, and
+    /// the opened chunk stays opened, since the pass would keep it again.
+    #[test]
+    fn warp_release_lets_nothing_go_while_a_heap_sync_pass_runs() {
+        let Some(_host) = warp() else { return };
+        let _on = Switched::on(false);
+        crate::pool::set_test(true);
+        let _reset = Reset;
+        let handle = committed_chunk(2 * K64);
+        match crate::pool::home(handle, 0, K64) {
+            Ok(placed) => drop(placed),
+            Err(why) => {
+                close_chunk(handle);
+                assert!(!warp_asked(), "the chunk is opened: {why:?}");
+                return;
+            }
+        }
+        let pass = crate::descriptor::hold_sync_for_test();
+        let released = title_memory(Duration::from_millis(300)).expect("the release runs");
+        assert_eq!(released.waited, Waited::Done, "the queue itself was idle");
+        assert_eq!(
+            (released.chunks, released.homes, released.retired),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            crate::pool::title_memory_pool_chunk_known(handle),
+            Some(true),
+            "the chunk stays opened"
+        );
+        drop(pass);
         close_chunk(handle);
     }
 

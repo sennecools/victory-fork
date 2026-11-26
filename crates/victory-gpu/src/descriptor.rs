@@ -253,6 +253,12 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+    // Once the title's end has begun (`crate::release`), no pass runs: the
+    // slots' kept resources, the homes and the chunks are being let go, and
+    // a pass would keep or mirror them again.
+    if crate::host::ending() {
+        return;
+    }
     // On the profile: what it did, and its time reading pages (`read_us`)
     // and mirroring their slots (`mirror_us`, with the waits for the heaps'
     // `made` locks), which alternate page by page; `skipped_made`: records
@@ -348,6 +354,31 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// At the title's end (`crate::release`), after `crate::host::end_submissions`:
+/// waits until `until` for a heap sync pass that is still running (the ahead
+/// helper's, `VICTORY_HEAP_SYNC_AHEAD`, which a refused submission does not
+/// wait for). A pass that starts later sees `ending()` and does nothing.
+/// False if a pass still runs at `until`.
+#[cfg(windows)]
+pub(crate) fn sync_quiet(until: std::time::Instant) -> bool {
+    use std::sync::TryLockError;
+    loop {
+        match SYNCING.try_lock() {
+            Ok(_) | Err(TryLockError::Poisoned(_)) => return true,
+            Err(TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(TryLockError::WouldBlock) => return false,
+        }
+    }
+}
+
+/// For the release's tests: a heap sync pass "still running".
+#[cfg(all(windows, test))]
+pub(crate) fn hold_sync_for_test() -> std::sync::MutexGuard<'static, ()> {
+    SYNCING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// At the title's end (`crate::release`): the slots of every shader-visible
 /// heap whose host resource `ours` names let it go (`HostHeap::let_go_kept`).
 /// Returns how many did.
@@ -357,7 +388,7 @@ pub(crate) fn let_go_slots(
 ) -> u64 {
     let mut out = Vec::new();
     {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         for &(_, _, at) in heaps.iter() {
             // SAFETY: registered heaps are live (removed when dropped).
             let heap = unsafe { &*(at as *const Heap) };
