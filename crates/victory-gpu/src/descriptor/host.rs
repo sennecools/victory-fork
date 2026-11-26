@@ -4091,7 +4091,8 @@ fn sync_tables() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
 }
 
-/// The faster heap sync (`VICTORY_HEAP_SYNC_FAST=1`, off by default): a
+/// The faster heap sync (on by default, as the play set runs it;
+/// `VICTORY_HEAP_SYNC_FAST=0`: off): a
 /// changed page's records under one lock of their prints
 /// ([`HostHeap::mirror_copied_page`]), and a record whose slot is made from
 /// it already done with before its claim ([`SKIPPED_MADE`]). The same
@@ -4102,13 +4103,14 @@ pub(crate) fn sync_fast() -> bool {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FAST").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FAST").is_none_or(|v| v != "0"))
 }
 
 /// Whether the pass over records copied in as bytes keeps the records
 /// themselves as last seen, and compares a changed page's records sixteen
-/// at a time with what it saw (`VICTORY_HEAP_SYNC_BYTES=1`, off by default:
-/// a print of each record, compared one by one, as before). Most of a
+/// at a time with what it saw (on by default, as the play set runs it;
+/// `VICTORY_HEAP_SYNC_BYTES=0`: a print of each record, compared one by
+/// one, as before). Most of a
 /// changed page is as it was: sixteen records of 32 bytes are one compare
 /// of 512, with no print made of any. The copy is 32 bytes a slot of the
 /// title's view heap where a print is 8 (on first use).
@@ -4117,15 +4119,15 @@ pub(crate) fn sync_fast() -> bool {
 /// of its 53c5256, both by local.
 pub(crate) fn sync_bytes() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BYTES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BYTES").is_none_or(|v| v != "0"))
 }
 
 /// Threads the heap sync reads, compares and sorts changed pages on, and
 /// mirrors the slots it found new records in, the calling one among them
 /// (`VICTORY_HEAP_SYNC_THREADS=N`, 2 to 16): the pages go [`SYNC_PAGES`] a
 /// job, the slots to mirror [`SYNC_SLOTS`] a job, on threads made for the
-/// pass (`crate::draw::each_on`). Unset, 0 or 1, the default: on the
-/// calling thread alone, as before.
+/// pass (`crate::draw::each_on`). Unset, the default: 4, as the play set
+/// runs it; 0 or 1: on the calling thread alone, as before.
 ///
 /// Ported from cool_fox 44629de, by local (cool_fox measured 14 ms a frame
 /// of one thread for 160 changed pages).
@@ -4135,7 +4137,7 @@ pub(crate) fn sync_threads() -> usize {
         std::env::var("VICTORY_HEAP_SYNC_THREADS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(1, |n| n.clamp(1, 16))
+            .map_or(4, |n| n.clamp(1, 16))
     })
 }
 

@@ -1,6 +1,6 @@
 //! The heap sync run ahead of the submission, on a thread of its own
-//! (`VICTORY_HEAP_SYNC_AHEAD=1`, off by default; off, [`super::sync_heaps`]
-//! runs in place in the submission, as before).
+//! (on by default, as the play set runs it; `VICTORY_HEAP_SYNC_AHEAD=0`:
+//! [`super::sync_heaps`] runs in place in the submission, as before).
 //!
 //! Lists read the host heap when they run, so a record the title copied
 //! into its heap as bytes before its `ExecuteCommandLists` must be in the
@@ -36,17 +36,17 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Whether the heap sync runs ahead on its own thread
-/// (`VICTORY_HEAP_SYNC_AHEAD=1`).
+/// Whether the heap sync runs ahead on its own thread (unless
+/// `VICTORY_HEAP_SYNC_AHEAD=0`).
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_AHEAD").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_AHEAD").is_none_or(|v| v != "0"))
 }
 
 /// How long the helper waits with no request before it runs a pass of its
-/// own, while submissions come (`VICTORY_HEAP_SYNC_EARLY=<ms>`, with
-/// `VICTORY_HEAP_SYNC_AHEAD=1`; unset or 0, the default: none, it waits for
-/// a request, as before). The title copies its records into its heaps while
+/// own, while submissions come (`VICTORY_HEAP_SYNC_EARLY=<ms>`; unset, the
+/// default: 4 ms, as the play set runs it; 0: none, it waits for a request,
+/// as before). The title copies its records into its heaps while
 /// it records, and the first submission of a frame found all of them for
 /// its pass to do (cool_fox measured 8 ms waited for); a pass of its own
 /// meanwhile leaves the requested one only what was written since. Such a
@@ -62,7 +62,7 @@ fn early() -> Option<std::time::Duration> {
         let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(4);
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }

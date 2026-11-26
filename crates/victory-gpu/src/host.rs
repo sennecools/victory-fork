@@ -7622,7 +7622,7 @@ impl Host {
         let entered = crate::profile::stamp();
         // The title heaps the lists bind: those the heap sync looks at.
         let bound = HostList::bound_heaps(runs);
-        // With `VICTORY_HEAP_SYNC_AHEAD=1`: the heap sync below runs on its
+        // Unless `VICTORY_HEAP_SYNC_AHEAD=0`: the heap sync below runs on its
         // own thread from here, while this one waits and prepares.
         let heap_sync = crate::descriptor::sync_ahead(&bound);
         // Lists whose binds lost the heap buffer pass's claim: not before
