@@ -2795,6 +2795,90 @@ pub(crate) mod tests {
         region.release();
     }
 
+    /// C (`VICTORY_R5_FLUSH=1`): a list that refreshes a home records no
+    /// refresh step and holds the home once, until it is reset: the title's
+    /// decommit of its pages waits while the list is open, also after the
+    /// list ran, and is done at the sweep after the reset. Without the
+    /// switch the refresh is a step, as before.
+    #[test]
+    fn warp_r5_flush_a_home_is_held_with_no_refresh_step() {
+        let Some(host) = warp13() else { return };
+        let _on = Switched::on(false);
+        let region = TestRegion::new(8 * K64 as usize);
+        let (start, len) = (region.base + K64, K64);
+        register(0xc0de_f201, start, len);
+        let home = find(start, len).expect("a home");
+        assert!(home.is_home() && home.is_placed());
+        {
+            let _switch = crate::host::r5_flush::TestSwitch::set(false);
+            let list = host.new_list().unwrap();
+            home.refresh(&list, start, len);
+            assert_eq!(list.r5_flush_held(), (1, 0), "without the switch: a step");
+            list.close();
+            list.reset();
+        }
+        let _switch = crate::host::r5_flush::TestSwitch::set(true);
+        let list = host.new_list().unwrap();
+        home.refresh(&list, start, len);
+        home.refresh(&list, start + 0x100, 0x100);
+        assert_eq!(list.r5_flush_held(), (0, 1), "no step, held once");
+        list.close();
+        host.execute(&[&list]);
+        drop(home);
+        let waiting = TOLD[2].load(Ordering::Relaxed);
+        assert_eq!(
+            title_virtual_free(start as usize, len as usize, mem::MEM_DECOMMIT),
+            1,
+            "told it was done"
+        );
+        assert_eq!(TOLD[2].load(Ordering::Relaxed), waiting + 1, "done later");
+        run_pending();
+        assert_eq!(state(start), mem::MEM_COMMIT, "held by the list");
+        list.reset();
+        assert_eq!(list.r5_flush_held(), (0, 0));
+        run_pending();
+        assert_eq!(
+            state(start),
+            mem::MEM_RESERVE,
+            "decommitted once the list let it go"
+        );
+        assert_eq!(PENDING.load(Ordering::Relaxed), 0);
+        unregister(0xc0de_f201, start);
+        drop(list);
+        region.release();
+    }
+
+    /// C (`VICTORY_R5_FLUSH=1`): a card copy whose CPU side is a home is no
+    /// placed copy: its refresh keeps its step (the card's side is sent up
+    /// from it).
+    #[test]
+    fn warp_r5_flush_a_card_copy_on_a_home_keeps_its_step() {
+        let Some(host) = warp13() else { return };
+        if !host.card_ready() {
+            return;
+        }
+        let _on = Switched::pool();
+        crate::card_home::set_test(true);
+        let _switch = crate::host::r5_flush::TestSwitch::set(true);
+        let bytes = 32 * K64;
+        let chunk = TestChunk::new(2 * bytes as usize, crate::pool::PoolChunk::Committed);
+        let p = Place::new(bytes as usize);
+        p.map(0, bytes, &chunk, 0);
+        let (start, len) = (p.base + K64, 1 << 20);
+        register(0xc0de_f202, start, len);
+        let copy = find(start, len).expect("a copy");
+        assert!(copy.card_home().is_some(), "its CPU side is a home");
+        assert!(!copy.is_placed(), "not placed itself");
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, start, len);
+        assert_eq!(list.r5_flush_held(), (1, 0), "its step is kept");
+        list.close();
+        list.reset();
+        unregister(0xc0de_f202, start);
+        drop((copy, list));
+        p.unmap(0, bytes);
+    }
+
     /// A decommit that waits, then the title commits the middle of those
     /// pages again: that part reads zeros and is never decommitted; the rest
     /// still is, once the heap goes.

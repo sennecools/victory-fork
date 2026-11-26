@@ -668,6 +668,9 @@ fn kernel_ask(first: usize, last: usize, found: &mut Vec<usize>) -> Option<usize
     // (A failed asking found nothing: its time is the kernel's still.)
     let asked = if failed { &[][..] } else { &found[..count] };
     crate::profile::kernel_asked(asking, ((last - first) * PAGE) as u64, asked);
+    if failed {
+        super::failed_ask(first, last);
+    }
     (!failed).then_some(count)
 }
 

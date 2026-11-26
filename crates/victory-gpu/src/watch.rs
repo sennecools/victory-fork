@@ -172,10 +172,47 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let left;
+    let ranges = if crate::host::r5_flush::on() {
+        left = without_known_views(ranges);
+        &left[..]
+    } else {
+        ranges
+    };
     match epoch::on() {
         Some(epochs) => epochs.ask_ahead(ranges),
         None => ask_ahead_in(&JOURNAL, ranges),
     }
+}
+
+/// `ranges` without those whose first block the guards hold as view memory
+/// ([`known_view`]), for the askings ahead (`VICTORY_R5_FLUSH=1`): the
+/// kernel cannot answer for them, and a run of joined ranges holding one
+/// fails and is asked again by halves. [`writes`] answers them from the
+/// guards, as it does after such a failed asking.
+fn without_known_views(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    use crate::host::r5_flush::{Count, count};
+    if view_ask() {
+        return ranges.to_vec();
+    }
+    let g = guards();
+    let (mut spans, mut bytes) = (0, 0);
+    let left = ranges
+        .iter()
+        .copied()
+        .filter(|&(start, end)| {
+            let view = start < end && known_view_in(&g, start);
+            if view {
+                spans += 1;
+                bytes += (end - start) as u64;
+            }
+            !view
+        })
+        .collect();
+    drop(g);
+    count(Count::ViewSpans, spans);
+    count(Count::ViewSpanBytes, bytes);
+    left
 }
 
 /// `ranges` as page ranges in order, empty ones left out.
@@ -308,6 +345,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let left;
+    let ranges = if crate::host::r5_flush::on() {
+        left = without_known_views(ranges);
+        &left[..]
+    } else {
+        ranges
+    };
     match epoch::on() {
         Some(epochs) => epochs.ask_once(ranges),
         None => ask_once_in(&JOURNAL, ranges),
@@ -462,6 +506,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let found = if failed { &[][..] } else { &j.found[..count] };
     crate::profile::kernel_asked(asking, ((last - first) * PAGE) as u64, found);
     if failed {
+        failed_ask(first, last);
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -560,6 +605,9 @@ fn writes_in(
         // (A failed asking found nothing: its time is the kernel's still.)
         let found = if failed { &[][..] } else { &j.found[..count] };
         crate::profile::kernel_asked(asking, ((last - first) * PAGE) as u64, found);
+        if failed {
+            failed_ask(first, last);
+        }
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
@@ -644,18 +692,40 @@ const BLOCK: usize = PAGE;
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
 fn known_view(start: usize) -> bool {
+    !view_ask() && known_view_in(&guards(), start)
+}
+
+/// Whether the kernel is asked about view memory anyway
+/// (`VICTORY_VIEW_ASK=1` or `VICTORY_GUARD_ASK=1`, [`known_view`]).
+fn view_ask() -> bool {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ask = *ASK.get_or_init(|| {
+    *ASK.get_or_init(|| {
         ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
             .iter()
             .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
-    });
-    if ask {
-        return false;
-    }
-    let g = guards();
+    })
+}
+
+/// [`known_view`] with the guards' lock held, whatever `VICTORY_VIEW_ASK`
+/// says.
+fn known_view_in(g: &Guards, start: usize) -> bool {
     let first = start / BLOCK;
     g.protected.contains(&first) || g.absent.contains(&first)
+}
+
+/// Whether the guards hold the block at `start` as view memory, whatever
+/// `VICTORY_VIEW_ASK` says: for the R5 flush's counters
+/// (`crate::host::r5_flush`).
+pub(crate) fn known_view_at(start: usize) -> bool {
+    known_view_in(&guards(), start)
+}
+
+/// A kernel asking about pages `[first, last)` failed: counted
+/// (`crate::host::r5_flush`).
+fn failed_ask(first: usize, last: usize) {
+    use crate::host::r5_flush::{Count, count};
+    count(Count::FailedAsks, 1);
+    count(Count::FailedBytes, ((last - first) * PAGE) as u64);
 }
 
 struct Guards {
@@ -863,9 +933,30 @@ fn protect_alias(g: &mut Guards, block: usize) {
         return;
     }
     let mut old = 0;
+    let timed = protect_timer();
     // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+    let done =
+        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
+    protected(timed, usize::from(done));
+    if done {
         g.protected.insert(block);
+    }
+}
+
+/// With `VICTORY_R5_FLUSH=1`: when a `VirtualProtect` of the guards starts,
+/// for [`protected`].
+fn protect_timer() -> Option<std::time::Instant> {
+    crate::host::r5_flush::on().then(std::time::Instant::now)
+}
+
+/// A `VirtualProtect` of the guards, begun at `timed`, made `blocks` blocks
+/// read-only: counted (`crate::host::r5_flush`).
+fn protected(timed: Option<std::time::Instant>, blocks: usize) {
+    use crate::host::r5_flush::{Count, count};
+    count(Count::Protects, 1);
+    count(Count::Guarded, blocks as u64);
+    if let Some(timed) = timed {
+        count(Count::ProtectUs, timed.elapsed().as_micros() as u64);
     }
 }
 
@@ -874,15 +965,18 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
+        let timed = protect_timer();
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        let done = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
-        }
+        };
+        protected(timed, if done { to - from } else { 0 });
+        done
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
@@ -1283,6 +1377,7 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            crate::host::r5_flush::count(crate::host::r5_flush::Count::Faults, 1);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;

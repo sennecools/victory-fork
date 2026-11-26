@@ -2821,6 +2821,12 @@ impl Shadow {
         self.core.is_some() || self.card_home().is_some()
     }
 
+    /// Whether the copy is title memory in place (a home of the memory core,
+    /// or a buffer in place, [`Shadow::placed`]): its refresh copies nothing.
+    pub(crate) fn is_placed(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The kind of home of the memory core this is, if it is one. `None`
     /// for a copy in the card's memory whose CPU side is one: it is not
     /// itself the title's memory (its home's kind is that home's).
@@ -3769,6 +3775,7 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        crate::host::r5_flush::copied(from, to);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);

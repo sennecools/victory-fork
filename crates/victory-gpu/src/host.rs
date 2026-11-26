@@ -20,6 +20,8 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 /// R5 (`VICTORY_R5=1`): what only the core's homes under the relay use.
 mod late_homes;
+/// R5 flush (`VICTORY_R5_FLUSH=1`): less work at submission, and its counters.
+pub(crate) mod r5_flush;
 
 #[cfg(test)]
 pub(crate) use late_homes::{flights, test_flights, test_relay_sees};
@@ -3423,6 +3425,9 @@ struct Deferred {
     /// CPU again since ([`HostList::unlift`]): held until the reset, as that
     /// submission's lift list reads and writes their buffers.
     spent: Vec<Lifted>,
+    /// Placed copies the list refreshed, held with no step
+    /// ([`r5_flush::on`]).
+    kept_homes: r5_flush::Kept,
 }
 
 /// What a list's submission-time steps asked for and did
@@ -9164,6 +9169,11 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        // A placed copy's refresh copies nothing: the list only holds it.
+        if shadow.is_placed() && r5_flush::on() {
+            deferred.kept_homes.keep(shadow);
+            return;
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
@@ -9665,6 +9675,7 @@ impl HostList {
             ..DeferredRun::default()
         };
         let batch_copied = batch.done.copied;
+        let counting = r5_flush::on();
         // For the submission's lift list ([`Step::Lifted`]).
         let mut lifted = Vec::new();
         for step in &deferred.copies {
@@ -9699,6 +9710,9 @@ impl HostList {
                     }
                     run.refreshes += 1;
                     run.asked += *len as u64;
+                    if counting && shadow.is_placed() {
+                        r5_flush::count(r5_flush::Count::PlacedSteps, 1);
+                    }
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -9743,6 +9757,10 @@ impl HostList {
                     if batch.texture_due(staging) {
                         run.textures += 1;
                         staging.refresh();
+                        if counting {
+                            let us = started.elapsed().as_micros() as u64;
+                            r5_flush::count(r5_flush::Count::TextureUs, us);
+                        }
                     }
                     continue;
                 }
@@ -9999,6 +10017,10 @@ impl Batch {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         self.done.refreshes += self.refreshes.len() as u64;
+        let counting = r5_flush::on();
+        if counting {
+            r5_flush::flush_begins(&self.refreshes);
+        }
         // The bytes, for the profiler's spans only ([`BatchDone`]).
         let profiling = crate::profile::on();
         if profiling {
@@ -10043,6 +10065,9 @@ impl Batch {
                     self.done.copied += copied;
                 }
             }
+        }
+        if counting {
+            r5_flush::flush_ends();
         }
         if ahead {
             crate::watch::ask_ahead_done();
@@ -10479,6 +10504,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        r5_flush::line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =
