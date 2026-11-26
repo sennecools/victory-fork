@@ -2007,6 +2007,17 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in aliased {
         g.aliased.remove(block);
     }
+    // What rested there was the old mapping's (`VICTORY_GUARD_REST`,
+    // [`rest`]): the new one is guarded at the next asking, as any other.
+    if !g.opened.is_empty() {
+        if range.len() < g.opened.len() {
+            for block in range {
+                g.opened.remove(&block);
+            }
+        } else {
+            g.opened.retain(|block, _| !range.contains(block));
+        }
+    }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -2975,6 +2986,27 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
         assert!(!writable(two) && !writable(one));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// A block that rests and is then mapped anew (the runtime tells of it,
+    /// [`title_memory_remapped`]) rests no more: the new mapping is guarded
+    /// at the next asking, as any other. (A rest left over from an old
+    /// mapping was kept for the whole rest, here an hour.)
+    #[test]
+    fn a_block_mapped_anew_rests_no_more() {
+        set_rest_in_test(std::time::Duration::from_secs(3600));
+        let (section, one, two) = two_views(BLOCK);
+        let page = one / PAGE;
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
+        // SAFETY: a view, opened by the handler.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
+        assert!(writable(one), "it rests");
+        title_memory_remapped(one, BLOCK);
+        crate::inplace::title_memory_view(one, BLOCK, section, 0);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]), "mapped anew");
+        assert!(!writable(one), "guarded again, not resting");
         drop_views(section, &[one, two], BLOCK);
     }
 
