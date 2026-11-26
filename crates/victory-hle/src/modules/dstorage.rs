@@ -1672,6 +1672,10 @@ mod tests {
         assert_eq!(buffers[3], contents[..16]);
     }
 
+    /// Half of an automatic queue's capacity submits it; a queue with
+    /// automatic submission off waits for the submit. With
+    /// `VICTORY_DSTORAGE_SUBMIT_FULL=1` an automatic queue waits for it too
+    /// (`a_full_queue_submits_itself` has where it does not).
     #[test]
     fn queue_options_control_submission_at_half_capacity() {
         let (_dir, file) = file_with(&pattern(64));
@@ -1681,10 +1685,12 @@ mod tests {
             let mut out = [0u8; 16];
             enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
             enqueue_status(queue, array, 0);
-            if options == AUTO_SUBMIT_DISABLED {
-                // SAFETY: this test owns the live queue returned by CreateQueue1.
-                let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
-                assert_eq!(scheduler().unwrap().lock().lanes[&id].unsubmitted.len(), 2);
+            // SAFETY: this test owns the live queue returned by CreateQueue1.
+            let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+            let waits = options == AUTO_SUBMIT_DISABLED || super::submit_when_full();
+            let unsubmitted = scheduler().unwrap().lock().lanes[&id].unsubmitted.len();
+            assert_eq!(unsubmitted, if waits { 2 } else { 0 });
+            if waits {
                 assert_eq!(result(array, 0), E_PENDING);
                 void(queue, 0x30);
             }
