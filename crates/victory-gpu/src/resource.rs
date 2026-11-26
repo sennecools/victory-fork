@@ -1902,7 +1902,6 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// makes the list or the slot hold it) is protected by that idle time alone.
 /// Every caller uses it at once, within the title's call.
 /// Called by the sweeper's thread (`crate::host`'s `sweeper`).
-/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 ///
 /// Looks at the textures after the address `from` (all with none) while
 /// `budget` lasts (`crate::host::sweep_walk`), and retires the host copies
@@ -1913,10 +1912,6 @@ pub(crate) fn let_go_idle(from: Option<usize>, budget: &mut crate::host::Budget)
     use std::ops::Bound::{Excluded, Unbounded};
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
-        return None;
-    }
     // The idle tiers do not count the pool's empty blocks (0 with its
     // texture half off).
     let memory = crate::host::host().and_then(|h| h.video_memory());

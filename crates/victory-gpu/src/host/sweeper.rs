@@ -82,12 +82,11 @@ fn bury_own() {
 
 /// Starts the sweeper's thread, once (at the first submission). Not under
 /// test: a sweeper beside a test would let go of, and bury, another test's
-/// objects; tests run its steps themselves. `VICTORY_SWEEP=0` keeps
-/// everything.
+/// objects; tests run its steps themselves.
 pub(super) fn start() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
-        if cfg!(test) || std::env::var_os("VICTORY_SWEEP").is_some_and(|v| v == "0") {
+        if cfg!(test) {
             return;
         }
         let spawned = std::thread::Builder::new()
