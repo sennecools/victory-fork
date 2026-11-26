@@ -342,13 +342,23 @@ fn ask_once_in(journal: &Mutex<Journal>, ranges: &[(usize, usize)]) {
     let _journal = crate::profile::journal_timer();
     ask_once_end_in(journal);
     ask_ahead_in(journal, ranges);
+    ask_alone_in(journal, ranges);
+}
+
+/// The second half of [`ask_once_in`]: the ranges of `ranges` that
+/// [`ask_ahead_in`] left, asked about one by one, and the asking made to
+/// stand.
+fn ask_alone_in(journal: &Mutex<Journal>, ranges: &[(usize, usize)]) {
     let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    if j.ahead.is_empty() {
-        // `ask_ahead` asked nothing (fewer than two ranges).
-        j.asked += 1;
-        j.ahead_asked = j.asked;
-    }
+    // A number of its own: what is marked below must be above every number
+    // handed out so far, as every mark is. Another asking may have come
+    // between `ask_ahead` and this lock, and been answered from the ranges
+    // asked ahead with their number, which it hands out again without a new
+    // one; a copy that took a page at that number would not see a write
+    // marked at it. (Pages `ask_ahead` marked stay below the new number.)
+    j.asked += 1;
+    j.ahead_asked = j.asked;
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
@@ -3303,9 +3313,9 @@ mod journal_tests {
     //! `crate::shadow::Shadow` keeps them. (The epoch tables' tests, which
     //! checked them against the journal of ordered maps the stamps replace.)
     use super::{
-        Journal, KERNEL_PAGE, PAGE, Taken, ask_ahead_done_in, ask_ahead_in, ask_once_end_in,
-        ask_once_in, asked_now_in, gpu_wrote_in, stale_words_in, writes_in, writes_now_in,
-        wrote_in,
+        Journal, KERNEL_PAGE, PAGE, Taken, ask_ahead_done_in, ask_ahead_in, ask_alone_in,
+        ask_once_end_in, ask_once_in, asked_now_in, gpu_wrote_in, stale_words_in, writes_in,
+        writes_now_in, wrote_in,
     };
     use std::ops::ControlFlow;
     use std::sync::Mutex;
@@ -3666,5 +3676,46 @@ mod journal_tests {
         for asker in askers {
             asker.join().unwrap();
         }
+    }
+
+    /// Another asking between the two halves of a submission's one asking
+    /// ([`ask_once_in`]), by the kernel or answered from the ranges asked
+    /// ahead: what the second half marks is above that asking's number, so a
+    /// copy that took the range at it sees the write.
+    #[test]
+    fn an_asking_between_the_halves_of_one_asking_misses_no_write() {
+        let journal = Mutex::new(Journal::new());
+        let r = Region::new(256 * PAGE);
+        // Two ranges asked about together, a third alone, too far from them
+        // to be asked with them (`AHEAD_GAP`).
+        let (a, b, c) = (
+            (r.0, r.0 + PAGE),
+            (r.0 + 2 * PAGE, r.0 + 3 * PAGE),
+            (r.0 + 200 * PAGE, r.0 + 201 * PAGE),
+        );
+        ask_once_end_in(&journal);
+        ask_ahead_in(&journal, &[a, b, c]);
+        // A copy of the third range asks meanwhile, the title writes it.
+        let (now, _) = writes_in(&journal, c.0, c.1, false, 0).expect("watched");
+        r.write(200 * PAGE + 9, 1);
+        ask_alone_in(&journal, &[a, b, c]);
+        let (_, written) = writes_in(&journal, c.0, c.1, false, now).expect("watched");
+        assert_eq!(written.len(), 1, "the write after the copy's asking");
+        assert!(written[0].1 > now);
+        ask_once_end_in(&journal);
+
+        // The asking between answered from the ranges asked ahead, which
+        // hands out their number again, by a copy of a range inside them; a
+        // range the second half asks alone shares its page.
+        let inside = (r.0 + PAGE, r.0 + 2 * PAGE);
+        ask_ahead_in(&journal, &[a, b]);
+        let (now, _) = writes_in(&journal, inside.0, inside.1, false, 0).expect("watched");
+        assert_eq!(asked_now_in(&journal, inside.0, inside.1), Some(now));
+        r.write(PAGE + 7, 2);
+        ask_alone_in(&journal, &[(r.0 + PAGE, r.0 + 5 * PAGE)]);
+        let (_, written) = writes_in(&journal, inside.0, inside.1, false, now).expect("watched");
+        assert_eq!(written.len(), 1, "the write marked by the second half");
+        assert!(written[0].1 > now);
+        ask_once_end_in(&journal);
     }
 }
