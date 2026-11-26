@@ -28,7 +28,6 @@
 //! summary per 4 MiB, so an answer costs what was written since the asker's
 //! last take, not what was ever written.
 
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 mod bits;
@@ -49,7 +48,23 @@ const KERNEL_PAGE: usize = 4096;
 pub(crate) struct Tracked {
     start: usize,
     end: usize,
-    seen: Mutex<BTreeMap<usize, u64>>,
+    taken: Mutex<TakenPages>,
+}
+
+/// What the takes of a [`Tracked`] range took: the journal's stamp at which
+/// each page was last taken whole, and a low-water mark at or below which
+/// every page was. A take asks the journal only for the pages stamped above
+/// the mark ([`Stamps::since`]): its cost is a look per group of the range
+/// and one per page of the groups written since, not one per page ever
+/// written. (Not [`Taken`], the host copies' notes, which hold a page never
+/// taken as stale: a heap's pages nothing ever wrote need no take.)
+struct TakenPages {
+    /// Per page of the range, from its first: the stamp of the write it was
+    /// last taken whole after (0: never). Below `low` it says nothing more.
+    pages: Vec<u64>,
+    /// Every page of the range was taken whole after every write stamped at
+    /// or below this: the asking of the last take of the whole range.
+    low: u64,
 }
 
 /// Tracks a runtime GPU-memory range, including physical-page views when
@@ -61,11 +76,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     if len == 0 || writes(start, end, views, u64::MAX).is_none() {
         return None;
     }
-    Some(Tracked {
-        start,
-        end,
-        seen: Mutex::default(),
-    })
+    Some(Tracked::new(start, end))
 }
 
 struct Journal {
@@ -688,22 +699,44 @@ fn ask(j: &mut Journal, first: usize, last: usize, guarded: bool) -> Option<u64>
 }
 
 impl Tracked {
+    /// `[start, end)`, none of it taken yet.
+    fn new(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            taken: Mutex::new(TakenPages {
+                pages: vec![0; end.div_ceil(PAGE) - start / PAGE],
+                low: 0,
+            }),
+        }
+    }
+
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        self.take_in(&JOURNAL, from, to)
+    }
+
+    /// [`Tracked::take`] from `journal`.
+    fn take_in(&self, journal: &Mutex<Journal>, from: usize, to: usize) -> Vec<(usize, usize)> {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
             return Vec::new();
         }
-        // shortcut: every page ever written, filtered by `seen` below; a
-        // stamp per page taken (one `since` for the range) is later work.
-        let Some((_, pages)) = writes(from, to, true, 0) else {
+        // Held over the asking: two takes at once would each raise `low` to
+        // their own asking, and the lower could follow the higher.
+        let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = &mut *taken;
+        // Every page was taken after what is stamped at or below `low`: only
+        // those stamped above it can be new.
+        let Some((now, pages)) = writes_in(journal, from, to, true, taken.low) else {
             return Vec::new();
         };
-        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let base = self.start / PAGE;
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for (page, write) in pages {
-            if seen.get(&page).is_some_and(|&last| last >= write) {
+            let last = &mut taken.pages[page - base];
+            if *last >= write {
                 continue;
             }
             let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
@@ -711,15 +744,19 @@ impl Tracked {
                 continue;
             }
             // Keep partial pages dirty: the caller has not taken the rest.
-            if (page * PAGE).max(self.start) >= from
-                && ((page + 1) * PAGE).min(self.end) <= to
-            {
-                seen.insert(page, write);
+            if (page * PAGE).max(self.start) >= from && ((page + 1) * PAGE).min(self.end) <= to {
+                *last = write;
             }
             match ranges.last_mut() {
                 Some((_, last)) if *last == start => *last = end,
                 _ => ranges.push((start, end)),
             }
+        }
+        // The whole range taken: every page holds what was written up to
+        // this asking, which is above every stamp it found but those of
+        // askings after it, and every later asking's stamp is above it.
+        if from == self.start && to == self.end {
+            taken.low = taken.low.max(now);
         }
         ranges
     }
@@ -3313,9 +3350,9 @@ mod journal_tests {
     //! `crate::shadow::Shadow` keeps them. (The epoch tables' tests, which
     //! checked them against the journal of ordered maps the stamps replace.)
     use super::{
-        Journal, KERNEL_PAGE, PAGE, Taken, ask_ahead_done_in, ask_ahead_in, ask_alone_in,
-        ask_once_end_in, ask_once_in, asked_now_in, gpu_wrote_in, stale_words_in, writes_in,
-        writes_now_in, wrote_in,
+        Journal, KERNEL_PAGE, PAGE, Taken, Tracked, ask_ahead_done_in, ask_ahead_in,
+        ask_alone_in, ask_once_end_in, ask_once_in, asked_now_in, gpu_wrote_in, stale_words_in,
+        writes_in, writes_now_in, wrote_in,
     };
     use std::ops::ControlFlow;
     use std::sync::Mutex;
@@ -3717,5 +3754,104 @@ mod journal_tests {
         assert_eq!(written.len(), 1, "the write marked by the second half");
         assert!(written[0].1 > now);
         ask_once_end_in(&journal);
+    }
+
+    /// Tracked ranges ([`Tracked`]) taken whole and in parts, while the
+    /// title writes, other copies ask and our own and the GPU's writes are
+    /// told: a copy brought up to date with what each take returns holds
+    /// the title's bytes of what was taken; a whole take after a whole take
+    /// with nothing written returns nothing and finds nothing to look at.
+    #[test]
+    fn tracked_takes_copy_every_write() {
+        const SIZE: usize = 12 << 20;
+        let journal = Mutex::new(Journal::new());
+        let r = Region::new(SIZE);
+        // Heaps not on page bounds, one over a whole group of the stamps.
+        let shapes: [(usize, usize); 4] = [
+            (100, 3 * PAGE),
+            (5 * PAGE, PAGE / 2),
+            ((4 << 20) - 32, (4 << 20) + 64),
+            (10 << 20, PAGE),
+        ];
+        let tracked: Vec<Tracked> = shapes
+            .iter()
+            .map(|&(at, len)| Tracked::new(r.0 + at, r.0 + at + len))
+            .collect();
+        let mut copies: Vec<Vec<u8>> = shapes.iter().map(|&(_, len)| vec![0; len]).collect();
+        let mut rng = Rng(0x0ddb_a11c_afef_00d5);
+        let (mut whole, mut parts) = (0, 0);
+        for step in 0..4000 {
+            match rng.next(8) {
+                0..=2 => {
+                    for _ in 0..1 + rng.next(6) {
+                        let (at, len) = shapes[rng.next(shapes.len())];
+                        r.write(at + rng.next(len), rng.next(256) as u8);
+                    }
+                }
+                // Another copy asks, about anything.
+                3 => {
+                    let from = r.0 + rng.next(SIZE);
+                    let to = from + 1 + rng.next(r.0 + SIZE - from);
+                    writes_in(&journal, from, to, false, 0).expect("watched");
+                }
+                // A submission's one asking with our own write told under it.
+                4 => {
+                    let all: Vec<(usize, usize)> = shapes
+                        .iter()
+                        .filter(|_| rng.next(2) == 0)
+                        .map(|&(at, len)| (r.0 + at, r.0 + at + len))
+                        .collect();
+                    ask_once_in(&journal, &all);
+                    let (at, len) = shapes[rng.next(shapes.len())];
+                    let offset = at + rng.next(len);
+                    r.write(offset, rng.next(256) as u8);
+                    wrote_in(&journal, r.0 + offset, 1);
+                    ask_once_end_in(&journal);
+                }
+                // The GPU writes, unseen by the write watch, and is told.
+                5 => {
+                    let (at, len) = shapes[rng.next(shapes.len())];
+                    let offset = at + rng.next(len);
+                    r.write(offset, rng.next(256) as u8);
+                    let page = (r.0 + offset) / KERNEL_PAGE * KERNEL_PAGE;
+                    // SAFETY: our allocation.
+                    assert_eq!(unsafe { ResetWriteWatch(page as *const _, KERNEL_PAGE) }, 0);
+                    gpu_wrote_in(&journal, r.0 + offset, 1);
+                }
+                // A take, whole or of a part.
+                _ => {
+                    let i = rng.next(shapes.len());
+                    let (at, len) = shapes[i];
+                    let (start, end) = (r.0 + at, r.0 + at + len);
+                    let (from, to) = if rng.next(2) == 0 {
+                        whole += 1;
+                        (start, end)
+                    } else {
+                        parts += 1;
+                        let from = start + rng.next(len);
+                        (from, from + 1 + rng.next(end - from))
+                    };
+                    for (a, b) in tracked[i].take_in(&journal, from, to) {
+                        assert!(from <= a && a < b && b <= to, "step {step}");
+                        // SAFETY: inside our committed region.
+                        let title = unsafe { std::slice::from_raw_parts(a as *const u8, b - a) };
+                        copies[i][a - start..b - start].copy_from_slice(title);
+                    }
+                    // SAFETY: as above.
+                    let title = unsafe { std::slice::from_raw_parts(from as *const u8, to - from) };
+                    assert!(
+                        copies[i][from - start..to - start] == *title,
+                        "step {step}: heap {i}, {from:#x}..{to:#x}"
+                    );
+                    if (from, to) == (start, end) {
+                        assert_eq!(tracked[i].take_in(&journal, start, end), []);
+                        let low = tracked[i].taken.lock().unwrap().low;
+                        let (_, left) = writes_in(&journal, start, end, false, low).unwrap();
+                        assert_eq!(left, [], "step {step}: nothing above the low-water");
+                    }
+                }
+            }
+        }
+        assert!(whole > 100 && parts > 100, "{whole} whole, {parts} parts");
     }
 }
