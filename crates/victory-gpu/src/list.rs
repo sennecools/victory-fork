@@ -1112,7 +1112,7 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some((buffer, staging)) = list.upload_for_texture(host, bytes) else {
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report

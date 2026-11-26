@@ -2466,7 +2466,7 @@ mod staging_tests {
 /// WARP: the staging buffer's lifetime against submissions, and transient
 /// staging buffers (`VICTORY_D3D12_WARP=1`, diagnostics builds).
 #[cfg(all(test, feature = "diagnostics"))]
-mod staging_warp_tests {
+pub(crate) mod staging_warp_tests {
     use super::{Arc, HostList, Recorded, Staging, TRANSIENT, make_staging};
     use crate::host::{host, references};
     use crate::object::This;
@@ -2516,33 +2516,11 @@ mod staging_warp_tests {
             assert!(!base.is_null());
             // SAFETY: inside the allocation (asserted above).
             let memory = unsafe { base.add(offset) };
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            };
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: 16,
-                Height: ROWS as u32,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                Format: DXGI_FORMAT_R32G32_UINT,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                ..Default::default()
-            };
-            let mut texture: Option<ID3D12Resource> = None;
-            // SAFETY: plain creation of a texture.
-            unsafe {
-                let dest = D3D12_RESOURCE_STATE_COPY_DEST;
-                host.device
-                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, dest, None, &mut texture)
-                    .unwrap();
-            }
             let fixture = Fixture {
                 base,
                 memory,
                 layout,
-                texture: texture.unwrap(),
+                texture: host_texture(host),
             };
             fixture.fill(0x11);
             fixture
@@ -2583,9 +2561,75 @@ mod staging_warp_tests {
         }
     }
 
+    /// The fixture's host texture, in the copy destination state.
+    fn host_texture(host: &crate::host::Host) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: ROWS as u32,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32G32_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a texture.
+        unsafe {
+            let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    dest,
+                    None,
+                    &mut texture,
+                )
+                .unwrap();
+        }
+        texture.unwrap()
+    }
+
+    /// For tests elsewhere: a staging state of the fixture's texture over
+    /// title memory at `memory` (which holds [`staging_at`]'s bytes, the
+    /// layout's size, while it lives), its host texture, and those bytes.
+    pub(crate) fn staging_at(memory: *mut u8) -> (Arc<Staging>, ID3D12Resource, usize) {
+        let host = host().expect("a WARP host device (VICTORY_D3D12_WARP=1)");
+        let (layout, texture) = (layout(), host_texture(host));
+        let bytes = layout.size as usize;
+        let staging = make_staging(memory, layout, &texture, false, false, || {
+            "test staging".into()
+        })
+        .expect("a staging state");
+        (Arc::new(staging), texture, bytes)
+    }
+
     /// The console layout of the fixture's texture.
     fn layout() -> victory_formats::texture::Layout {
-        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, ROWS as u32, 65537, 10, 1, 0, 256, 3_145_728, 0];
+        let words: [u32; 14] = [
+            3,
+            0,
+            0,
+            0,
+            16,
+            0,
+            ROWS as u32,
+            65537,
+            10,
+            1,
+            0,
+            256,
+            3_145_728,
+            0,
+        ];
         // SAFETY: fourteen words are a resource description (plain numbers).
         let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
         crate::resource::texture_layout(&desc)
