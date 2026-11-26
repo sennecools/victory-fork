@@ -7439,7 +7439,8 @@ mod made_tests {
             let slot = (r % u64::from(SLOTS)) as u32;
             let at = base + u64::from(slot) * 32;
             // A buffer view or a constant buffer view: each write logs a
-            // change to the queue and one to the sets.
+            // change to the queue and one to the sets (as bits, changes
+            // the sets at once).
             let buffer = r >> 8 & 1 == 1;
             write(at, &views[if buffer { 2 } else { 0 }]);
             heap.mirror(slot, at, false);
@@ -7450,7 +7451,13 @@ mod made_tests {
             }
         }
         assert!(most.0 <= LOG_MOST && most.1 <= LOG_MOST, "{most:?}");
-        assert!(most.0 > 0 && most.1 > 0, "{most:?}");
+        if heap.bits.is_some() {
+            // Sets as bits (`VICTORY_SLOT_BITS=1`): each write changes its
+            // bits under the slot's claim and logs no buffer change at all.
+            assert!(most.0 > 0 && most.1 == 0, "{most:?}");
+        } else {
+            assert!(most.0 > 0 && most.1 > 0, "{most:?}");
+        }
         // What was applied on the way is what the sets hold.
         let holding: Vec<u32> = (0..SLOTS).filter(|&slot| last[slot as usize]).collect();
         assert_eq!(heap.buffer_slots(), holding);
