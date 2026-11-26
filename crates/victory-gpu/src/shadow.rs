@@ -77,9 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
-    /// With `place`: a home of the memory core (`crate::home`), not a
-    /// placement of `VICTORY_INPLACE`'s.
-    core: bool,
+    /// With `place`: a home of the memory core (`crate::home`), and of
+    /// which kind; `None` for a placement of `VICTORY_INPLACE`'s.
+    core: Option<crate::home::Kind>,
     /// For device-removed reports ([`near`]): the ways the copy was handed
     /// to the card ([`Hand`], one bit each), the last four of them (one
     /// byte each, the newest lowest), and the offset in the copy of the
@@ -2360,8 +2360,8 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            if self.core {
-                crate::home::gone(self.start, self.len, self.id);
+            if let Some(kind) = self.core {
+                crate::home::gone(self.start, self.len, self.id, kind);
             } else {
                 crate::inplace::gone(self.window, self.start, self.len);
             }
@@ -2710,7 +2710,7 @@ impl crate::home::Home for Shadow {
         // bytes (a title buffer inside this one with a copy of its own, a
         // texture in it) is not told: the card's writes are not seen by
         // write watching.
-        if self.place.is_some() && !self.core {
+        if self.place.is_some() && self.core.is_none() {
             return;
         }
         // A home of the memory core is declared as a copy is, and `writing`,
@@ -2769,9 +2769,21 @@ impl Shadow {
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
-    /// `core`: a home of the memory core (`crate::home`).
-    fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool, core: bool) -> Shadow {
-        crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
+    /// `core`: a home of the memory core (`crate::home`), of that kind.
+    pub(crate) fn placed(
+        placed: crate::inplace::Placed,
+        start: u64,
+        len: u64,
+        window: bool,
+        core: Option<crate::home::Kind>,
+    ) -> Shadow {
+        // A home in a chunk of the pool shares the chunk's buffer, which
+        // keeps the chunk's name (`crate::pool::home`).
+        if core != Some(crate::home::Kind::Pool) {
+            crate::host::name(&placed.buffer, || {
+                format!("title memory {start:#x}+{len:#x} in place")
+            });
+        }
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
         // Not a copy: not counted with them, and nothing asks what the
         // title wrote there.
@@ -2787,6 +2799,11 @@ impl Shadow {
     /// Whether this is a home of the memory core (`crate::home`): the
     /// title's own memory, placed.
     pub(crate) fn is_home(&self) -> bool {
+        self.core.is_some()
+    }
+
+    /// The kind of home of the memory core this is, if it is one.
+    pub(crate) fn home_kind(&self) -> Option<crate::home::Kind> {
         self.core
     }
 
@@ -2823,7 +2840,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
-            core: false,
+            core: None,
             hands: AtomicU32::new(0),
             last_hands: AtomicU32::new(0),
             root_at: AtomicU64::new(u64::MAX),
@@ -4226,10 +4243,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     entry.shadow = Some(home);
                     return entry.shadow.clone();
                 }
-                crate::home::Found::New(placed) => {
-                    let home = Arc::new(Shadow::placed(placed, key.0, len, false, true));
-                    crate::home::tabled(&home);
-                    entry.shadow = Some(home);
+                crate::home::Found::New(new) => {
+                    entry.shadow = Some(new.home(key.0, len, false));
                     return entry.shadow.clone();
                 }
                 crate::home::Found::Card | crate::home::Found::Copy => {}
@@ -4263,7 +4278,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
         }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false, false)));
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false, None)));
             return entry.shadow.clone();
         }
         let Some((buffer, data)) = host().and_then(|host| host.shared_buffer(size)) else {
@@ -4492,11 +4507,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if crate::home::on() {
         let home = match crate::home::resolve(start, len, true, false, &mut || false) {
             crate::home::Found::Home(home) => Some(home),
-            crate::home::Found::New(placed) => {
-                let home = Arc::new(Shadow::placed(placed, start, len, true, true));
-                crate::home::tabled(&home);
-                Some(home)
-            }
+            crate::home::Found::New(new) => Some(new.home(start, len, true)),
             crate::home::Found::Card | crate::home::Found::Copy => None,
         };
         // A home found for the window's exact span is the window; one that
@@ -4513,7 +4524,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true, false));
+        let shadow = Arc::new(Shadow::placed(placed, start, len, true, None));
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);

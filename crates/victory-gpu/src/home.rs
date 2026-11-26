@@ -17,6 +17,15 @@
 //! ([`crate::shadow`]). A big title buffer is offered a copy in the card's
 //! memory first (**G**) and becomes C only when the card turns it down.
 //!
+//! With the memory pool on as well (`VICTORY_MEMORY_POOL=1`,
+//! [`crate::pool`]), a second class, **C-pool**: title buffers and windows
+//! whose bytes are one run of one committed chunk of the page pool at one
+//! title view. Their home is the buffer placed over the whole chunk's heap
+//! (`OpenExistingHeapFromFileMapping`), at the run's offset in the chunk
+//! ([`Kind::Pool`]); it pins nothing. A remap of its title addresses lets it
+//! go, as the frees do a C home (`Touch::Remapped`). View memory that is
+//! scattered, in a reserved chunk, or in no chunk keeps its copy.
+//!
 //! What this module holds:
 //!
 //! - [`classify`]: the order of the rules, as a pure function over what a
@@ -161,6 +170,9 @@ pub(crate) struct Gate {
     pub(crate) device13: bool,
     /// The host refused three openings in a row with the same error.
     pub(crate) latched: bool,
+    /// The memory pool is on (`crate::pool`): view memory in its chunks
+    /// may have homes.
+    pub(crate) pool: bool,
 }
 
 impl Gate {
@@ -170,6 +182,7 @@ impl Gate {
             late: crate::host::late(),
             device13: device13(),
             latched: LATCHED.load(Ordering::Relaxed),
+            pool: crate::pool::on(),
         }
     }
 }
@@ -177,13 +190,11 @@ impl Gate {
 /// Whether the host device is an `ID3D12Device13`: asked once, when the
 /// first range is classified (`false` before there is a device).
 fn device13() -> bool {
-    use std::sync::atomic::AtomicU8;
-    static KNOWN: AtomicU8 = AtomicU8::new(0);
     #[cfg(test)]
     if NO_DEVICE13.with(std::cell::Cell::get) {
         return false;
     }
-    match KNOWN.load(Ordering::Relaxed) {
+    match DEVICE13.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
@@ -191,7 +202,7 @@ fn device13() -> bool {
                 return false;
             };
             let yes = host.device.cast::<ID3D12Device13>().is_ok();
-            KNOWN.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
+            DEVICE13.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
             if !yes && on() {
                 tracing::warn!(
                     "memory core: the device cannot open parts of an allocation (no ID3D12Device13); nothing is placed in place, every range keeps its copy"
@@ -200,6 +211,17 @@ fn device13() -> bool {
             yes
         }
     }
+}
+
+/// What [`device13`] found: 0 not asked yet, 1 yes, 2 no.
+static DEVICE13: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether something that stops every home of the core is known to hold
+/// now: late waits or the relay, a device that is no `ID3D12Device13`
+/// (once asked), the host's refusals latched. Creates no device
+/// (`crate::pool::memory_pool_homes_possible`).
+pub(crate) fn homes_ruled_out() -> bool {
+    crate::host::late() || DEVICE13.load(Ordering::Relaxed) == 2 || LATCHED.load(Ordering::Relaxed)
 }
 
 /// Set once the host refused three openings in a row with the same error:
@@ -217,8 +239,28 @@ pub(crate) enum Why {
     Latched,
     /// A home holds part of the range only.
     Overlap,
-    /// View memory (the page pool): slice 2.
+    /// View memory (the page pool), with the memory pool off
+    /// (`crate::pool`).
     View,
+    /// View memory not one run of one section: views of several places,
+    /// or holes between them.
+    Scattered,
+    /// View memory of a section that is no chunk of the memory pool.
+    NotPool,
+    /// View memory of a chunk of the pool made reserved (no room in the
+    /// PC's commit charge, or an old Windows).
+    ReservedChunk,
+    /// View memory of a chunk the host refused to open as a heap.
+    ChunkRefused,
+    /// View memory of an unopened chunk while the shared part of the card's
+    /// budget has no room for it (`crate::pool::fits_shared`); asked again
+    /// later.
+    OverBudget,
+    /// View memory whose run reaches past its chunk's end: the census of
+    /// views and the chunk table disagree (never expected).
+    PastChunk,
+    /// View memory whose mapping the runtime is changing right now.
+    Remapping,
     /// Not inside an `XMemVirtualAlloc` region (the process heap, memory
     /// from elsewhere).
     NotRegion,
@@ -234,12 +276,25 @@ pub(crate) enum Why {
     Refused,
 }
 
-const WHYS: [(Why, &str); 11] = [
+const WHYS: [(Why, &str); 18] = [
     (Why::Late, "late waits"),
     (Why::NoDevice13, "no ID3D12Device13"),
     (Why::Latched, "after the host's refusals"),
     (Why::Overlap, "partly in a home"),
     (Why::View, "view memory"),
+    (Why::Scattered, "view memory from several places"),
+    (Why::NotPool, "view memory in no pool chunk"),
+    (Why::ReservedChunk, "view memory in a reserved pool chunk"),
+    (
+        Why::ChunkRefused,
+        "view memory in a pool chunk the host refused",
+    ),
+    (
+        Why::OverBudget,
+        "view memory in a pool chunk the shared budget has no room for",
+    ),
+    (Why::PastChunk, "view memory past its pool chunk's end"),
+    (Why::Remapping, "view memory being remapped"),
     (Why::NotRegion, "not an XMemVirtualAlloc region"),
     (Why::Blacklisted, "blacklisted region"),
     (Why::Busy, "region busy with a title free or protection"),
@@ -283,15 +338,30 @@ pub(crate) enum Held<H> {
     Part,
 }
 
+/// What the title's views say of a range ([`Ask::view`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Viewed<P> {
+    /// No view holds it: private memory, or memory of no one's.
+    No,
+    /// One run of one committed chunk of the memory pool, opened: its home
+    /// there (C-pool).
+    Pool(P),
+    /// View memory that keeps its copy, and why.
+    Copy(Why),
+}
+
 /// What [`classify`] asks, in its order: each only once it is needed.
 pub(crate) trait Ask {
     type Home;
+    /// A home in a chunk of the memory pool.
+    type Pool;
     /// A home over the range ([`Held`]).
     fn holder(&mut self) -> Held<Self::Home>;
     /// For a big buffer: whether the card took a copy of it.
     fn card(&mut self) -> bool;
-    /// Whether the range is view memory.
-    fn view(&mut self) -> bool;
+    /// Whether the range is view memory, and if so whether it has a home in
+    /// a chunk of the pool.
+    fn view(&mut self) -> Viewed<Self::Pool>;
     /// The region that holds the range's pages: `None` if none does,
     /// `Some(Err(why))` if it may not be given a home now
     /// ([`Why::Blacklisted`], [`Why::Busy`]).
@@ -306,7 +376,7 @@ pub(crate) trait Ask {
 
 /// What [`classify`] decides for a range.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Class<H> {
+pub(crate) enum Class<H, P> {
     /// Today's copy (X).
     Copy(Why),
     /// The card took a copy (G): the copy path, with that card side.
@@ -315,6 +385,8 @@ pub(crate) enum Class<H> {
     Home(H),
     /// Claimed: open the pages and place a buffer (C, new).
     Place,
+    /// A new home in a chunk of the memory pool (C-pool).
+    Pool(P),
 }
 
 /// The rules of the memory core, in order. `big`: a title buffer large
@@ -329,7 +401,9 @@ pub(crate) enum Class<H> {
 /// 3. One home per byte: a range that one home holds whole is that home; a
 ///    range that homes hold only part of keeps a copy (a second home over the
 ///    same bytes, or one over two homes, could not be one buffer).
-/// 4. View memory (the page pool's views) keeps its copy in this slice.
+/// 4. View memory (the page pool's views) that is one run of one chunk of
+///    the memory pool, committed and opened, is a new home in that chunk
+///    (C-pool, `crate::pool`); other view memory keeps its copy.
 /// 5. The range's pages lie in one `XMemVirtualAlloc` region that the title
 ///    is not freeing or protecting ([`Why::Busy`]) and whose protection was
 ///    never refused ([`Why::Blacklisted`]).
@@ -337,7 +411,7 @@ pub(crate) enum Class<H> {
 ///    read-write.
 /// 7. The pages fit in `VICTORY_MEMORY_CORE_MB`: they are claimed, and the
 ///    caller opens them.
-pub(crate) fn classify<A: Ask>(gate: Gate, big: bool, ask: &mut A) -> Class<A::Home> {
+pub(crate) fn classify<A: Ask>(gate: Gate, big: bool, ask: &mut A) -> Class<A::Home, A::Pool> {
     if !gate.on {
         return Class::Copy(Why::Off);
     }
@@ -358,8 +432,10 @@ pub(crate) fn classify<A: Ask>(gate: Gate, big: bool, ask: &mut A) -> Class<A::H
         Held::Part => return Class::Copy(Why::Overlap),
         Held::None => {}
     }
-    if ask.view() {
-        return Class::Copy(Why::View);
+    match ask.view() {
+        Viewed::No => {}
+        Viewed::Pool(home) => return Class::Pool(home),
+        Viewed::Copy(why) => return Class::Copy(why),
     }
     match ask.region() {
         None => return Class::Copy(Why::NotRegion),
@@ -613,10 +689,18 @@ struct LiveAsk<'a> {
     /// The region found by `region`.
     base: usize,
     card: &'a mut dyn FnMut() -> bool,
+    /// The memory pool is on ([`Gate::pool`]).
+    pool: bool,
+    /// For a home in a chunk of the pool: the mapping of the range held
+    /// still from the look at its views until the home is in the tables
+    /// ([`New::home`]), so that a remap of it either comes first (and the
+    /// views say what it shows now) or lets the home go after.
+    reading: Option<crate::watch::Reading>,
 }
 
 impl Ask for LiveAsk<'_> {
     type Home = Arc<Shadow>;
+    type Pool = crate::inplace::Placed;
 
     fn holder(&mut self) -> Held<Arc<Shadow>> {
         holder(self.start, self.end)
@@ -626,9 +710,31 @@ impl Ask for LiveAsk<'_> {
         (self.card)()
     }
 
-    fn view(&mut self) -> bool {
-        crate::inplace::cover(self.start as usize, (self.end - self.start) as usize)
-            != crate::inplace::Cover::None
+    fn view(&mut self) -> Viewed<crate::inplace::Placed> {
+        use crate::inplace::{Cover, cover};
+        let (start, len) = (self.start as usize, (self.end - self.start) as usize);
+        match cover(start, len) {
+            Cover::None => return Viewed::No,
+            _ if !self.pool => return Viewed::Copy(Why::View),
+            Cover::Holes | Cover::Scattered => return Viewed::Copy(Why::Scattered),
+            Cover::Run(..) => {}
+        }
+        // Not waited for: the caller holds the shadow tables, which a remap
+        // under way takes to let homes go (`crate::shadow::let_go_homes`).
+        let Some(reading) = crate::watch::title_memory_reading_now(start, len) else {
+            return Viewed::Copy(Why::Remapping);
+        };
+        // Asked again with the mapping held still.
+        let Cover::Run(section, offset) = cover(start, len) else {
+            return Viewed::Copy(Why::Scattered);
+        };
+        match crate::pool::home(section, offset, self.end - self.start) {
+            Ok(placed) => {
+                self.reading = Some(reading);
+                Viewed::Pool(placed)
+            }
+            Err(why) => Viewed::Copy(why),
+        }
     }
 
     fn region(&mut self) -> Option<Result<(), Why>> {
@@ -731,16 +837,52 @@ fn refused(error: &windows::core::Error, start: u64, len: u64) {
     }
 }
 
+/// The kinds of home.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// C: a part of an `XMemVirtualAlloc` region opened as a heap, its pages
+    /// pinned and counted in `VICTORY_MEMORY_CORE_MB`.
+    Private,
+    /// C-pool: a run of a chunk of the memory pool, in the chunk's heap
+    /// (`crate::pool`), which pins nothing.
+    Pool,
+}
+
 /// What a range of title memory resolves to.
 pub(crate) enum Found {
     /// The home that holds it.
     Home(Arc<Shadow>),
-    /// A new home: the caller makes the `Shadow` and tables it ([`tabled`]).
-    New(crate::inplace::Placed),
+    /// A new home, for the caller to make ([`New::home`]).
+    New(New),
     /// The card took a copy: the copy path, with the card side it made.
     Card,
     /// Today's copy.
     Copy,
+}
+
+/// A new home, opened and placed, not yet in the tables.
+pub(crate) struct New {
+    placed: crate::inplace::Placed,
+    kind: Kind,
+    /// For [`Kind::Pool`]: the mapping held still ([`LiveAsk::reading`]).
+    _reading: Option<crate::watch::Reading>,
+}
+
+impl New {
+    /// The home's `Shadow` for title memory `[start, start + len)` (a window
+    /// if `window`), in the tables of the one-home rule ([`tabled`]); then
+    /// the mapping may change again.
+    pub(crate) fn home(self, start: u64, len: u64, window: bool) -> Arc<Shadow> {
+        let home = Arc::new(Shadow::placed(
+            self.placed,
+            start,
+            len,
+            window,
+            Some(self.kind),
+        ));
+        tabled(&home);
+        home
+    }
 }
 
 /// The home of title memory `[start, start + len)` (a window if `window`):
@@ -778,6 +920,8 @@ fn resolve_with(
         bytes,
         base: 0,
         card,
+        pool: gate.pool,
+        reading: None,
     };
     match classify(gate, big, &mut ask) {
         Class::Copy(why) => {
@@ -794,11 +938,23 @@ fn resolve_with(
             MADE[2].fetch_add(1, Ordering::Relaxed);
             Found::Home(home)
         }
+        Class::Pool(placed) => {
+            crate::pool::made(len);
+            Found::New(New {
+                placed,
+                kind: Kind::Pool,
+                _reading: ask.reading.take(),
+            })
+        }
         Class::Place => match open_home(start, at, bytes) {
             Ok(placed) => {
                 opened();
                 MADE[usize::from(!window)].fetch_add(1, Ordering::Relaxed);
-                Found::New(placed)
+                Found::New(New {
+                    placed,
+                    kind: Kind::Private,
+                    _reading: None,
+                })
             }
             Err(error) => {
                 unclaim(at, bytes);
@@ -848,8 +1004,9 @@ fn open_home(
 }
 
 /// A home's `Shadow` is gone (`start`, `len`: its title span; `id`: its
-/// number): its pages are given back and the tables forget it.
-pub(crate) fn gone(start: u64, len: u64, id: u64) {
+/// number; `kind`: its kind): the tables forget it, and a home of
+/// [`Kind::Private`] gives its pages back.
+pub(crate) fn gone(start: u64, len: u64, id: u64, kind: Kind) {
     let Some((at, bytes)) = crate::inplace::aligned_span(start, len) else {
         return;
     };
@@ -862,7 +1019,10 @@ pub(crate) fn gone(start: u64, len: u64, id: u64) {
             }
         }
     }
-    unclaim(at, bytes);
+    match kind {
+        Kind::Private => unclaim(at, bytes),
+        Kind::Pool => crate::pool::gone(len),
+    }
 }
 
 /// Something other than the GPU touched title memory `[at, at + len)`.
@@ -913,6 +1073,12 @@ fn let_go_over(at: usize, len: usize, now: bool) -> u64 {
     }
     let gone = homes.len() as u64;
     for home in homes {
+        if home.home_kind() == Some(Kind::Pool) {
+            crate::pool::let_go();
+            // The view heap slots made on it are made anew at their next use.
+            let (start, len) = home.span();
+            crate::descriptor::host::pool_let_go(start, start.saturating_add(len));
+        }
         crate::host::retire(home);
     }
     gone
@@ -1350,22 +1516,59 @@ fn run_pending_after(give_up_ms: u64) {
 /// its next refresh takes them again (`crate::watch::gpu_wrote`). Normally
 /// no copy lies over a home and nothing is done.
 ///
-/// shortcut: host copies of textures over a home are not looked for.
+/// A home in a chunk of the pool ([`Kind::Pool`]) writes pages the title
+/// may show at other views too: the copies there are looked for as well
+/// (`crate::pool::shown_at`), and the placed textures over all of those
+/// ranges are told (`crate::pool::textures_told`), since a texture's host
+/// copy there would otherwise keep what it had (a copy's write-back tells
+/// them; nothing is written back from such a home). The other views are
+/// looked for per home, whose ranges each lie in its one run of pages: two
+/// homes side by side at the title's addresses need not be one run.
+///
+/// shortcut: host copies of textures over a home of [`Kind::Private`] are
+/// not looked for.
 pub(crate) fn after_wait(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)]) {
     if !on() {
         return;
     }
     // Each byte looked for once: `crate::memory` declares every home it
-    // numbered for every dispatch of its shaders.
-    let mut ranges: Vec<(usize, usize)> = declared
-        .iter()
-        .filter(|(home, _)| home.is_home())
-        .flat_map(|(_, ranges)| ranges.iter().copied())
-        .filter(|&(from, to)| from < to)
-        .collect();
-    if ranges.is_empty() {
-        return;
+    // numbered for every dispatch of its shaders. The pool's ranges are
+    // merged per home before their other views are looked for.
+    let mut private: Vec<(usize, usize)> = Vec::new();
+    let mut pool: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for (home, written) in declared {
+        let ranges = match home.home_kind() {
+            None => continue,
+            Some(Kind::Private) => &mut private,
+            Some(Kind::Pool) => pool.entry(Arc::as_ptr(home) as usize).or_default(),
+        };
+        ranges.extend(written.iter().copied().filter(|(from, to)| from < to));
     }
+    let mut ranges = merged(private);
+    if !pool.is_empty() {
+        let shown: Vec<(usize, usize)> = pool
+            .into_values()
+            .flat_map(merged)
+            .flat_map(|(from, to)| crate::pool::shown_at(from, to))
+            .collect();
+        let shown = merged(shown);
+        for &(from, to) in &shown {
+            crate::pool::textures_told(from, to);
+        }
+        ranges.extend(shown);
+        ranges = merged(ranges);
+    }
+    for (from, to) in ranges {
+        for (a, b) in crate::shadow::copies_over(from as u64, to as u64) {
+            crate::watch::gpu_wrote(a, b - a);
+            TOLD[8].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `ranges` (start, end) in order, those that overlap or touch joined.
+fn merged(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (from, to) in ranges {
@@ -1374,12 +1577,7 @@ pub(crate) fn after_wait(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)]) {
             _ => merged.push((from, to)),
         }
     }
-    for (from, to) in merged {
-        for (a, b) in crate::shadow::copies_over(from as u64, to as u64) {
-            crate::watch::gpu_wrote(a, b - a);
-            TOLD[8].fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    merged
 }
 
 /// Once per sweep (`crate::inplace::tick`): the frees that waited, and the
@@ -1416,6 +1614,7 @@ fn lines() -> Vec<String> {
         .collect();
     // Before the core's lock: `crate::memory` has its own.
     let views = crate::memory::let_go_views_waiting();
+    let pool = crate::pool::line();
     let core = core();
     let (homes, pinned) = core.live.iter().fold((0u64, 0u64), |a, (&(_, bytes), &n)| {
         (a.0 + u64::from(n), a.1 + bytes * u64::from(n))
@@ -1424,7 +1623,7 @@ fn lines() -> Vec<String> {
         "memory core: {homes} homes pin {} MB (made {} windows, {} buffers; {} asks joined a home; {} big buffers given a card copy first; {} opens, {} us); \
          kept a copy: {}; title frees of GPU regions {} ({} in regions that had a home, {} done later, {} ms waited, {} failed later, {} given up, {} waiting), \
          protections {} ({} in regions that had a home, {} refused, {} homes taken out of the shaders' directory at once); \
-         GPU writes into homes told to copies over them {}; view heaps whose slots still hold a let-go home {views}",
+         GPU writes into homes told to copies over them {}; view heaps whose slots still hold a let-go home {views}; {pool}",
         pinned >> 20,
         made[0],
         made[1],
@@ -1511,14 +1710,31 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             TEST_ON.with(|on| on.set(false));
             NO_DEVICE13.with(|no| no.set(false));
+            crate::pool::set_test(false);
         }
+    }
+
+    impl Switched {
+        /// [`Switched::on`] with the memory pool on too.
+        fn pool() -> Switched {
+            let switched = Switched::on(false);
+            crate::pool::set_test(true);
+            switched
+        }
+    }
+
+    /// The core and the pool on for the thread that calls it, for a thread
+    /// a test starts (the switches are per thread).
+    fn pool_on_here() {
+        TEST_ON.with(|on| on.set(true));
+        crate::pool::set_test(true);
     }
 
     /// Fixed answers, and the asks in the order they came.
     struct Fixed {
         holder: Option<bool>,
         card: bool,
-        view: bool,
+        view: Viewed<u32>,
         region: Option<Result<(), Why>>,
         committed: bool,
         claim: Result<(), Why>,
@@ -1530,7 +1746,7 @@ pub(crate) mod tests {
             Fixed {
                 holder: None,
                 card: false,
-                view: false,
+                view: Viewed::No,
                 region: Some(Ok(())),
                 committed: true,
                 claim: Ok(()),
@@ -1541,6 +1757,7 @@ pub(crate) mod tests {
 
     impl Ask for Fixed {
         type Home = u32;
+        type Pool = u32;
         fn holder(&mut self) -> Held<u32> {
             self.asked.push("holder");
             match self.holder {
@@ -1553,7 +1770,7 @@ pub(crate) mod tests {
             self.asked.push("card");
             self.card
         }
-        fn view(&mut self) -> bool {
+        fn view(&mut self) -> Viewed<u32> {
             self.asked.push("view");
             self.view
         }
@@ -1576,6 +1793,7 @@ pub(crate) mod tests {
         late: false,
         device13: true,
         latched: false,
+        pool: true,
     };
 
     /// Every rule of [`classify`], in its order, and that a rule asks
@@ -1655,14 +1873,47 @@ pub(crate) mod tests {
         };
         assert_eq!(run(OPEN, false, &mut f), Class::Place);
         assert!(!f.asked.contains(&"card"));
+        // 4: one run of an opened chunk of the pool: a new home there, with
+        // nothing about regions asked; a big one the card turned down too.
+        for big in [false, true] {
+            let mut f = Fixed {
+                view: Viewed::Pool(9),
+                ..Fixed::good()
+            };
+            assert_eq!(run(OPEN, big, &mut f), Class::Pool(9));
+            assert_eq!(f.asked.last(), Some(&"view"));
+        }
+        // But a big one the card takes stays G.
+        let mut f = Fixed {
+            view: Viewed::Pool(9),
+            card: true,
+            ..Fixed::good()
+        };
+        assert_eq!(run(OPEN, true, &mut f), Class::Card);
         // 4-7, each stopping there.
         for (f, why, last) in [
             (
                 Fixed {
-                    view: true,
+                    view: Viewed::Copy(Why::View),
                     ..Fixed::good()
                 },
                 Why::View,
+                "view",
+            ),
+            (
+                Fixed {
+                    view: Viewed::Copy(Why::Scattered),
+                    ..Fixed::good()
+                },
+                Why::Scattered,
+                "view",
+            ),
+            (
+                Fixed {
+                    view: Viewed::Copy(Why::ReservedChunk),
+                    ..Fixed::good()
+                },
+                Why::ReservedChunk,
                 "view",
             ),
             (
@@ -2265,6 +2516,8 @@ pub(crate) mod tests {
             bytes: K64,
             base,
             card: &mut card,
+            pool: false,
+            reading: None,
         };
         assert_eq!(ask.claim(), Err(Why::Busy), "busy: nothing claimed");
         unbusy(base);
@@ -2462,5 +2715,488 @@ pub(crate) mod tests {
         unregister(0xc0de_1402, region.base + 4 * K64);
         drop((held, copy));
         region.release();
+    }
+
+    /// A section as `xmem` makes a chunk of the memory pool, told to the GPU
+    /// side as one; gone (and told) when dropped.
+    struct TestChunk {
+        handle: usize,
+        committed: bool,
+    }
+
+    impl TestChunk {
+        fn new(bytes: usize, how: crate::pool::PoolChunk) -> TestChunk {
+            let committed = how == crate::pool::PoolChunk::Committed;
+            // SAFETY: plain section creation.
+            let handle = unsafe {
+                mem::CreateFileMappingW(
+                    windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    mem::PAGE_READWRITE
+                        | if committed {
+                            mem::SEC_COMMIT
+                        } else {
+                            mem::SEC_RESERVE
+                        },
+                    0,
+                    bytes as u32,
+                    std::ptr::null(),
+                )
+            } as usize;
+            assert_ne!(handle, 0);
+            crate::inplace::title_memory_section(handle, bytes as u64, committed);
+            crate::pool::title_memory_pool_chunk(handle, bytes as u64, how);
+            TestChunk { handle, committed }
+        }
+    }
+
+    impl Drop for TestChunk {
+        fn drop(&mut self) {
+            crate::pool::title_memory_pool_chunk_gone(self.handle);
+            // SAFETY: the test's own handle; views keep the section alive.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle as _) };
+        }
+    }
+
+    /// Title addresses as `xmem` reserves them for physical pages: one
+    /// placeholder, mapped and unmapped as `xmem` maps pages.
+    struct Place {
+        base: u64,
+        bytes: usize,
+    }
+
+    impl Place {
+        fn new(bytes: usize) -> Place {
+            // SAFETY: a reservation of the test's own.
+            let base = unsafe {
+                mem::VirtualAlloc2(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    std::ptr::null(),
+                    bytes,
+                    mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+                    mem::PAGE_NOACCESS,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } as u64;
+            assert_ne!(base, 0);
+            Place { base, bytes }
+        }
+
+        /// Shows `len` bytes of `chunk` from `offset` on at `base + at`, as
+        /// `xmem`'s `map` does: under the remapping lock, the GPU side told.
+        fn map(&self, at: u64, len: u64, chunk: &TestChunk, offset: u64) {
+            let address = self.base + at;
+            let _changing =
+                crate::watch::title_memory_remapping_range(address as usize, len as usize);
+            // SAFETY: splits the test's placeholder (failing harmlessly when
+            // it is the whole of one), then maps the section over that part.
+            let view = unsafe {
+                mem::VirtualFree(
+                    address as *mut c_void,
+                    len as usize,
+                    mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER,
+                );
+                mem::MapViewOfFile3(
+                    chunk.handle as _,
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    address as *const c_void,
+                    offset,
+                    len as usize,
+                    mem::MEM_REPLACE_PLACEHOLDER,
+                    mem::PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(view.Value as u64, address);
+            if !chunk.committed {
+                // SAFETY: the view just mapped, of a reserved section.
+                let done = unsafe {
+                    mem::VirtualAlloc(
+                        address as *const c_void,
+                        len as usize,
+                        mem::MEM_COMMIT,
+                        mem::PAGE_READWRITE,
+                    )
+                };
+                assert!(!done.is_null());
+            }
+            crate::watch::title_memory_remapped(address as usize, len as usize);
+            crate::inplace::title_memory_view(address as usize, len as usize, chunk.handle, offset);
+        }
+
+        /// Takes the view at `base + at` (of `len` bytes) away, as `xmem`'s
+        /// `unmap` does.
+        fn unmap(&self, at: u64, len: u64) {
+            let address = self.base + at;
+            let _changing =
+                crate::watch::title_memory_remapping_range(address as usize, len as usize);
+            crate::watch::title_memory_remapped(address as usize, len as usize);
+            // SAFETY: a view the test mapped; it becomes a placeholder again.
+            unsafe {
+                mem::UnmapViewOfFile2(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    mem::MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: address as *mut c_void,
+                    },
+                    mem::MEM_PRESERVE_PLACEHOLDER,
+                )
+            };
+        }
+    }
+
+    impl Drop for Place {
+        fn drop(&mut self) {
+            /// Joins placeholders (not in windows-sys' memory module).
+            const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+            // SAFETY: the test's placeholders, every view unmapped: joined
+            // again, then released.
+            unsafe {
+                mem::VirtualFree(
+                    self.base as *mut c_void,
+                    self.bytes,
+                    mem::MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+                );
+                mem::VirtualFree(self.base as *mut c_void, 0, mem::MEM_RELEASE);
+            }
+        }
+    }
+
+    /// A title buffer in one run of a committed chunk of the pool is a home
+    /// in the chunk's heap at the run's offset: the GPU reads the title's
+    /// bytes there, and what the CPU wrote since, with nothing copied.
+    #[test]
+    fn warp_pool_a_buffer_in_one_run_of_a_chunk_is_a_home_at_its_offset() {
+        let Some(host) = warp13() else { return };
+        let _on = Switched::pool();
+        let chunk = TestChunk::new(8 * K64 as usize, crate::pool::PoolChunk::Committed);
+        let place = Place::new(4 * K64 as usize);
+        place.map(0, 4 * K64, &chunk, 2 * K64);
+        let (start, len) = (place.base + K64 + 0x40, 2 * K64);
+        register(0xc0de_2001, start, len);
+        let home = find(start, len).expect("a home");
+        assert_eq!(home.home_kind(), Some(Kind::Pool));
+        assert_eq!(
+            home.offset(start),
+            3 * K64 + 0x40,
+            "at the run's offset in the chunk"
+        );
+        let mut rig = Rig::new(&host.device).unwrap();
+        fill(start, len, 3);
+        let got = rig
+            .fetch(&home.buffer, home.offset(start), len as usize)
+            .unwrap();
+        assert!(same(start, &got), "the GPU reads the title's bytes");
+        fill(start, len, 77);
+        let got = rig
+            .fetch(&home.buffer, home.offset(start), len as usize)
+            .unwrap();
+        assert!(same(start, &got), "and what the CPU wrote since");
+        assert_eq!(
+            home.update(start as usize, len as usize),
+            0,
+            "a refresh copies nothing"
+        );
+        assert!(home.unwatched(), "no write-watch asking, no guard");
+        // A window over the same run is the same chunk's buffer.
+        let window = find(place.base + 2 * K64 + 0x10, 16).expect("a window");
+        assert_eq!(window.home_kind(), Some(Kind::Pool));
+        unregister(0xc0de_2001, start);
+        drop((home, window, rig));
+        place.unmap(0, 4 * K64);
+    }
+
+    /// A buffer view made into a view heap slot over a C-pool home is made
+    /// on the home, as every other use of the buffer is; a remap that lets
+    /// the home go has the slot made anew at its next use, on what the
+    /// addresses show now, and walked as changed by the heap buffer pass.
+    #[test]
+    fn warp_pool_a_slot_on_a_home_is_made_anew_after_a_remap() {
+        use windows::core::Interface;
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::pool();
+        let (a, b) = (
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+        );
+        let place = Place::new(2 * K64 as usize);
+        place.map(0, 2 * K64, &a, 0);
+        let (start, len) = (place.base + 0x100, 0x1000);
+        register(0xc0de_2501, start, len);
+        let home = find(start, len).expect("a home");
+        assert_eq!(home.home_kind(), Some(Kind::Pool));
+        let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("a view heap");
+        // The buffer as the title placed it (dimension 1, its width), and a
+        // view of 64 of its elements of 16 bytes: format, dimension (1:
+        // buffer), mapping, a pad, first element, elements, stride, flags.
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 64, 16, 0, 0]);
+        (desc[10], desc[11]) = (start as u32, (start >> 32) as u32);
+        let view = crate::descriptor::View::Placed(
+            false,
+            [1, 0, 0, 0, len as u32, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+            desc,
+        );
+        let mut records = vec![[0u32; 8]; 4];
+        let handle = records.as_mut_ptr() as u64 + 32;
+        crate::descriptor::record(handle, view);
+        heap.mirror(1, handle, true);
+        assert!(heap.made(1));
+        assert_eq!(heap.kept_raw(1), Some(home.buffer.as_raw()), "on the home");
+        drop(heap.buffer_changes());
+        let (anew, _) = crate::pool::told_counts();
+        // The title maps other pages there and writes no descriptor.
+        place.unmap(0, 2 * K64);
+        place.map(0, 2 * K64, &b, 0);
+        heap.pool_slots_let_go();
+        assert!(!heap.made(1), "made from no record");
+        assert_eq!(heap.buffer_changes(), [1], "walked as changed");
+        assert_eq!(crate::pool::told_counts().0, anew + 1);
+        heap.mirror(1, handle, true);
+        let new = find(start, len).expect("a home");
+        assert!(!Arc::ptr_eq(&home, &new), "the remap let the first go");
+        assert!(heap.made(1));
+        assert_eq!(
+            heap.kept_raw(1),
+            Some(new.buffer.as_raw()),
+            "made anew on the new home"
+        );
+        unregister(0xc0de_2501, start);
+        drop((heap, home, new, records));
+        place.unmap(0, 2 * K64);
+    }
+
+    /// The GPU wrote two C-pool homes side by side at the title's
+    /// addresses, in two chunks: the copies over the same pages at other
+    /// views are told for each (the two ranges are no one run, and looked
+    /// for together their other views were missed).
+    #[test]
+    fn warp_pool_gpu_writes_are_told_at_other_views_per_home() {
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::pool();
+        let (a, b) = (
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+        );
+        // The same pages at two places: `p`, where the homes are, and `q`.
+        let (p, q) = (Place::new(2 * K64 as usize), Place::new(2 * K64 as usize));
+        for place in [&p, &q] {
+            place.map(0, K64, &a, 0);
+            place.map(K64, K64, &b, 0);
+        }
+        let len = 0x1000;
+        let (first, second) = (p.base + K64 - len, p.base + K64);
+        register(0xc0de_2601, first, len);
+        register(0xc0de_2602, second, len);
+        let one = find(first, len).expect("a home");
+        let two = find(second, len).expect("a home");
+        assert_eq!(one.home_kind(), Some(Kind::Pool));
+        assert_eq!(two.home_kind(), Some(Kind::Pool));
+        // Copies over both homes' pages at `q`.
+        let copies = [
+            crate::shadow::exact(q.base + K64 - len, len).expect("a copy"),
+            crate::shadow::exact(q.base + K64, len).expect("a copy"),
+        ];
+        let before = TOLD[8].load(Ordering::Relaxed);
+        let range = |at: u64| vec![(at as usize, (at + len) as usize)];
+        after_wait(&[(one.clone(), range(first)), (two.clone(), range(second))]);
+        assert_eq!(
+            TOLD[8].load(Ordering::Relaxed),
+            before + 2,
+            "both copies told"
+        );
+        unregister(0xc0de_2601, first);
+        unregister(0xc0de_2602, second);
+        drop((one, two, copies));
+        for place in [&p, &q] {
+            place.unmap(0, K64);
+            place.unmap(K64, K64);
+        }
+    }
+
+    /// A buffer over views of two chunks keeps its copy (one placed buffer
+    /// cannot show two heaps); one inside the first view alone is a home.
+    #[test]
+    fn warp_pool_a_view_across_two_chunks_stays_a_copy() {
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::pool();
+        let (a, b) = (
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+        );
+        let place = Place::new(4 * K64 as usize);
+        place.map(0, 2 * K64, &a, 0);
+        place.map(2 * K64, 2 * K64, &b, 0);
+        let scattered = turned(Why::Scattered);
+        let (start, len) = (place.base + K64, 2 * K64);
+        register(0xc0de_2101, start, len);
+        let copy = find(start, len).expect("a copy");
+        assert!(!copy.is_home());
+        assert_eq!(turned(Why::Scattered), scattered + 1);
+        let (inside, small) = (place.base + 0x100, 0x1000);
+        register(0xc0de_2102, inside, small);
+        let home = find(inside, small).expect("a home");
+        assert_eq!(home.home_kind(), Some(Kind::Pool));
+        unregister(0xc0de_2101, start);
+        unregister(0xc0de_2102, inside);
+        drop((copy, home));
+        place.unmap(0, 2 * K64);
+        place.unmap(2 * K64, 2 * K64);
+    }
+
+    /// A chunk made reserved (no room in the commit charge) keeps its views'
+    /// copies, counted; and with the pool off, view memory is counted as
+    /// before.
+    #[test]
+    fn warp_pool_a_reserved_chunk_keeps_its_copies() {
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::pool();
+        let chunk = TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::ShortOfCommit);
+        let place = Place::new(2 * K64 as usize);
+        place.map(0, 2 * K64, &chunk, 0);
+        let reserved = turned(Why::ReservedChunk);
+        let (start, len) = (place.base + 0x80, K64);
+        register(0xc0de_2201, start, len);
+        let copy = find(start, len).expect("a copy");
+        assert!(!copy.is_home());
+        assert_eq!(turned(Why::ReservedChunk), reserved + 1);
+        unregister(0xc0de_2201, start);
+        drop(copy);
+        let committed = TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed);
+        place.unmap(0, 2 * K64);
+        place.map(0, 2 * K64, &committed, 0);
+        crate::pool::set_test(false);
+        let view = turned(Why::View);
+        register(0xc0de_2202, start, len);
+        let copy = find(start, len).expect("a copy");
+        assert!(!copy.is_home(), "the pool off: a copy");
+        assert_eq!(turned(Why::View), view + 1);
+        unregister(0xc0de_2202, start);
+        drop(copy);
+        place.unmap(0, 2 * K64);
+    }
+
+    /// A remap lets the home go: the next ask is a home in what the
+    /// addresses show now. A home a list still holds keeps reading the pages
+    /// it was made on through its heap, also once the view is gone and its
+    /// section closed.
+    #[test]
+    fn warp_pool_a_remap_lets_the_home_go_and_a_held_home_keeps_its_pages() {
+        let Some(host) = warp13() else { return };
+        let _on = Switched::pool();
+        let (a, b) = (
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+        );
+        let place = Place::new(2 * K64 as usize);
+        place.map(0, 2 * K64, &a, 0);
+        let (start, len) = (place.base + 0x200, 0x2000);
+        fill(start, len, 1);
+        let old: Vec<u8> = (0..len)
+            .map(|i| (i as u8).wrapping_mul(13).wrapping_add(1))
+            .collect();
+        register(0xc0de_2301, start, len);
+        let held = find(start, len).expect("a home");
+        assert_eq!(held.home_kind(), Some(Kind::Pool));
+        // The title maps other pages there.
+        place.unmap(0, 2 * K64);
+        place.map(0, 2 * K64, &b, 0);
+        fill(start, len, 50);
+        let new = find(start, len).expect("a home");
+        assert!(!Arc::ptr_eq(&held, &new), "the remap let the first go");
+        assert_eq!(new.home_kind(), Some(Kind::Pool));
+        let mut rig = Rig::new(&host.device).unwrap();
+        let got = rig
+            .fetch(&new.buffer, new.offset(start), len as usize)
+            .unwrap();
+        assert!(
+            same(start, &got),
+            "the new home shows what the addresses show"
+        );
+        // The first, held: its heap still is the first section.
+        place.unmap(0, 2 * K64);
+        drop(a);
+        let got = rig
+            .fetch(&held.buffer, held.offset(start), len as usize)
+            .unwrap();
+        assert_eq!(got, old, "a held home reads the pages it was made on");
+        unregister(0xc0de_2301, start);
+        drop((held, new, rig, b));
+    }
+
+    /// Maps, unmaps and remaps on one thread while another resolves homes
+    /// over the same addresses and reads them on the GPU: no fault, no
+    /// deadlock, every home shows one of the two chunks' bytes whole, and
+    /// once the remaps stop the home shows what the addresses show.
+    #[test]
+    fn warp_pool_remaps_race_with_homes_the_gpu_holds() {
+        let Some(host) = warp13() else { return };
+        let _on = Switched::pool();
+        let bytes = 2 * K64 as usize;
+        let (a, b) = (
+            Arc::new(TestChunk::new(bytes, crate::pool::PoolChunk::Committed)),
+            Arc::new(TestChunk::new(bytes, crate::pool::PoolChunk::Committed)),
+        );
+        let place = Arc::new(Place::new(bytes));
+        // Each chunk's bytes, written through the first mapping of it.
+        for (chunk, seed) in [(&a, 0x11u8), (&b, 0x22)] {
+            place.map(0, bytes as u64, chunk, 0);
+            // SAFETY: mapped read-write.
+            unsafe { std::ptr::write_bytes(place.base as *mut u8, seed, bytes) };
+            place.unmap(0, bytes as u64);
+        }
+        place.map(0, bytes as u64, &a, 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let remapper = {
+            let (place, a, b, stop) = (place.clone(), a.clone(), b.clone(), stop.clone());
+            std::thread::spawn(move || {
+                pool_on_here();
+                let mut on_a = true;
+                let mut n = 0u32;
+                while !stop.load(Ordering::Relaxed) && n < 400 {
+                    place.unmap(0, bytes as u64);
+                    on_a = !on_a;
+                    place.map(0, bytes as u64, if on_a { &a } else { &b }, 0);
+                    n += 1;
+                }
+                on_a
+            })
+        };
+        let (start, len) = (place.base + 0x100, 0x1000);
+        let mut rig = Rig::new(&host.device).unwrap();
+        let mut homes = 0;
+        for k in 0..60usize {
+            register(0xc0de_2400 + k, start, len);
+            if let Some(found) = find(start, len)
+                && found.is_home()
+            {
+                homes += 1;
+                let got = rig
+                    .fetch(&found.buffer, found.offset(start), len as usize)
+                    .unwrap();
+                assert!(
+                    got.iter().all(|&x| x == 0x11) || got.iter().all(|&x| x == 0x22),
+                    "a home shows one chunk's pages whole"
+                );
+            }
+            unregister(0xc0de_2400 + k, start);
+        }
+        stop.store(true, Ordering::Relaxed);
+        let on_a = remapper.join().expect("the remapper never faulted");
+        register(0xc0de_24ff, start, len);
+        let last = find(start, len).expect("a home");
+        assert!(last.is_home());
+        let got = rig
+            .fetch(&last.buffer, last.offset(start), len as usize)
+            .unwrap();
+        assert!(
+            got.iter().all(|&x| x == if on_a { 0x11 } else { 0x22 }),
+            "the home shows what the addresses show"
+        );
+        assert!(homes > 0 || turned(Why::Remapping) > 0);
+        unregister(0xc0de_24ff, start);
+        drop((last, rig));
+        place.unmap(0, bytes as u64);
     }
 }

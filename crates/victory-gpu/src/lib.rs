@@ -43,6 +43,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod pool;
+#[cfg(windows)]
 mod primitive;
 pub mod profile;
 pub mod query;
@@ -78,6 +80,11 @@ pub use home::{
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use pool::{
+    PoolChunk, memory_pool_homes_possible, memory_pool_on, title_memory_pool_chunk,
+    title_memory_pool_chunk_gone, title_memory_pool_chunk_known,
+};
 #[cfg(windows)]
 pub use upscale::{hook as upscaler_dispatch, standin as upscaler_standin};
 #[cfg(windows)]

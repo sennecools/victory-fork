@@ -1770,6 +1770,8 @@ impl State {
         let _pass = crate::profile::span_args("heap buffer pass", &[("heap", host.id())]);
         let passes = &mut entry.passes;
         let ranges = &mut entry.ranges;
+        // Slots on C-pool homes let go since are walked as changed.
+        host.pool_slots_let_go();
         let changed = host.buffer_changes();
         let full = (*passes).is_multiple_of(16);
         let slots = if full {

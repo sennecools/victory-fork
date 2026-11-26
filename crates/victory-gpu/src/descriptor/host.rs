@@ -119,6 +119,13 @@ pub(crate) struct HostHeap {
     spanned: Box<[std::sync::atomic::AtomicU32]>,
     /// The heap buffer pass's claim and walk ([`WalkGate`]).
     walk: std::sync::Arc<WalkGate>,
+    /// The slots made on C-pool homes ([`PoolSlots`]), and the number of
+    /// the newest let-go of such a home ([`pool_let_go`]) this heap looked
+    /// at ([`HostHeap::pool_slots_let_go`]).
+    pool_slots: Mutex<PoolSlots>,
+    pool_seen: std::sync::atomic::AtomicU64,
+    /// How many slots `pool_slots` holds (changed under its lock).
+    pool_noted: std::sync::atomic::AtomicUsize,
 }
 
 /// The heap buffer pass of one view heap (`State::heap_buffers` in
@@ -627,6 +634,154 @@ pub(crate) fn page_written(at: usize, len: usize) {
         ranges.clear();
     }
     ranges.push((start, end));
+}
+
+/// Title memory the GPU wrote through homes in chunks of the memory pool
+/// (`crate::pool::textures_told`), since a texture pass last took the
+/// ranges ([`pool_written`]).
+static POOL_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Since the start: such ranges kept for a pass; ranges dropped because no
+/// pass took them; slots of placed textures that held bytes of them when a
+/// pass took them; of those, the slots uploaded before, made due again.
+pub(crate) static POOL_WRITES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The GPU wrote title memory `[at, at + len)` through a home in a chunk of
+/// the memory pool: the placed textures there changed with nothing the
+/// guards see, and are made due at the next texture pass
+/// ([`HostHeap::texture_slots_page_written`]). Returns the part of the
+/// range where placed textures lie (between the lowest start and the
+/// highest end of their spans, [`SPANNED`]), `None` if none of it does.
+/// Called after a submission's wait; locks one mutex and calls nothing.
+///
+/// Ranges no pass took are dropped past a bound (counted): the slots of
+/// textures picked by index there are then not made due by them; a draw
+/// that reads such a texture through a table still sees the write in the
+/// journal (`crate::pool::textures_told`).
+pub(crate) fn pool_written(at: usize, len: usize) -> Option<(usize, usize)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    /// Ranges kept until a pass takes them.
+    const MOST: usize = 1 << 15;
+    let (lowest, highest) = (SPANNED[0].load(Relaxed), SPANNED[1].load(Relaxed));
+    let (start, end) = (
+        (at as u64).max(lowest),
+        (at.saturating_add(len) as u64).min(highest),
+    );
+    if start >= end {
+        return None;
+    }
+    let mut ranges = POOL_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    POOL_WRITES[0].fetch_add(1, Relaxed);
+    if ranges.len() >= MOST {
+        POOL_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
+    }
+    ranges.push((start, end));
+    Some((start as usize, end as usize))
+}
+
+/// Title memory of homes in chunks of the memory pool that a remap, free or
+/// protection let go (`crate::home::cpu_touched`), each with its number,
+/// the newest last ([`pool_let_go`]); at most [`POOL_GONE_MOST`] kept.
+static POOL_GONE: Mutex<std::collections::VecDeque<(u64, u64, u64)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// The number of the newest range in [`POOL_GONE`] (0: none so far).
+static POOL_GONE_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Ranges [`POOL_GONE`] keeps: a heap that has not looked since more went
+/// makes all its slots on C-pool homes anew ([`HostHeap::pool_slots_let_go`]).
+const POOL_GONE_MOST: usize = 1 << 12;
+
+/// The memory core let a home in a chunk of the memory pool go, over title
+/// memory `[start, end)`: the view heap slots made on it show the pages it
+/// had, through the chunk's heap, and are made anew from their records at
+/// their next use ([`HostHeap::pool_slots_let_go`]). Called on the title's
+/// threads with the runtime's own locks held: locks one mutex of its own
+/// and calls nothing.
+pub(crate) fn pool_let_go(start: u64, end: u64) {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let mut gone = POOL_GONE.lock().unwrap_or_else(|e| e.into_inner());
+    let n = POOL_GONE_LAST.load(Relaxed) + 1;
+    if gone.len() >= POOL_GONE_MOST {
+        gone.pop_front();
+    }
+    gone.push_back((n, start, end));
+    POOL_GONE_LAST.store(n, Release);
+}
+
+/// A view heap's slots made on C-pool homes (`crate::pool`), by the title
+/// memory their views read: which to make anew when a home is let go
+/// ([`pool_let_go`]).
+#[derive(Default)]
+struct PoolSlots {
+    /// Each slot's range (start, end).
+    by_slot: std::collections::HashMap<u32, (u64, u64)>,
+    /// The same, by (start, slot), to the end.
+    by_start: std::collections::BTreeMap<(u64, u32), u64>,
+    /// The longest range ever noted: a range over `[start, end)` begins
+    /// at most this far before `start`.
+    longest: u64,
+}
+
+impl PoolSlots {
+    /// Slot `index` now shows `span` of title memory on a C-pool home, or
+    /// (`None`) no such home.
+    fn set(&mut self, index: u32, span: Option<(u64, u64)>) {
+        if let Some((start, _)) = self.by_slot.remove(&index) {
+            self.by_start.remove(&(start, index));
+        }
+        if let Some((start, end)) = span {
+            self.by_slot.insert(index, (start, end));
+            self.by_start.insert((start, index), end);
+            self.longest = self.longest.max(end - start);
+        }
+    }
+
+    /// Takes out the slots whose range overlaps `[start, end)`.
+    fn take_over(&mut self, start: u64, end: u64) -> Vec<u32> {
+        let from = start.saturating_sub(self.longest);
+        let over: Vec<(u64, u32)> = self
+            .by_start
+            .range((from, 0)..(end, 0))
+            .filter(|&(_, &to)| to > start)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in &over {
+            self.by_start.remove(key);
+            self.by_slot.remove(&key.1);
+        }
+        over.into_iter().map(|(_, slot)| slot).collect()
+    }
+
+    /// Takes out every slot.
+    fn take_all(&mut self) -> Vec<u32> {
+        self.by_start.clear();
+        self.longest = 0;
+        self.by_slot.drain().map(|(slot, _)| slot).collect()
+    }
+}
+
+/// The title memory a slot made from `view` on `kept` reads, if `kept` is
+/// the buffer of a chunk of the memory pool (a C-pool home's, `crate::pool`):
+/// the view's range and the whole buffer it is of, joined.
+fn pool_slot_span(view: &View, kept: Option<&ID3D12Resource>) -> Option<(u64, u64)> {
+    let kept = kept?;
+    if !crate::pool::on() || !crate::pool::is_chunk_buffer(kept) {
+        return None;
+    }
+    let span = match *view {
+        View::Constant(address, size) => Some((address, address.saturating_add(u64::from(size)))),
+        _ => {
+            let range = |r: Option<(u64, u64)>| r.map(|(at, len)| (at, at.saturating_add(len)));
+            match (range(buffer_range(view)), range(buffer_extent(view))) {
+                (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
+                (a, b) => a.or(b),
+            }
+        }
+    }?;
+    Some((span.0, span.1.max(span.0 + 1)))
 }
 
 /// Whose the memory of a texture view is, by [`Spans`].
@@ -1298,6 +1453,12 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             walk: std::sync::Arc::new(WalkGate::new(id)),
+            pool_slots: Mutex::default(),
+            pool_noted: std::sync::atomic::AtomicUsize::new(0),
+            // No slot made on a home before this heap was.
+            pool_seen: std::sync::atomic::AtomicU64::new(
+                POOL_GONE_LAST.load(std::sync::atomic::Ordering::Acquire),
+            ),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1956,19 +2117,42 @@ impl HostHeap {
     /// upload takes the bytes that are there by then. Slots tables read
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
+    ///
+    /// The GPU's writes into homes in chunks of the memory pool
+    /// ([`pool_written`]) are taken here too, and their slots are always
+    /// made due, from the next frame: those bytes are new for certain, as a
+    /// copy's write-back would have said, and landed before the wait that
+    /// told them (no write under way to wait for).
     fn texture_slots_page_written(&self, frame: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let pool = std::mem::take(&mut *POOL_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut due = 0;
+        if !pool.is_empty() {
+            let [held, uploaded, made] = self.slots_written_under(&pool, frame, Some(1));
+            POOL_WRITES[2].fetch_add(held as u64, Relaxed);
+            POOL_WRITES[3].fetch_add(uploaded as u64, Relaxed);
+            due += made;
+        }
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
-            return 0;
+            return due;
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        let after = (crate::watch::page_writes() & 2 != 0).then_some(PAGE_WRITE_AFTER);
+        let [held, uploaded, made] = self.slots_written_under(&ranges, frame, after);
+        PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
+        PAGE_WRITES[3].fetch_add(uploaded as u64, Relaxed);
+        due + made
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
     /// the slots that held bytes of them, those of them uploaded before,
-    /// and those made due (the latter, if `due`).
-    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
-        use std::sync::atomic::Ordering::Relaxed;
+    /// and those made due (the latter only with `due`: that many frames on).
+    fn slots_written_under(
+        &self,
+        ranges: &[(u64, u64)],
+        frame: u64,
+        due: Option<u64>,
+    ) -> [usize; 3] {
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
@@ -1981,13 +2165,11 @@ impl HostHeap {
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
-        PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
-        PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
-        if !due {
+        let Some(after) = due else {
             return [held, slots.len(), 0];
-        }
+        };
         for &slot in &slots {
-            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+            textures.changed(slot, frame, frame + after);
         }
         [held, slots.len(), slots.len()]
     }
@@ -2835,6 +3017,88 @@ impl HostHeap {
         self.mirror_marking(index, handle, true, !walk_once(), hold::WALK)
     }
 
+    /// The slots of this heap made on C-pool homes that a let-go since the
+    /// last look lets go ([`pool_let_go`]; all of them if more went than
+    /// were kept) count as made from no record: the next mirror of each (a
+    /// draw that reads it through a table, the heap buffer pass, which
+    /// walks them as changed) makes it anew from its record, on what its
+    /// memory is now. Until then it shows what it showed. Called before a
+    /// mirror and the heap buffer pass, with no claim and no lock of the
+    /// heap's held; one atomic load when nothing went.
+    ///
+    /// shortcut: a slot made by a thread that found the home just before the
+    /// let-go, and noted after this look, keeps the old pages until the title
+    /// writes it again.
+    pub(crate) fn pool_slots_let_go(&self) {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        let last = POOL_GONE_LAST.load(Acquire);
+        let seen = self.pool_seen.load(Relaxed);
+        // Another thread looking at the same let-goes does them for both.
+        if last == seen
+            || self
+                .pool_seen
+                .compare_exchange(seen, last, Relaxed, Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let ranges: Option<Vec<(u64, u64)>> = {
+            let gone = POOL_GONE.lock().unwrap_or_else(|e| e.into_inner());
+            // Every let-go since `seen` is still kept.
+            gone.front()
+                .is_some_and(|&(n, _, _)| n <= seen + 1)
+                .then(|| {
+                    gone.iter()
+                        .filter(|&&(n, _, _)| n > seen && n <= last)
+                        .map(|&(_, start, end)| (start, end))
+                        .collect()
+                })
+        };
+        let slots: Vec<u32> = {
+            let mut pool = self.pool_slots.lock().unwrap_or_else(|e| e.into_inner());
+            let slots = match ranges {
+                Some(ranges) => ranges
+                    .iter()
+                    .flat_map(|&(start, end)| pool.take_over(start, end))
+                    .collect(),
+                None => pool.take_all(),
+            };
+            self.pool_noted.store(pool.by_slot.len(), Relaxed);
+            slots
+        };
+        if slots.is_empty() {
+            return;
+        }
+        {
+            let _made = self.lock_made(None);
+            for &slot in &slots {
+                if let Ok(mut claim) = self.claim(slot, |made| made != 0) {
+                    claim.value = 0;
+                }
+            }
+        }
+        crate::pool::slots_made_anew(slots.len() as u64);
+        self.changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(slots);
+    }
+
+    /// Slot `index` was just made from `view`, showing `kept`: noted among
+    /// the slots made on C-pool homes if it is one ([`PoolSlots`]), and
+    /// taken out of them otherwise.
+    fn note_pool_slot(&self, index: u32, view: Option<&View>, kept: Option<&ID3D12Resource>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let span = view.and_then(|view| pool_slot_span(view, kept));
+        // No lock while the heap has no such slot (the pool off, mostly).
+        if span.is_none() && self.pool_noted.load(Relaxed) == 0 {
+            return;
+        }
+        let mut pool = self.pool_slots.lock().unwrap_or_else(|e| e.into_inner());
+        pool.set(index, span);
+        self.pool_noted.store(pool.by_slot.len(), Relaxed);
+    }
+
     /// [`HostHeap::mirror`]; `mark`: a slot that is or was a buffer view
     /// goes into the set the next heap buffer pass walks. `site`: who asks
     /// ([`hold`]), for the profiler.
@@ -2860,6 +3124,8 @@ impl HostHeap {
             }
             return None;
         }
+        // Slots on C-pool homes let go since: made anew below if this is one.
+        self.pool_slots_let_go();
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
@@ -2879,6 +3145,7 @@ impl HostHeap {
                 claim.value = 0;
                 self.write_word(index, 0);
                 self.make_null(index);
+                self.note_pool_slot(index, None, None);
                 let _ = self.note_buffer(index, None, false, mark);
             } else {
                 // Left for later and stale since: out of the sets and the stride table.
@@ -2950,7 +3217,9 @@ impl HostHeap {
                     self.refused_for_now(&mut value, index, handle, &view);
                 }
             }
-            self.keep(index, kept.flatten());
+            let kept = kept.flatten();
+            self.note_pool_slot(index, Some(&view), kept.as_ref());
+            self.keep(index, kept);
             // What the slot holds now, made or a null view of its kind.
             self.write_word(index, slot_word(Some(&view)));
             // Shown to other threads only now, with its descriptor and its
@@ -3020,6 +3289,17 @@ impl HostHeap {
     pub(crate) fn made(&self, index: u32) -> bool {
         let _made = self.lock_made(None);
         self.claim(index, |_| false).is_err_and(|key| key != 0)
+    }
+
+    /// The host resource slot `index` keeps, as its raw pointer (tests).
+    #[cfg(test)]
+    pub(crate) fn kept_raw(&self, index: u32) -> Option<*mut std::ffi::c_void> {
+        let mut raw = None;
+        self.kept_at(index, |kept| {
+            raw = kept.map(windows::core::Interface::as_raw);
+            true
+        });
+        raw
     }
 
     /// Host slot `index` was just made null from `view`. If its texture is
@@ -5302,18 +5582,20 @@ mod tests {
         assert!(heap.note_buffer(1, Some(&view), false, true).is_empty());
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
-        assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
+        let after = Some(PAGE_WRITE_AFTER);
+        assert_eq!(heap.slots_written_under(&written, 50, after), [1, 0, 0]);
         let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
         // Uploaded and out of the queue. Memory elsewhere: nothing.
-        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, true), [0, 0, 0]);
+        let elsewhere = [(at + 0x10_0000, at + 0x10_1000)];
+        assert_eq!(heap.slots_written_under(&elsewhere, 60, after), [0, 0, 0]);
         // Under it, counted only: it stays out of the queue.
-        assert_eq!(heap.slots_written_under(&written, 60, false), [1, 1, 0]);
+        assert_eq!(heap.slots_written_under(&written, 60, None), [1, 1, 0]);
         assert_eq!(slots(u64::MAX), []);
         // Under it, asked for: due two frames on, not before.
-        assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
+        assert_eq!(heap.slots_written_under(&written, 60, after), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
     }
@@ -5403,6 +5685,96 @@ mod tests {
         let stale = heap.note_buffer(2, Some(&view(at, 128)), false, true);
         assert_eq!(stale.iter().map(|&(slot, _)| slot).collect::<Vec<_>>(), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// The GPU's write through a home in a chunk of the memory pool under an
+    /// uploaded placed texture makes its slot due two frames on, whatever
+    /// `VICTORY_PAGE_WRITES` says, and is counted; memory elsewhere does
+    /// nothing.
+    #[test]
+    fn a_pool_write_makes_an_uploaded_texture_slot_due() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let at = 0x7fec_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(1, Some(&view), false, true).is_empty());
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(queued, 1);
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(slots(u64::MAX), []);
+        let due = POOL_WRITES[3].load(Relaxed);
+        // Past every span: not kept, and said so.
+        assert_eq!(pool_written(0x7fff_0000_0000, 0x1000), None);
+        pool_written((at + 0x10_0000) as usize, 0x1000);
+        assert_eq!(
+            pool_written(at as usize, 0x1000),
+            Some((at as usize, at as usize + 0x1000))
+        );
+        assert_eq!(heap.texture_slots_page_written(60), 1);
+        assert!(POOL_WRITES[3].load(Relaxed) > due);
+        assert_eq!(slots(60), []);
+        assert_eq!(slots(61), [1], "the next frame: the GPU's write has landed");
+    }
+
+    /// The slots made on C-pool homes are found by any overlap with a range
+    /// let go, however long their own range, and taken out once.
+    #[test]
+    fn pool_slots_are_found_by_overlap_and_taken_once() {
+        let mut slots = PoolSlots::default();
+        slots.set(1, Some((0x1000, 0x2000)));
+        slots.set(2, Some((0x10_0000, 0x50_0000)));
+        slots.set(3, Some((0x2000, 0x3000)));
+        slots.set(4, Some((0x8000, 0x9000)));
+        slots.set(4, None);
+        let mut over = |start, end| {
+            let mut got = slots.take_over(start, end);
+            got.sort_unstable();
+            got
+        };
+        assert_eq!(over(0x2000, 0x2001), [3], "touching is no overlap");
+        assert_eq!(over(0x40_0000, 0x40_0010), [2], "inside a long range");
+        assert_eq!(over(0x8000, 0x9000), [0u32; 0], "a slot noted gone");
+        assert_eq!(over(0, u64::MAX), [1]);
+        assert_eq!(over(0, u64::MAX), [0u32; 0], "taken out");
+        slots.set(5, Some((0x1000, 0x2000)));
+        assert_eq!(slots.take_all(), [5]);
+    }
+
+    /// A heap looks at the let-goes since its last look once; one that
+    /// missed some (more went than were kept) takes all its slots.
+    #[test]
+    fn a_heap_takes_its_pool_slots_a_let_go_lets_go() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let note = |slot: u32, start: u64| {
+            let mut pool = heap.pool_slots.lock().unwrap();
+            pool.set(slot, Some((start, start + 0x1000)));
+            heap.pool_noted.store(pool.by_slot.len(), Relaxed);
+        };
+        let at = 0x7fed_0000_0000u64;
+        note(1, at);
+        note(2, at + 0x10_0000);
+        pool_let_go(at + 0x800, at + 0x900);
+        heap.pool_slots_let_go();
+        assert_eq!(heap.buffer_changes(), [1]);
+        heap.pool_slots_let_go();
+        assert_eq!(heap.buffer_changes(), [0u32; 0], "looked at once");
+        // More let-goes than are kept, none over slot 2: it goes too.
+        for n in 0..POOL_GONE_MOST as u64 + 1 {
+            let from = at + 0x100_0000 + n * 0x1000;
+            pool_let_go(from, from + 1);
+        }
+        heap.pool_slots_let_go();
+        assert_eq!(heap.buffer_changes(), [2]);
+        assert_eq!(heap.pool_noted.load(Relaxed), 0);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's
