@@ -674,7 +674,7 @@ impl Rig {
     }
 
     /// Records with `record`, runs it and waits (ten seconds at most).
-    fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
+    pub(crate) fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
         // SAFETY: our own list and queue, one run at a time.
         unsafe {
             self.allocator.Reset()?;
@@ -682,6 +682,22 @@ impl Rig {
             record(&self.list);
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
+            self.done += 1;
+            self.queue.Signal(&self.fence, self.done)?;
+            self.fence.SetEventOnCompletion(self.done, self.event)?;
+            if WaitForSingleObject(self.event, 10_000).0 != 0 {
+                return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+            }
+            self.device.GetDeviceRemovedReason()
+        }
+    }
+
+    /// Runs `list`, closed, and waits (ten seconds at most).
+    #[cfg(test)]
+    pub(crate) fn run_closed(&mut self, list: &ID3D12CommandList) -> windows::core::Result<()> {
+        // SAFETY: a closed list, run alone on our own queue.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(list.clone())]);
             self.done += 1;
             self.queue.Signal(&self.fence, self.done)?;
             self.fence.SetEventOnCompletion(self.done, self.event)?;

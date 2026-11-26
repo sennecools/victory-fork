@@ -169,6 +169,14 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// With `VICTORY_MEMORY_CARDS=1` (`crate::card_home`): the home of the
+    /// memory core that is the CPU's side, the title's own memory. Then
+    /// `staging` is its buffer, `data` the title's address, and nothing is
+    /// copied into it: what changed goes up from the home on the card, and
+    /// what shaders wrote is merged into it on the card.
+    home: Option<Arc<Shadow>>,
+    /// Where the copy's first byte lies in `staging` (0 without a home).
+    staging_at: u64,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -878,7 +886,7 @@ impl Flights {
 /// later flight at this moment, and a store there, even of the value just
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
-fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+pub(crate) fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -2374,6 +2382,9 @@ impl Drop for Shadow {
         }
         let window = self.window;
         if let Some(card) = &mut self.card {
+            if card.home.is_some() {
+                crate::card_home::gone(card.size);
+            }
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
@@ -2797,14 +2808,25 @@ impl Shadow {
     }
 
     /// Whether this is a home of the memory core (`crate::home`): the
-    /// title's own memory, placed.
+    /// title's own memory, placed. Or a copy in the card's memory whose
+    /// CPU side is one (`crate::card_home`): it holds the home's heap as a
+    /// home does, so the title's frees and protections and `crate::memory`'s
+    /// directory let it go as one.
     pub(crate) fn is_home(&self) -> bool {
-        self.core.is_some()
+        self.core.is_some() || self.card_home().is_some()
     }
 
-    /// The kind of home of the memory core this is, if it is one.
+    /// The kind of home of the memory core this is, if it is one. `None`
+    /// for a copy in the card's memory whose CPU side is one: it is not
+    /// itself the title's memory (its home's kind is that home's).
     pub(crate) fn home_kind(&self) -> Option<crate::home::Kind> {
         self.core
+    }
+
+    /// Of a copy in the card's memory: the home that is its CPU side
+    /// (`crate::card_home`), if it has one.
+    pub(crate) fn card_home(&self) -> Option<&Arc<Shadow>> {
+        self.card.as_ref()?.home.as_ref()
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -3719,6 +3741,13 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        // A CPU side that is a home is title memory itself: nothing to copy,
+        // the changed bytes go up from it on the card (`card_upload`), and
+        // no byte was copied here.
+        if self.card_home().is_some() {
+            self.card_changed(from - start, to - start);
+            return 0;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -3756,6 +3785,86 @@ impl Shadow {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Some((&card.staging, before, card.size))
+    }
+
+    /// Records into `list` the copies of offsets `ranges` of a copy in the
+    /// card's memory from its CPU side to its card side (`Host::card_before`):
+    /// from the staging buffer, or from the home that is the CPU side
+    /// (`crate::card_home`), which is title memory itself. Returns the bytes.
+    ///
+    /// # Safety
+    ///
+    /// `list` is open, and the ranges lie in the copy.
+    pub(crate) unsafe fn card_upload(&self, list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList, ranges: &[(usize, usize)]) -> u64 {
+        let Some(card) = &self.card else {
+            return 0;
+        };
+        let mut bytes = 0;
+        for &(a, b) in ranges {
+            // SAFETY: the caller's; both buffers hold the range (the home
+            // from `staging_at` on holds the copy's bytes).
+            unsafe { list.CopyBufferRegion(&self.buffer, a as u64, &card.staging, card.staging_at + a as u64, (b - a) as u64) };
+            bytes += (b - a) as u64;
+        }
+        if card.home.is_some() {
+            crate::card_home::uploaded(bytes);
+        }
+        bytes
+    }
+
+    /// For a copy in the card's memory whose CPU side is a home
+    /// (`crate::card_home`): its home, where the copy's first byte lies in
+    /// the home's buffer, and its card side's bytes.
+    pub(crate) fn card_homed(&self) -> Option<(&Arc<Shadow>, u64, u64)> {
+        let card = self.card.as_ref()?;
+        Some((card.home.as_ref()?, card.staging_at, card.size))
+    }
+
+    /// For a copy in the card's memory whose CPU side is a home: offsets
+    /// `[from, to)` were merged into the home on the card
+    /// (`crate::card_home`), where the shaders wrote them. The card's side
+    /// takes them from the home before the next submission (with what the
+    /// title wrote there meanwhile, and their hashes made anew), and copies
+    /// of the same bytes elsewhere take them again (write watching does not
+    /// see the card's writes).
+    pub(crate) fn card_merged(&self, from: usize, to: usize) {
+        let Some(home) = self.card_home() else {
+            return;
+        };
+        let (from, to) = (from.min(self.len as usize), to.min(self.len as usize));
+        if from >= to {
+            return;
+        }
+        self.card_changed(from, to);
+        // (A home in a chunk of the pool: told with its other views, by the
+        // run, `Shadow::card_merged_shown`.)
+        if home.home_kind() != Some(crate::home::Kind::Pool) {
+            crate::home::Home::gpu_wrote(home, self.start + from as u64, (to - from) as u64);
+        }
+    }
+
+    /// For a copy in the card's memory whose CPU side is a home in a chunk
+    /// of the pool: offsets `[from, to)`, pieces [`Shadow::card_merged`]
+    /// took joined, were merged into the home. The pages show at the home's
+    /// other views and under placed textures too: all are told, as
+    /// `crate::home::after_wait` tells a C-pool home the shaders wrote.
+    /// Nothing for another copy.
+    pub(crate) fn card_merged_shown(&self, from: usize, to: usize) {
+        let Some(home) = self.card_home() else {
+            return;
+        };
+        if home.home_kind() != Some(crate::home::Kind::Pool) {
+            return;
+        }
+        let (from, to) = (from.min(self.len as usize), to.min(self.len as usize));
+        if from >= to {
+            return;
+        }
+        let at = self.start as usize + from;
+        for (from, to) in crate::pool::shown_at(at, at + (to - from)) {
+            crate::watch::gpu_wrote(from, to - from);
+            crate::pool::textures_told(from, to);
+        }
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -3843,7 +3952,9 @@ impl Shadow {
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_none() || at + gpu.len() > self.len as usize {
+        // A CPU side that is a home is merged on the card (`card_merged`):
+        // `data` is title memory, no reference from before the shaders.
+        if self.card.is_none() || self.card_home().is_some() || at + gpu.len() > self.len as usize {
             return 0;
         }
         // SAFETY: inside the mapping (checked above); only the submitting
@@ -3911,7 +4022,9 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
-        if at + gpu.len() > self.len as usize {
+        // Never with a home as the CPU side: the core refuses homes with the
+        // relay (`crate::home::Why::Late`).
+        if card.home.is_some() || at + gpu.len() > self.len as usize {
             return 0;
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -4034,8 +4147,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// The memory core lets `homes` go (`crate::home::cpu_touched`): the
 /// tables forget them, as the window they are and as the copy of every title
 /// buffer that resolved to them (which all start inside them), so that the
-/// next ask makes a copy or a home anew.
-pub(crate) fn let_go_homes(homes: &[Arc<Shadow>]) {
+/// next ask makes a copy or a home anew. A copy in the card's memory whose
+/// CPU side is one of them (`crate::card_home`) goes too, and is returned:
+/// it holds the home, so the caller lets it go as one.
+pub(crate) fn let_go_homes(homes: &[Arc<Shadow>]) -> Vec<Arc<Shadow>> {
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         for home in homes {
@@ -4044,15 +4159,22 @@ pub(crate) fn let_go_homes(homes: &[Arc<Shadow>]) {
             }
         }
     }
+    let mut cards: Vec<Arc<Shadow>> = Vec::new();
     let mut map = buffers();
     for home in homes {
         let end = home.start.saturating_add(home.len);
         for (_, entry) in map.range_mut((home.start, 0)..(end, 0)) {
-            if entry.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, home)) {
+            let Some(shadow) = &entry.shadow else {
+                continue;
+            };
+            if Arc::ptr_eq(shadow, home) {
                 entry.shadow = None;
+            } else if shadow.card_home().is_some_and(|h| Arc::ptr_eq(h, home)) {
+                cards.extend(entry.shadow.take());
             }
         }
     }
+    cards
 }
 
 /// The parts of title memory `[start, end)` that host copies hold (not
@@ -4093,6 +4215,12 @@ pub(crate) fn copies_over(start: u64, end: u64) -> Vec<(usize, usize)> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// The copy the title buffer at `start` has in the tables, if any (tests).
+#[cfg(test)]
+pub(crate) fn tabled_copy(start: u64) -> Option<Arc<Shadow>> {
+    buffers().range((start, 0)..=(start, usize::MAX)).find_map(|(_, entry)| entry.shadow.clone())
 }
 
 /// A copy's bytes as the host copy holds them (tests).
@@ -4202,6 +4330,67 @@ fn fold_buffers() -> bool {
 /// Buffers folded into windows so far ([`fold_buffers`]).
 pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 
+/// The home that is to be the CPU side of a copy in the card's memory of
+/// title memory `[start, start + len)` (`crate::card_home`): the home that
+/// holds the bytes, or a new one, if the memory core gives them one
+/// (classified as a buffer not offered the card, so a later slice's homes
+/// come here the same way). `None`: the copy keeps a staging buffer.
+fn card_side(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !crate::card_home::on() {
+        return None;
+    }
+    // The merge on the card stores whole words of 16-byte steps of the copy
+    // into the home: they must be steps of the home too. A private home's
+    // buffer starts on a 64 KiB line of title memory, and a pool home lies at
+    // a 64 KiB page's offset in its chunk's buffer, so asked before any opening.
+    if !start.is_multiple_of(16) {
+        crate::card_home::misaligned();
+        return None;
+    }
+    let home = match crate::home::resolve(start, len, false, false, &mut || false) {
+        crate::home::Found::Home(home) => home,
+        // Of either kind: a home in private memory or in a chunk of the pool.
+        crate::home::Found::New(new) => new.home(start, len, false),
+        crate::home::Found::Card | crate::home::Found::Copy => return None,
+    };
+    // (A home that holds it from further out, of a kind that does not. As
+    // homes are made today the offset keeps `start`'s step, so this never
+    // turns one down: a defence.)
+    if !home.offset(start).is_multiple_of(16) {
+        crate::card_home::misaligned();
+        return None;
+    }
+    Some(home)
+}
+
+/// A copy in the card's memory (`on_card`, `size` bytes) of title buffer
+/// `[start, start + len)` whose CPU side is `home` (`crate::card_home`).
+fn carded_home(on_card: ID3D12Resource, home: Arc<Shadow>, start: u64, len: u64, size: u64) -> Arc<Shadow> {
+    crate::host::name(&on_card, || format!("title buffer {start:#x}+{len:#x} on the card, its home in place"));
+    tracing::info!(
+        start = format_args!("{start:#x}"),
+        len,
+        "a buffer's host copy is in the card's memory, its CPU side the title's own memory"
+    );
+    // SAFETY: a live buffer.
+    let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+    let card = Card {
+        staging: home.buffer.clone(),
+        before: Mutex::default(),
+        dirty: Mutex::default(),
+        sent: Mutex::default(),
+        size,
+        staging_at: home.offset(start),
+        home: Some(home),
+    };
+    // `data` is title memory: what reads the CPU side reads the title's
+    // bytes, and nothing writes it (`Shadow::copy`, `Shadow::card_merge`).
+    let mut shadow = Shadow::new(on_card, start as *mut u8, gpu, start, len);
+    shadow.card = Some(card);
+    crate::card_home::made(size);
+    Arc::new(shadow)
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
@@ -4281,6 +4470,20 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false, None)));
             return entry.shadow.clone();
         }
+        // The card took a copy that the core offered it first: its CPU side
+        // is the home of the buffer's bytes if they can have one
+        // (`VICTORY_MEMORY_CARDS=1`), with no staging buffer of ours.
+        if let Some(Some(on_card)) = &card_asked
+            && let Some(home) = card_side(key.0, len)
+        {
+            let shadow = carded_home(on_card.clone(), home, key.0, len, size);
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            entry.shadow = Some(shadow);
+            return entry.shadow.clone();
+        }
+        if let Some(Some(_)) = &card_asked {
+            crate::card_home::kept();
+        }
         let Some((buffer, data)) = host().and_then(|host| host.shared_buffer(size)) else {
             // A card side the core asked for first is given back.
             if let Some(Some(_)) = &card_asked {
@@ -4306,6 +4509,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    home: None,
+                    staging_at: 0,
                 };
                 (on_card, Some(card))
             }
@@ -4543,6 +4748,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                home: None,
+                staging_at: 0,
             };
             (on_card, Some(card))
         }
@@ -4868,6 +5075,8 @@ mod card_merge_tests {
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                home: None,
+                staging_at: 0,
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {

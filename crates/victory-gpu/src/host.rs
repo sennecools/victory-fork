@@ -3191,6 +3191,11 @@ struct CardRange {
     at: u32,
     /// Whether the card compares it; else every piece is fetched.
     compared: bool,
+    /// For a copy whose CPU side is a home (`crate::card_home`): where the
+    /// range's card bytes from before the lists lie in the reference the
+    /// merge on the card takes. Such a range is merged on the card, not
+    /// fetched.
+    reference: Option<u32>,
 }
 
 /// What a submission does for copies in the card's memory.
@@ -6223,13 +6228,11 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    let copies = |shadow: &crate::shadow::Shadow,
-                                  staging: &ID3D12Resource,
-                                  ranges: &[(usize, usize)]| {
-                        for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
-                        }
+                    // From the CPU side: the staging buffer, or the home
+                    // that is title memory itself (`crate::card_home`).
+                    let copies = |shadow: &crate::shadow::Shadow, ranges: &[(usize, usize)]| {
+                        let bytes = shadow.card_upload(list, ranges);
+                        crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                     };
                     // All copies first, then one barrier, then all passes
@@ -6238,10 +6241,10 @@ impl Host {
                     if wide {
                         let mut barriers = Vec::new();
                         for (shadow, ranges) in &dirty {
-                            let Some((staging, before, _)) = shadow.card_sides() else {
+                            let Some((_, before, _)) = shadow.card_sides() else {
                                 continue;
                             };
-                            copies(shadow, staging, ranges);
+                            copies(shadow, ranges);
                             if before.is_some() && !ranges.is_empty() {
                                 barriers.push(transition(
                                     &shadow.buffer,
@@ -6255,11 +6258,11 @@ impl Host {
                         }
                     }
                     for (shadow, ranges) in &dirty {
-                        let Some((staging, before, size)) = shadow.card_sides() else {
+                        let Some((_, before, size)) = shadow.card_sides() else {
                             continue;
                         };
                         if !wide {
-                            copies(shadow, staging, ranges);
+                            copies(shadow, ranges);
                         }
                         let Some(before) = before else {
                             continue;
@@ -6350,6 +6353,7 @@ impl Host {
                     span,
                     at,
                     compared,
+                    reference: None,
                 });
                 if compared {
                     at += span.pieces;
@@ -6357,7 +6361,30 @@ impl Host {
             }
         }
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        // Copies whose CPU side is a home (`crate::card_home`): their ranges'
+        // card bytes, once the changes went up, are set aside ahead of the
+        // lists (a list of ours, run now) for the merge after them.
+        let homed: Vec<usize> = (0..plan.ranges.len())
+            .filter(|&i| plan.ranges[i].shadow.card_homed().is_some())
+            .collect();
+        if !homed.is_empty() {
+            let spans: Vec<_> = homed
+                .iter()
+                .map(|&i| &plan.ranges[i])
+                .map(|r| (&*r.shadow, r.span.from, r.span.to))
+                .collect();
+            let Some((list, places)) = crate::card_home::before(self, &spans) else {
+                fail(format_args!(
+                    "no memory for, or no list to record, what card copies held before a submission"
+                ));
+            };
+            // SAFETY: a closed list of ours; it goes ahead of the lists.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+            for (&i, place) in homed.iter().zip(places) {
+                plan.ranges[i].reference = Some(place);
+            }
+        }
+        if plan.ranges.iter().any(|r| r.compared || r.reference.is_some()) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -6444,6 +6471,12 @@ impl Host {
                         plan.inflight = every;
                         plan.inflight_landed = inflight.landed;
                     }
+                    // Copies whose CPU side is a home: what the shaders
+                    // wrote is merged into it behind the compares.
+                    let homed = plan.ranges.iter().filter_map(|r| {
+                        Some((&*r.shadow, &r.span, r.reference?, r.compared.then_some(r.at * 4)))
+                    });
+                    crate::card_home::record_merges(list, &work.differs.0, homed);
                     list.Close()?;
                     list.cast()
                 })()
@@ -6998,17 +7031,44 @@ impl Host {
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
+            // The range's merged pieces, joined where they touch, for the
+            // other views of a home in a chunk of the pool
+            // (`Shadow::card_merged_shown`).
+            let mut run: Option<(usize, usize)> = None;
             for p in 0..r.span.pieces {
                 if r.compared && differs[(r.at + p) as usize] == 0 {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                // Merged into the home on the card already
+                // (`crate::card_home`): nothing to fetch.
+                if r.reference.is_some() {
+                    if lo < hi {
+                        crate::card_home::merged(&r.shadow, lo, hi);
+                        run = match run {
+                            Some((from, to)) if lo <= to && hi >= from => Some((from.min(lo), to.max(hi))),
+                            Some((from, to)) => {
+                                r.shadow.card_merged_shown(from, to);
+                                Some((lo, hi))
+                            }
+                            None => Some((lo, hi)),
+                        };
+                    }
+                    continue;
+                }
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
             }
+            if let Some((from, to)) = run {
+                r.shadow.card_merged_shown(from, to);
+            }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+        }
+        // What the merges on the card stored into homes.
+        if plan.ranges.iter().any(|r| r.reference.is_some()) {
+            COPY_BACK[1].fetch_add(crate::card_home::stored(), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {

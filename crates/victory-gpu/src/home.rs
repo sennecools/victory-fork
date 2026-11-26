@@ -85,6 +85,16 @@ pub(crate) trait Home: Send + Sync {
     fn visible(self: &Arc<Self>, list: &HostList, at: u64, len: u64);
     /// The shaders of `list` may write `[at, at + len)`.
     fn gpu_may_write(self: &Arc<Self>, list: &HostList, at: u64, len: u64);
+
+    // ---- Slice 4 (`crate::card_home`, `VICTORY_MEMORY_CARDS=1`) ----
+
+    /// The card wrote `[at, at + len)` into the home outside any list (a
+    /// copy in the card's memory whose CPU side the home is, merged into it
+    /// on the card): every copy over those bytes takes them again at its next
+    /// refresh, as write watching does not see the card's writes.
+    fn gpu_wrote(self: &Arc<Self>, at: u64, len: u64) {
+        crate::watch::gpu_wrote(at as usize, len as usize);
+    }
 }
 
 /// Something other than the GPU touched title bytes ([`cpu_touched`]).
@@ -514,6 +524,10 @@ struct Core {
     /// ([`run_pending`]), when no submission runs: a shader of one running
     /// now may read them.
     unnumber: Vec<(u64, u64)>,
+    /// Slice 4 (`crate::card_home`): copies in the card's memory let go with
+    /// their home, which go out of the directory at the same sweep, each by
+    /// itself (not by range: theirs may lie over other homes still in use).
+    unnumber_cards: Vec<Weak<Shadow>>,
 }
 
 static CORE: Mutex<Core> = Mutex::new(Core {
@@ -523,6 +537,7 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     tabled_longest: 0,
     pending: Vec::new(),
     unnumber: Vec::new(),
+    unnumber_cards: Vec::new(),
 });
 
 fn core() -> std::sync::MutexGuard<'static, Core> {
@@ -1056,11 +1071,21 @@ pub(crate) fn cpu_touched(at: usize, len: usize, how: Touch) -> u64 {
 /// out of `crate::memory`'s directory at once, else at the next sweep.
 fn let_go_over(at: usize, len: usize, now: bool) -> u64 {
     let end = at.saturating_add(len) as u64;
-    let homes = untable_over(at as u64, end);
+    let mut homes = untable_over(at as u64, end);
     if homes.is_empty() {
         return 0;
     }
-    crate::shadow::let_go_homes(&homes);
+    // Copies in the card's memory whose CPU side is one of them
+    // (`crate::card_home`) hold it: let go with it.
+    let cards = crate::shadow::let_go_homes(&homes);
+    if !now {
+        // (Weak: held here they would hold the home's heap. The directory
+        // holds a numbered one alive until the sweep forgets it.)
+        core()
+            .unnumber_cards
+            .extend(cards.iter().map(Arc::downgrade));
+    }
+    homes.extend(cards);
     if now {
         for home in &homes {
             if crate::memory::forget(home) {
@@ -1091,6 +1116,11 @@ fn unnumber() {
     let ranges = std::mem::take(&mut core().unnumber);
     for (from, to) in ranges {
         crate::memory::forget_homes_over(from, to);
+    }
+    // Slice 4: the card copies let go with their homes, each by itself.
+    let cards = std::mem::take(&mut core().unnumber_cards);
+    for card in cards.iter().filter_map(Weak::upgrade) {
+        crate::memory::forget(&card);
     }
 }
 
@@ -1539,6 +1569,9 @@ pub(crate) fn after_wait(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)]) {
         std::collections::HashMap::new();
     for (home, written) in declared {
         let ranges = match home.home_kind() {
+            // (Also a copy in the card's memory whose CPU side is a home:
+            // what its shaders wrote reaches the home by its merge,
+            // `crate::card_home`, which tells it.)
             None => continue,
             Some(Kind::Private) => &mut private,
             Some(Kind::Pool) => pool.entry(Arc::as_ptr(home) as usize).or_default(),
@@ -1645,6 +1678,8 @@ fn lines() -> Vec<String> {
         told[10],
         told[8],
     )];
+    // Slice 4: copies in the card's memory whose CPU side is a home.
+    lines.extend(crate::card_home::line());
     // The census: regions by the console's protection above the host's
     // bits, its page-size kind bits and the XMem flags, with the bytes homes
     // pin in them.
@@ -1711,6 +1746,7 @@ pub(crate) mod tests {
             TEST_ON.with(|on| on.set(false));
             NO_DEVICE13.with(|no| no.set(false));
             crate::pool::set_test(false);
+            crate::card_home::set_test(false);
         }
     }
 
@@ -3012,6 +3048,57 @@ pub(crate) mod tests {
         for place in [&p, &q] {
             place.unmap(0, K64);
             place.unmap(K64, K64);
+        }
+    }
+
+    /// With `VICTORY_MEMORY_CARDS=1` (`crate::card_home`) a big buffer's
+    /// copy in the card's memory can have a C-pool home as its CPU side.
+    /// What is merged into that home shows at another view of its pages:
+    /// told there, a copy at that view takes the pages again.
+    #[test]
+    fn warp_pool_a_card_copy_on_a_pool_home_tells_its_other_views() {
+        let Some(host) = warp13() else { return };
+        if !host.card_ready() {
+            return;
+        }
+        let _on = Switched::pool();
+        crate::card_home::set_test(true);
+        let bytes = 32 * K64;
+        let chunk = TestChunk::new(2 * bytes as usize, crate::pool::PoolChunk::Committed);
+        // The same pages at two places: `p`, where the card copy is, and `q`.
+        let (p, q) = (Place::new(bytes as usize), Place::new(bytes as usize));
+        for place in [&p, &q] {
+            place.map(0, bytes, &chunk, 0);
+        }
+        let (start, len) = (p.base + K64, 1 << 20);
+        register(0xc0de_2701, start, len);
+        let copy = find(start, len).expect("a copy");
+        assert!(copy.carded(), "in the card's memory");
+        let home = copy.card_home().expect("its CPU side is a home").clone();
+        assert_eq!(home.home_kind(), Some(Kind::Pool));
+        assert!(copy.home_kind().is_none(), "the card copy is no home itself");
+        let at = 3 * K64 + 0x100;
+        let (view, small) = (q.base + K64 + at, 0x1000u64);
+        let other = crate::shadow::exact(view, small).expect("an exact copy");
+        assert!(!other.is_home());
+        fill(start, len, 9);
+        other.update(view as usize, small as usize);
+        assert!(same(view, crate::shadow::copy_bytes(&other)));
+        // The merge's store into the home, as the card makes it.
+        let new = [0xa5u8; 0x1000];
+        let mut rig = Rig::new(&host.device).unwrap();
+        rig.store(&home.buffer, home.offset(start + at), &new).unwrap();
+        assert!(same(view, &new), "the same pages");
+        copy.card_merged_shown(at as usize, (at + small) as usize);
+        other.update(view as usize, small as usize);
+        assert!(
+            same(view, crate::shadow::copy_bytes(&other)),
+            "told, the other view's copy takes the pages again"
+        );
+        unregister(0xc0de_2701, start);
+        drop((home, copy, other, rig));
+        for place in [&p, &q] {
+            place.unmap(0, bytes);
         }
     }
 

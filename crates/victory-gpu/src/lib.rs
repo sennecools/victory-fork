@@ -18,6 +18,8 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod card_home;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
