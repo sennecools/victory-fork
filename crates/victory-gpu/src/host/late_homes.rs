@@ -522,6 +522,12 @@ pub(crate) mod flights {
         }
     }
 
+    /// The host's submission lock, held as a submission holds it (a test
+    /// that waits under it for what a submission waits for).
+    pub(crate) fn submission_lock(host: &Host) -> std::sync::MutexGuard<'_, u64> {
+        host.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     impl Drop for QueueHold {
         fn drop(&mut self) {
             self.release();
