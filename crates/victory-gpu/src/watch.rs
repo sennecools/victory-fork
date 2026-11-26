@@ -25,15 +25,12 @@
 //!
 //! The journal's numbers are kept in [`stamps`]' tables: one per page and a
 //! summary per 4 MiB, so an answer costs what was written since the asker's
-//! last take, not what was ever written. With `VICTORY_EPOCH_JOURNAL=1` the
-//! journal is kept in [`epoch`]'s tables instead: a number per 4 KiB page,
-//! no lock shared by every asking.
+//! last take, not what was ever written.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 mod bits;
-mod epoch;
 mod stamps;
 
 use bits::{Bits, BitsOf, Blocks, guard_bits, in_word};
@@ -161,10 +158,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     } else {
         ranges
     };
-    match epoch::on() {
-        Some(epochs) => epochs.ask_ahead(ranges),
-        None => ask_ahead_in(&JOURNAL, ranges),
-    }
+    ask_ahead_in(&JOURNAL, ranges);
 }
 
 /// `ranges` without those of which a block is read-only by our hand, by the
@@ -295,10 +289,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    match epoch::on() {
-        Some(epochs) => epochs.ask_ahead_done(),
-        None => ask_ahead_done_in(&JOURNAL),
-    }
+    ask_ahead_done_in(&JOURNAL);
 }
 
 /// [`ask_ahead_done`] in `journal`.
@@ -350,10 +341,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     } else {
         ranges
     };
-    match epoch::on() {
-        Some(epochs) => epochs.ask_once(ranges),
-        None => ask_once_in(&JOURNAL, ranges),
-    }
+    ask_once_in(&JOURNAL, ranges);
 }
 
 /// [`ask_once`] in `journal`, whatever [`once`] says.
@@ -388,10 +376,7 @@ fn ask_once_in(journal: &Mutex<Journal>, ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    match epoch::on() {
-        Some(epochs) => epochs.ask_once_end(),
-        None => ask_once_end_in(&JOURNAL),
-    }
+    ask_once_end_in(&JOURNAL);
 }
 
 /// [`ask_once_end`] in `journal`.
@@ -407,10 +392,7 @@ fn ask_once_end_in(journal: &Mutex<Journal>) {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    match epoch::on() {
-        Some(epochs) => epochs.wrote(at, len),
-        None => wrote_in(&JOURNAL, at, len),
-    }
+    wrote_in(&JOURNAL, at, len);
 }
 
 /// [`wrote`] in `journal`.
@@ -437,10 +419,7 @@ fn wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
 /// every copy over them takes them again at its next refresh. ([`wrote`]
 /// acts only while a submission's one asking stands.)
 pub(crate) fn gpu_wrote(at: usize, len: usize) {
-    match epoch::on() {
-        Some(epochs) => epochs.gpu_wrote(at, len),
-        None => gpu_wrote_in(&JOURNAL, at, len),
-    }
+    gpu_wrote_in(&JOURNAL, at, len);
 }
 
 /// [`gpu_wrote`] in `journal`.
@@ -524,10 +503,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// the number of the asking that stands (as [`writes`] gives it). `None` if
 /// the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
-    match epoch::on() {
-        Some(epochs) => epochs.asked(start, end).map(|(now, w)| (now, after(w, since))),
-        None => asked_in(&JOURNAL, start, end, since),
-    }
+    asked_in(&JOURNAL, start, end, since)
 }
 
 /// [`asked`] in `journal`.
@@ -557,17 +533,7 @@ pub(crate) fn writes(
     guarded: bool,
     since: u64,
 ) -> Option<(u64, Vec<(usize, u64)>)> {
-    match epoch::on() {
-        Some(epochs) => epochs
-            .writes(start, end, guarded)
-            .map(|(now, w)| (now, after(w, since))),
-        None => writes_in(&JOURNAL, start, end, guarded, since),
-    }
-}
-
-/// Of the epoch tables' answer `written`, the pages written after `since`.
-fn after(written: Vec<(usize, u64)>, since: u64) -> Vec<(usize, u64)> {
-    written.into_iter().filter(|w| w.1 > since).collect()
+    writes_in(&JOURNAL, start, end, guarded, since)
 }
 
 /// [`writes`] in `journal`.
@@ -751,8 +717,8 @@ pub(crate) fn light() -> bool {
 /// Why that is so: a block's bit is set under the guards' lock while the
 /// block is clean, by the asking that made it clean, after that asking noted
 /// in the journal what it found ([`publish`]; no other asking of the block
-/// comes between: the journal's lock, or the epoch tables' span locks, are
-/// held from before the guards are asked until after). It is cleared under
+/// comes between: the journal's lock is held from before the guards are
+/// asked until after). It is cleared under
 /// the guards' lock before the block becomes writable again ([`unguard`]),
 /// before another view of its page does ([`open`], [`views_mapped`]), or
 /// when it is forgotten ([`title_memory_remapped`]). So while the bit is set
@@ -951,13 +917,6 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64])
     }
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
-    if let Some(epochs) = epoch::on() {
-        return epochs.known(first, last, known).is_some_and(|pages| {
-            pages
-                .iter()
-                .all(|&(page, write)| write <= taken[page - first])
-        });
-    }
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     (known || j.ahead.iter().any(|&(a, b)| a <= first && last <= b))
         && j.stamps.none_above(first, last, taken)
@@ -1247,8 +1206,8 @@ fn cover(g: &mut Guards, block: usize) -> bool {
 /// is looked at anew under the lock). Ported from cool_fox 7bc7c07.
 ///
 /// Letting go is safe: no other asking guards these blocks meanwhile (the
-/// caller holds the journal's lock, or the epoch tables' span locks), and
-/// what a fault or the runtime does meanwhile only opens or forgets blocks.
+/// caller holds the journal's lock), and what a fault or the runtime does
+/// meanwhile only opens or forgets blocks.
 /// A block opened after the look below was not clean at it, or is told as
 /// written at the next asking; one forgotten is made read-only again, as
 /// any block that is not clean.

@@ -786,41 +786,6 @@ pub(crate) fn refresh_stamp() -> u64 {
     }
 }
 
-/// Whether the calling thread is in a [`refresh_scope`] while recording.
-pub(crate) fn in_refresh() -> bool {
-    STATE.load(Ordering::Relaxed) == ON && REFRESH.try_with(|r| r.get().0).unwrap_or(false)
-}
-
-/// Runs `f`, which hands work to other threads (each of its pieces timing
-/// its own journal share where it runs, this thread's too) and waits for
-/// it, as time the calling thread's journal timer leaves out, as it leaves
-/// out the kernel askings.
-pub(crate) fn handed_off<R>(f: impl FnOnce() -> R) -> R {
-    let start = refresh_stamp();
-    if start == 0 {
-        return f();
-    }
-    let Ok((_, kernel, copy, timing)) = REFRESH.try_with(std::cell::Cell::get) else {
-        return f();
-    };
-    // The pieces run here start timers of their own.
-    let _ = REFRESH.try_with(|r| {
-        let (on, kernel, copy, _) = r.get();
-        r.set((on, kernel, copy, false));
-    });
-    let answer = f();
-    let ticks = elapsed(start);
-    let _ = REFRESH.try_with(|r| {
-        let (on, now_kernel, now_copy, _) = r.get();
-        // The whole wait counts as the kernel's for a timer running here,
-        // less what it sees as copies already.
-        let copied = now_copy.saturating_sub(copy);
-        let kernel = now_kernel.max(kernel + ticks.saturating_sub(copied));
-        r.set((on, kernel, now_copy, timing));
-    });
-    answer
-}
-
 /// A kernel write-watch asking begun at `start` ([`refresh_stamp`]; 0:
 /// not counted) asked about `bytes` and found the 4 KiB pages at
 /// `found` (in address order, as the kernel gives them).
