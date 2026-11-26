@@ -2508,6 +2508,70 @@ fn stale_pages_in(taken: &Taken, a: usize, e: usize) -> Vec<usize> {
     pages
 }
 
+/// The byte runs to copy of `stale` (pages in order, each with the parts
+/// to take, a bit per 4 KiB), cut to `[from, to)`: next to it shaders may
+/// be writing the copy. Parts that follow each other, in a page or across
+/// two, are one run. Adapted from cool_fox's 3ead56e (`by_parts`,
+/// `PAGE_PARTS`; author `local`), as carried in Belobug/VIctory-Belobug-AMD
+/// (read at cd8dfc06), GPL-3.0-or-later.
+fn by_parts(stale: &[(usize, u16)], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(stale.len());
+    for &(page, parts) in stale {
+        for (a, b) in crate::watch::part_runs(parts) {
+            let (a, b) = ((page * PAGE + a).max(from), (page * PAGE + b).min(to));
+            if a >= b {
+                continue;
+            }
+            match out.last_mut() {
+                Some((_, end)) if *end == a => *end = b,
+                _ => out.push((a, b)),
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::{PAGE, by_parts};
+
+    /// Ported from cool_fox's `runs_are_cut_to_the_parts_written` (3ead56e).
+    #[test]
+    fn runs_are_cut_to_the_parts_written() {
+        const P: usize = PAGE / 16;
+        let at = |page: usize, part: usize| page * PAGE + part * P;
+        // Pages 10 and 11 again (the range from the middle of 10's part 1
+        // on), 12 never taken (whole), 14 again (the range to the middle of
+        // its part 9).
+        let (from, to) = (at(10, 1) + 100, at(14, 9) + 7);
+        let whole = [
+            (10, u16::MAX),
+            (11, u16::MAX),
+            (12, u16::MAX),
+            (14, u16::MAX),
+        ];
+        assert_eq!(
+            by_parts(&whole, from, to),
+            [(from, at(13, 0)), (at(14, 0), to)]
+        );
+        let parts = [
+            (10, 0b1000_0000_0000_0011),
+            (11, 0b11),
+            (12, u16::MAX),
+            (14, 0b10_0000_0000),
+        ];
+        assert_eq!(
+            by_parts(&parts, from, to),
+            [
+                (at(10, 1) + 100, at(10, 2)),
+                (at(10, 15), at(11, 2)),
+                (at(12, 0), at(13, 0)),
+                (at(14, 9), at(14, 9) + 7),
+            ]
+        );
+    }
+}
+
 #[cfg(test)]
 mod stale_tests {
     use super::*;
@@ -2541,6 +2605,7 @@ mod stale_tests {
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
+    use crate::watch::KERNEL_PAGE;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc,
     };
@@ -2603,7 +2668,8 @@ mod refresh_tests {
         assert_eq!(copy.taken.lock().unwrap().taken_pages(), 8);
     }
 
-    /// Bytes written in two pages: those two pages are taken, no more.
+    /// Bytes written in two pages: the 4 KiB part of each that holds them
+    /// is taken, no more.
     #[test]
     fn warp_refresh_copies_only_dirty_pages() {
         if host().is_none() {
@@ -2615,7 +2681,7 @@ mod refresh_tests {
         assert_eq!(copy.update(at, len), len);
         poke(at + 2 * PAGE + 100, 1);
         poke(at + 5 * PAGE + 7, 2);
-        assert_eq!(copy.update(at, len), 2 * PAGE);
+        assert_eq!(copy.update(at, len), 2 * KERNEL_PAGE);
         assert!(holds(&copy, at, at + len));
         assert_eq!(copy.update(at, len), 0);
     }
@@ -2647,6 +2713,39 @@ mod refresh_tests {
         assert_eq!(copy.update(at, len), 0);
     }
 
+    /// Writes in parts of pages: the parts written since the last refresh
+    /// are taken, a run of them across two pages as one, each page's other
+    /// parts not; the copy holds the title's bytes after each refresh.
+    #[test]
+    fn warp_refresh_copies_only_written_parts() {
+        if host().is_none() {
+            return;
+        }
+        let at = region(4);
+        let len = 4 * PAGE;
+        let copy = exact(at as u64, len as u64).expect("a copy");
+        assert_eq!(copy.update(at, len), len);
+        // Parts 2 and 9 of page 0; part 15 of page 1 and part 0 of page 2.
+        poke(at + 2 * KERNEL_PAGE + 1, 1);
+        poke(at + 9 * KERNEL_PAGE + 2, 2);
+        poke(at + 2 * PAGE - 1, 3);
+        poke(at + 2 * PAGE, 4);
+        assert_eq!(copy.update(at, len), 4 * KERNEL_PAGE);
+        assert!(holds(&copy, at, at + len));
+        // Written again, elsewhere: the parts of this asking alone.
+        poke(at + 3 * PAGE + 5 * KERNEL_PAGE, 5);
+        poke(at + 9 * KERNEL_PAGE + 3, 6);
+        assert_eq!(copy.update(at, len), 2 * KERNEL_PAGE);
+        assert!(holds(&copy, at, at + len));
+        assert_eq!(copy.update(at, len), 0);
+        // A refresh of part of a page copies the written parts inside it.
+        poke(at + 3 * PAGE + 7 * KERNEL_PAGE, 7);
+        poke(at + 3 * PAGE + 12 * KERNEL_PAGE, 8);
+        let from = at + 3 * PAGE + 6 * KERNEL_PAGE;
+        assert_eq!(copy.update(from, at + len - from), 2 * KERNEL_PAGE);
+        assert!(holds(&copy, at, at + len));
+    }
+
     /// A range shaders may be writing is left alone: the pages around it
     /// are refreshed, it is not, and no run spans it.
     #[test]
@@ -2663,7 +2762,11 @@ mod refresh_tests {
         for page in 2..5 {
             poke(at + page * PAGE + 9, 0xa0 + page as u8);
         }
-        assert_eq!(copy.update(at, len), 2 * PAGE, "pages 2 and 4");
+        assert_eq!(
+            copy.update(at, len),
+            2 * KERNEL_PAGE,
+            "pages 2 and 4, a part each"
+        );
         assert!(holds(&copy, at, at + 3 * PAGE));
         assert!(holds(&copy, at + 4 * PAGE, at + len));
         assert_eq!(
@@ -3910,8 +4013,9 @@ impl Shadow {
     }
 
     /// Copies the pages of `[from, to)` (inside the buffer) the copy must
-    /// take after asking `now` ([`crate::watch::stale_words`]), one copy per
-    /// run of them, and notes the pages it took whole. The walk costs a look
+    /// take after asking `now` ([`crate::watch::stale_words`]), only the
+    /// 4 KiB parts of each written since the copy took it, one copy per run
+    /// of parts, and notes the pages it took whole. The walk costs a look
     /// per 64 pages of the range and one per page of the groups written
     /// since the copy took them; the first refresh of a range takes all of
     /// it, as one run.
@@ -3920,21 +4024,25 @@ impl Shadow {
         // copies are not (`crate::profile::journal_timer`).
         let _journal = crate::profile::journal_timer();
         let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        let _ = crate::watch::stale_words(from / PAGE, to.div_ceil(PAGE), &taken, |page, _| {
+        // Runs of stale pages, and each stale page with its parts to take.
+        let (mut runs, mut stale): (Vec<(usize, usize)>, Vec<(usize, u16)>) =
+            (Vec::new(), Vec::new());
+        let _ = crate::watch::stale_words(from / PAGE, to.div_ceil(PAGE), &taken, |page, parts| {
             match runs.last_mut() {
                 Some((_, end)) if *end == page => *end += 1,
                 _ => runs.push((page, page + 1)),
             }
+            stale.push((page, parts));
             ControlFlow::Continue(())
         });
+        let mut bytes = 0;
+        for (a, b) in by_parts(&stale, from, to) {
+            bytes += self.copy(a, b);
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let whole =
             |page: usize| (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
-        let mut bytes = 0;
         for (a, b) in runs {
-            // Cut to the range: next to it shaders may be writing the copy.
-            bytes += self.copy((a * PAGE).max(from), (b * PAGE).min(to));
             // A page only partly in the range is copied in part: it stays
             // stale for the rest.
             let first = if whole(a) { a } else { a + 1 };
