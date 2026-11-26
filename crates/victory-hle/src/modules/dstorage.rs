@@ -471,6 +471,9 @@ struct Lane {
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
+    /// An automatic queue submits itself only once it is full, not at half
+    /// its capacity ([`submit_when_full`]).
+    submit_full: bool,
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
@@ -735,6 +738,7 @@ impl Lane {
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
             closed: false,
+            submit_full: submit_when_full(),
         }
     }
 
@@ -922,7 +926,30 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Blocks while full. Automatic queues submit when half their capacity is pending.
+/// Whether an automatic queue waits for the title's submit
+/// (`VICTORY_DSTORAGE_SUBMIT_FULL=1`; unset: it submits itself once half
+/// its capacity is enqueued, as DirectStorage for the PC does and as ours
+/// did). The title fills in the page lists of a batch, and maps the pages
+/// they name, in its own submit, after it has enqueued the whole batch, and
+/// its batches can hold more than half of a queue: the requests started at
+/// half ran on lists not filled in yet, page 0 (waited for) or the pages an
+/// earlier mapping left there (written: somebody else's memory). With the
+/// switch, a queue submits itself only when it is full of commands nobody
+/// submitted and nothing of it runs, since nothing else could make room.
+fn submit_when_full() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DSTORAGE_SUBMIT_FULL").is_some_and(|v| v == "1");
+        tracing::info!(
+            on,
+            "dstorage: automatic queues wait for the submit (VICTORY_DSTORAGE_SUBMIT_FULL)"
+        );
+        on
+    })
+}
+
+/// Blocks while full. Automatic queues submit when half their capacity is
+/// pending, or with [`submit_when_full`] when they are full.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let Queue { id, auto_submit } = unsafe { &*this }.state;
@@ -938,6 +965,21 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        if auto_submit
+            && lane.submit_full
+            && !lane.unsubmitted.is_empty()
+            && lane.reads.is_empty()
+            && lane.running.is_empty()
+        {
+            tracing::warn!(
+                queue = id,
+                commands = lane.unsubmitted.len(),
+                "dstorage: a queue full of commands that are not submitted submits itself"
+            );
+            lanes.submit(id);
+            scheduler.work.notify_all();
+            continue;
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -947,7 +989,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if auto_submit && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if auto_submit && !lane.submit_full && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -1622,6 +1664,97 @@ mod tests {
             release::<Queue>(queue.cast());
             release::<StatusArray>(array.cast());
         }
+    }
+
+    /// Makes an automatic queue wait for the submit, as
+    /// `VICTORY_DSTORAGE_SUBMIT_FULL=1` does.
+    fn submit_when_full(queue: *mut c_void) {
+        // SAFETY: a live queue the test created.
+        let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+        scheduler()
+            .unwrap()
+            .lock()
+            .lanes
+            .get_mut(&id)
+            .unwrap()
+            .submit_full = true;
+    }
+
+    #[test]
+    fn half_a_queue_waits_for_the_submit() {
+        use crate::modules::xmem;
+        // Two pages the title owns: the one its list still names from
+        // earlier, and the one it maps for this batch when it submits.
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        let [stale, right] = pages;
+        let plain = pattern(64);
+        let mut list = [stale];
+        let (queue, array) = (queue_with_options(1, 0x80, 0), status_array(1));
+        submit_when_full(queue);
+        // More than half of the queue's 128.
+        for i in 0..100 {
+            let mut r = request(
+                PAGE_DESTINATION | MEMORY_SOURCE,
+                list.as_mut_ptr().cast(),
+                plain.len(),
+                plain.as_ptr().cast(),
+                0,
+                plain.len(),
+            );
+            r.page_offset = i * 64;
+            enqueue(queue, &r);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: our own list, which a worker may be reading.
+        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), right) };
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let bytes = |page: usize| -> Vec<u8> {
+            xmem::page_window(&[page], 0, 6400)
+                .unwrap()
+                .bytes()
+                .to_vec()
+        };
+        assert!(
+            bytes(stale) == [0; 6400],
+            "written to the page the list named before"
+        );
+        assert!(
+            bytes(right) == plain.repeat(100),
+            "not written to the page the list names"
+        );
+        release::<Queue>(queue.cast());
+        release::<StatusArray>(array.cast());
+    }
+
+    #[test]
+    fn a_full_queue_submits_itself() {
+        let (_dir, file) = file_with(&pattern(64));
+        let queue = queue_with_options(0, 4, 0);
+        submit_when_full(queue);
+        let array = status_array(1);
+        let mut outs = [[0u8; 16]; 4];
+        for out in &mut outs[..2] {
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+        }
+        enqueue_status(queue, array, 0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(result(array, 0), E_PENDING, "three of four: not submitted");
+        // One more than fits: would wait for good.
+        for out in &mut outs[2..] {
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+        }
+        assert_eq!(wait(array, 0), S_OK);
+        void(queue, 0x40);
+        assert!(outs[..2].iter().all(|out| out[..] == pattern(64)[8..24]));
+        release::<Queue>(queue.cast());
+        release::<StatusArray>(array.cast());
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
