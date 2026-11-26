@@ -684,3 +684,348 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
     words_agree(host);
     assert!(alive());
 }
+
+/// Records over a page, some slots a table's lately, some made by a draw,
+/// some written with bytes that are no view, mirrored one by one
+/// (`mirror_copied`) on one heap, and on another sorted in parts of the
+/// page on four threads (`sort_copied_page`) and the slots found mirrored
+/// on four threads (`mirror_synced`): after every round the same slots
+/// made from the same records, with the same words and buffer sets, and
+/// the same records last seen. With prints or bytes (`bytes`), and with or
+/// without `shows_none`.
+fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
+    let (Some(one), Some(sorted)) = (
+        HostHeap::with_made(false, SLOTS, false),
+        HostHeap::with_made(false, SLOTS, false),
+    ) else {
+        return; // no host GPU
+    };
+    let views = views(memory());
+    let none_before = SHOWED_NONE.load(Relaxed);
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let step = 32u64;
+    let mut rng = 0x0dd5_eed5_1f1a_4330u64 ^ u64::from(bytes) ^ u64::from(shows_none) << 1;
+    let mut mirrored = 0u64;
+    for round in 0..200 {
+        for _ in 0..8 {
+            let r = next(&mut rng);
+            let s = (r % u64::from(SLOTS)) as u32;
+            let handle = base + u64::from(s) * step;
+            if r >> 50 & 7 == 0 {
+                // Bytes that are no view of ours.
+                // SAFETY: a record of `records`.
+                unsafe { (handle as *mut [u32; 8]).write_unaligned([(r >> 8) as u32 | 1; 8]) };
+            } else {
+                write(handle, &views[(r >> 16) as usize % views.len()]);
+            }
+            if r >> 40 & 7 == 0 {
+                one.texture_slot_tabled(s, false);
+                sorted.texture_slot_tabled(s, false);
+            }
+            if r >> 44 & 3 == 0 {
+                one.mirror(s, handle, true);
+                sorted.mirror(s, handle, true);
+            }
+        }
+        // SAFETY: `records` is `SLOTS` records of `step` bytes.
+        let page = unsafe {
+            std::slice::from_raw_parts(base as *const u8, (u64::from(SLOTS) * step) as usize)
+        }
+        .to_vec();
+        let mut one_by_one = 0;
+        for index in 0..u64::from(SLOTS) {
+            let at = (index * step) as usize;
+            if one.mirror_copied(
+                index as u32,
+                base + index * step,
+                &page[at..at + step as usize],
+            ) {
+                one_by_one += 1;
+            }
+        }
+        // The page in eight parts of 256 bytes, as ranges the watch gives.
+        let parts: Vec<(usize, usize)> = (0..8)
+            .map(|p| (base as usize + p * 256, base as usize + (p + 1) * 256))
+            .collect();
+        let found: Vec<std::sync::Mutex<SyncPart>> =
+            parts.iter().map(|_| Default::default()).collect();
+        {
+            let copied = sorted.copied_begin(step as usize, bytes);
+            crate::draw::each_on(4, parts.len(), "test-sync", &|n| {
+                let (from, to) = parts[n];
+                let mut part = SyncPart::default();
+                let at = from - base as usize;
+                let slots = (at as u64 / step)..((to - base as usize) as u64).div_ceil(step);
+                // SAFETY: the parts are apart from one another.
+                unsafe {
+                    sorted.sort_copied_page(
+                        &copied,
+                        slots,
+                        (base, step),
+                        from,
+                        &page[at..to - base as usize],
+                        shows_none,
+                        &mut part,
+                    )
+                };
+                *found[n].lock().unwrap() = part;
+            });
+        }
+        let mut make = Vec::new();
+        let mut nothing = 0;
+        for part in found {
+            let mut part = part.into_inner().unwrap();
+            assert_eq!(part.looked, 8, "round {round}");
+            nothing += part.nothing;
+            make.append(&mut part.make);
+        }
+        assert!(make.is_sorted(), "round {round}");
+        crate::draw::each_on(4, make.len().div_ceil(4), "test-sync", &|n| {
+            for &index in make.chunks(4).nth(n).unwrap_or_default() {
+                sorted.mirror_synced(index, base + u64::from(index) * step);
+            }
+        });
+        if shows_none {
+            assert_eq!(make.len() as u64 + nothing, one_by_one, "round {round}");
+        } else {
+            assert_eq!(nothing, 0, "round {round}");
+            assert_eq!(make.len() as u64, one_by_one, "round {round}");
+        }
+        mirrored += one_by_one;
+        for s in 0..SLOTS {
+            assert_eq!(key(&one, s), key(&sorted, s), "round {round}, slot {s}");
+            assert_eq!(one.word(s), sorted.word(s), "round {round}, slot {s}");
+            let print = one.copied_print(s);
+            if bytes {
+                let seen = sorted.copied_record(s, step as usize).expect("bytes kept");
+                if print == 0 {
+                    assert!(seen.iter().all(|&b| b == 0), "round {round}, slot {s}");
+                } else {
+                    assert_eq!(record_print(&seen) | 1, print, "round {round}, slot {s}");
+                }
+            } else {
+                assert_eq!(print, sorted.copied_print(s), "round {round}, slot {s}");
+            }
+        }
+        assert_eq!(one.buffer_slots(), sorted.buffer_slots(), "round {round}");
+        words_agree(&sorted);
+    }
+    assert!(mirrored > 0);
+    if shows_none {
+        assert!(SHOWED_NONE.load(Relaxed) > none_before, "records left");
+    }
+    assert!(alive());
+}
+
+/// [`sorted_against_one_by_one`] with prints.
+#[test]
+fn pages_sorted_on_threads_make_what_one_by_one_makes() {
+    sorted_against_one_by_one(false, false);
+}
+
+/// [`sorted_against_one_by_one`] with the records' bytes as last seen.
+#[test]
+fn pages_sorted_with_bytes_make_what_one_by_one_makes() {
+    sorted_against_one_by_one(true, false);
+}
+
+/// [`sorted_against_one_by_one`] with bytes, records of no view into slots
+/// made from none left before their mirror.
+#[test]
+fn records_of_no_view_left_before_their_mirror_make_what_one_by_one_makes() {
+    sorted_against_one_by_one(true, true);
+}
+
+/// The records [`changed_records`] gives are those that differ one by one,
+/// in order, and it changes nothing (from cool_fox 53c5256's test).
+#[test]
+fn changed_records_are_those_that_differ_one_by_one() {
+    for (step, count) in [(32usize, 128usize), (32, 2048), (16, 77), (32, 5), (32, 17)] {
+        let mut seed = 7u64;
+        let mut random = move || {
+            seed = seed
+                .wrapping_mul(0x5851_F42D_4C95_7F2D)
+                .wrapping_add(0x1405_7B7E_F767_814F);
+            (seed >> 33) as usize
+        };
+        let last: Vec<u8> = (0..step * count).map(|_| random() as u8).collect();
+        let mut now = last.clone();
+        let mut differ = Vec::new();
+        for slot in 0..count {
+            if random() % 9 == 0 {
+                now[slot * step + random() % step] ^= 1 + (random() % 255) as u8;
+                differ.push(1000 + slot as u32);
+            }
+        }
+        let mut out = Vec::new();
+        changed_records(&last, &now, step, 1000, &mut out);
+        assert_eq!(out, differ);
+        out.clear();
+        changed_records(&now, &now, step, 1000, &mut out);
+        assert!(out.is_empty());
+    }
+}
+
+/// With passes of its own (`VICTORY_HEAP_SYNC_EARLY`): none before the
+/// first request; some after it while requests are recent, none of which
+/// answers a request (one made during such a pass, held, waits for a pass
+/// of its own); none once requests have stopped. Without them, no pass
+/// past the requested ones.
+#[test]
+fn passes_of_its_own_run_between_requests_and_answer_none() {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc::channel;
+    let passes = std::sync::Arc::new(AtomicU64::new(0));
+    let (came, come) = channel::<u64>();
+    let (go, gone) = channel::<()>();
+    let gone = std::sync::Mutex::new(gone);
+    let ahead = Ahead::start_with(
+        {
+            let passes = passes.clone();
+            move || {
+                // The second pass, of its own, is held until the test lets
+                // it go on.
+                let n = passes.fetch_add(1, Relaxed) + 1;
+                if n == 2 {
+                    let _ = came.send(n);
+                    let _ = gone.lock().unwrap().recv();
+                }
+            }
+        },
+        Some(Duration::from_millis(2)),
+    )
+    .expect("a helper thread");
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(passes.load(Relaxed), 0, "no pass before a request");
+    let first = ahead.request().expect("a request");
+    assert!(ahead.wait(first));
+    // A pass of its own begins, and is held.
+    assert_eq!(
+        come.recv_timeout(Duration::from_secs(30))
+            .expect("a pass of its own"),
+        2
+    );
+    assert_eq!(ahead.behind(first), 0);
+    let second = ahead.request().expect("a request");
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        ahead.behind(second),
+        1,
+        "a pass of its own answers no request"
+    );
+    go.send(()).unwrap();
+    assert!(ahead.wait(second));
+    assert!(
+        passes.load(Relaxed) >= 3,
+        "the request had a pass of its own"
+    );
+    // More passes of its own while requests are recent.
+    let after = passes.load(Relaxed);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(passes.load(Relaxed) > after, "passes between requests");
+    // None once requests have stopped.
+    std::thread::sleep(super::super::ahead::EARLY_WINDOW + Duration::from_millis(100));
+    let stopped = passes.load(Relaxed);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        passes.load(Relaxed),
+        stopped,
+        "no passes long after a request"
+    );
+    drop(ahead);
+
+    // Without passes of its own: the requested ones alone.
+    let passes = std::sync::Arc::new(AtomicU64::new(0));
+    let ahead = Ahead::start({
+        let passes = passes.clone();
+        move || {
+            passes.fetch_add(1, Relaxed);
+        }
+    })
+    .expect("a helper thread");
+    let first = ahead.request().expect("a request");
+    assert!(ahead.wait(first));
+    let after = passes.load(Relaxed);
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(passes.load(Relaxed), after);
+}
+
+/// With `VICTORY_SAME_RECORDS`, records copied onto the same bytes leave
+/// their page unwritten for the write watch, and records that differ are
+/// copied and mark it, as without the switch (which writes the same bytes
+/// too). In write-watched memory that is no heap: no pass of another test
+/// takes its pages.
+#[test]
+fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch,
+        VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    let page = crate::watch::PAGE;
+    // SAFETY: new memory.
+    let memory = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            2 * page,
+            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+        )
+    };
+    assert!(!memory.is_null());
+    let (src, dst) = (memory as u64, memory as u64 + page as u64);
+    // The kernel pages of `dst`'s page written since the last look.
+    let written = || {
+        let mut found = vec![std::ptr::null_mut::<std::ffi::c_void>(); page / 4096 + 1];
+        let (mut count, mut granularity) = (found.len(), 0u32);
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                1,
+                dst as *const _,
+                page,
+                found.as_mut_ptr(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        assert_eq!(failed, 0);
+        count
+    };
+    // Records 0..8 of both alike, as the title left them.
+    for k in 0..8u64 {
+        // SAFETY: records of the allocation.
+        unsafe {
+            (dst as *mut [u32; 8])
+                .add(k as usize)
+                .write([k as u32 + 1; 8]);
+            (src as *mut [u32; 8])
+                .add(k as usize)
+                .write([k as u32 + 1; 8]);
+        }
+    }
+    // SAFETY: the allocation's own.
+    assert_eq!(unsafe { ResetWriteWatch(memory, 2 * page) }, 0);
+    let _ = written();
+    // (On this thread alone: other tests copy records meanwhile.)
+    descriptor::SAME_RECORDS_HERE.set(Some(true));
+    descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
+    assert_eq!(written(), 0, "the same records: the page is not written");
+    // One record differs: all eight are copied.
+    // SAFETY: a record of the allocation.
+    unsafe { (src as *mut [u32; 8]).add(5).write([99; 8]) };
+    descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
+    assert!(written() > 0, "a record that differs is written");
+    // SAFETY: as above.
+    assert_eq!(unsafe { (dst as *const [u32; 8]).add(5).read() }, [99; 8]);
+    // Without the switch (whatever the environment says) the same bytes
+    // are written, and mark the page.
+    descriptor::SAME_RECORDS_HERE.set(Some(false));
+    let _ = written();
+    descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
+    descriptor::SAME_RECORDS_HERE.set(None);
+    assert!(written() > 0, "without the switch the page is written");
+    // SAFETY: this allocation belongs to the test.
+    unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+}

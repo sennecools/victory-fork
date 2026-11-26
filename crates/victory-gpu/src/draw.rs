@@ -387,8 +387,10 @@ pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`), and the buffer
-/// slots the pass over buffer views looked at; since the last frame line.
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// slots the pass over buffer views looked at, and of those the ones it
+/// left to the draws that read them through tables (`VICTORY_HEAP_PASS_TABLED=1`);
+/// since the last frame line.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1749,15 +1751,19 @@ impl State {
         // too (`won`: it runs the pass).
         let mut lock_wait =
             crate::profile::span_args("heap pass lock wait", &[("heap", host.id())]);
-        let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = kept
-            .get_or_insert_with(Default::default)
-            .entry(host.id())
-            .or_insert_with(|| HeapRanges {
-                last_frame: u64::MAX,
-                passes: 0,
-                ranges: HeapRangeMap::new(),
-            });
+        // The heap's own lock with `VICTORY_HEAP_SWEEP_OWN=1`
+        // (`HostHeap::buffer_sweep`), else the one of every heap's.
+        let mut global = None;
+        let mut own: Option<std::sync::MutexGuard<'_, HeapRanges>> = None;
+        let entry: &mut HeapRanges = if heap_sweep_own() {
+            own.insert(host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            global
+                .insert(HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner()))
+                .get_or_insert_with(Default::default)
+                .entry(host.id())
+                .or_insert_with(HeapRanges::new)
+        };
         let won = entry.last_frame != frame;
         if let Some(wait) = lock_wait.as_mut() {
             wait.arg("won", u64::from(won));
@@ -1773,12 +1779,24 @@ impl State {
         // Slots on C-pool homes let go since are walked as changed.
         host.pool_slots_let_go();
         let changed = host.buffer_changes();
-        let full = (*passes).is_multiple_of(16);
-        let slots = if full {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
+        let plan = pass_slots(*passes, heap_spread());
+        let full = plan == PassSlots::All;
+        let slots = match plan {
+            PassSlots::All => {
+                ranges.clear();
+                host.buffer_slots()
+            }
+            PassSlots::Changed => changed,
+            PassSlots::ChangedAndPart(part) => {
+                // The written ones, and this pass's part of the others.
+                let parts = HEAP_ROUND as u32;
+                forget_part(ranges, part, parts);
+                let mut slots = host.buffer_slots_of(part, parts);
+                slots.extend(changed);
+                slots.sort_unstable();
+                slots.dedup();
+                slots
+            }
         };
         *passes += 1;
         // The walk's parts are timed in sums, not in a span each (some
@@ -1793,61 +1811,102 @@ impl State {
             crate::profile::parts_begin();
         }
         let mut copy_ticks = 0;
+        // Of the jobs on other threads (`VICTORY_HEAP_PASS_THREADS`): the
+        // ticks and the count of the views they made.
+        let mut jobs_made = (0, 0);
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let mut alive =
+            !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            // Its copy and range are taken below from what this returns:
-            // it does not mark the slot for the next pass.
-            let Some(view) = host.mirror_walked(index, handle) else {
-                continue;
-            };
-            #[cfg(test)]
-            WALK_HOOK.with_borrow_mut(|hook| {
-                if let Some(hook) = hook {
-                    hook();
-                }
-            });
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
+        // Slots draws read through tables lately are the draws' to make
+        // (`VICTORY_HEAP_PASS_TABLED=1`).
+        let tabled = heap_pass_tabled().then_some(frame);
+        let threads = heap_pass_threads();
+        if threads > 1 && slots.len() > HEAP_WALK_JOB {
+            let handles: Vec<Option<u64>> = slots.iter().map(|&i| heap.handle(i)).collect();
+            let walked = walk_spread(host, &slots, &handles, threads, tabled, timed, alive);
+            copy_ticks = walked.copy_ticks;
+            jobs_made = (walked.make_ticks, walked.made);
+            if let Some((why, job)) = walked.removed
+                && !GONE.swap(true, Ordering::Relaxed)
             {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
+                let at = job * HEAP_WALK_JOB;
+                let last: Vec<String> = slots[at..slots.len().min(at + HEAP_WALK_JOB)]
                     .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .filter_map(|&i| {
+                        crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
+                    })
                     .map(|s| s.chars().take(200).collect())
                     .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                tracing::error!(
+                    why,
+                    "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                );
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let copy_began = if timed { crate::profile::stamp() } else { 0 };
-            let copy = crate::descriptor::host::buffer_copy(&view);
-            copy_ticks += crate::profile::elapsed(copy_began);
-            let Some((shadow, address, len)) = copy else {
-                continue;
-            };
-            #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            // In slot order of the walk, as one thread leaves them.
+            for (index, found) in walked.found {
+                ranges.remove(&index);
+                if let Some(range) = found {
+                    ranges.insert(index, range);
+                }
             }
-            ranges.insert(index, (shadow, address, address + len));
+        } else {
+            for (n, &index) in slots.iter().enumerate() {
+                ranges.remove(&index);
+                let Some(handle) = heap.handle(index) else {
+                    continue;
+                };
+                if tabled.is_some_and(|frame| host.buffer_slot_tabled_lately(index, frame)) {
+                    HEAP_PASS_PARTS[2].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // Its copy and range are taken below from what this returns:
+                // it does not mark the slot for the next pass.
+                let Some(view) = host.mirror_walked(index, handle) else {
+                    continue;
+                };
+                #[cfg(test)]
+                WALK_HOOK.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                });
+                // Every 64 views while the device lives (a cheap query).
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = slots[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| {
+                            crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
+                        })
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(
+                        why,
+                        slot = index,
+                        "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                    );
+                    crate::host::log_removal_context();
+                }
+                let Some(range) = walked_copy(host, index, &view, timed, &mut copy_ticks) else {
+                    continue;
+                };
+                ranges.insert(index, range);
+            }
         }
         if let Some(walk) = walk.as_mut() {
             let (make_ticks, made) = crate::profile::parts_end();
-            walk.arg("made", made);
-            walk.arg("make_us", crate::profile::micros(make_ticks));
+            walk.arg("made", made + jobs_made.1);
+            walk.arg("make_us", crate::profile::micros(make_ticks + jobs_made.0));
             walk.arg("copy_us", crate::profile::micros(copy_ticks));
+            walk.arg("threads", threads as u64);
         }
         drop(walk);
         // The walk has ended: its last `mirror` is behind it, and what is
@@ -1865,7 +1924,8 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(kept);
+        drop(global);
+        drop(own);
         // Its deferred steps are the pass's (the `run_deferred` span says so).
         list.ran_heap_pass();
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
@@ -2951,6 +3011,9 @@ impl State {
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
+            } else if heap_pass_tabled() {
+                // Not the heap buffer pass's to make for a while.
+                host.buffer_slot_tabled(index);
             }
         }
     }
@@ -3121,6 +3184,19 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // With `VICTORY_HEAP_PASS_TABLED=1` they are such a table's,
+            // whatever they hold: the heap buffer pass leaves them to the
+            // draw. (Of a big one, which may lie over slots shaders pick by
+            // index, only the ones the shader names.)
+            if heap_pass_tabled()
+                && let Some(title) = title_first
+            {
+                for k in (0..n)
+                    .filter(|&k| n <= 64 || entries.iter().any(|u| u.table_offset_dwords / 8 == k))
+                {
+                    host.buffer_slot_tabled(title + k);
+                }
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -4065,10 +4141,24 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 type HeapRangeMap =
     std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
 
-struct HeapRanges {
+/// What the heap buffer pass keeps of a heap: the last frame its buffer
+/// views were looked at, its pass counter, and the host copy and range each
+/// slot's view reads.
+pub(crate) struct HeapRanges {
     last_frame: u64,
     passes: u64,
     ranges: HeapRangeMap,
+}
+
+impl HeapRanges {
+    /// Before the heap's first pass.
+    pub(crate) fn new() -> Self {
+        Self {
+            last_frame: u64::MAX,
+            passes: 0,
+            ranges: HeapRangeMap::new(),
+        }
+    }
 }
 
 /// Per host view heap (keyed by monotonic [`crate::descriptor::host::HostHeap::id`]):
@@ -4096,6 +4186,261 @@ fn heap_claim() -> bool {
 fn heap_wait_at_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WAIT_AT_SUBMIT").is_none_or(|v| v != "0"))
+}
+
+/// Passes after which every buffer slot of the heap was looked at again
+/// by the heap buffer pass, whether no write changed it: a view of a
+/// released resource goes stale without a write, and a slot written before
+/// its memory had a host copy is only made then.
+const HEAP_ROUND: u64 = 16;
+
+/// Whether the heap buffer pass looks again at a part of the slots no
+/// write changed at every pass, each slot at every [`HEAP_ROUND`]th
+/// (`VICTORY_HEAP_SPREAD=1`), instead of at all of them at every
+/// [`HEAP_ROUND`]th pass (off, the default, as before). A slot is looked
+/// at as often either way, and the first pass looks at all of them. Ours
+/// measured 200-720 ms for a whole pass on a thread that records the frame
+/// (`docs/perf-notes/heap-pass.md`); cool_fox measured some 115 ms for one
+/// of 72,000 slots, against 11 ms for the others.
+fn heap_spread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SPREAD").is_some_and(|v| v == "1"))
+}
+
+/// Threads the walk of the heap buffer pass runs on, the one that binds
+/// among them (`VICTORY_HEAP_PASS_THREADS`, 2 to 16, in jobs of
+/// [`HEAP_WALK_JOB`] slots on threads of the pass's own, made for the
+/// walk: not the ones of any other work, so it waits for none). Unset, 0 or
+/// 1, the default: on the thread that binds alone, as before. A walk of
+/// one job or less runs there either way.
+fn heap_pass_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_PASS_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(1, |n| n.clamp(1, 16))
+    })
+}
+
+/// Whether the heap buffer pass leaves the slots draws read through their
+/// tables within the last few frames to those draws
+/// (`VICTORY_HEAP_PASS_TABLED=1`; off, the default: it makes them and
+/// brings up to date the copies they show, as before). Such a draw makes
+/// what its table holds and brings what it reads up to date itself
+/// (`table_entry`, `tables`), so for the title's per-draw tables the pass
+/// did the same work again. With the switch on, the draws mark the buffer
+/// slots of their tables too, not only the texture slots, in marks of the
+/// pass's own: the heap sync and the queue of textures picked by index do
+/// not read them, so a record the title copies into such a slot still
+/// reaches the set of changes, and the pass makes it once no table held
+/// the slot for a few frames
+/// ([`crate::descriptor::host::HostHeap::buffer_slot_tabled`]).
+fn heap_pass_tabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_TABLED").is_some_and(|v| v == "1"))
+}
+
+/// Whether what the heap buffer pass keeps of a heap lies on the heap
+/// under a lock of its own (`VICTORY_HEAP_SWEEP_OWN=1`,
+/// [`crate::descriptor::host::HostHeap::buffer_sweep`]) and goes with it,
+/// instead of in [`HEAP_RANGES`] under one lock for every heap (off, the
+/// default, as before): the passes of two heaps in one frame do not wait
+/// for each other.
+fn heap_sweep_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SWEEP_OWN").is_some_and(|v| v == "1"))
+}
+
+/// Slots of a job of the walk of the heap buffer pass on several threads
+/// ([`heap_pass_threads`]).
+const HEAP_WALK_JOB: usize = 256;
+
+/// Which slots a pass of the heap buffer pass looks at
+/// ([`pass_slots`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassSlots {
+    /// Every slot that holds a buffer view; what was kept is forgotten.
+    All,
+    /// The slots changed since the last pass.
+    Changed,
+    /// Those, and the slots of this part of [`HEAP_ROUND`] parts
+    /// ([`heap_spread`]); what was kept of that part is forgotten.
+    ChangedAndPart(u32),
+}
+
+/// The slots pass number `passes` (from 0) of a heap looks at; `spread`:
+/// [`heap_spread`].
+fn pass_slots(passes: u64, spread: bool) -> PassSlots {
+    if passes == 0 || (!spread && passes.is_multiple_of(HEAP_ROUND)) {
+        PassSlots::All
+    } else if spread {
+        PassSlots::ChangedAndPart((passes % HEAP_ROUND) as u32)
+    } else {
+        PassSlots::Changed
+    }
+}
+
+/// Forgets what `ranges` holds of the slots of part `part` of `parts`
+/// ([`crate::descriptor::host::HostHeap::buffer_slots_of`]).
+fn forget_part<T>(ranges: &mut std::collections::HashMap<u32, T>, part: u32, parts: u32) {
+    ranges.retain(|&slot, _| slot % parts != part);
+}
+
+/// What the walk of the heap buffer pass keeps of a slot: the host copy its
+/// buffer view shows, and the range of it the view reads.
+type HeapRange = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+/// The copy and range the view `view` of title slot `index` shows
+/// (`buffer_copy`, not the one the view's range alone would find), with
+/// the ticks taken added to `copy_ticks` when `timed`.
+fn walked_copy(
+    host: &crate::descriptor::host::HostHeap,
+    index: u32,
+    view: &View,
+    timed: bool,
+    copy_ticks: &mut u64,
+) -> Option<HeapRange> {
+    let copy_began = if timed { crate::profile::stamp() } else { 0 };
+    let copy = crate::descriptor::host::buffer_copy(view);
+    *copy_ticks += crate::profile::elapsed(copy_began);
+    let (shadow, address, len) = copy?;
+    #[cfg(feature = "diagnostics")]
+    if host.shows(index, &shadow.buffer) == Some(false) {
+        HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (host, index);
+    Some((shadow, address, address + len))
+}
+
+/// What the walk on several threads found ([`walk_spread`]).
+struct SpreadWalk {
+    /// Per slot looked at, in the order given: what to keep of it.
+    found: Vec<(u32, Option<HeapRange>)>,
+    /// Ticks of the copies looked up, and of the views made with their
+    /// count (summed by each job's thread while the profile records).
+    copy_ticks: u64,
+    make_ticks: u64,
+    made: u64,
+    /// The device went in this job: why, and the job's number.
+    removed: Option<(String, usize)>,
+}
+
+/// The walk of the heap buffer pass over `slots` (with their records'
+/// `handles`) in jobs of [`HEAP_WALK_JOB`] slots on `threads` threads, this
+/// one among them, as the walk on one thread does it: each slot is
+/// mirrored (`mirror_walked`; slots of different jobs at once, which a
+/// mirror allows from any thread) and its copy looked up; the caller keeps
+/// what was found, in slot order. `tabled`: the frame for
+/// [`heap_pass_tabled`]. `alive`: the device was there; it is asked about
+/// after each job (a cheap query), and the first job after which it went is
+/// named.
+fn walk_spread(
+    host: &crate::descriptor::host::HostHeap,
+    slots: &[u32],
+    handles: &[Option<u64>],
+    threads: usize,
+    tabled: Option<u64>,
+    timed: bool,
+    alive: bool,
+) -> SpreadWalk {
+    let jobs = slots.len().div_ceil(HEAP_WALK_JOB);
+    let found: Vec<std::sync::OnceLock<Vec<(u32, Option<HeapRange>)>>> =
+        (0..jobs).map(|_| std::sync::OnceLock::new()).collect();
+    let ticks = [const { AtomicU64::new(0) }; 3];
+    let removed = std::sync::Mutex::new(None::<(String, usize)>);
+    let gone = std::sync::atomic::AtomicBool::new(!alive);
+    each_on(threads, jobs, "victory-heap-walk", &|job| {
+        let at = job * HEAP_WALK_JOB;
+        let end = slots.len().min(at + HEAP_WALK_JOB);
+        // A span of its own on this thread sums the views it makes.
+        let span = if timed {
+            crate::profile::span_args("heap walk job", &[("slots", (end - at) as u64)])
+        } else {
+            None
+        };
+        if span.is_some() {
+            crate::profile::parts_begin();
+        }
+        let mut copy_ticks = 0;
+        let mut skipped = 0;
+        let looked: Vec<_> = (at..end)
+            .map(|n| {
+                let index = slots[n];
+                let range = handles[n].and_then(|handle| {
+                    if tabled.is_some_and(|frame| host.buffer_slot_tabled_lately(index, frame)) {
+                        skipped += 1;
+                        return None;
+                    }
+                    let view = host.mirror_walked(index, handle)?;
+                    walked_copy(host, index, &view, timed, &mut copy_ticks)
+                });
+                (index, range)
+            })
+            .collect();
+        if span.is_some() {
+            let (make, made) = crate::profile::parts_end();
+            ticks[1].fetch_add(make, Ordering::Relaxed);
+            ticks[2].fetch_add(made, Ordering::Relaxed);
+        }
+        drop(span);
+        ticks[0].fetch_add(copy_ticks, Ordering::Relaxed);
+        if skipped > 0 {
+            HEAP_PASS_PARTS[2].fetch_add(skipped, Ordering::Relaxed);
+        }
+        if !gone.load(Ordering::Relaxed)
+            && let Some(why) = crate::descriptor::host::device_removed()
+            && !gone.swap(true, Ordering::Relaxed)
+        {
+            *removed.lock().unwrap_or_else(|e| e.into_inner()) = Some((why, job));
+        }
+        let _ = found[job].set(looked);
+    });
+    let [copy_ticks, make_ticks, made] = ticks.map(AtomicU64::into_inner);
+    SpreadWalk {
+        found: found
+            .into_iter()
+            .filter_map(std::sync::OnceLock::into_inner)
+            .flatten()
+            .collect(),
+        copy_ticks,
+        make_ticks,
+        made,
+        removed: removed.into_inner().unwrap_or_else(|e| e.into_inner()),
+    }
+}
+
+/// Calls `f` with every number below `count`, on this thread and on up to
+/// `threads - 1` more made for the call, and returns when every call has.
+/// A panic of one call is the caller's once all have ended. With fewer than
+/// two threads or numbers, on this thread alone. The threads are named
+/// `name-1` on. (Also the heap sync's, `VICTORY_HEAP_SYNC_THREADS`.)
+pub(crate) fn each_on(threads: usize, count: usize, name: &str, f: &(dyn Fn(usize) + Sync)) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let run = || {
+        loop {
+            let n = next.fetch_add(1, Ordering::Relaxed);
+            if n >= count {
+                break;
+            }
+            f(n);
+        }
+    };
+    if threads < 2 || count < 2 {
+        run();
+        return;
+    }
+    std::thread::scope(|s| {
+        for i in 1..threads.min(count) {
+            // (A thread that cannot be made is only missed: the others
+            // take its numbers.)
+            let _ = std::thread::Builder::new()
+                .name(format!("{name}-{i}"))
+                .spawn_scoped(s, run);
+        }
+        run();
+    });
 }
 
 #[cfg(test)]
@@ -4446,6 +4791,197 @@ void main() {
             free,
             "the list's slots are given back"
         );
+    }
+
+    /// Without `VICTORY_HEAP_SPREAD` every slot is looked at at every
+    /// [`HEAP_ROUND`]th pass; with it the first pass looks at all, and
+    /// then each of the [`HEAP_ROUND`] parts once a round, in turn.
+    #[test]
+    fn a_spread_pass_looks_at_each_part_once_a_round() {
+        for passes in 0..3 * HEAP_ROUND {
+            let whole = passes % HEAP_ROUND == 0;
+            assert_eq!(
+                pass_slots(passes, false),
+                if whole {
+                    PassSlots::All
+                } else {
+                    PassSlots::Changed
+                },
+                "pass {passes}"
+            );
+        }
+        assert_eq!(pass_slots(0, true), PassSlots::All);
+        for round in 0..3 {
+            let mut parts: Vec<u32> = (1..=HEAP_ROUND)
+                .map(|n| match pass_slots(round * HEAP_ROUND + n, true) {
+                    PassSlots::ChangedAndPart(part) => part,
+                    other => panic!("pass {n} of round {round}: {other:?}"),
+                })
+                .collect();
+            parts.sort_unstable();
+            assert_eq!(parts, (0..HEAP_ROUND as u32).collect::<Vec<_>>());
+        }
+    }
+
+    /// Round by round every slot is looked at again once, whatever was
+    /// written between, and what a slot holds is what was found last.
+    /// (Ported from cool_fox 2aa8134, on our map of ranges.)
+    #[test]
+    fn every_slot_is_looked_at_again_in_a_round() {
+        const SLOTS: u32 = 1000;
+        let mut ranges: std::collections::HashMap<u32, (u64, u64)> = Default::default();
+        for slot in (0..SLOTS).step_by(3) {
+            ranges.insert(slot, (0, 1));
+        }
+        let parts = HEAP_ROUND as u32;
+        for pass in 1..=HEAP_ROUND {
+            let PassSlots::ChangedAndPart(part) = pass_slots(pass, true) else {
+                panic!("pass {pass} is not a part's");
+            };
+            forget_part(&mut ranges, part, parts);
+            for slot in (0..SLOTS).step_by(3).filter(|slot| slot % parts == part) {
+                assert!(!ranges.contains_key(&slot), "slot {slot} not forgotten");
+                ranges.insert(slot, (pass, pass));
+            }
+            assert_eq!(ranges.len(), SLOTS.div_ceil(3) as usize);
+        }
+        assert!(
+            ranges.values().all(|r| r.0 != 0),
+            "a slot not looked at in a round"
+        );
+    }
+
+    /// Every number below the count is called once, on as many threads as
+    /// asked or on this one alone.
+    #[test]
+    fn each_on_calls_every_number_once() {
+        for threads in [0, 1, 2, 4, 16] {
+            for count in [0, 1, 2, 7, 1000] {
+                let calls: Vec<AtomicU64> = (0..count).map(|_| AtomicU64::new(0)).collect();
+                each_on(threads, count, "victory-heap-walk", &|n| {
+                    calls[n].fetch_add(1, Ordering::Relaxed);
+                });
+                assert!(
+                    calls.iter().all(|c| c.load(Ordering::Relaxed) == 1),
+                    "{threads} threads, {count} numbers"
+                );
+            }
+        }
+    }
+
+    /// The walk of the heap buffer pass on several threads
+    /// (`VICTORY_HEAP_PASS_THREADS`) makes and finds for every slot what it
+    /// does on one, in slot order; with `VICTORY_HEAP_PASS_TABLED=1` a slot
+    /// a draw's table held lately is left out, on either.
+    #[test]
+    fn the_walk_on_threads_finds_what_it_finds_on_one() {
+        use crate::descriptor::{HeapDesc, create_heap, heap};
+        use crate::object::{S_OK, This, guid};
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        #[repr(C)]
+        struct Extended(HeapDesc, [u64; 2]);
+        let desc = HeapDesc {
+            kind: 0,
+            count: 2048,
+            flags: 1,
+            nodes: 1,
+        };
+        let iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let extended = Extended(desc, [0; 2]);
+        let mut h: This = std::ptr::null();
+        assert_eq!(
+            create_heap(std::ptr::null(), &extended.0, &iid, &mut h),
+            S_OK
+        );
+        let views = heap(h).host().expect("host view heap");
+        // A title buffer in memory of its own and a view of 64 of its
+        // elements in 1,200 slots (five jobs), as in
+        // `a_bind_that_loses_the_claim_returns_while_the_walk_runs`.
+        const SIZE: usize = 1 << 16;
+        const SLOTS: u32 = 1200;
+        // SAFETY: new memory, left to the process.
+        let memory = unsafe {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(memory, 0);
+        crate::shadow::register(memory, memory as u64, SIZE as u64);
+        let mut record = [0u32; 16];
+        record[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 64, 12, 0, 0]);
+        (record[10], record[11]) = (memory as u32, (memory as u64 >> 32) as u32);
+        for slot in 0..SLOTS {
+            let view = View::Placed(
+                false,
+                [1, 0, 0, 0, SIZE as u32, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+                record,
+            );
+            crate::descriptor::record(heap(h).handle(slot).unwrap(), view);
+        }
+        let slots = views.buffer_slots();
+        assert_eq!(slots, (0..SLOTS).collect::<Vec<_>>());
+        let handles: Vec<Option<u64>> = slots.iter().map(|&i| heap(h).handle(i)).collect();
+        // First on four threads, which make the slots, then on one.
+        let four = walk_spread(views, &slots, &handles, 4, None, false, true);
+        assert!(views.made(0) && views.made(SLOTS - 1), "made by the walk");
+        let one = walk_spread(views, &slots, &handles, 1, None, false, true);
+        assert!(four.removed.is_none() && one.removed.is_none());
+        let same = |a: &SpreadWalk, b: &SpreadWalk| {
+            a.found.len() == b.found.len()
+                && a.found.iter().zip(&b.found).all(|((i, x), (j, y))| {
+                    i == j
+                        && match (x, y) {
+                            (Some(x), Some(y)) => {
+                                std::sync::Arc::ptr_eq(&x.0, &y.0) && (x.1, x.2) == (y.1, y.2)
+                            }
+                            (None, None) => true,
+                            _ => false,
+                        }
+                })
+        };
+        assert!(same(&four, &one), "the same slots, copies and ranges");
+        assert!(
+            four.found.iter().all(|(_, r)| r.is_some()),
+            "every slot shows its copy"
+        );
+        let found: Vec<u32> = four.found.iter().map(|&(i, _)| i).collect();
+        assert_eq!(found, slots, "in slot order");
+        // A slot of a draw's table lately: left to the draw, on both.
+        views.buffer_slot_tabled(700);
+        let frame = crate::frame::current();
+        let tabled =
+            [4, 1].map(|n| walk_spread(views, &slots, &handles, n, Some(frame), false, true));
+        assert!(same(&tabled[0], &tabled[1]));
+        for (index, range) in &tabled[0].found {
+            assert_eq!(range.is_none(), *index == 700, "slot {index}");
+        }
+        // A slot of a table made afresh, then no table for nine frames:
+        // left to the draw at first, then made by the pass.
+        let first = frame + 100;
+        views.buffer_tabled_in(701, first);
+        let walk = |at: u64| walk_spread(views, &slots, &handles, 4, Some(at), false, true);
+        let shown = |w: &SpreadWalk| {
+            w.found
+                .iter()
+                .find(|&&(i, _)| i == 701)
+                .map(|(_, r)| r.is_some())
+        };
+        assert_eq!(shown(&walk(first)), Some(false), "left to the draw");
+        assert_eq!(shown(&walk(first + 9)), Some(true), "made by the pass");
     }
 
     #[test]
