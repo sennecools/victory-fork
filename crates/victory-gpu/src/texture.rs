@@ -196,6 +196,11 @@ pub(crate) struct Staging {
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
+    /// Made by the pass over textures picked by index for one upload
+    /// ([`once`]): filled at the list's submission without asking the write
+    /// watch or the guards, and never looked at again. A draw that samples
+    /// the texture through a table takes it back to the rule of the others.
+    once: std::sync::atomic::AtomicBool,
     /// For such a texture: the levels that were the title's at the last
     /// detiling (a bit a level; the staging buffer holds zeros for the
     /// others), and what that was judged by ([`Staging::judgement`]).
@@ -622,6 +627,27 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let out = f();
     REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     out
+}
+
+/// Whether a staging buffer made for one upload of a texture picked by
+/// index is filled without asking the write watch and the guards
+/// (`VICTORY_TEXTURE_ONCE=1`; off by default: with them, as every other).
+/// What they say is for the next refresh, and there is none: the pass lets
+/// go of the staging state after recording the upload
+/// (`crate::draw`'s pass over textures picked by index). Asking the guards
+/// guards the texture's blocks (a change of protection, under the lock every
+/// other refresh wants), and the title's next write there faults to open
+/// them again.
+fn once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ONCE").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// The thread records the upload of a texture for the pass over
+    /// textures picked by index, which lets go of its staging state at once
+    /// ([`once`]).
+    pub(crate) static PICKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -1153,6 +1179,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
+    if !PICKING.get() {
+        // Sampled through a table: kept and checked from here on.
+        staging.once.store(false, Relaxed);
+    }
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at
@@ -1669,7 +1699,16 @@ impl Staging {
     fn refresh_locked(&self, last: &mut Last) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        // Made for one upload ([`once`]): filled once, from what the memory
+        // holds, and not asked about again.
+        let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
+        if alone && last.hash.is_some() {
+            return 0;
+        }
+        if !alone
+            && let Some((now, written)) =
+                waited(1, || crate::watch::writes(start, start + size, false))
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1696,8 +1735,11 @@ impl Staging {
         // for a while once it found the texture changed ([`guard_skips`]).
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+        if !alone
+            && *GUARD
+                .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+            && let Some((now, written)) =
+                waited(1, || crate::watch::writes(start, start + size, true))
         {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
@@ -2313,6 +2355,7 @@ fn make_staging(
         last_upload: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand,
+        once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get()),
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),

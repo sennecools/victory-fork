@@ -2372,7 +2372,10 @@ impl State {
                 crate::texture::upload_again(resource);
             }
             if let Some(view) = &view {
+                // (Not tabled: the staging state made here goes below.)
+                crate::texture::PICKING.set(!tabled);
                 readable(list, sampled.kind, view);
+                crate::texture::PICKING.set(false);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
