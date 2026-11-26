@@ -743,8 +743,7 @@ fn log_memory() {
         "memory of textures: {} title textures have no host copy yet ({:.0} MB of title memory); \
          host copies the host renders to or writes: {} alive {:.0} MB; host copies the title \
          fills: {} alive {:.0} MB ({} of them placed), {} let go {:.0} MB and {} made again \
-         {:.0} MB since the start; {} host copies made in all; passes that made none for lack of \
-         room: {}; the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
+         {:.0} MB since the start; {} host copies made in all; the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
          shared with it in use",
         census[2],
         mb(census[3]),
@@ -758,7 +757,6 @@ fn log_memory() {
         kinds[4],
         mb(kinds[5]),
         kinds[6],
-        crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),

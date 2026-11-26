@@ -211,6 +211,9 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// For the black census: where the first level held at the last partial
+    /// upload is noted for the texture's views (`Hosted::held_from`).
+    held_from: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// What tells a texture's memory changed (see [`content_hash`]). Kept in
@@ -361,6 +364,7 @@ impl Last {
     /// Do not record their hash as if they had replaced the staging data.
     fn accept_partial(&mut self, bytes: &[u8]) -> bool {
         if bytes.iter().all(|&b| b == 0) {
+            crate::census::GUARD_LOOKS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         self.rehash(content_hash(bytes))
@@ -1802,6 +1806,49 @@ impl Staging {
         held
     }
 
+    /// For the black census: the bytes of the levels `held` (as
+    /// [`Staging::held_levels`] gives them) lacks, by the same ranges: each
+    /// level's own, and the share of the first block the smallest levels
+    /// have together. 0 for a texture whose levels it cannot tell.
+    fn missing_bytes(&self, held: u32) -> u64 {
+        let mips = &self.layout.mips;
+        if held == u32::MAX || self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
+            return 0;
+        }
+        let tail = (self.layout.first_tail_mip as usize).min(mips.len());
+        let mut missing = 0;
+        for (level, m) in mips.iter().enumerate().take(tail) {
+            if held & (1 << level) == 0 {
+                let end = if level == 0 {
+                    self.layout.slice_size
+                } else {
+                    mips[level - 1].offset
+                };
+                missing += end.saturating_sub(m.offset);
+            }
+        }
+        // The tail's levels are held together: all or none.
+        if tail < mips.len() && held & (1 << tail) == 0 {
+            missing += self.layout.alignment.min(self.layout.slice_size);
+        }
+        missing
+    }
+
+    /// For the black census: the lowest level from which all the levels to
+    /// the end of the chain are in `held` (the number of levels if the last
+    /// is not); 0 if all are, or the levels cannot be told.
+    fn first_held(&self, held: u32) -> u32 {
+        let levels = self.layout.mips.len();
+        if held == u32::MAX || self.layout.slices != 1 || levels == 0 || levels > 32 {
+            return 0;
+        }
+        let mut first = levels;
+        while first > 0 && held & (1 << (first - 1)) != 0 {
+            first -= 1;
+        }
+        first as u32
+    }
+
     /// The host copy `copy` holds what the staging buffer was filled from
     /// ([`unchanged`]): called after the check at a submission whose list
     /// copies the staging buffer into it.
@@ -1899,6 +1946,7 @@ impl Staging {
 
     /// [`Staging::refresh_timed`] with the texture's lock held.
     fn refresh_locked(&self, last: &mut Last) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         // Made for one upload ([`once`]): filled once, from what the memory
@@ -1940,6 +1988,9 @@ impl Staging {
         // for a while once it found the texture changed ([`guard_skips`]).
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Whether the guard was asked and let the texture through (counted
+        // when a hash then finds it changed: the black census).
+        let mut guarded = false;
         if !alone
             && *GUARD
                 .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
@@ -1949,7 +2000,9 @@ impl Staging {
         {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
+            guarded = true;
             if guard_skips(unwritten, crate::frame::current(), start, last.changed) {
+                crate::census::GUARD_LOOKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return 0;
             }
         }
@@ -1980,6 +2033,7 @@ impl Staging {
             // unprotectable sparse blocks even without an actual write.
             let frame = crate::frame::current();
             if !last.partial_due(frame) {
+                crate::census::GUARD_LOOKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return 0;
             }
             last.partial = Some(frame);
@@ -1987,8 +2041,23 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                // For the black census, which levels have pages (only
+                // committed pages are asked: no lock, no judgement of
+                // views). Every level goes up, as `detile` is given no
+                // mask, so the ones without pages go up as zeros.
+                let held = if self.on_demand {
+                    u32::MAX
+                } else {
+                    self.held_levels([0, u64::MAX])
+                };
+                self.held_from.store(self.first_held(held), Relaxed);
                 if !last.accept_partial(read) {
                     return false;
+                }
+                let missing = self.missing_bytes(held);
+                if missing > 0 {
+                    crate::census::ZERO_LEVELS[0].fetch_add(1, Relaxed);
+                    crate::census::ZERO_LEVELS[1].fetch_add(missing, Relaxed);
                 }
                 self.detile(read);
                 true
@@ -2002,6 +2071,9 @@ impl Staging {
         }
         // Fully mapped again: a later partial mapping starts a new poll.
         last.partial = None;
+        if self.held_from.load(Relaxed) != 0 {
+            self.held_from.store(0, Relaxed);
+        }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = content_hash(tiled);
@@ -2024,6 +2096,9 @@ impl Staging {
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if !last.rehash(hash) {
             return size;
+        }
+        if guarded {
+            crate::census::GUARD_LOOKS[1].fetch_add(1, Relaxed);
         }
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
@@ -2519,6 +2594,20 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// Counts, for the black census, a texture whose contents are not uploaded
+/// (`why`: 0 no layout for the dimension, 1 for the swizzle word, 2 for
+/// the format, 3 an XOR mode) of `bytes` of title memory. Once for each
+/// resource, though the staging state is asked for again at every use: a
+/// one-shot flag on the resource (`first_refusal`), no lock.
+fn note_upload_refused(resource: This, bytes: u64, why: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::resource::first_refusal(resource) {
+        return;
+    }
+    crate::census::UPLOAD_REFUSED[why * 2].fetch_add(1, Relaxed);
+    crate::census::UPLOAD_REFUSED[why * 2 + 1].fetch_add(bytes, Relaxed);
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // Asked before the table is locked: the sweep lets go of a staging
@@ -2530,22 +2619,47 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
-    else {
-        once!(
-            ?desc,
-            "texture contents without a console layout not uploaded"
-        );
-        return None;
+    let console = match crate::resource::layout_of(&desc) {
+        Ok(console) => console,
+        Err(refusal) => {
+            once!(
+                ?desc,
+                "texture contents without a console layout not uploaded"
+            );
+            use crate::resource::LayoutRefusal::{Dimension, Swizzle};
+            let why = match refusal {
+                Dimension => 0,
+                Swizzle => 1,
+                _ => 2,
+            };
+            note_upload_refused(resource, crate::resource::footprint_bytes(&desc), why);
+            return None;
+        }
     };
+    // Only plane 0 is uploaded (the stencil plane after a depth plane is
+    // not): counted once, with the staging state made below.
+    let left = console
+        .planes
+        .iter()
+        .skip(1)
+        .map(|p| p.layout.size)
+        .sum::<u64>();
+    let layout = console.planes[0].layout.clone();
     if layout.desc.swizzle.xor() {
         once!(?desc, "texture contents in an XOR mode not uploaded");
+        note_upload_refused(resource, console.size, 3);
         return None;
     }
-    let s = Arc::new(make_staging(memory, layout, texture, on_demand, transient(), || {
+    let mut made = make_staging(memory, layout, texture, on_demand, transient(), || {
         format!("staging of {resource:?}")
-    })?);
+    })?;
+    made.held_from = crate::resource::held_from_cell(resource);
+    let s = Arc::new(made);
     tracing::debug!(?desc, total = s.bytes, "texture contents uploaded from title memory");
+    if left > 0 && crate::resource::first_planes(resource) {
+        crate::census::PLANES_LEFT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::census::PLANES_LEFT[1].fetch_add(left, std::sync::atomic::Ordering::Relaxed);
+    }
     map.insert(resource as usize, s.clone());
     Some(s)
 }
@@ -2628,6 +2742,7 @@ fn make_staging(
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        held_from: Arc::default(),
     })
 }
 
@@ -2754,6 +2869,7 @@ mod title_memory_tests {
 
     #[test]
     fn skipped_zero_partial_read_does_not_replace_staged_hash() {
+        let _census = crate::census::lock_tests();
         let mut last = Last::default();
         let data = [0x51; 64];
         let zero = [0; 64];
@@ -3548,6 +3664,7 @@ pub(crate) mod staging_warp_tests {
     /// be read again the buffer is filled and copied.
     #[test]
     fn warp_transient_staging_keeps_an_uploaded_texture_when_its_memory_cannot_be_read() {
+        let _census = crate::census::lock_tests();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -3650,5 +3767,364 @@ pub(crate) mod staging_warp_tests {
         assert_eq!(pass(), (expected, true), "left to the next list, the slot kept due");
         assert!(!staging.fresh.load(Relaxed) && staging.dirty.load(Relaxed), "filled by the check");
         assert_eq!(pass(), (changed, false), "the new bytes arrive");
+    }
+}
+
+/// The black census at the texture refresh: the levels a partly mapped
+/// upload lacks, the first level held, and the guards' counters
+/// (`VICTORY_D3D12_WARP=1`, diagnostics builds).
+#[cfg(all(test, feature = "diagnostics"))]
+mod census_warp_tests {
+    use super::{Arc, Staging, make_staging};
+    use crate::census::{GUARD_LOOKS, ZERO_LEVELS};
+    use crate::host::host;
+    use crate::object::This;
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
+    };
+
+    const PAGE: usize = 4096;
+    const LEVELS: u32 = 5;
+
+    /// A 256 by 256 texture of 5 levels in format 28 in the console's
+    /// linear layout, in title memory that is not write-watched (so the
+    /// refresh finds it partly mapped by its pages, as view memory is).
+    struct Partly {
+        base: *mut u8,
+        len: usize,
+        layout: victory_formats::texture::Layout,
+        staging: Arc<Staging>,
+    }
+
+    impl Partly {
+        fn new() -> Partly {
+            let host = host().expect("a WARP host device (VICTORY_D3D12_WARP=1)");
+            let words: [u32; 14] = [
+                3,
+                0,
+                0,
+                0,
+                256,
+                0,
+                256,
+                LEVELS << 16 | 1,
+                28,
+                1,
+                0,
+                256,
+                0,
+                0,
+            ];
+            // SAFETY: fourteen words are a resource description (plain numbers).
+            let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+            let layout = crate::resource::texture_layout(&desc)
+                .expect("a console layout")
+                .planes[0]
+                .layout
+                .clone();
+            assert_eq!(layout.mips.len(), LEVELS as usize);
+            let len = (layout.size as usize).next_multiple_of(PAGE);
+            // SAFETY: a new committed allocation the test owns.
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    len,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            }
+            .cast::<u8>();
+            assert!(!base.is_null());
+            // SAFETY: the committed allocation.
+            unsafe { std::ptr::write_bytes(base, 0x5a, len) };
+            let host_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: LEVELS as u16,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a texture.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &host_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            let staging = make_staging(
+                base,
+                layout.clone(),
+                &texture.unwrap(),
+                false,
+                false,
+                || "census staging".into(),
+            )
+            .expect("a staging state");
+            Partly {
+                base,
+                len,
+                layout,
+                staging: Arc::new(staging),
+            }
+        }
+
+        /// Takes the pages from `offset` (rounded up to a page) on away.
+        fn unmap_from(&self, offset: usize) {
+            let from = offset.next_multiple_of(PAGE);
+            // SAFETY: pages of the test's own allocation.
+            unsafe {
+                assert_ne!(
+                    VirtualFree(self.base.add(from).cast(), self.len - from, MEM_DECOMMIT),
+                    0
+                );
+            }
+        }
+
+        /// All the memory mapped again.
+        fn map_all(&self) {
+            // SAFETY: the test's own allocation, committed again where it was not.
+            let again =
+                unsafe { VirtualAlloc(self.base.cast(), self.len, MEM_COMMIT, PAGE_READWRITE) };
+            assert!(!again.is_null());
+        }
+    }
+
+    impl Drop for Partly {
+        fn drop(&mut self) {
+            // SAFETY: the allocation `new` made.
+            unsafe { VirtualFree(self.base.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    /// The bytes of the levels a mask lacks and the first level from which
+    /// all are held, for the layout of the fixture.
+    #[test]
+    fn warp_missing_bytes_and_the_first_held_level() {
+        let p = Partly::new();
+        let (s, l) = (&p.staging, &p.layout);
+        let level = |i: usize| {
+            (if i == 0 {
+                l.slice_size
+            } else {
+                l.mips[i - 1].offset
+            }) - l.mips[i].offset
+        };
+        let all: u32 = (1 << LEVELS) - 1;
+        assert_eq!(
+            s.missing_bytes(u32::MAX),
+            0,
+            "levels it cannot tell are all held"
+        );
+        assert_eq!(s.missing_bytes(all), 0);
+        assert_eq!(s.missing_bytes(all & !1), level(0));
+        assert_eq!(s.missing_bytes(all & !0b101), level(0) + level(2));
+        assert_eq!(
+            s.missing_bytes(0),
+            (0..LEVELS as usize).map(level).sum::<u64>()
+        );
+        assert_eq!(s.first_held(u32::MAX), 0);
+        assert_eq!(s.first_held(all), 0);
+        assert_eq!(s.first_held(all & !1), 1);
+        assert_eq!(
+            s.first_held(0b10111),
+            4,
+            "held to the end only from level 4 on"
+        );
+        assert_eq!(s.first_held(0b01111), LEVELS, "the last level is not held");
+        assert_eq!(s.first_held(0), LEVELS);
+    }
+
+    /// A partly mapped texture whose first level has no pages goes up with
+    /// that level's zeros: the census counts the upload and the bytes. It
+    /// notes the first level held for its views; the next poll is passed
+    /// over (30 frames apart), and once all is mapped the note is gone.
+    #[test]
+    fn warp_a_partly_mapped_upload_counts_its_zero_levels() {
+        let _census = crate::census::lock_tests();
+        let p = Partly::new();
+        p.unmap_from(p.layout.mips[0].offset as usize);
+        assert_eq!(p.staging.held_from.load(Relaxed), 0);
+        let (zero, skipped) = (
+            [ZERO_LEVELS[0].load(Relaxed), ZERO_LEVELS[1].load(Relaxed)],
+            GUARD_LOOKS[2].load(Relaxed),
+        );
+        p.staging.refresh();
+        assert_eq!(
+            ZERO_LEVELS[0].load(Relaxed) - zero[0],
+            1,
+            "one upload with a level missing"
+        );
+        assert_eq!(
+            ZERO_LEVELS[1].load(Relaxed) - zero[1],
+            p.layout.slice_size - p.layout.mips[0].offset,
+            "the bytes of level 0"
+        );
+        assert_eq!(p.staging.held_from.load(Relaxed), 1);
+        // Polled again at once: passed over, nothing more counted.
+        p.staging.refresh();
+        assert_eq!(GUARD_LOOKS[2].load(Relaxed) - skipped, 1);
+        assert_eq!(ZERO_LEVELS[0].load(Relaxed) - zero[0], 1);
+        // Everything mapped: the levels are all held again.
+        p.map_all();
+        p.staging.refresh();
+        assert_eq!(p.staging.held_from.load(Relaxed), 0);
+        assert_eq!(ZERO_LEVELS[0].load(Relaxed) - zero[0], 1);
+    }
+
+    /// A partial read that is all zero is not uploaded and is counted so;
+    /// it still notes which levels have pages.
+    #[test]
+    fn warp_an_all_zero_partial_read_is_counted_and_not_uploaded() {
+        let _census = crate::census::lock_tests();
+        let p = Partly::new();
+        // SAFETY: the committed allocation.
+        unsafe { std::ptr::write_bytes(p.base, 0, p.len) };
+        p.unmap_from(p.layout.mips[0].offset as usize);
+        let (zero, rejected) = (ZERO_LEVELS[0].load(Relaxed), GUARD_LOOKS[3].load(Relaxed));
+        p.staging.refresh();
+        assert_eq!(GUARD_LOOKS[3].load(Relaxed) - rejected, 1);
+        assert_eq!(ZERO_LEVELS[0].load(Relaxed), zero, "nothing was uploaded");
+        assert_eq!(p.staging.held_from.load(Relaxed), 1);
+    }
+
+    /// A title texture of 16 by 16 texels in `format` with console layout
+    /// word `layout`, and a host texture to give its staging state.
+    fn title(format: i32, layout: i32) -> (This, ID3D12Resource) {
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT(layout),
+            ..Default::default()
+        };
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut resource: This = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                (&raw const props).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut resource,
+            ),
+            crate::object::S_OK
+        );
+        let host = host().expect("a WARP host device (VICTORY_D3D12_WARP=1)");
+        let host_desc = D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ..desc
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a texture.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &host_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut texture,
+                )
+                .unwrap();
+        }
+        (resource, texture.unwrap())
+    }
+
+    /// Textures whose contents are never uploaded are counted once each, by
+    /// the reason (no format, no swizzle word, an XOR mode) with their
+    /// bytes, though the staging state is asked for at every use.
+    #[test]
+    fn warp_textures_never_uploaded_are_counted_once_by_reason() {
+        let _census = crate::census::lock_tests();
+        use crate::census::UPLOAD_REFUSED;
+        let counts = || std::array::from_fn::<u64, 8, _>(|i| UPLOAD_REFUSED[i].load(Relaxed));
+        // (format, layout word, the reason's index): format 5 has no layout
+        // here, 0x2000 is no swizzle word, 0x100 | 26 is an XOR mode.
+        for (format, layout, why) in [(5, 0, 2usize), (28, 0x2000, 1), (28, 0x100 | 26, 3)] {
+            let (resource, host_texture) = title(format, layout);
+            let before = counts();
+            assert!(super::staging(resource, &host_texture).is_none());
+            let after = counts();
+            // (At least: other tests stage textures too. That it is counted
+            // once for the resource is asked of the resource's own flag.)
+            assert!(after[why * 2] > before[why * 2], "reason {why} counted");
+            assert!(after[why * 2 + 1] > before[why * 2 + 1], "its bytes");
+            assert!(
+                !crate::resource::first_refusal(resource),
+                "noted on the resource"
+            );
+            assert!(super::staging(resource, &host_texture).is_none());
+        }
+    }
+
+    /// A depth texture with a stencil plane uploads plane 0 only: counted
+    /// with the bytes of the planes after it, once with its staging state.
+    #[test]
+    fn warp_a_texture_with_a_stencil_plane_is_counted() {
+        let _census = crate::census::lock_tests();
+        use crate::census::PLANES_LEFT;
+        let (resource, host_texture) = title(45, 0);
+        let before = [PLANES_LEFT[0].load(Relaxed), PLANES_LEFT[1].load(Relaxed)];
+        let staging = super::staging(resource, &host_texture).expect("a staging state");
+        let again = super::staging(resource, &host_texture).expect("the same state");
+        assert!(Arc::ptr_eq(&staging, &again));
+        super::unstage(resource);
+        // (At least: other tests stage depth textures too; once for the
+        // resource is asked of its flag.)
+        assert!(PLANES_LEFT[0].load(Relaxed) > before[0]);
+        assert!(
+            PLANES_LEFT[1].load(Relaxed) > before[1],
+            "the stencil plane's bytes"
+        );
+        // Let go and made again (the sweep does that): not counted again.
+        assert!(
+            !crate::resource::first_planes(resource),
+            "noted on the resource"
+        );
+        let _ = super::staging(resource, &host_texture).expect("a new staging state");
+        super::unstage(resource);
+        assert!(!crate::resource::first_planes(resource), "still noted");
     }
 }
