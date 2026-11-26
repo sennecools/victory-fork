@@ -545,6 +545,33 @@ mod d3d {
         Some((owned, memory.0, piece.start, data))
     }
 
+    /// Tests: whether the staging pool holds `buffer` as one of its blocks,
+    /// and whether the piece at `start` in it has been given back (resting
+    /// or free again: no longer any holder's).
+    #[cfg(test)]
+    pub(crate) fn staging_piece(buffer: &ID3D12Resource, start: u64) -> (bool, bool) {
+        let pool = lock(&STAGING);
+        let Some(i) = pool
+            .blocks
+            .iter()
+            .position(|b| b.as_ref().is_some_and(|b| b.memory.0 == *buffer))
+        else {
+            return (false, false);
+        };
+        let given = pool
+            .resting
+            .iter()
+            .any(|&(_, p)| p.block == i && p.start == start)
+            || pool.blocks[i].as_ref().is_some_and(|b| {
+                b.free
+                    .0
+                    .range(..=start)
+                    .next_back()
+                    .is_some_and(|(&at, &len)| start < at + len)
+            });
+        (true, given)
+    }
+
     /// An object the host texture holds and releases when it goes: its
     /// piece is free then.
     #[repr(C)]

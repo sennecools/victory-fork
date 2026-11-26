@@ -3207,12 +3207,27 @@ pub(crate) mod staging_warp_tests {
     /// state (`unstage`, as the pass over textures picked by index does
     /// after every upload), and the last holder lets go while a submission
     /// is still on the card. The buffer must outlive that submission.
+    ///
+    /// With the staging half of `VICTORY_TEXTURE_POOL` on, the buffer is a
+    /// block of the pool, which holds a reference of its own to it for as
+    /// long as it keeps the block, and the staging state's part of it is a
+    /// piece: then the piece must not be given back to the pool (where the
+    /// next texture's staging would take and write it) before that
+    /// submission has finished.
     #[test]
     fn warp_a_staging_buffer_let_go_during_a_submission_outlives_it() {
         let f = Fixture::new();
         let host = host().unwrap();
         let staging = f.staging(false);
         let buffer = buffer_of(&staging).expect("a staging buffer");
+        let piece = (staging.buf.lock().unwrap().as_ref())
+            .and_then(|b| b.piece.is_some().then_some(b.base));
+        let pooled = crate::texture_pool::staging_on();
+        assert_eq!(piece.is_some(), pooled, "pooled exactly with the switch");
+        // The pool's own reference to its block, if the buffer is one.
+        let pool = u32::from(piece.is_some());
+        let given = || piece.map(|at| crate::texture_pool::staging_piece(&buffer, at));
+        assert_eq!(given(), piece.map(|_| (true, false)), "the piece is the staging state's");
         let list = host.new_list().unwrap();
         assert_eq!(staging.record_copies(&list, &f.texture, key()), Recorded::Copies);
         list.defer_texture(staging.clone(), true);
@@ -3222,16 +3237,22 @@ pub(crate) mod staging_warp_tests {
             .get_or_insert_with(Default::default)
             .insert(key() as usize, staging);
         super::unstage(key());
-        // The list holds the staging state alone now, and ours is the only
-        // other reference to the buffer.
-        assert_eq!(references(&buffer), 2);
+        // The list holds the staging state alone now, and ours (and the
+        // pool's) is the only other reference to the buffer.
+        assert_eq!(references(&buffer), 2 + pool);
         list.close();
         let running = crate::host::Running::start();
         // The holder lets go while the submission runs.
         list.reset();
-        assert_eq!(references(&buffer), 2, "the buffer waits for the submission running when it was let go");
+        assert_eq!(
+            references(&buffer),
+            2 + pool,
+            "the buffer waits for the submission running when it was let go"
+        );
+        assert_eq!(given(), piece.map(|_| (true, false)), "and so does its piece");
         drop(running);
-        assert_eq!(references(&buffer), 1, "and goes once that submission has finished");
+        assert_eq!(references(&buffer), 1 + pool, "and goes once that submission has finished");
+        assert_eq!(given(), piece.map(|_| (true, true)), "its piece back in the pool");
     }
 
     /// Transient staging buffers: given for the copy a list records, filled
