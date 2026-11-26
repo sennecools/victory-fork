@@ -83,7 +83,9 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
-    fn bit(&mut self) -> Option<u32> {
+    /// At a packet boundary, moves past the other streams' packets and the
+    /// next packet's header; elsewhere does nothing.
+    fn enter_packet(&mut self) -> Option<()> {
         if self.pos.is_multiple_of(PACKET_BITS) {
             // Leaving a packet: jump over the other streams' packets.
             let previous = self.pos / PACKET_BITS;
@@ -93,6 +95,11 @@ impl Cursor<'_> {
             }
             self.pos += HEADER_BITS;
         }
+        Some(())
+    }
+
+    fn bit(&mut self) -> Option<u32> {
+        self.enter_packet()?;
         let byte = *self.data.get(self.pos / 8)?;
         let bit = (byte >> (7 - self.pos % 8)) & 1;
         self.pos += 1;
@@ -104,27 +111,79 @@ impl Cursor<'_> {
     }
 }
 
+/// Where a frame read by [`read_frame_into`] lies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSpan {
+    pub bits: usize,
+    /// Bit offset in the buffer where it starts, and where the next frame
+    /// starts (`None` when the buffer has no further frame).
+    pub start: usize,
+    pub next: Option<usize>,
+}
+
+/// The most bytes a frame can take: its 15-bit length counts bits.
+pub const MAX_FRAME_BYTES: usize = (1 << LENGTH_BITS) / 8;
+
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
 /// payload) of `data`, a buffer of whole packets of one stream.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
-    let mut cursor = Cursor { data, pos: start };
-    let bits = cursor.bits(LENGTH_BITS)? as usize;
+    let mut out = Vec::new();
+    let span = read_frame_into(data, start, &mut out)?;
+    Some(Frame {
+        data: out,
+        bits: span.bits,
+        start: span.start,
+        next: span.next,
+    })
+}
+
+/// [`read_frame`] into a buffer the caller keeps, so a decoder reading
+/// frame after frame allocates nothing once the buffer has grown to
+/// [`MAX_FRAME_BYTES`]. `out` holds the frame's bits afterwards, MSB first.
+pub fn read_frame_into(data: &[u8], start: usize, out: &mut Vec<u8>) -> Option<FrameSpan> {
+    let bits = Cursor { data, pos: start }.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
         return None;
     }
-    let mut out = vec![0u8; bits.div_ceil(8)];
+    out.clear();
+    out.resize(bits.div_ceil(8), 0);
+    // The bits run on inside a packet and jump only at its end, so they are
+    // copied a packet's run at a time, a byte at a time.
     let mut cursor = Cursor { data, pos: start };
-    for i in 0..bits {
-        out[i / 8] |= (cursor.bit()? as u8) << (7 - i % 8);
+    let mut done = 0;
+    while done < bits {
+        cursor.enter_packet()?;
+        let run = (bits - done).min(PACKET_BITS - cursor.pos % PACKET_BITS);
+        if (cursor.pos + run - 1) / 8 >= data.len() {
+            return None;
+        }
+        copy_bits(data, cursor.pos, out, done, run);
+        cursor.pos += run;
+        done += run;
     }
-    let end = cursor.pos;
-    let next = next_frame(data, start, end);
-    Some(Frame {
-        data: out,
-        bits,
-        start,
-        next,
-    })
+    let next = next_frame(data, start, cursor.pos);
+    Some(FrameSpan { bits, start, next })
+}
+
+/// ORs `count` bits of `src` from bit `from` into `dst` from bit `to`, MSB
+/// first. The source bits must lie inside `src`; `dst` must have room.
+fn copy_bits(src: &[u8], mut from: usize, dst: &mut [u8], mut to: usize, mut count: usize) {
+    while count > 0 {
+        let n = count.min(8);
+        let at = from / 8;
+        let pair = (src[at] as u16) << 8 | *src.get(at + 1).unwrap_or(&0) as u16;
+        let byte = ((pair << (from % 8)) >> 8) as u8 & (0xff << (8 - n));
+        let (d, shift) = (to / 8, to % 8);
+        dst[d] |= byte >> shift;
+        if shift != 0
+            && let Some(next) = dst.get_mut(d + 1)
+        {
+            *next |= byte << (8 - shift);
+        }
+        from += n;
+        to += n;
+        count -= n;
+    }
 }
 
 /// Where the frame after the one at `start`..`end` begins: right after it,
@@ -282,38 +341,78 @@ fn log2(v: usize) -> u32 {
 /// Half-length inverse MDCT as FFmpeg defines it (`av_tx` MDCT, inverse):
 /// `n` coefficients to the middle `n` samples of the 2n-sample window,
 /// negated and scaled by `scale`. Computed as a DCT-IV through an
-/// n/2-point complex FFT.
+/// n/2-point complex FFT, in f32 with the twiddle factors from tables.
+/// `n` is 128, 256 or 512.
 fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let n = input.len();
     let m = n / 2;
-    let mut re = vec![0f64; m];
-    let mut im = vec![0f64; m];
+    let t = imdct_tables(n);
+    let mut re = [0f32; FRAME_SAMPLES / 2];
+    let mut im = [0f32; FRAME_SAMPLES / 2];
+    let (re, im) = (&mut re[..m], &mut im[..m]);
     for k in 0..m {
-        let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
-        let (s, c) = (-std::f64::consts::PI * k as f64 / n as f64).sin_cos();
+        let (a, b) = (input[2 * k], input[n - 1 - 2 * k]);
+        let (s, c) = t.pre[k];
         (re[k], im[k]) = (a * c - b * s, a * s + b * c);
     }
-    fft(&mut re, &mut im);
+    fft(re, im, t);
     for k in 0..m {
-        let (s, c) = (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos();
+        let (s, c) = t.post[k];
         let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
         // DCT-IV: c[2k] = Re, c[n-1-2k] = -Im; output j is c[n-1-j].
-        out[n - 1 - 2 * k] = (wr as f32) * scale;
-        out[2 * k] = -(wi as f32) * scale;
+        out[n - 1 - 2 * k] = wr * scale;
+        out[2 * k] = -wi * scale;
     }
 }
 
-/// In-place radix-2 forward DFT (`exp(-2πi nk/N)`).
-fn fft(re: &mut [f64], im: &mut [f64]) {
-    let n = re.len();
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
+/// The twiddle factors of one transform size as `(sin, cos)` pairs, worked
+/// out in f64 once and kept as f32.
+struct ImdctTables {
+    /// `exp(-iπk/n)` for k < n/2, before the FFT.
+    pre: Box<[(f32, f32)]>,
+    /// `exp(-iπ(4k+1)/4n)` for k < n/2, after it.
+    post: Box<[(f32, f32)]>,
+    /// `exp(-2πij/m)` for j < m/2, with m = n/2: the FFT's roots of unity.
+    roots: Box<[(f32, f32)]>,
+    /// The FFT's bit-reversal permutation of 0..m.
+    bitrev: Box<[u16]>,
+}
+
+impl ImdctTables {
+    fn new(n: usize) -> ImdctTables {
+        use std::f64::consts::PI;
+        let m = n / 2;
+        let sin_cos = |angle: f64| {
+            let (s, c) = angle.sin_cos();
+            (s as f32, c as f32)
+        };
+        let bits = log2(m);
+        ImdctTables {
+            pre: (0..m).map(|k| sin_cos(-PI * k as f64 / n as f64)).collect(),
+            post: (0..m)
+                .map(|k| sin_cos(-PI * (4 * k + 1) as f64 / (4 * n) as f64))
+                .collect(),
+            roots: (0..m / 2)
+                .map(|j| sin_cos(-2.0 * PI * j as f64 / m as f64))
+                .collect(),
+            bitrev: (0..m)
+                .map(|i| (i.reverse_bits() >> (usize::BITS - bits)) as u16)
+                .collect(),
         }
-        j |= bit;
+    }
+}
+
+/// The tables for transforms of 128, 256 and 512 coefficients.
+fn imdct_tables(n: usize) -> &'static ImdctTables {
+    static TABLES: OnceLock<[ImdctTables; 3]> = OnceLock::new();
+    &TABLES.get_or_init(|| [128, 256, 512].map(ImdctTables::new))[log2(n) as usize - 7]
+}
+
+/// In-place radix-2 forward DFT (`exp(-2πi nk/N)`) of `t`'s size.
+fn fft(re: &mut [f32], im: &mut [f32], t: &ImdctTables) {
+    let n = re.len();
+    for i in 0..n {
+        let j = t.bitrev[i] as usize;
         if i < j {
             re.swap(i, j);
             im.swap(i, j);
@@ -321,15 +420,14 @@ fn fft(re: &mut [f64], im: &mut [f64]) {
     }
     let mut len = 2;
     while len <= n {
-        let (ws, wc) = (-2.0 * std::f64::consts::PI / len as f64).sin_cos();
+        let (half, stride) = (len / 2, n / len);
         for start in (0..n).step_by(len) {
-            let (mut cr, mut ci) = (1.0, 0.0);
-            for k in 0..len / 2 {
-                let (a, b) = (start + k, start + k + len / 2);
-                let (tr, ti) = (re[b] * cr - im[b] * ci, re[b] * ci + im[b] * cr);
+            for k in 0..half {
+                let (s, c) = t.roots[k * stride];
+                let (a, b) = (start + k, start + k + half);
+                let (tr, ti) = (re[b] * c - im[b] * s, re[b] * s + im[b] * c);
                 (re[b], im[b]) = (re[a] - tr, im[a] - ti);
                 (re[a], im[a]) = (re[a] + tr, im[a] + ti);
-                (cr, ci) = (cr * wc - ci * ws, cr * ws + ci * wc);
             }
         }
         len <<= 1;
@@ -1076,6 +1174,160 @@ mod tests {
         }
     }
 
+    /// The transform as it was before the tables: f64 throughout, with the
+    /// twiddle factors worked out per coefficient.
+    fn imdct_half_f64(input: &[f32], out: &mut [f64], scale: f64) {
+        use std::f64::consts::PI;
+        let n = input.len();
+        let m = n / 2;
+        let mut re = vec![0f64; m];
+        let mut im = vec![0f64; m];
+        for k in 0..m {
+            let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
+            let (s, c) = (-PI * k as f64 / n as f64).sin_cos();
+            (re[k], im[k]) = (a * c - b * s, a * s + b * c);
+        }
+        let mut j = 0;
+        for i in 1..m {
+            let mut bit = m >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                re.swap(i, j);
+                im.swap(i, j);
+            }
+        }
+        let mut len = 2;
+        while len <= m {
+            for start in (0..m).step_by(len) {
+                for k in 0..len / 2 {
+                    let (s, c) = (-2.0 * PI * k as f64 / len as f64).sin_cos();
+                    let (a, b) = (start + k, start + k + len / 2);
+                    let (tr, ti) = (re[b] * c - im[b] * s, re[b] * s + im[b] * c);
+                    (re[b], im[b]) = (re[a] - tr, im[a] - ti);
+                    (re[a], im[a]) = (re[a] + tr, im[a] + ti);
+                }
+            }
+            len <<= 1;
+        }
+        for k in 0..m {
+            let (s, c) = (-PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos();
+            let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
+            out[n - 1 - 2 * k] = wr * scale;
+            out[2 * k] = -wi * scale;
+        }
+    }
+
+    /// A small xorshift generator, so the random tests repeat.
+    fn random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The f32 transform against the f64 one at the decoder's own scale:
+    /// coefficients up to about 3e4, output in [-1, 1]. The difference stays
+    /// far below one step of a 16-bit sample.
+    #[test]
+    fn f32_imdct_matches_the_f64_one() {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        for n in [128usize, 256, 512] {
+            let scale = 2.0 / n as f32 / 32768.0;
+            let (mut differing, mut total) = (0, 0);
+            for _ in 0..50 {
+                let input: Vec<f32> = (0..n)
+                    .map(|_| (random(&mut state) % 60_001) as f32 - 30_000.0)
+                    .collect();
+                let mut fast = vec![0f32; n];
+                let mut exact = vec![0f64; n];
+                imdct_half(&input, &mut fast, scale);
+                imdct_half_f64(&input, &mut exact, scale as f64);
+                for (&a, &b) in fast.iter().zip(&exact) {
+                    assert!((a as f64 - b).abs() <= 4e-6, "n {n}: {a} vs {b}");
+                    let (a, b) = (to_i16(a), to_i16(b as f32));
+                    assert!(a.abs_diff(b) <= 1, "n {n}: {a} vs {b}");
+                    differing += usize::from(a != b);
+                    total += 1;
+                }
+            }
+            assert!(
+                differing * 100 <= total,
+                "n {n}: {differing} of {total} samples differ"
+            );
+        }
+    }
+
+    /// `read_frame` as it was: one bit at a time through the cursor.
+    fn read_frame_bitwise(data: &[u8], start: usize) -> Option<Frame> {
+        let mut cursor = Cursor { data, pos: start };
+        let bits = cursor.bits(LENGTH_BITS)? as usize;
+        if bits <= LENGTH_BITS as usize || bits == 0x7fff {
+            return None;
+        }
+        let mut out = vec![0u8; bits.div_ceil(8)];
+        let mut cursor = Cursor { data, pos: start };
+        for i in 0..bits {
+            out[i / 8] |= (cursor.bit()? as u8) << (7 - i % 8);
+        }
+        let end = cursor.pos;
+        let next = next_frame(data, start, end);
+        Some(Frame {
+            data: out,
+            bits,
+            start,
+            next,
+        })
+    }
+
+    /// The run-wise copy gives what the bit-wise one gave, on random
+    /// packets (with random skips to other streams' packets) and random
+    /// start bits, including frames that cross packets and run off the end.
+    #[test]
+    fn read_frame_into_matches_the_bitwise_copy() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let mut buffer = Vec::new();
+        let (mut found, mut crossing) = (0, 0);
+        for _ in 0..400 {
+            let packets = 1 + (random(&mut state) % 4) as usize;
+            let mut data: Vec<u8> = (0..packets * PACKET_BYTES)
+                .map(|_| random(&mut state) as u8)
+                .collect();
+            for p in 0..packets {
+                // Mostly no skip, sometimes one packet of another stream.
+                data[p * PACKET_BYTES + 3] = random(&mut state).is_multiple_of(4) as u8;
+            }
+            let start =
+                HEADER_BITS + (random(&mut state) as usize % (packets * PACKET_BITS - HEADER_BITS));
+            if start.is_multiple_of(PACKET_BITS) || start % PACKET_BITS < HEADER_BITS {
+                continue;
+            }
+            let old = read_frame_bitwise(&data, start);
+            let new = read_frame_into(&data, start, &mut buffer);
+            match (&old, new) {
+                (None, None) => {}
+                (Some(old), Some(new)) => {
+                    assert_eq!(
+                        (old.bits, old.start, old.next),
+                        (new.bits, new.start, new.next)
+                    );
+                    assert_eq!(old.data, buffer, "frame at {start}");
+                    found += 1;
+                    crossing +=
+                        usize::from(start / PACKET_BITS != (start + old.bits) / PACKET_BITS);
+                }
+                _ => panic!("frame at {start}: {old:?} vs {new:?}"),
+            }
+        }
+        assert!(
+            found > 50 && crossing > 10,
+            "{found} frames, {crossing} crossing"
+        );
+    }
+
     /// Windowed MDCT blocks of a signal, put back together the way the
     /// decoder does (half IMDCT, then window and overlap), give the signal.
     #[test]
@@ -1151,6 +1403,13 @@ mod tests {
         assert_eq!(c.bits, 60);
         // C was packet 1's only frame: the next would be in packet 2.
         assert_eq!(c.next, None);
+        // The same through a reused buffer.
+        let mut buffer = Vec::new();
+        for frame in [&a, &b, &c] {
+            let span = read_frame_into(&data, frame.start, &mut buffer).unwrap();
+            assert_eq!((span.bits, span.next), (frame.bits, frame.next));
+            assert_eq!(buffer, frame.data);
+        }
     }
 
     /// Walks and decodes saved input buffers (`VICTORY_XMA_STREAMS=<dir>` of

@@ -19,8 +19,9 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -316,9 +317,8 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
         std::ptr::addr_of_mut!((*contexts).apu).write_unaligned(addresses);
     }
     *allocated = Some(arrays.map(|p| p as usize));
-    let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
-    xma.array = arrays[4] as usize;
-    xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
+    *XMA.write().unwrap_or_else(|e| e.into_inner()) =
+        Xma::new(arrays[4] as usize, counts[4] as usize);
     S_OK
 }
 
@@ -367,48 +367,174 @@ const BLOCK_BYTES: usize = 256;
 const SAMPLES_PER_BLOCK: usize = BLOCK_BYTES / 2;
 /// Error status: the input ran out.
 const INPUT_INVALID: u32 = 4;
+/// Decoded samples a voice holds at most, for a moment before they go into
+/// the ring: the ring's free blocks (at most 31, the size field has 5 bits)
+/// plus one stereo frame, rounded up. Between steps it holds less than a
+/// block plus the rest of one frame.
+const PCM_CAPACITY: usize = 32 * SAMPLES_PER_BLOCK + 2 * xma::FRAME_SAMPLES * 2;
+/// A voice that could not get the samples its ring has room for is looked
+/// at again this soon: a 256-byte output block lasts 2.7 ms at 48 kHz mono.
+const WAITING_POLL: Duration = Duration::from_millis(2);
+/// Every enabled voice is looked at this often, signalled or not, in case
+/// the title changed its context words without a command.
+// shortcut: the sweep is now the only thing that notices a writable bit or
+// new input the title set by writing the context without a command (the
+// old decoder looked at every context every 2 ms), so such a voice may
+// start up to 20 ms late; shorten the sweep if a title relies on it.
+const SWEEP: Duration = Duration::from_millis(20);
 
-struct Voice {
-    decoder: Option<xma::Decoder>,
+/// A voice's decoding side, held by the decoder thread for a whole step and
+/// taken by enable and disable, never by the title's mixer commands. Its
+/// buffers are kept from one enable to the next, so a running voice
+/// allocates nothing.
+struct Decoding {
+    active: bool,
+    /// Changed by every enable and disable; the output side carries the
+    /// same number while it belongs to the same voice.
+    generation: u32,
+    decoder: Option<Box<xma::Decoder>>,
+    /// An earlier voice's decoder, set up again for this voice's first frame.
+    spare: Option<Box<xma::Decoder>>,
+    /// Decoded samples not in the ring yet.
     pcm: VecDeque<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
-    trace: Trace,
+    /// The current frame's bits, and its samples.
+    frame: Vec<u8>,
+    samples: Vec<i16>,
+    since: Instant,
+    frames: u32,
+    bad_frames: u32,
+    /// Milliseconds after enabling when the input ran out.
+    ended_ms: Option<u128>,
+    /// The longest a step decoded for, in microseconds.
+    max_decode_us: u64,
 }
 
-/// What a voice did, for the debug log when it is disabled.
-struct Trace {
-    since: Instant,
+impl Decoding {
+    fn new() -> Decoding {
+        Decoding {
+            active: false,
+            generation: 0,
+            decoder: None,
+            spare: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: false,
+            frame: Vec::new(),
+            samples: Vec::new(),
+            since: Instant::now(),
+            frames: 0,
+            bad_frames: 0,
+            ended_ms: None,
+            max_decode_us: 0,
+        }
+    }
+
+    /// Starts a new voice from a cold decoder, keeping the buffers.
+    fn start(&mut self, skip: usize) {
+        self.active = true;
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(decoder) = self.decoder.take() {
+            self.spare = Some(decoder);
+        }
+        self.pcm.clear();
+        self.pcm.reserve(PCM_CAPACITY);
+        self.skip = skip;
+        self.ended = false;
+        self.frame.clear();
+        self.frame.reserve(xma::MAX_FRAME_BYTES);
+        self.samples.clear();
+        self.samples.reserve(xma::FRAME_SAMPLES * 2);
+        self.since = Instant::now();
+        self.frames = 0;
+        self.bad_frames = 0;
+        self.ended_ms = None;
+        self.max_decode_us = 0;
+    }
+}
+
+/// A voice's output side: what the title's commands touch. Taken briefly,
+/// by `advance_read` and by the decoder thread to copy blocks into the ring.
+struct Output {
+    active: bool,
+    generation: u32,
     /// Samples per channel written to the ring.
     produced: usize,
+    /// The loudest sample written.
+    peak: i16,
     /// Blocks the title took (command 18), how often, and how often it
     /// found the ring less than full.
     taken: usize,
     takes: u32,
     partial_takes: u32,
-    frames: u32,
-    bad_frames: u32,
-    /// The loudest sample written.
-    peak: i16,
-    /// Milliseconds after enabling when the input ran out.
-    ended_ms: Option<u128>,
+    /// The longest the decoder thread held this lock, in microseconds.
+    max_fill_us: u64,
+}
+
+impl Output {
+    fn new(active: bool, generation: u32) -> Output {
+        Output {
+            active,
+            generation,
+            produced: 0,
+            peak: 0,
+            taken: 0,
+            takes: 0,
+            partial_takes: 0,
+            max_fill_us: 0,
+        }
+    }
+}
+
+/// One context. The lock order is `decoding`, then `output`.
+struct Slot {
+    decoding: Mutex<Decoding>,
+    output: Mutex<Output>,
+}
+
+impl Slot {
+    fn new() -> Slot {
+        Slot {
+            decoding: Mutex::new(Decoding::new()),
+            output: Mutex::new(Output::new(false, 0)),
+        }
+    }
 }
 
 struct Xma {
     /// Host address of the context array.
     array: usize,
-    /// One entry per context, `Some` while enabled. Each has its own lock,
-    /// so a command for one voice never waits for others to decode (the
-    /// title sends them from its time-critical mixer thread).
-    voices: Vec<Mutex<Option<Voice>>>,
+    /// One entry per context. A command for one voice never waits for
+    /// another to decode, and `advance_read` (sent from the title's
+    /// time-critical mixer thread) never waits for its own voice either.
+    slots: Vec<Slot>,
+    /// One bit per context: enabled or read from since the decoder thread
+    /// last looked.
+    pending: Vec<AtomicU64>,
+    /// One bit per enabled context, for the sweep.
+    enabled: Vec<AtomicU64>,
 }
 
 impl Xma {
     const EMPTY: Xma = Xma {
         array: 0,
-        voices: Vec::new(),
+        slots: Vec::new(),
+        pending: Vec::new(),
+        enabled: Vec::new(),
     };
+
+    fn new(array: usize, count: usize) -> Xma {
+        let bits =
+            || -> Vec<AtomicU64> { (0..count.div_ceil(64)).map(|_| AtomicU64::new(0)).collect() };
+        Xma {
+            array,
+            slots: (0..count).map(|_| Slot::new()).collect(),
+            pending: bits(),
+            enabled: bits(),
+        }
+    }
 }
 
 /// Written only when the context arrays are allocated or released.
@@ -416,6 +542,15 @@ static XMA: RwLock<Xma> = RwLock::new(Xma::EMPTY);
 
 fn xma() -> RwLockReadGuard<'static, Xma> {
     XMA.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn set_bit(words: &[AtomicU64], index: usize, on: bool) {
+    let (word, bit) = (&words[index / 64], 1u64 << (index % 64));
+    if on {
+        word.fetch_or(bit, Ordering::Release);
+    } else {
+        word.fetch_and(!bit, Ordering::Release);
+    }
 }
 
 /// A context's words in title memory.
@@ -446,19 +581,76 @@ impl Context {
     fn channels(self) -> usize {
         1 + self.field(1, 29, 1) as usize
     }
+
+    fn writable(self) -> bool {
+        self.field(1, 31, 1) == 1
+    }
+
+    /// The output blocks the title has left room for: none while the ring is
+    /// not writable, all of them when the write block is on the read block
+    /// of a ring that is.
+    fn free_blocks(self, size: usize) -> usize {
+        if !self.writable() {
+            return 0;
+        }
+        let (write, read) = (self.field(0, 27, 5) as usize, self.field(9, 0, 5) as usize);
+        match (read % size + size - write % size) % size {
+            0 => size,
+            n => n,
+        }
+    }
+}
+
+/// What a step left a voice waiting for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    /// Nothing until the title sends a command: disabled, done, or its ring
+    /// is full.
+    Idle,
+    /// Its ring has room the decoder could not fill (no input yet, or only
+    /// frames that decode to nothing): looked at again soon.
+    Waiting,
+}
+
+/// Why decoding ahead stopped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stop {
+    /// Enough samples for the blocks the ring has room for.
+    Full,
+    /// Out of input while the ring did not need samples yet.
+    Input,
+    /// Frames that decoded to nothing, one after another.
+    Empty,
+    /// The input ran out: nothing more to decode.
+    Ended,
+}
+
+/// One pass of the decoder thread.
+#[derive(Default)]
+struct Pass {
+    stepped: u32,
+    waiting: u32,
 }
 
 impl Xma {
     fn context(&self, index: u32) -> Option<Context> {
-        ((index as usize) < self.voices.len() && self.array != 0)
+        ((index as usize) < self.slots.len() && self.array != 0)
             .then(|| Context((self.array + index as usize * 64) as *mut u32))
+    }
+
+    /// Marks a voice for the decoder thread's next pass; the caller wakes
+    /// the thread.
+    fn signal(&self, index: u32) {
+        set_bit(&self.pending, index as usize, true);
     }
 
     fn enable(&self, index: u32) {
         let Some(context) = self.context(index) else {
             return;
         };
-        let mut slot = lock(&self.voices[index as usize]);
+        let slot = &self.slots[index as usize];
+        let mut voice = lock(&slot.decoding);
+        let mut output = lock(&slot.output);
         context.set_field(2, 26, 6, 0);
         tracing::debug!(
             index,
@@ -467,59 +659,57 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
-        *slot = Some(Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        });
-        drop(slot);
-        wake_decoder();
+        voice.start(context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES);
+        *output = Output::new(true, voice.generation);
+        set_bit(&self.enabled, index as usize, true);
+        drop(output);
+        drop(voice);
+        self.signal(index);
     }
 
     fn disable(&self, index: u32) {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
+        let slot = &self.slots[index as usize];
+        let mut voice = lock(&slot.decoding);
+        if !voice.active {
             return;
-        };
-        let t = &voice.trace;
+        }
+        voice.active = false;
+        voice.generation = voice.generation.wrapping_add(1);
+        let o = std::mem::replace(
+            &mut *lock(&slot.output),
+            Output::new(false, voice.generation),
+        );
+        set_bit(&self.enabled, index as usize, false);
         tracing::debug!(
             index,
-            ms = t.since.elapsed().as_millis(),
-            produced = t.produced,
-            taken = t.taken * SAMPLES_PER_BLOCK / context.channels(),
-            takes = t.takes,
-            partial_takes = t.partial_takes,
-            frames = t.frames,
-            bad_frames = t.bad_frames,
-            peak = t.peak,
-            input_ended_ms = ?t.ended_ms,
+            ms = voice.since.elapsed().as_millis(),
+            produced = o.produced,
+            taken = o.taken * SAMPLES_PER_BLOCK / context.channels(),
+            takes = o.takes,
+            partial_takes = o.partial_takes,
+            frames = voice.frames,
+            bad_frames = voice.bad_frames,
+            peak = o.peak,
+            input_ended_ms = ?voice.ended_ms,
+            max_decode_us = voice.max_decode_us,
+            max_fill_us = o.max_fill_us,
             read_bit = context.field(2, 0, 26),
             input_bits = context.field(0, 0, 12) * xma::PACKET_BYTES as u32 * 8,
             "XMA voice disabled"
         );
     }
 
-    /// Moves the title's read block on, which frees output space.
+    /// Moves the title's read block on, which frees output space. Takes
+    /// only the output lock: a decode of the same voice does not hold it.
     fn advance_read(&self, index: u32, blocks: u32) {
         let Some(context) = self.context(index) else {
             return;
         };
-        // The decoder writes the same words.
-        let mut slot = lock(&self.voices[index as usize]);
+        // The decoder thread writes the same words under the same lock.
+        let mut output = lock(&self.slots[index as usize].output);
         let size = context.field(0, 22, 5).max(1);
         // The count is the title's: reduced first, so the sum stays small.
         let read = (context.field(9, 0, 5) + blocks % size) % size;
@@ -527,70 +717,188 @@ impl Xma {
         if blocks > 0 {
             context.set_field(1, 31, 1, 1);
         }
-        if let Some(voice) = &mut *slot {
-            let t = &mut voice.trace;
-            t.taken += blocks as usize;
-            t.takes += 1;
-            t.partial_takes += u32::from(blocks < size);
+        if output.active {
+            output.taken += blocks as usize;
+            output.takes += 1;
+            output.partial_takes += u32::from(blocks < size);
         }
-        drop(slot);
-        wake_decoder();
+        drop(output);
+        self.signal(index);
     }
 
-    /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    /// Steps the voices signalled since the last pass and those left
+    /// waiting by it, plus every enabled voice when `sweep` is set.
+    /// `waiting` is the decoder thread's own bitmask of waiting voices.
+    fn pass(&self, waiting: &mut Vec<u64>, sweep: bool) -> Pass {
         let start = Instant::now();
-        let mut active = 0;
-        for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
-                pump(context, voice);
-                active += 1;
+        waiting.resize(self.pending.len(), 0);
+        let mut pass = Pass::default();
+        for (w, word) in self.pending.iter().enumerate() {
+            let mut bits = word.swap(0, Ordering::Acquire) | std::mem::take(&mut waiting[w]);
+            if sweep {
+                bits |= self.enabled[w].load(Ordering::Acquire);
+            }
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                pass.stepped += 1;
+                if self.step(w * 64 + bit as usize) == Step::Waiting {
+                    waiting[w] |= 1 << bit;
+                    pass.waiting += 1;
+                }
             }
         }
         let took = start.elapsed();
         if took.as_millis() >= 4 {
-            tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
+            tracing::debug!(
+                stepped = pass.stepped,
+                waiting = pass.waiting,
+                ms = took.as_millis(),
+                "slow XMA decoding pass"
+            );
+        }
+        pass
+    }
+
+    /// Decodes ahead for one voice and fills its ring as far as it has room.
+    fn step(&self, index: usize) -> Step {
+        let Some(slot) = self.slots.get(index) else {
+            return Step::Idle;
+        };
+        #[cfg(test)]
+        tests::STEPPED.with_borrow_mut(|stepped| {
+            // The decoding thread records its steps too; keep its list short.
+            if stepped.len() < 1024 {
+                stepped.push(index);
+            }
+        });
+        let Some(context) = self.context(index as u32) else {
+            return Step::Idle;
+        };
+        let mut voice = lock(&slot.decoding);
+        if !voice.active {
+            return Step::Idle;
+        }
+        fill(context, &slot.output, &mut voice)
+    }
+
+    /// Every voice, one after another, as the decoder thread would.
+    #[cfg(test)]
+    fn step_all(&self) {
+        for index in 0..self.slots.len() {
+            self.step(index);
         }
     }
 }
 
-fn pump(context: Context, voice: &mut Voice) {
-    let size = context.field(0, 22, 5);
+/// Decodes into `voice.pcm` what the ring has room for, then copies whole
+/// blocks into the ring under the output lock only.
+fn fill(context: Context, output: &Mutex<Output>, voice: &mut Decoding) -> Step {
+    let size = context.field(0, 22, 5) as usize;
     if size == 0 {
-        return;
+        return Step::Waiting;
     }
-    while context.field(1, 31, 1) == 1 {
-        let mut empty_steps = 0u32;
-        while voice.pcm.len() < SAMPLES_PER_BLOCK {
-            let before = voice.pcm.len();
-            if !decode(context, voice) {
-                if voice.pcm.is_empty() {
-                    return;
-                }
-                break;
-            }
-            if voice.pcm.len() == before {
-                empty_steps += 1;
-                if empty_steps > 16 {
-                    return;
-                }
-            } else {
-                empty_steps = 0;
-            }
+    {
+        // The output side must belong to this voice before decoding moves
+        // the context words on. It cannot change while the decoding lock is
+        // held (enable and disable take that first); this is a safety net.
+        let out = lock(output);
+        if !out.active || out.generation != voice.generation {
+            return Step::Idle;
         }
+    }
+    let mut stop = decode_ahead(context, voice, size);
+    loop {
+        let Some(writable) = publish(context, output, voice, size) else {
+            return Step::Waiting;
+        };
+        let starving = writable && voice.pcm.len() < SAMPLES_PER_BLOCK;
+        if matches!(stop, Stop::Input | Stop::Full) && starving {
+            // The ring needs samples now (the title read on while this step
+            // ran, or the input may end the voice): decode for it at once
+            // rather than at the next poll.
+            stop = decode_ahead(context, voice, size);
+            continue;
+        }
+        return match stop {
+            Stop::Ended if voice.pcm.is_empty() => Step::Idle,
+            _ if !writable => Step::Idle,
+            _ if starving => Step::Waiting,
+            _ => Step::Idle,
+        };
+    }
+}
+
+/// Decodes frames until the voice holds samples for every block the title
+/// has left room for, so the context words the title sees (read position,
+/// valid inputs, current input, loop count) move on no earlier than the
+/// hardware's would: at most one frame ahead of the ring. The input may
+/// run out (which ends the voice and sets its error status) only when the
+/// ring has room and less than a block is decoded.
+fn decode_ahead(context: Context, voice: &mut Decoding, size: usize) -> Stop {
+    let start = Instant::now();
+    let mut empty_steps = 0u32;
+    let stop = loop {
+        // The read block is read without the output lock: a stale value
+        // only makes the room look smaller.
+        if voice.pcm.len() >= context.free_blocks(size) * SAMPLES_PER_BLOCK {
+            break Stop::Full;
+        }
+        let may_end = context.writable() && voice.pcm.len() < SAMPLES_PER_BLOCK;
+        let before = voice.pcm.len();
+        if !decode(context, voice, may_end) {
+            break if voice.ended {
+                Stop::Ended
+            } else {
+                Stop::Input
+            };
+        }
+        if voice.pcm.len() == before {
+            empty_steps += 1;
+            if empty_steps > 16 {
+                break Stop::Empty;
+            }
+        } else {
+            empty_steps = 0;
+        }
+    };
+    voice.max_decode_us = voice.max_decode_us.max(start.elapsed().as_micros() as u64);
+    stop
+}
+
+/// Copies decoded blocks into the ring while it is writable; the last,
+/// partial block of an ended voice is padded with silence. Whether the
+/// ring is still writable, or `None` when the ring could not be reached or
+/// the output side belongs to another voice.
+fn publish(
+    context: Context,
+    output: &Mutex<Output>,
+    voice: &mut Decoding,
+    size: usize,
+) -> Option<bool> {
+    let start = Instant::now();
+    let mut out = lock(output);
+    // A safety net: `fill` checked this before decoding.
+    if !out.active || out.generation != voice.generation {
+        return None;
+    }
+    let size = size as u32;
+    let mut reached = true;
+    while context.writable()
+        && (voice.pcm.len() >= SAMPLES_PER_BLOCK || (voice.ended && !voice.pcm.is_empty()))
+    {
         let write = context.field(0, 27, 5);
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(mut out) = heap_bytes(address as u32, BLOCK_BYTES) else {
-            return;
+        let Some(mut ring) = heap_bytes(address as u32, BLOCK_BYTES) else {
+            reached = false;
+            break;
         };
-        for pair in out.as_chunks_mut::<2>().0 {
+        for pair in ring.as_chunks_mut::<2>().0 {
             let sample = voice.pcm.pop_front().unwrap_or(0);
-            voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
+            out.peak = out.peak.max(sample.saturating_abs());
             pair.copy_from_slice(&sample.to_le_bytes());
         }
-        voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
+        out.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
         if write == context.field(9, 0, 5) {
@@ -598,11 +906,15 @@ fn pump(context: Context, voice: &mut Voice) {
             context.set_field(1, 31, 1, 0);
         }
     }
+    let writable = context.writable();
+    out.max_fill_us = out.max_fill_us.max(start.elapsed().as_micros() as u64);
+    reached.then_some(writable)
 }
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
-/// when there is nothing left to decode.
-fn decode(context: Context, voice: &mut Voice) -> bool {
+/// when there is nothing left to decode, or when the input is used up and
+/// `may_end` is not set (the voice then stays as it is).
+fn decode(context: Context, voice: &mut Decoding, may_end: bool) -> bool {
     if voice.ended {
         return false;
     }
@@ -611,14 +923,17 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
+            if !may_end {
+                return false;
+            }
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.samples.clear();
+                decoder.flush(&mut voice.samples);
+                voice.pcm.extend(&voice.samples);
             }
             voice.ended = true;
-            voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
+            voice.ended_ms = Some(voice.since.elapsed().as_millis());
             context.set_field(2, 26, 5, INPUT_INVALID);
             context.set_field(2, 31, 1, 1);
             return !voice.pcm.is_empty();
@@ -639,24 +954,33 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if at < 32 {
         at = 32 + xma::packet(&data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(&data, at) else {
+    let Some(frame) = xma::read_frame_into(&data, at, &mut voice.frame) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
+    let spare = &mut voice.spare;
     let decoder = voice.decoder.get_or_insert_with(|| {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
-        xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
+        let fresh = xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize]);
+        match spare.take() {
+            Some(mut decoder) => {
+                *decoder = fresh;
+                decoder
+            }
+            None => Box::new(fresh),
+        }
     });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
-    voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
-        voice.trace.bad_frames += 1;
-        if voice.trace.bad_frames <= 2 {
+    let pcm = &mut voice.samples;
+    pcm.clear();
+    voice.frames += 1;
+    if let Err(e) = decoder.decode(&voice.frame, frame.bits, pcm) {
+        voice.bad_frames += 1;
+        if voice.bad_frames <= 2 {
             tracing::debug!(
                 at,
                 bits = frame.bits,
-                head = ?&frame.data[..frame.data.len().min(8)],
+                head = ?&voice.frame[..voice.frame.len().min(8)],
                 %e,
                 "XMA frame did not decode"
             );
@@ -718,34 +1042,72 @@ fn dump_input(index: u32, context: Context) {
     );
 }
 
-/// Starts the decoding thread on the first enabled voice, and has it fill
-/// rings now: a voice just enabled or read from.
+/// Starts the decoding thread on the first enabled voice, and has it look
+/// at the voices signalled since its last pass now.
 fn wake_decoder() {
     static DECODER: OnceLock<std::thread::Thread> = OnceLock::new();
     DECODER
         .get_or_init(|| {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
-                .spawn(|| {
-                    loop {
-                        xma().pump();
-                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
-                    }
-                })
+                .spawn(decoder_thread)
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
         })
         .unpark();
 }
 
+/// Steps signalled voices as they come, waiting ones every
+/// [`WAITING_POLL`] and all enabled ones every [`SWEEP`]. A pass with
+/// nothing to do reads one word per 64 contexts.
+fn decoder_thread() {
+    let mut waiting = Vec::new();
+    let mut last_sweep = Instant::now();
+    let (mut since, mut passes, mut stepped, mut busy) =
+        (Instant::now(), 0u32, 0u64, Duration::ZERO);
+    loop {
+        let sweep = last_sweep.elapsed() >= SWEEP;
+        if sweep {
+            last_sweep = Instant::now();
+        }
+        let start = Instant::now();
+        // The guard is dropped before parking, so allocating or releasing
+        // the context arrays never waits for a timeout.
+        let pass = xma().pass(&mut waiting, sweep);
+        busy += start.elapsed();
+        passes += 1;
+        stepped += u64::from(pass.stepped);
+        if since.elapsed().as_secs() >= 10 {
+            tracing::debug!(
+                passes,
+                stepped,
+                waiting = pass.waiting,
+                busy_ms = busy.as_millis(),
+                "XMA decoder in the last 10 s"
+            );
+            (since, passes, stepped, busy) = (Instant::now(), 0, 0, Duration::ZERO);
+        }
+        let timeout = match pass.waiting {
+            0 => SWEEP.saturating_sub(last_sweep.elapsed()),
+            _ => WAITING_POLL,
+        };
+        std::thread::park_timeout(timeout);
+    }
+}
+
 /// Runs an XMA command; false for one this does not know.
 fn xma_command(command: u32, word: impl Fn(usize) -> Option<u32>) -> bool {
     let xma = xma();
-    match command {
-        ENABLE_XMA => xma.enable(word(0).unwrap_or(u32::MAX)),
-        DISABLE_XMA => xma.disable(word(0).unwrap_or(u32::MAX)),
+    let wake = match command {
+        ENABLE_XMA => {
+            xma.enable(word(0).unwrap_or(u32::MAX));
+            true
+        }
+        DISABLE_XMA => {
+            xma.disable(word(0).unwrap_or(u32::MAX));
+            false
+        }
         ENABLE_XMAS | DISABLE_XMAS => {
-            for i in 0..xma.voices.len() as u32 {
+            for i in 0..xma.slots.len() as u32 {
                 if word(i as usize / 32).unwrap_or(0) & (1 << (i % 32)) != 0 {
                     match command {
                         ENABLE_XMAS => xma.enable(i),
@@ -753,9 +1115,18 @@ fn xma_command(command: u32, word: impl Fn(usize) -> Option<u32>) -> bool {
                     }
                 }
             }
+            command == ENABLE_XMAS
         }
-        ADVANCE_XMA_READ => xma.advance_read(word(0).unwrap_or(u32::MAX), word(1).unwrap_or(0)),
+        ADVANCE_XMA_READ => {
+            xma.advance_read(word(0).unwrap_or(u32::MAX), word(1).unwrap_or(0));
+            true
+        }
         _ => return false,
+    };
+    drop(xma);
+    // One wake for a whole mask of voices.
+    if wake {
+        wake_decoder();
     }
     true
 }
@@ -1111,7 +1482,7 @@ mod tests {
             );
         };
         submit(ENABLE_XMA, &[1]);
-        xma().pump();
+        xma().step_all();
         // Full: all four blocks written (silence), the write block wrapped
         // onto the read block, and the ring no longer writable.
         assert_eq!(context.field(0, 27, 5), 0);
@@ -1124,13 +1495,16 @@ mod tests {
         // ring keeps room (the decoding thread may fill it too).
         for _ in 0..20 {
             submit(ADVANCE_XMA_READ, &[1, 4]);
-            xma().pump();
+            xma().step_all();
             if context.field(2, 31, 1) == 1 && context.field(1, 31, 1) == 1 {
                 break;
             }
         }
         // Six frames and the flushed tail: 3,328 samples, 26 blocks.
-        let produced = |x: &Xma| lock(&x.voices[1]).as_ref().map(|v| v.trace.produced);
+        let produced = |x: &Xma| {
+            let output = lock(&x.slots[1].output);
+            output.active.then_some(output.produced)
+        };
         assert_eq!(produced(&xma()), Some(26 * SAMPLES_PER_BLOCK));
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
@@ -1237,24 +1611,10 @@ mod tests {
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 
-    fn test_voice(skip: usize) -> Voice {
-        Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        }
+    fn test_voice(skip: usize) -> Decoding {
+        let mut voice = Decoding::new();
+        voice.start(skip);
+        voice
     }
 
     #[test]
@@ -1286,7 +1646,7 @@ mod tests {
         context.set(5, input_apu);
 
         let mut voice = test_voice(0);
-        assert!(decode(context, &mut voice));
+        assert!(decode(context, &mut voice, true));
         // Current loop_end frame keeps 256 samples; loop_start skip of 256 is
         // deferred to the next frame rather than eating the current frame.
         assert_eq!(voice.pcm.len(), 2 * xma::SUBFRAME_SAMPLES);
@@ -1334,7 +1694,12 @@ mod tests {
 
         // Start with skip = 512 (4 subframes): frame 0 of buffer 1 is also skipped whole.
         let mut voice = test_voice(xma::FRAME_SAMPLES);
-        pump(context, &mut voice);
+        let ring = Mutex::new(Output::new(true, voice.generation));
+        assert_eq!(
+            fill(context, &ring, &mut voice),
+            Step::Idle,
+            "the ring is full"
+        );
 
         // Buffer 0 became invalid, switched to buffer 1, skipped frame 0 whole,
         // and decoded frame 1 (512 samples = 4 blocks) without injecting any
@@ -1342,13 +1707,190 @@ mod tests {
         assert_eq!(context.field(0, 20, 1), 0, "input 0 consumed");
         assert_eq!(context.field(4, 31, 1), 1, "switched to input 1");
         assert_eq!(voice.skip, 0);
-        assert_eq!(voice.trace.frames, 2, "frame 0 skipped + frame 1 filled the 4-block ring");
-        assert_eq!(voice.trace.produced, 4 * SAMPLES_PER_BLOCK);
+        assert_eq!(
+            voice.frames, 2,
+            "frame 0 skipped + frame 1 filled the 4-block ring"
+        );
+        assert_eq!(lock(&ring).produced, 4 * SAMPLES_PER_BLOCK);
 
         ApuFree(input0);
         ApuFree(input1);
         ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// Allocates `count` XMA contexts and gives voice `index` the silent
+    /// stream and a ring of four blocks, as the title sets one up.
+    struct TestVoice {
+        context: Context,
+        input: *mut c_void,
+        output: *mut c_void,
+    }
+
+    impl TestVoice {
+        fn new(count: u32, index: usize) -> TestVoice {
+            let mut request = ShapeContexts {
+                counts: [0, 0, 0, 0, count, 0],
+                arrays: [std::ptr::null_mut(); 6],
+                apu: [0; 6],
+            };
+            assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+            let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16 * index));
+            let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+            assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+            let stream = silent_stream();
+            // SAFETY: two packets were allocated.
+            unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+            let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+            assert_eq!(
+                ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+                S_OK
+            );
+            context.set(0, 2 | 1 << 20 | 4 << 22);
+            context.set(1, 1 << 31 | 3 << 27);
+            context.set(2, 32);
+            context.set(5, input_apu);
+            context.set(7, output_apu);
+            TestVoice {
+                context,
+                input,
+                output,
+            }
+        }
+    }
+
+    impl Drop for TestVoice {
+        fn drop(&mut self) {
+            ApuFree(self.input);
+            ApuFree(self.output);
+            AcpHalReleaseShapeContexts();
+        }
+    }
+
+    thread_local! {
+        /// The slots this thread stepped, in order.
+        pub(super) static STEPPED: std::cell::RefCell<Vec<usize>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A pass looks only at the voices signalled since the last one (and
+    /// those it left waiting), not at every context. The decoding thread
+    /// (started by an earlier test) may take a signal first, so only this
+    /// thread's own steps are counted.
+    #[test]
+    fn only_signalled_voices_are_stepped() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let voice = TestVoice::new(200, 130);
+        let stepped = || STEPPED.with_borrow_mut(std::mem::take);
+        let xma = xma();
+        let mut waiting = Vec::new();
+        stepped();
+        // Nothing enabled or signalled: nothing is stepped.
+        xma.pass(&mut waiting, false);
+        assert_eq!(stepped(), []);
+        xma.enable(130);
+        xma.pass(&mut waiting, false);
+        assert!(stepped().iter().all(|&i| i == 130));
+        // A sweep looks at every enabled voice, and only those.
+        xma.pass(&mut waiting, true);
+        assert_eq!(stepped(), [130]);
+        assert_eq!(voice.context.field(1, 31, 1), 0, "the ring was filled");
+        // Its ring is full, so it does not wait for input: a pass with
+        // nothing signalled steps nothing, and neither does a sweep once
+        // it is disabled.
+        assert_eq!(waiting.iter().map(|w| w.count_ones()).sum::<u32>(), 0);
+        xma.pass(&mut waiting, false);
+        assert_eq!(stepped(), []);
+        xma.disable(130);
+        xma.pass(&mut waiting, true);
+        assert_eq!(stepped(), []);
+        drop(xma);
+    }
+
+    /// `advance_read`, sent from the title's mixer thread, does not wait for
+    /// a decode of the same voice: it takes only the output lock.
+    #[test]
+    fn advance_read_does_not_wait_for_a_decode() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let voice = TestVoice::new(4, 1);
+        let xma = xma();
+        xma.enable(1);
+        voice.context.set_field(9, 0, 5, 0);
+        // As if the decoder thread were in the middle of decoding voice 1.
+        let decoding = lock(&xma.slots[1].decoding);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                xma.advance_read(1, 3);
+                done.send(()).unwrap();
+            });
+            let returned = finished.recv_timeout(Duration::from_secs(5));
+            drop(decoding);
+            assert!(returned.is_ok(), "advance_read waited for the decode");
+        });
+        assert_eq!(voice.context.field(9, 0, 5), 3);
+        assert_eq!(lock(&xma.slots[1].output).takes, 1);
+        xma.disable(1);
+        drop(xma);
+    }
+
+    /// The context words the title sees move on with the ring, not ahead of
+    /// it: a full ring decodes nothing, and reading k blocks decodes only
+    /// the frames that k blocks need (four blocks to a mono frame here).
+    #[test]
+    fn decoding_keeps_pace_with_the_ring() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let voice = TestVoice::new(4, 1);
+        let context = voice.context;
+        // The silent stream's frames start at bits 32, 63 and 94 of packet
+        // 0, then at bit 32 of packet 1.
+        let next_frame = || context.field(2, 0, 26);
+        let second_packet = (xma::PACKET_BYTES * 8 + 32) as u32;
+        let xma = xma();
+        xma.enable(1);
+        xma.step_all();
+        assert_eq!(context.field(1, 31, 1), 0, "the ring is full");
+        assert_eq!(next_frame(), 63, "one frame for four blocks");
+        // Full: nothing more is decoded however often the voice is stepped.
+        xma.step_all();
+        xma.step_all();
+        assert_eq!(next_frame(), 63);
+        // Four blocks read: one frame.
+        xma.advance_read(1, 4);
+        xma.step_all();
+        assert_eq!(next_frame(), 94);
+        // Two blocks read: one frame, half of it kept for later.
+        xma.advance_read(1, 2);
+        xma.step_all();
+        assert_eq!(next_frame(), second_packet);
+        // Two more: the kept half fills them, nothing is decoded.
+        xma.advance_read(1, 2);
+        xma.step_all();
+        assert_eq!(next_frame(), second_packet);
+        assert_eq!(context.field(0, 20, 2), 1, "input 0 is still valid");
+        assert_eq!(context.field(4, 31, 1), 0, "still on input 0");
+        assert_eq!(lock(&xma.slots[1].output).produced, 12 * SAMPLES_PER_BLOCK);
+        xma.disable(1);
+        drop(xma);
+    }
+
+    /// A voice re-enabled while the output side still belonged to the old
+    /// one: the old voice's samples never reach the new ring.
+    #[test]
+    fn a_stale_voice_does_not_fill_the_ring() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let voice = TestVoice::new(4, 1);
+        // SAFETY: the ring was just allocated.
+        unsafe { voice.output.cast::<u8>().write_bytes(0x55, 0x400) };
+        let mut old = test_voice(0);
+        let output = Mutex::new(Output::new(true, old.generation.wrapping_add(1)));
+        assert_eq!(fill(voice.context, &output, &mut old), Step::Idle);
+        assert_eq!(voice.context.field(2, 0, 26), 32, "nothing was decoded");
+        // SAFETY: the ring.
+        let ring = unsafe { std::slice::from_raw_parts(voice.output.cast::<u8>(), 0x400) };
+        assert!(ring.iter().all(|&b| b == 0x55), "nothing was written");
+        assert_eq!(voice.context.field(0, 27, 5), 0);
+        assert_eq!(lock(&output).produced, 0);
     }
 
     #[test]
