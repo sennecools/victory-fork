@@ -33,7 +33,7 @@ use std::sync::Mutex;
 mod bits;
 mod stamps;
 
-use bits::{Bits, BitsOf, Blocks, guard_bits, in_word};
+use bits::{Bits, Blocks};
 use stamps::Stamps;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -72,7 +72,7 @@ struct Journal {
     /// For each page, the highest asking that found it written. Marked
     /// with this lock held only, so that an asking's marks are made before
     /// its number is handed out and before another asking of the same
-    /// memory begins (the guards rely on that, [`guard_switched`]).
+    /// memory begins (the guards rely on that, [`guard_blocks`]).
     stamps: Stamps,
     /// Room for the kernel's answer.
     found: Vec<usize>,
@@ -824,7 +824,8 @@ pub fn title_memory_allocated(at: usize, len: usize) {
     let mut g = guards();
     let blocks = g
         .held
-        .range(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+        .iter(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK))
+        .collect::<Vec<_>>();
     for block in blocks {
         g.held.remove(block);
         PUBLISHED.clear(block);
@@ -963,8 +964,11 @@ fn failed_ask(first: usize, last: usize) {
     count(Count::FailedBytes, ((last - first) * PAGE) as u64);
 }
 
-/// The guards' sets of blocks (words of bits with `VICTORY_GUARD_BITS=1`,
-/// [`bits::guard_bits`]; ordered trees without).
+/// The guards' sets of blocks, as words of bits (cool_fox measured, before
+/// its change, the title's write faults waiting for the guards' lock most of
+/// their time, and a look at a range walking a tree of every guarded block:
+/// 586 faults a frame took 69 ms of the title's threads; ported from
+/// cool_fox 7bc7c07, its `VICTORY_GUARD_BITS`).
 struct Guards {
     /// Blocks we made read-only.
     protected: Blocks,
@@ -1048,57 +1052,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
-    if switched() {
-        return Some(guard_switched(start / BLOCK, end.div_ceil(BLOCK)));
-    }
-    let mut g = guards();
-    let mut written = Vec::new();
-    let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first, last);
-    if clean.len() == last - first {
-        // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
-    }
-    let mut next_clean = 0;
-    let mut uncommitted_until = first;
-    for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
-            next_clean += 1;
-        }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
-            }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(block);
-            }
-        }
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-            } else {
-                run.get_or_insert(block);
-                continue;
-            }
-        }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, block);
-        }
-    }
-    Some(written)
+    Some(guard_blocks(start / BLOCK, end.div_ceil(BLOCK)))
 }
 
 /// Whether a write fault opens the view that was written and leaves the
@@ -1154,13 +1108,6 @@ fn set_rest_in_test(rest: std::time::Duration) {
     REST_IN_TEST.set(Some(rest));
 }
 
-/// Whether one of the switches that change how [`guard`] goes through a
-/// range is on: [`guard_bits`], [`light`], [`open_one_view`], [`rest`],
-/// [`known_holes`].
-fn switched() -> bool {
-    guard_bits() || light() || covering() || known_holes()
-}
-
 /// Whether a block read-only by our hand whose page has other views can be
 /// left with one of those writable ([`open_one_view`], [`rest`]): then the
 /// block is clean only once they are read-only too ([`cover`]).
@@ -1199,11 +1146,10 @@ fn cover(g: &mut Guards, block: usize) -> bool {
     all
 }
 
-/// [`guard`] of blocks `[first, last)`, a view, with [`switched`]: the
-/// blocks to take are read off the sets by words, and with
-/// `VICTORY_GUARD_BITS=1` the guards' lock is let go between the runs of
-/// blocks made read-only, for the title's faults that wait for it (each run
-/// is looked at anew under the lock). Ported from cool_fox 7bc7c07.
+/// [`guard`] of blocks `[first, last)`, a view: the blocks to take are read
+/// off the sets by words, and the guards' lock is let go between the runs
+/// of blocks made read-only, for the title's faults that wait for it (each
+/// run is looked at anew under the lock). Ported from cool_fox 7bc7c07.
 ///
 /// Letting go is safe: no other asking guards these blocks meanwhile (the
 /// caller holds the journal's lock), and what a fault or the runtime does
@@ -1211,9 +1157,9 @@ fn cover(g: &mut Guards, block: usize) -> bool {
 /// A block opened after the look below was not clean at it, or is told as
 /// written at the next asking; one forgotten is made read-only again, as
 /// any block that is not clean.
-fn guard_switched(first: usize, last: usize) -> Vec<usize> {
+fn guard_blocks(first: usize, last: usize) -> Vec<usize> {
     let mut g = guards();
-    if g.clean.count(first, last) == last - first {
+    if g.clean.all(first, last) {
         // Nothing written, mapped or new since the range was last taken.
         return Vec::new();
     }
@@ -1224,13 +1170,13 @@ fn guard_switched(first: usize, last: usize) -> Vec<usize> {
     // block out of the set, and it is looked at as any other below.
     let holes = known_holes();
     let unsure: Vec<usize> = if holes {
-        let unsure = g.absent.range(first, last);
+        let unsure = g.absent.iter(first, last).collect::<Vec<_>>();
         unsure
             .into_iter()
             .filter(|&block| !g.held.contains(block))
             .collect()
     } else {
-        g.absent.range(first, last)
+        g.absent.iter(first, last).collect::<Vec<_>>()
     };
     let came = |unsure: Vec<usize>| {
         let mut came = Vec::new();
@@ -1259,11 +1205,7 @@ fn guard_switched(first: usize, last: usize) -> Vec<usize> {
     // The range's blocks that are neither clean nor (still) holes: all
     // told as written.
     let mut written = Vec::new();
-    for word in first / 64..last.div_ceil(64) {
-        let known = g.clean.word(word) | g.absent.word(word);
-        written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
-    }
-    let let_go = guard_bits();
+    g.clean.in_neither(&g.absent, first, last, &mut written);
     let rest = rest();
     let mut run: Option<(usize, usize)> = None;
     for &block in &written {
@@ -1272,10 +1214,8 @@ fn guard_switched(first: usize, last: usize) -> Vec<usize> {
         {
             protect(&mut g, from, to);
             run = None;
-            if let_go {
-                drop(g);
-                g = guards();
-            }
+            drop(g);
+            g = guards();
         }
         if g.protected.contains(block) {
             // Written through the runtime, or through another view of its
@@ -1531,10 +1471,13 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         return open_together(g, start, end);
     }
     let any = open_here(g, start, end);
-    if start >= end || g.aliased.is_empty() {
+    if start >= end || g.aliased.len() == 0 {
         return any;
     }
-    let aliased: Vec<usize> = g.aliased.range(start / BLOCK, end.div_ceil(BLOCK));
+    let aliased: Vec<usize> = g
+        .aliased
+        .iter(start / BLOCK, end.div_ceil(BLOCK))
+        .collect::<Vec<_>>();
     for block in aliased {
         g.aliased.remove(block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
@@ -1558,10 +1501,10 @@ fn open_together(g: &mut Guards, start: usize, end: usize) -> bool {
     if first >= last {
         return false;
     }
-    let mut blocks = g.protected.range(first, last);
+    let mut blocks = g.protected.iter(first, last).collect::<Vec<_>>();
     let any = !blocks.is_empty();
     let one = open_one_view();
-    for block in g.aliased.range(first, last) {
+    for block in g.aliased.iter(first, last).collect::<Vec<_>>() {
         g.aliased.remove(block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
             let alias = alias / BLOCK;
@@ -1611,7 +1554,10 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g.protected.range(start / BLOCK, end.div_ceil(BLOCK));
+    let blocks: Vec<usize> = g
+        .protected
+        .iter(start / BLOCK, end.div_ceil(BLOCK))
+        .collect::<Vec<_>>();
     for &block in &blocks {
         g.protected.remove(block);
         g.clean.remove(block);
@@ -1741,7 +1687,8 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
             .iter()
             .flat_map(|&(at, n)| {
                 g.protected
-                    .range(at / BLOCK, at.saturating_add(n).div_ceil(BLOCK))
+                    .iter(at / BLOCK, at.saturating_add(n).div_ceil(BLOCK))
+                    .collect::<Vec<_>>()
             })
             .collect();
         #[cfg(feature = "diagnostics")]
@@ -1934,14 +1881,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::memory::remapped(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.start, range.end);
+    let absent: Vec<usize> = g.absent.iter(range.start, range.end).collect::<Vec<_>>();
     for block in absent {
         g.absent.remove(block);
         if g.held.remove(block) {
             PUBLISHED.clear(block);
         }
     }
-    let blocks: Vec<usize> = g.protected.range(range.start, range.end);
+    let blocks: Vec<usize> = g.protected.iter(range.start, range.end).collect::<Vec<_>>();
     let light = light();
     for block in blocks {
         g.protected.remove(block);
@@ -1951,10 +1898,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             PROTECTED.clear(block);
         }
     }
-    let aliased: Vec<usize> = g.aliased.range(range.start, range.end);
-    for block in aliased {
-        g.aliased.remove(block);
-    }
+    g.aliased.remove_range(range.start, range.end, |_| {});
     // What rested there was the old mapping's (`VICTORY_GUARD_REST`,
     // [`rest`]): the new one is guarded at the next asking, as any other.
     if !g.opened.is_empty() {

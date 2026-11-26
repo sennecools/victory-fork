@@ -2,15 +2,15 @@
 //!
 //! - [`Bits`]: a bit per block of the address space, read with no lock, for
 //!   what the guards publish to the askings and to the fault handler
-//!   (`VICTORY_LIGHT_REFRESH=1`, `super::PUBLISHED`, `super::PROTECTED`).
+//!   (`super::PUBLISHED`, `super::PROTECTED`).
 //! - [`Blocks`]: the guards' own sets (`super::Guards`), held under their
-//!   lock. With `VICTORY_GUARD_BITS=1` a set is words of bits, so a fault or
-//!   a look at a range of thousands of blocks is a few words; without it the
-//!   ordered tree it was before.
+//!   lock: words of bits, with a summary per 4 GiB of which words have a
+//!   block and which are full, so a fault or a look at a range of thousands
+//!   of blocks is a few words.
 //!
 //! Ported from cool_fox 2aa8134, 74045e4 (`Bits`) and 7bc7c07 (`Blocks`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 /// A bit per block of the address space, in pieces made when first needed
@@ -99,25 +99,37 @@ impl Bits {
     }
 }
 
-/// Whether the guards' sets are words of bits (`VICTORY_GUARD_BITS=1`; off
-/// by default: ordered trees, as before).
-///
-/// cool_fox measured, before its change, the title's write faults waiting
-/// for the guards' lock most of their time, and a look at a range walking a
-/// tree of every guarded block: 586 faults a frame took 69 ms of the title's
-/// threads. The same switch has a refresh let go of the lock between the
-/// runs of blocks it guards (`super::guard`).
-pub(super) fn guard_bits() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_BITS").is_some_and(|v| v == "1"))
+/// A set of blocks: words of bits in pieces of 4 GiB, made when a block
+/// there is first put in and kept, each with a summary of its words.
+pub(super) struct Blocks {
+    pieces: BTreeMap<usize, Box<Piece>>,
+    len: usize,
 }
 
-/// A set of blocks: words of bits with [`guard_bits`], an ordered tree
-/// without. One of the two is used for the whole run.
-pub(super) struct Blocks {
-    tree: BTreeSet<usize>,
-    words: BTreeMap<usize, Box<[u64; Blocks::WORDS]>>,
-    len: usize,
+/// The words of 4 GiB of blocks, and a bit per word: whether it has a block
+/// (`any`), whether it has all 64 (`full`).
+struct Piece {
+    words: [u64; Blocks::WORDS],
+    any: [u64; Blocks::WORDS / 64],
+    full: [u64; Blocks::WORDS / 64],
+}
+
+impl Piece {
+    /// Word `k` set to `bits`, its summary bits with it.
+    fn store(&mut self, k: usize, bits: u64) {
+        self.words[k] = bits;
+        let (s, bit) = (k / 64, 1u64 << (k % 64));
+        if bits != 0 {
+            self.any[s] |= bit;
+        } else {
+            self.any[s] &= !bit;
+        }
+        if bits == u64::MAX {
+            self.full[s] |= bit;
+        } else {
+            self.full[s] &= !bit;
+        }
+    }
 }
 
 impl Blocks {
@@ -127,67 +139,53 @@ impl Blocks {
 
     pub(super) const fn new() -> Blocks {
         Blocks {
-            tree: BTreeSet::new(),
-            words: BTreeMap::new(),
+            pieces: BTreeMap::new(),
             len: 0,
         }
     }
 
     /// The 64 bits of blocks `[word * 64, word * 64 + 64)`.
     pub(super) fn word(&self, word: usize) -> u64 {
-        if guard_bits() {
-            return self
-                .words
-                .get(&(word / Blocks::WORDS))
-                .map_or(0, |piece| piece[word % Blocks::WORDS]);
-        }
-        let base = word * 64;
-        self.tree
-            .range(base..base.saturating_add(64))
-            .fold(0, |bits, &block| bits | 1 << (block - base))
+        self.pieces
+            .get(&(word / Blocks::WORDS))
+            .map_or(0, |piece| piece.words[word % Blocks::WORDS])
     }
 
     pub(super) fn contains(&self, block: usize) -> bool {
-        if guard_bits() {
-            self.word(block / 64) >> (block % 64) & 1 != 0
-        } else {
-            self.tree.contains(&block)
-        }
+        self.word(block / 64) >> (block % 64) & 1 != 0
     }
 
     /// Whether it was not there.
     pub(super) fn insert(&mut self, block: usize) -> bool {
-        let new = if guard_bits() {
-            let piece = self
-                .words
-                .entry(block / Blocks::IN_PIECE)
-                .or_insert_with(|| Box::new([0; Blocks::WORDS]));
-            let word = &mut piece[block % Blocks::IN_PIECE / 64];
-            let was = *word;
-            *word |= 1 << (block % 64);
-            was != *word
-        } else {
-            self.tree.insert(block)
-        };
+        let piece = self
+            .pieces
+            .entry(block / Blocks::IN_PIECE)
+            .or_insert_with(|| {
+                Box::new(Piece {
+                    words: [0; Blocks::WORDS],
+                    any: [0; Blocks::WORDS / 64],
+                    full: [0; Blocks::WORDS / 64],
+                })
+            });
+        let k = block % Blocks::IN_PIECE / 64;
+        let was = piece.words[k];
+        piece.store(k, was | 1 << (block % 64));
+        let new = was != piece.words[k];
         self.len += usize::from(new);
         new
     }
 
     /// Whether it was there.
     pub(super) fn remove(&mut self, block: usize) -> bool {
-        let was = if guard_bits() {
-            let Some(piece) = self.words.get_mut(&(block / Blocks::IN_PIECE)) else {
-                return false;
-            };
-            let word = &mut piece[block % Blocks::IN_PIECE / 64];
-            let was = *word;
-            *word &= !(1 << (block % 64));
-            was != *word
-        } else {
-            self.tree.remove(&block)
+        let Some(piece) = self.pieces.get_mut(&(block / Blocks::IN_PIECE)) else {
+            return false;
         };
-        self.len -= usize::from(was);
-        was
+        let k = block % Blocks::IN_PIECE / 64;
+        let was = piece.words[k];
+        piece.store(k, was & !(1 << (block % 64)));
+        let gone = was != piece.words[k];
+        self.len -= usize::from(gone);
+        gone
     }
 
     pub(super) fn insert_all(&mut self, blocks: std::ops::Range<usize>) {
@@ -196,72 +194,148 @@ impl Blocks {
         }
     }
 
+    /// The words of `[first, last)` that have a block, in order: the word's
+    /// number and its bits in the range. Words with none are skipped by the
+    /// summary.
+    fn words_in(&self, first: usize, last: usize) -> impl Iterator<Item = (usize, u64)> + '_ {
+        let pieces = if first < last {
+            self.pieces
+                .range(first / Blocks::IN_PIECE..=(last - 1) / Blocks::IN_PIECE)
+        } else {
+            self.pieces.range(1..1)
+        };
+        pieces.flat_map(move |(&piece, words)| {
+            let base = piece * Blocks::IN_PIECE;
+            let from = first.max(base) - base;
+            let to = last.min(base + Blocks::IN_PIECE) - base;
+            let (lo, hi) = (from / 64, to.div_ceil(64));
+            (lo / 64..hi.div_ceil(64)).flat_map(move |s| {
+                let mask = in_word(s * 64, lo, hi);
+                BitsOf(words.any[s] & mask).map(move |bit| {
+                    let k = s * 64 + bit;
+                    let bits = words.words[k] & in_word(k * 64, from, to);
+                    (piece * Blocks::WORDS + k, bits)
+                })
+            })
+        })
+    }
+
     /// Those of `[first, last)`, in order.
-    pub(super) fn range(&self, first: usize, last: usize) -> Vec<usize> {
-        let mut all = Vec::new();
+    pub(super) fn iter(&self, first: usize, last: usize) -> impl Iterator<Item = usize> + '_ {
+        self.words_in(first, last)
+            .flat_map(|(word, bits)| BitsOf(bits).map(move |bit| word * 64 + bit))
+    }
+
+    /// Takes out those of `[first, last)`, telling `gone` of each, in order.
+    pub(super) fn remove_range(&mut self, first: usize, last: usize, mut gone: impl FnMut(usize)) {
         if first >= last {
-            return all;
+            return;
         }
-        if !guard_bits() {
-            all.extend(self.tree.range(first..last).copied());
-            return all;
-        }
+        let mut taken = 0;
         for (&piece, words) in self
-            .words
-            .range(first / Blocks::IN_PIECE..=(last - 1) / Blocks::IN_PIECE)
+            .pieces
+            .range_mut(first / Blocks::IN_PIECE..=(last - 1) / Blocks::IN_PIECE)
         {
             let base = piece * Blocks::IN_PIECE;
             let from = first.max(base) - base;
             let to = last.min(base + Blocks::IN_PIECE) - base;
-            for (k, &bits) in words[from / 64..to.div_ceil(64)].iter().enumerate() {
-                let at = (from / 64 + k) * 64;
-                all.extend(BitsOf(bits & in_word(at, from, to)).map(|bit| base + at + bit));
+            let (lo, hi) = (from / 64, to.div_ceil(64));
+            for s in lo / 64..hi.div_ceil(64) {
+                for bit in BitsOf(words.any[s] & in_word(s * 64, lo, hi)) {
+                    let k = s * 64 + bit;
+                    let out = words.words[k] & in_word(k * 64, from, to);
+                    words.store(k, words.words[k] & !out);
+                    taken += out.count_ones() as usize;
+                    for b in BitsOf(out) {
+                        gone(base + k * 64 + b);
+                    }
+                }
             }
         }
-        all
+        self.len -= taken;
     }
 
     /// The first `n` from `first` on, in order.
     pub(super) fn first_from(&self, first: usize, n: usize) -> Vec<usize> {
-        if !guard_bits() {
-            return self.tree.range(first..).take(n).copied().collect();
-        }
-        let mut all = Vec::new();
-        for (&piece, words) in self.words.range(first / Blocks::IN_PIECE..) {
-            let base = piece * Blocks::IN_PIECE;
-            let from = first.max(base) - base;
-            for (k, &bits) in words[from / 64..].iter().enumerate() {
-                let at = (from / 64 + k) * 64;
-                for bit in BitsOf(bits & in_word(at, from, Blocks::IN_PIECE)) {
-                    if all.len() == n {
-                        return all;
-                    }
-                    all.push(base + at + bit);
-                }
-            }
-        }
-        all
+        self.iter(first, usize::MAX).take(n).collect()
     }
 
     /// How many of `[first, last)` there are.
     pub(super) fn count(&self, first: usize, last: usize) -> usize {
-        if first >= last {
-            return 0;
-        }
-        if !guard_bits() {
-            return self.tree.range(first..last).count();
-        }
-        (first / 64..last.div_ceil(64))
-            .map(|word| (self.word(word) & in_word(word * 64, first, last)).count_ones() as usize)
+        self.words_in(first, last)
+            .map(|(_, bits)| bits.count_ones() as usize)
             .sum()
+    }
+
+    /// Whether all of `[first, last)` are there (true of an empty range).
+    pub(super) fn all(&self, first: usize, last: usize) -> bool {
+        let mut block = first;
+        while block < last {
+            let piece = block / Blocks::IN_PIECE;
+            let Some(words) = self.pieces.get(&piece) else {
+                return false;
+            };
+            let base = piece * Blocks::IN_PIECE;
+            let to = last.min(base + Blocks::IN_PIECE) - base;
+            let mut at = block - base;
+            while at < to {
+                let k = at / 64;
+                // Whole full words at once, by the summary.
+                if at.is_multiple_of(64)
+                    && k.is_multiple_of(64)
+                    && to - at >= 64 * 64
+                    && words.full[k / 64] == u64::MAX
+                {
+                    at += 64 * 64;
+                    continue;
+                }
+                let mask = in_word(k * 64, at, to);
+                if words.words[k] & mask != mask {
+                    return false;
+                }
+                at = (k + 1) * 64;
+            }
+            block = base + to;
+        }
+        true
+    }
+
+    /// Of `[first, last)`, the blocks in neither `self` nor `other`, in
+    /// order, into `out`. Words full in either are skipped by the summaries.
+    pub(super) fn in_neither(
+        &self,
+        other: &Blocks,
+        first: usize,
+        last: usize,
+        out: &mut Vec<usize>,
+    ) {
+        static EMPTY: Piece = Piece {
+            words: [0; Blocks::WORDS],
+            any: [0; Blocks::WORDS / 64],
+            full: [0; Blocks::WORDS / 64],
+        };
+        let mut block = first;
+        while block < last {
+            let piece = block / Blocks::IN_PIECE;
+            let base = piece * Blocks::IN_PIECE;
+            let to = last.min(base + Blocks::IN_PIECE) - base;
+            let a = self.pieces.get(&piece).map_or(&EMPTY, |p| &**p);
+            let b = other.pieces.get(&piece).map_or(&EMPTY, |p| &**p);
+            let from = block - base;
+            let (lo, hi) = (from / 64, to.div_ceil(64));
+            for s in lo / 64..hi.div_ceil(64) {
+                for bit in BitsOf(!(a.full[s] | b.full[s]) & in_word(s * 64, lo, hi)) {
+                    let k = s * 64 + bit;
+                    let unknown = !(a.words[k] | b.words[k]) & in_word(k * 64, from, to);
+                    out.extend(BitsOf(unknown).map(|n| base + k * 64 + n));
+                }
+            }
+            block = base + to;
+        }
     }
 
     pub(super) fn len(&self) -> usize {
         self.len
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.len == 0
     }
 }
 
@@ -291,6 +365,7 @@ impl Iterator for BitsOf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// A range's bits are all of its blocks', whatever lies beside them.
     #[test]
@@ -333,8 +408,7 @@ mod tests {
         assert!(!BITS.any(1 << 40, (1 << 40) + 1));
     }
 
-    /// The set of blocks against another of the same, whichever way
-    /// `VICTORY_GUARD_BITS` keeps it.
+    /// The set of blocks against another of the same.
     #[test]
     fn blocks_are_a_set() {
         let (mut set, mut other) = (Blocks::new(), BTreeSet::new());
@@ -359,14 +433,13 @@ mod tests {
                 let a = near[next(4)] + next(140);
                 let b = a + [next(10), next(300), 2 * Blocks::IN_PIECE + next(100)][next(3)];
                 let want: Vec<usize> = other.range(a..b).copied().collect();
-                assert_eq!(set.range(a, b), want, "{a}..{b}");
+                assert_eq!(set.iter(a, b).collect::<Vec<_>>(), want, "{a}..{b}");
                 assert_eq!(set.count(a, b), want.len(), "{a}..{b}");
                 assert_eq!(
-                    set.range(0, usize::MAX),
+                    set.iter(0, usize::MAX).collect::<Vec<_>>(),
                     other.iter().copied().collect::<Vec<_>>()
                 );
                 assert_eq!(set.len(), other.len());
-                assert_eq!(set.is_empty(), other.is_empty());
                 let word = a / 64;
                 let bits = other
                     .range(word * 64..word * 64 + 64)
@@ -374,12 +447,88 @@ mod tests {
                 assert_eq!(set.word(word), bits);
             }
         }
-        assert_eq!(set.range(5, usize::MAX).first(), other.range(5..).next());
+        assert_eq!(
+            set.iter(5, usize::MAX).next().as_ref(),
+            other.range(5..).next()
+        );
         for from in [0, 5, 64, Blocks::IN_PIECE - 3, 3 * Blocks::IN_PIECE] {
             for n in [0, 1, 7, 1000] {
                 let want: Vec<usize> = other.range(from..).take(n).copied().collect();
                 assert_eq!(set.first_from(from, n), want, "{from} {n}");
             }
         }
+    }
+
+    /// The summaries of the words follow them: whole ranges filled and
+    /// emptied across words and pieces answer `all`, `count`, `iter`,
+    /// `in_neither` and `remove_range` as a plain set does, including after
+    /// a word goes empty or stops being full.
+    #[test]
+    fn blocks_summary_matches_words() {
+        let (mut set, mut other) = (Blocks::new(), BTreeSet::new());
+        let (mut beside, mut beside_other) = (Blocks::new(), BTreeSet::new());
+        let mut seed = 7u64;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        // About the end of a summary word (4096 blocks) and of a piece.
+        let near = [0, 4096 - 70, Blocks::IN_PIECE - 5000, 2 * Blocks::IN_PIECE];
+        for round in 0..3000 {
+            let a = near[next(4)] + next(9000);
+            let b = a + [next(3), next(130), next(9000)][next(3)];
+            match next(5) {
+                0 => {
+                    let mut gone = Vec::new();
+                    set.remove_range(a, b, |block| gone.push(block));
+                    let want: Vec<usize> = other.range(a..b).copied().collect();
+                    for block in &want {
+                        other.remove(block);
+                    }
+                    assert_eq!(gone, want, "round {round}: removed {a}..{b}");
+                }
+                1 => {
+                    let block = a + next(b - a + 1);
+                    assert_eq!(beside.insert(block), beside_other.insert(block));
+                }
+                2 => {
+                    for block in a..b {
+                        if next(16) != 0 {
+                            assert_eq!(set.remove(block), other.remove(&block));
+                        }
+                    }
+                }
+                _ => {
+                    set.insert_all(a..b);
+                    other.extend(a..b);
+                }
+            }
+            let (a, b) = {
+                let a = near[next(4)] + next(9000);
+                (a, a + [next(3), next(130), next(9000)][next(3)])
+            };
+            let want: Vec<usize> = other.range(a..b).copied().collect();
+            assert_eq!(
+                set.iter(a, b).collect::<Vec<_>>(),
+                want,
+                "round {round}: {a}..{b}"
+            );
+            assert_eq!(set.count(a, b), want.len(), "round {round}: {a}..{b}");
+            assert_eq!(
+                set.all(a, b),
+                want.len() == b - a,
+                "round {round}: all {a}..{b}"
+            );
+            assert_eq!(set.len(), other.len(), "round {round}");
+            let mut neither = Vec::new();
+            set.in_neither(&beside, a, b, &mut neither);
+            let want: Vec<usize> = (a..b)
+                .filter(|b| !other.contains(b) && !beside_other.contains(b))
+                .collect();
+            assert_eq!(neither, want, "round {round}: in neither {a}..{b}");
+        }
+        assert!(Blocks::new().all(5, 5) && !Blocks::new().all(5, 6));
     }
 }
