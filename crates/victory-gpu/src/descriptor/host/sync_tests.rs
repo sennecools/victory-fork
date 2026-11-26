@@ -1008,7 +1008,8 @@ fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
     // SAFETY: the allocation's own.
     assert_eq!(unsafe { ResetWriteWatch(memory, 2 * page) }, 0);
     let _ = written();
-    let on = descriptor::SAME_RECORDS_FOR_TESTS.swap(true, Relaxed);
+    // (On this thread alone: other tests copy records meanwhile.)
+    descriptor::SAME_RECORDS_HERE.set(Some(true));
     descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
     assert_eq!(written(), 0, "the same records: the page is not written");
     // One record differs: all eight are copied.
@@ -1018,10 +1019,12 @@ fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
     assert!(written() > 0, "a record that differs is written");
     // SAFETY: as above.
     assert_eq!(unsafe { (dst as *const [u32; 8]).add(5).read() }, [99; 8]);
-    descriptor::SAME_RECORDS_FOR_TESTS.store(on, Relaxed);
-    // Without the switch the same bytes are written, and mark the page.
+    // Without the switch (whatever the environment says) the same bytes
+    // are written, and mark the page.
+    descriptor::SAME_RECORDS_HERE.set(Some(false));
     let _ = written();
     descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
+    descriptor::SAME_RECORDS_HERE.set(None);
     assert!(written() > 0, "without the switch the page is written");
     // SAFETY: this allocation belongs to the test.
     unsafe { VirtualFree(memory, 0, MEM_RELEASE) };

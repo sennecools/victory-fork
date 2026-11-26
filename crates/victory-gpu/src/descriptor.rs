@@ -1332,17 +1332,20 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
 /// leaves out).
 fn same_records() -> bool {
     #[cfg(test)]
-    if SAME_RECORDS_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
+    if let Some(on) = SAME_RECORDS_HERE.get() {
+        return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_some_and(|v| v == "1"))
 }
 
-/// Tests: [`same_records`] on, whatever the environment says.
 #[cfg(test)]
-pub(crate) static SAME_RECORDS_FOR_TESTS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Tests: [`same_records`] as a test on this thread sets it, whatever
+    /// the switch says; other threads' tests are left as the switch says.
+    pub(crate) static SAME_RECORDS_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Device method: ranges of descriptors (start and count each) gathered
 /// from the sources and scattered to the destinations, in order.
