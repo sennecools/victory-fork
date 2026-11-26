@@ -43,13 +43,9 @@ pub(crate) struct HostHeap {
     /// makes to `textures`, `buffers` and `changed`, in the order they were
     /// made, until whatever reads those takes them ([`NoteLog`]).
     log: NoteLog,
-    /// A fingerprint of the record each slot held when the pass over
-    /// records copied in as bytes last looked at it
-    /// ([`HostHeap::copied_begin`]; 0: never looked at). Made on first use.
-    copied: Mutex<Vec<u64>>,
-    /// With [`sync_bytes`]: the records themselves, `step` bytes a slot, as
-    /// that pass last saw them, in place of `copied`'s prints
-    /// ([`HostHeap::copied_begin`]). Made on first use.
+    /// The record each slot held when the pass over records copied in as
+    /// bytes last looked at it, `step` bytes a slot (zeros: never looked at,
+    /// or nothing there; [`HostHeap::copied_begin`]). Made on first use.
     copied_bytes: Mutex<Vec<u8>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
@@ -1488,7 +1484,6 @@ impl HostHeap {
             #[cfg(test)]
             writes: std::sync::atomic::AtomicU64::new(0),
             log: NoteLog::default(),
-            copied: Mutex::new(Vec::new()),
             copied_bytes: Mutex::new(Vec::new()),
             kept: (0..(count + extra).div_ceil(KEPT_SHARD))
                 .map(|shard| {
@@ -3066,42 +3061,30 @@ impl HostHeap {
     }
 
     /// What the pass over records copied in as bytes last saw of this heap,
-    /// held for one pass over it (`super::sync_heaps`):
-    /// the prints of `copied`, or with `bytes` ([`sync_bytes`]) the records
+    /// held for one pass over it (`super::sync_heaps`): the records
     /// themselves, `step` bytes each. Threads that sort parts of the heap's
     /// changed pages beside one another share it
     /// ([`HostHeap::sort_copied_page`]).
-    pub(crate) fn copied_begin(&self, step: usize, bytes: bool) -> Copied<'_> {
+    ///
+    /// Most of a changed page is as it was: sixteen records of 32 bytes are
+    /// one compare of 512 ([`changed_records`]), with no fingerprint made of
+    /// any. The copy is 32 bytes a slot of the title's view heap (on first
+    /// use). Ported from the byte copy of cool_fox 1f1a433 and the sixteen at
+    /// a time of its 53c5256, both by local.
+    pub(crate) fn copied_begin(&self, step: usize) -> Copied<'_> {
         let slots = self.count as usize;
-        if bytes {
-            let mut held = self.copied_bytes.lock().unwrap_or_else(|e| e.into_inner());
-            // Nothing there: a slot never looked at that holds nothing is as
-            // it was, as with prints.
-            if held.len() != slots * step {
-                held.clear();
-                held.resize(slots * step, 0);
-            }
-            Copied {
-                at: held.as_mut_ptr(),
-                slots,
-                step,
-                bytes: true,
-                _prints: None,
-                _bytes: Some(held),
-            }
-        } else {
-            let mut held = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if held.len() != slots {
-                held.resize(slots, 0);
-            }
-            Copied {
-                at: held.as_mut_ptr().cast(),
-                slots,
-                step,
-                bytes: false,
-                _prints: Some(held),
-                _bytes: None,
-            }
+        let mut held = self.copied_bytes.lock().unwrap_or_else(|e| e.into_inner());
+        // Nothing there: a slot never looked at that holds nothing is as it
+        // was.
+        if held.len() != slots * step {
+            held.clear();
+            held.resize(slots * step, 0);
+        }
+        Copied {
+            at: held.as_mut_ptr(),
+            slots,
+            step,
+            _held: held,
         }
     }
 
@@ -3201,8 +3184,8 @@ impl HostHeap {
         self.mirror_marking(index, handle, false, true, hold::SYNC);
     }
 
-    /// The record [`HostHeap::copied_begin`] with bytes last saw in slot
-    /// `index` (tests; `None` before the first pass).
+    /// The record [`HostHeap::copied_begin`] last saw in slot `index`
+    /// (tests; `None` before the first pass).
     #[cfg(test)]
     pub(crate) fn copied_record(&self, index: u32, step: usize) -> Option<Vec<u8>> {
         let bytes = self.copied_bytes.lock().unwrap_or_else(|e| e.into_inner());
@@ -3967,22 +3950,6 @@ pub(crate) fn sync_fast() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FAST").is_none_or(|v| v != "0"))
 }
 
-/// Whether the pass over records copied in as bytes keeps the records
-/// themselves as last seen, and compares a changed page's records sixteen
-/// at a time with what it saw (on by default, as the play set runs it;
-/// `VICTORY_HEAP_SYNC_BYTES=0`: a print of each record, compared one by
-/// one, as before). Most of a
-/// changed page is as it was: sixteen records of 32 bytes are one compare
-/// of 512, with no print made of any. The copy is 32 bytes a slot of the
-/// title's view heap where a print is 8 (on first use).
-///
-/// Ported from the byte copy of cool_fox 1f1a433 and the sixteen at a time
-/// of its 53c5256, both by local.
-pub(crate) fn sync_bytes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BYTES").is_none_or(|v| v != "0"))
-}
-
 /// Whether the heap sync leaves a changed record that is no view of ours,
 /// into a slot made from no record, before its mirror
 /// (`VICTORY_SHOWS_NONE=1`, off by default: such a record is mirrored, which
@@ -4024,16 +3991,13 @@ pub(crate) struct SyncPart {
 }
 
 /// The records last seen of a heap, held for one pass
-/// ([`HostHeap::copied_begin`]): `slots` prints, or `slots` records of
-/// `step` bytes, at `at`.
+/// ([`HostHeap::copied_begin`]): `slots` records of `step` bytes, at `at`.
 pub(crate) struct Copied<'a> {
     at: *mut u8,
     slots: usize,
     step: usize,
-    bytes: bool,
-    /// The lock held of the prints, or of the bytes.
-    _prints: Option<std::sync::MutexGuard<'a, Vec<u64>>>,
-    _bytes: Option<std::sync::MutexGuard<'a, Vec<u8>>>,
+    /// The lock held of the records.
+    _held: std::sync::MutexGuard<'a, Vec<u8>>,
 }
 
 // SAFETY: the copy is reached only through `differ` and `take`, whose
@@ -4055,25 +4019,10 @@ impl Copied<'_> {
         if n == 0 {
             return;
         }
-        if self.bytes {
-            // SAFETY: within the records held; the caller's slots alone.
-            let last = unsafe {
-                std::slice::from_raw_parts(self.at.add(first_at * self.step), n * self.step)
-            };
-            changed_records(last, records, self.step, first, out);
-        } else {
-            // SAFETY: as above, `slots` prints of 8 bytes.
-            let last =
-                unsafe { std::slice::from_raw_parts(self.at.cast::<u64>().add(first_at), n) };
-            for (k, (record, &last)) in records.chunks_exact(self.step).zip(last).enumerate() {
-                // Never 0, which is "never looked at"; a slot never looked
-                // at that holds nothing: as it was.
-                let print = record_print(record) | 1;
-                if last != print && !(last == 0 && record.iter().all(|&b| b == 0)) {
-                    out.push(first + k as u32);
-                }
-            }
-        }
+        // SAFETY: within the records held; the caller's slots alone.
+        let last =
+            unsafe { std::slice::from_raw_parts(self.at.add(first_at * self.step), n * self.step) };
+        changed_records(last, records, self.step, first, out);
     }
 
     /// `record` is the one last seen in slot `index` from here on.
@@ -4085,19 +4034,14 @@ impl Copied<'_> {
         if index >= self.slots || record.len() != self.step {
             return;
         }
-        if self.bytes {
-            // SAFETY: within the records held; the caller's slot alone.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    record.as_ptr(),
-                    self.at.add(index * self.step),
-                    self.step,
-                )
-            };
-        } else {
-            // SAFETY: as above.
-            unsafe { *self.at.cast::<u64>().add(index) = record_print(record) | 1 };
-        }
+        // SAFETY: within the records held; the caller's slot alone.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                record.as_ptr(),
+                self.at.add(index * self.step),
+                self.step,
+            )
+        };
     }
 }
 
@@ -4201,25 +4145,6 @@ pub(crate) fn claims_line(frames: f64) {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::sort_copied_page`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
-/// equal records give equal prints, and two different records the same
-/// print about once in 2^64. Not a hash anyone can attack: the records
-/// are our own.
-fn record_print(record: &[u8]) -> u64 {
-    const K: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut h = K ^ record.len() as u64;
-    let mut words = record.chunks_exact(8);
-    for word in &mut words {
-        let w = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
-        h = (h ^ w).wrapping_mul(K);
-        h ^= h >> 29;
-    }
-    for &b in words.remainder() {
-        h = (h ^ u64::from(b)).wrapping_mul(K);
-    }
-    h ^ (h >> 32)
-}
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own
 /// bytes (`VICTORY_VIEW_OWN_COPY=0`: it is refused and reads zeros, as
@@ -7734,30 +7659,6 @@ mod made_tests {
             assert_eq!(queue.0.slots.contains_key(&index), texture, "slot {index}");
             assert_eq!(queue.1.contains(&index), buffer, "slot {index}");
         }
-    }
-}
-#[cfg(test)]
-mod record_print_tests {
-    use super::record_print;
-
-    /// Equal records print alike; a record that differs in any one byte,
-    /// or in its length, prints otherwise.
-    #[test]
-    fn a_record_that_changed_prints_otherwise() {
-        let record: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(37).wrapping_add(5)).collect();
-        let print = record_print(&record);
-        assert_eq!(print, record_print(&record.clone()));
-        for at in 0..32 {
-            for bit in 0..8 {
-                let mut other = record.clone();
-                other[at] ^= 1 << bit;
-                assert_ne!(record_print(&other), print, "byte {at} bit {bit}");
-            }
-        }
-        assert_ne!(record_print(&record[..16]), print);
-        assert_ne!(record_print(&[0u8; 32]), record_print(&[0u8; 16]));
-        // A record of zeros is told from "never looked at" by the caller's `| 1`.
-        assert_ne!(record_print(&[0u8; 32]) | 1, 0);
     }
 }
 

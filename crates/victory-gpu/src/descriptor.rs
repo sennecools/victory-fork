@@ -418,7 +418,7 @@ fn sync_parted_heap(
     }
     let threads = SYNC_THREADS;
     let shows_none = host::shows_none();
-    let copied = host.copied_begin(step as usize, host::sync_bytes());
+    let copied = host.copied_begin(step as usize);
     let jobs: Vec<&[(usize, usize)]> = parts.chunks(host::SYNC_PAGES).collect();
     let found: Vec<std::sync::Mutex<host::SyncPart>> =
         jobs.iter().map(|_| Default::default()).collect();

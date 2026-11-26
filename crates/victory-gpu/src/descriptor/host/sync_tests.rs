@@ -609,9 +609,8 @@ fn mirror_one(
 /// page on four threads (`sort_copied_page`) and the slots found mirrored
 /// on four threads (`mirror_synced`): after every round the same slots
 /// made from the same records, with the same words and buffer sets, and
-/// the same records last seen. With prints or bytes (`bytes`), and with or
-/// without `shows_none`.
-fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
+/// the same records last seen. With or without `shows_none`.
+fn sorted_against_one_by_one(shows_none: bool) {
     let (Some(one), Some(sorted)) = (HostHeap::new(false, SLOTS), HostHeap::new(false, SLOTS))
     else {
         return; // no host GPU
@@ -621,7 +620,7 @@ fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
     let mut records = vec![[0u32; 8]; SLOTS as usize];
     let base = records.as_mut_ptr() as u64;
     let step = 32u64;
-    let mut rng = 0x0dd5_eed5_1f1a_4330u64 ^ u64::from(bytes) ^ u64::from(shows_none) << 1;
+    let mut rng = 0x0dd5_eed5_1f1a_4330u64 ^ 1 ^ u64::from(shows_none) << 1;
     let mut mirrored = 0u64;
     let mut last = vec![vec![0u8; step as usize]; SLOTS as usize];
     for round in 0..200 {
@@ -665,7 +664,7 @@ fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
         let found: Vec<std::sync::Mutex<SyncPart>> =
             parts.iter().map(|_| Default::default()).collect();
         {
-            let copied = sorted.copied_begin(step as usize, bytes);
+            let copied = sorted.copied_begin(step as usize);
             crate::draw::each_on(4, parts.len(), "test-sync", &|n| {
                 let (from, to) = parts[n];
                 let mut part = SyncPart::default();
@@ -710,10 +709,8 @@ fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
         for s in 0..SLOTS {
             assert_eq!(key(&one, s), key(&sorted, s), "round {round}, slot {s}");
             assert_eq!(one.word(s), sorted.word(s), "round {round}, slot {s}");
-            if bytes {
-                let seen = sorted.copied_record(s, step as usize).expect("bytes kept");
-                assert_eq!(seen, last[s as usize], "round {round}, slot {s}");
-            }
+            let seen = sorted.copied_record(s, step as usize).expect("bytes kept");
+            assert_eq!(seen, last[s as usize], "round {round}, slot {s}");
         }
         assert_eq!(one.buffer_slots(), sorted.buffer_slots(), "round {round}");
         words_agree(&sorted);
@@ -725,23 +722,17 @@ fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
     assert!(alive());
 }
 
-/// [`sorted_against_one_by_one`] with prints.
+/// [`sorted_against_one_by_one`].
 #[test]
 fn pages_sorted_on_threads_make_what_one_by_one_makes() {
-    sorted_against_one_by_one(false, false);
+    sorted_against_one_by_one(false);
 }
 
-/// [`sorted_against_one_by_one`] with the records' bytes as last seen.
-#[test]
-fn pages_sorted_with_bytes_make_what_one_by_one_makes() {
-    sorted_against_one_by_one(true, false);
-}
-
-/// [`sorted_against_one_by_one`] with bytes, records of no view into slots
-/// made from none left before their mirror.
+/// [`sorted_against_one_by_one`] with records of no view into slots made
+/// from none left before their mirror.
 #[test]
 fn records_of_no_view_left_before_their_mirror_make_what_one_by_one_makes() {
-    sorted_against_one_by_one(true, true);
+    sorted_against_one_by_one(true);
 }
 
 /// The records [`changed_records`] gives are those that differ one by one,
