@@ -3447,6 +3447,10 @@ struct Deferred {
     /// CPU again since ([`HostList::unlift`]): held until the reset, as that
     /// submission's lift list reads and writes their buffers.
     spent: Vec<Lifted>,
+    /// With [`lift_uploads`]: the texture uploads of `uploads` that lie in
+    /// shared memory ([`HostList::upload_for_texture`]): their CPU address,
+    /// bytes, and buffer, for a lifted fill to find ([`HostList::scratch_chunk`]).
+    shared_uploads: Vec<(usize, u64, ID3D12Resource)>,
 }
 
 /// What a list's submission-time steps asked for and did
@@ -4366,6 +4370,23 @@ fn lift_mode() -> LiftMode {
         Ok("2") => LiftMode::Fills,
         _ => LiftMode::Off,
     })
+}
+
+/// Whether the upload buffers of the title's buffer to texture copies lie
+/// in shared memory, so that a fill of one can be lifted to the card like a
+/// fill of a scratch chunk (`VICTORY_LIFT_UPLOADS=1`; off by default, and
+/// only where fills are lifted: `VICTORY_LIFT_READS=2` or
+/// `VICTORY_R5_LIFT=1`). Without it such a fill over what flights write
+/// aborts its plan ([`LiftAbort::BigScratch`]); with
+/// `VICTORY_LIFT_CLOSURE=1` so does one that reads what a lifted copy
+/// writes.
+///
+/// Shared memory is the CPU's, cached: the copy into the texture reads it
+/// over the bus, as it reads upload memory.
+fn lift_uploads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIFT_UPLOADS").is_some_and(|v| v == "1"))
+        && lift_mode() == LiftMode::Fills
 }
 
 /// The most bytes a lifted copy within one host copy moves through a
@@ -9440,6 +9461,29 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// As [`HostList::upload`], for the bytes a buffer to texture copy reads
+    /// out of title memory, which a fill puts there: with [`lift_uploads`]
+    /// the buffer lies in shared memory, so that a lifted fill can copy into
+    /// it on the card.
+    pub(crate) fn upload_for_texture(
+        &self,
+        host: &Host,
+        size: u64,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
+        if !lift_uploads() {
+            return self.upload(host, size);
+        }
+        let (buffer, data) = host.shared_buffer(size)?;
+        label(&buffer, "list upload shared", size);
+        name(&buffer, || format!("list upload shared {size:#x}"));
+        let mut deferred = self.deferred();
+        deferred.hold_upload(buffer.clone(), size);
+        deferred
+            .shared_uploads
+            .push((data as usize, size, buffer.clone()));
+        Some((buffer, data))
+    }
+
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
@@ -10022,19 +10066,30 @@ impl HostList {
     /// The list's scratch chunk that holds `[at, at + len)` of its upload
     /// memory (CPU addresses, as a fill's destination): the chunk's buffer
     /// and the offset in it. `None` outside the chunks (a scratch of its own).
+    /// With [`lift_uploads`] a texture upload in shared memory counts as one.
     fn scratch_chunk(&self, at: usize, len: usize) -> Option<(ID3D12Resource, u64)> {
-        let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        scratch
-            .chunks
+        let within = |data: usize, size: u64| {
+            data <= at
+                && at
+                    .checked_add(len)
+                    .is_some_and(|end| end <= data + size as usize)
+        };
+        let found = {
+            let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            scratch
+                .chunks
+                .iter()
+                .find(|(chunk, size)| chunk.shared && within(chunk.data, *size))
+                .map(|(chunk, _)| (chunk.buffer.clone(), (at - chunk.data) as u64))
+        };
+        if found.is_some() || !lift_uploads() {
+            return found;
+        }
+        self.deferred()
+            .shared_uploads
             .iter()
-            .find(|(chunk, size)| {
-                chunk.shared
-                    && chunk.data <= at
-                    && at
-                        .checked_add(len)
-                        .is_some_and(|end| end <= chunk.data + *size as usize)
-            })
-            .map(|(chunk, _)| (chunk.buffer.clone(), (at - chunk.data) as u64))
+            .find(|(data, size, _)| within(*data, *size))
+            .map(|(data, _, buffer)| (buffer.clone(), (at - data) as u64))
     }
 }
 
