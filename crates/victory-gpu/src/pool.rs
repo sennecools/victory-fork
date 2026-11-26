@@ -345,6 +345,9 @@ pub fn title_memory_pool_chunk(section: usize, bytes: u64, how: PoolChunk) {
         serial: MADE_CHUNKS.fetch_add(1, Ordering::Relaxed),
     };
     let old = chunks().insert(section, chunk);
+    if let Some(opened) = old.as_ref().and_then(|chunk| chunk.opened.as_ref()) {
+        crate::memory::chunk_gone(section, &opened.buffer);
+    }
     drop(old);
 }
 
@@ -354,6 +357,10 @@ pub fn title_memory_pool_chunk(section: usize, bytes: u64, how: PoolChunk) {
 /// charge, after the title freed its pages.
 pub fn title_memory_pool_chunk_gone(section: usize) {
     let old = chunks().remove(&section);
+    // The memory directory's number for it goes too (it holds the buffer).
+    if let Some(opened) = old.as_ref().and_then(|chunk| chunk.opened.as_ref()) {
+        crate::memory::chunk_gone(section, &opened.buffer);
+    }
     drop(old);
 }
 

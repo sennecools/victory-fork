@@ -75,8 +75,8 @@ pub mod window;
 
 #[cfg(windows)]
 pub use home::{
-    Committing, memory_core_on, title_memory_committing, title_memory_region, title_virtual_free,
-    title_virtual_protect,
+    Committing, memory_core_on, memory_own_alloc, memory_own_free_now, memory_own_on,
+    title_memory_committing, title_memory_region, title_virtual_free, title_virtual_protect,
 };
 #[cfg(windows)]
 pub use host::on_failure;

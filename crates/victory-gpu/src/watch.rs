@@ -1240,6 +1240,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::home::cpu_touched(at, len, crate::home::Touch::Remapped);
+    // The directory of raw-address shaders looks at its pages there again.
+    crate::memory::remapped(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();

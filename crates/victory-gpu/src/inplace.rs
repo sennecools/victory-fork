@@ -481,6 +481,8 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+    // The directory of raw-address shaders looks at its pages there again.
+    crate::memory::remapped(at, len);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):

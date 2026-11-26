@@ -921,6 +921,10 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// A region of our own (`VICTORY_MEMORY_OWN=1`,
+    /// `crate::home::memory_own_alloc`): given back through the memory
+    /// core.
+    own: bool,
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -984,6 +988,7 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            own: false,
         })
     }
 
@@ -1003,6 +1008,19 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
+        // With `VICTORY_MEMORY_OWN=1`: a watched region of our own below
+        // 128 GiB, which the memory core may give homes in (zeroed: freshly
+        // committed).
+        if crate::home::own_on()
+            && let Some(ptr) = crate::home::memory_own_alloc(layout.size(), layout.align())
+        {
+            return Ok(Memory {
+                ptr,
+                layout,
+                attributes: None,
+                own: true,
+            });
+        }
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
         // The big ones are named in the log: the memory line counts our own
@@ -1015,12 +1033,17 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            own: false,
         })
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        if self.own {
+            crate::home::memory_own_free(self.ptr.as_ptr() as usize);
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.

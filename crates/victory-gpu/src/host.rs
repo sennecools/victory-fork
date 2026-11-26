@@ -7728,6 +7728,14 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        // The directory of title memory by address (`crate::memory`, with
+        // `VICTORY_MEMORY_DIRECTORY=1`): its entries changed since the last
+        // submission go into the shaders' table ahead of this one's lists,
+        // so that each submission sees it whole, as it was when sent.
+        if !late && let Some(list) = crate::memory::before_submission(self) {
+            // SAFETY: a closed list of ours; it goes ahead of the lists.
+            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+        }
         let card_before = crate::profile::span("card_before");
         let card = self.card_before(runs, flown);
         drop(card_before);
@@ -7931,8 +7939,10 @@ impl Host {
             let _hand_back = crate::profile::span_args("hand_back", &[("shadows", back.len() as u64)]);
             hand_back(&back);
         }
-        // Copies over homes the shaders wrote take those bytes again.
+        // Copies over homes the shaders wrote take those bytes again, and
+        // those over pool pages raw-address shaders reach in place.
         crate::home::after_wait(&back);
+        crate::memory::after_wait(runs);
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -9366,6 +9376,12 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether the list asked about `key` since the reset
+    /// ([`HostList::first_use`]).
+    pub(crate) fn used(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
     }
 
     /// The list ran the heap buffer pass: its submission-time steps are

@@ -231,7 +231,20 @@ static DEVICE13: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(
 /// (once asked), the host's refusals latched. Creates no device
 /// (`crate::pool::memory_pool_homes_possible`).
 pub(crate) fn homes_ruled_out() -> bool {
-    crate::host::late() || DEVICE13.load(Ordering::Relaxed) == 2 || LATCHED.load(Ordering::Relaxed)
+    ruled_out().is_some()
+}
+
+/// [`homes_ruled_out`], with the reason.
+pub(crate) fn ruled_out() -> Option<Why> {
+    if crate::host::late() {
+        Some(Why::Late)
+    } else if DEVICE13.load(Ordering::Relaxed) == 2 {
+        Some(Why::NoDevice13)
+    } else if LATCHED.load(Ordering::Relaxed) {
+        Some(Why::Latched)
+    } else {
+        None
+    }
 }
 
 /// Set once the host refused three openings in a row with the same error:
@@ -317,9 +330,27 @@ const WHYS: [(Why, &str); 18] = [
 static TURNED_DOWN: [AtomicU64; WHYS.len()] = [const { AtomicU64::new(0) }; WHYS.len()];
 
 fn turned_down(why: Why) {
-    if let Some(i) = WHYS.iter().position(|w| w.0 == why) {
+    if let Some(i) = why_index(why) {
         TURNED_DOWN[i].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// How many reasons [`WHYS`] counts (`crate::memory` counts its own by them).
+pub(crate) const WHY_COUNT: usize = WHYS.len();
+
+/// `why`'s place in [`WHYS`] (none for [`Why::Off`]).
+pub(crate) fn why_index(why: Why) -> Option<usize> {
+    WHYS.iter().position(|w| w.0 == why)
+}
+
+/// The words of the reason at `i` of [`WHYS`].
+pub(crate) fn why_label(i: usize) -> &'static str {
+    WHYS.get(i).map_or("", |w| w.1)
+}
+
+/// Ranges that kept a copy for `why` since the start.
+pub(crate) fn turned_down_count(why: Why) -> u64 {
+    why_index(why).map_or(0, |i| TURNED_DOWN[i].load(Ordering::Relaxed))
 }
 
 /// Since the start: homes made (windows, buffers); asks that joined a home
@@ -479,6 +510,13 @@ struct Region {
     busy: u32,
     /// A protection was refused while a home stood: no home again.
     blacklisted: bool,
+    /// One of our own heaps (slice 3, [`memory_own_alloc`]), not the
+    /// title's.
+    own: bool,
+    /// Which region this is, of all ever told: a release leaves the table
+    /// only with the region it freed ([`released`]), not one of ours made
+    /// at the same base right after the host freed it.
+    serial: u64,
 }
 
 impl Region {
@@ -502,6 +540,8 @@ struct Pending {
     kind: u32,
     pages: (usize, usize),
     region: usize,
+    /// The region's [`Region::serial`].
+    serial: u64,
     since: u64,
 }
 
@@ -604,9 +644,15 @@ pub fn title_memory_region(at: usize, len: usize, kind: u32, flags: u64, protect
     for base in stale {
         core.regions.remove(&base);
     }
-    core.regions.insert(
-        at,
+    core.regions
+        .insert(at, Region::new(len, kind, flags, protect, false));
+}
+
+impl Region {
+    fn new(len: usize, kind: u32, flags: u64, protect: u32, own: bool) -> Region {
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
         Region {
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
             len,
             kind,
             flags,
@@ -614,8 +660,9 @@ pub fn title_memory_region(at: usize, len: usize, kind: u32, flags: u64, protect
             homes_ever: 0,
             busy: 0,
             blacklisted: false,
-        },
-    );
+            own,
+        }
+    }
 }
 
 /// The homes in the tables, for the one-home rule: `home` was put there.
@@ -1125,17 +1172,17 @@ fn unnumber() {
 }
 
 /// The pages of a title `VirtualFree(at, len, kind)` in a region, and the
-/// region's base; `None` if they are not a region's, the call is of a kind
+/// region's base and serial; `None` if they are not a region's, the call is of a kind
 /// that never touches a home (placeholders), or the host would refuse it
 /// for its own shape whatever stood there: a release that is not of the
 /// whole allocation from its base, a decommit of length 0 not at the base,
 /// a range past the region's end or over more than its one allocation.
 /// Such a call goes to the host as it is, and its refusal is the title's.
-fn free_span(at: usize, len: usize, kind: u32) -> Option<(usize, usize, usize)> {
-    let (base, region_end) = {
+fn free_span(at: usize, len: usize, kind: u32) -> Option<(usize, usize, usize, u64)> {
+    let (base, region_end, serial) = {
         let mut core = core();
         let (base, region) = core.region_at(at)?;
-        (base, base + region.len)
+        (base, base + region.len, region.serial)
     };
     let (from, to) = match kind {
         mem::MEM_RELEASE if at == base && len == 0 => (base, region_end),
@@ -1150,7 +1197,7 @@ fn free_span(at: usize, len: usize, kind: u32) -> Option<(usize, usize, usize)> 
         return None;
     }
     (allocation_of(from) == Some(base) && allocation_of(to - 1) == Some(base))
-        .then_some((from, to, base))
+        .then_some((from, to, base, serial))
 }
 
 /// The base of the host allocation holding `at` (one question to Windows).
@@ -1174,15 +1221,23 @@ fn busy(base: usize, which: usize) -> (bool, bool) {
     if found != base {
         return (false, false);
     }
-    TOLD[which].fetch_add(1, Ordering::Relaxed);
+    // Our own heaps' frees are counted apart ([`own_free`]).
+    let title = !region.own;
+    if title {
+        TOLD[which].fetch_add(1, Ordering::Relaxed);
+    }
     region.busy += 1;
     if region.homes_ever == 0 {
         return (true, false);
     }
-    TOLD[which + 1].fetch_add(1, Ordering::Relaxed);
+    if title {
+        TOLD[which + 1].fetch_add(1, Ordering::Relaxed);
+    }
     (true, true)
 }
 
+/// By base only: a region made at the same base since (after the host's
+/// release) loses at most a busy count it never had, which saturates at 0.
 fn unbusy(base: usize) {
     let mut core = core();
     if let Some((found, region)) = core.region_at(base)
@@ -1208,7 +1263,7 @@ pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
     let host = || unsafe { mem::VirtualFree(at as *mut c_void, len, kind) };
     // SAFETY: a plain read of this thread's last error.
     let before = unsafe { GetLastError() };
-    let Some((from, to, base)) = free_span(at, len, kind) else {
+    let Some((from, to, base, serial)) = free_span(at, len, kind) else {
         return host();
     };
     // A release ends the region and its waiting frees: from before the
@@ -1225,7 +1280,7 @@ pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
             let error = unsafe { GetLastError() };
             unbusy(base);
             if done != 0 && kind == mem::MEM_RELEASE {
-                released(base);
+                released(base, serial);
             }
             // SAFETY: as the host left it.
             unsafe { SetLastError(error) };
@@ -1240,7 +1295,7 @@ pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
     if done != 0 || error != REFUSED_BY_HEAP {
         unbusy(base);
         if done != 0 && kind == mem::MEM_RELEASE {
-            released(base);
+            released(base, serial);
         }
         // SAFETY: as the host left it.
         unsafe { SetLastError(error) };
@@ -1255,6 +1310,7 @@ pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
             kind,
             pages: (from, to),
             region: base,
+            serial,
             since: crate::host::now_ms(),
         });
         PENDING.fetch_add(1, Ordering::Release);
@@ -1265,13 +1321,17 @@ pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
     1
 }
 
-/// The region at `base` was released: it leaves the table, and the frees of
-/// it that wait go with it (the host freed their pages with the rest).
-/// Called with [`FREEING`] held.
-fn released(base: usize) {
+/// The region at `base` with serial `serial` was released: it leaves the
+/// table, and the frees of it that wait go with it (the host freed their
+/// pages with the rest). Called with [`FREEING`] held. A region of ours
+/// ([`memory_own_alloc`], which does not take [`FREEING`]) made at the same
+/// base once the host had freed it is another region and stays.
+fn released(base: usize, serial: u64) {
     let mut core = core();
-    core.regions.remove(&base);
-    drop_pending(&mut core, |p| p.region == base);
+    if core.regions.get(&base).is_some_and(|r| r.serial == serial) {
+        core.regions.remove(&base);
+    }
+    drop_pending(&mut core, |p| p.region == base && p.serial == serial);
 }
 
 /// Drops the waiting frees `which` picks, with their marks of their
@@ -1532,7 +1592,7 @@ fn run_pending_after(give_up_ms: u64) {
             kept.retain(|k| k.region != p.region);
             PENDING.fetch_sub((before - kept.len()) as u64, Ordering::Release);
             // With those put in the list since this pass took it.
-            released(p.region);
+            released(p.region, p.serial);
         }
     }
     core().pending.extend(kept);
@@ -1580,18 +1640,44 @@ pub(crate) fn after_wait(declared: &[(Arc<Shadow>, Vec<(usize, usize)>)]) {
     }
     let mut ranges = merged(private);
     if !pool.is_empty() {
-        let shown: Vec<(usize, usize)> = pool
-            .into_values()
-            .flat_map(merged)
-            .flat_map(|(from, to)| crate::pool::shown_at(from, to))
-            .collect();
-        let shown = merged(shown);
-        for &(from, to) in &shown {
-            crate::pool::textures_told(from, to);
-        }
+        let shown = pool_shown(pool.into_values().flat_map(merged));
         ranges.extend(shown);
         ranges = merged(ranges);
     }
+    tell_copies(ranges);
+}
+
+/// Slice 3 (`crate::memory`, `VICTORY_MEMORY_DIRECTORY=1`): after a
+/// submission's wait, raw-address shaders may have written the pages of
+/// chunks of the pool that the directory names (`ranges`, in order and
+/// apart), which have no home there: as for a C-pool home's ranges
+/// ([`after_wait`]), the copies over those pages at every view, and the
+/// placed textures there, are told.
+pub(crate) fn directory_written(ranges: Vec<(usize, usize)>) {
+    if ranges.is_empty() {
+        return;
+    }
+    tell_copies(pool_shown(ranges.into_iter()));
+}
+
+/// The title ranges that show the pool pages under `ranges` at every view
+/// (`crate::pool::shown_at`; each range lies in one run of pages), merged,
+/// with the placed textures over them told (`crate::pool::textures_told`).
+fn pool_shown(ranges: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, usize)> {
+    let shown = merged(
+        ranges
+            .flat_map(|(from, to)| crate::pool::shown_at(from, to))
+            .collect(),
+    );
+    for &(from, to) in &shown {
+        crate::pool::textures_told(from, to);
+    }
+    shown
+}
+
+/// The copies over `ranges` (merged) take those bytes again: the GPU wrote
+/// them where write watching does not see it.
+fn tell_copies(ranges: Vec<(usize, usize)>) {
     for (from, to) in ranges {
         for (a, b) in crate::shadow::copies_over(from as u64, to as u64) {
             crate::watch::gpu_wrote(a, b - a);
@@ -1613,12 +1699,224 @@ fn merged(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     merged
 }
 
-/// Once per sweep (`crate::inplace::tick`): the frees that waited, and the
-/// line every ten seconds.
+// ---- Slice 3: our own heaps (`VICTORY_MEMORY_OWN=1`) ----
+
+/// `VICTORY_MEMORY_OWN=1` with the core on: the memory we give the title
+/// out of our own allocator (its D3D12 heaps, its descriptor heaps,
+/// committed resources when it names no allocator, `XMemAllocDefault`'s
+/// blocks of 64 KiB and more) is a region of our own below 128 GiB, 64 KiB
+/// aligned and write-watched ([`memory_own_alloc`]), which the core gives
+/// homes in as it does the title's regions: what was class O, process-heap
+/// memory no home may be opened on (`Why::NotRegion`), becomes C. Read
+/// once.
+pub(crate) fn own_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_MEMORY_OWN").is_some_and(|v| v == "1");
+        if asked && !on() {
+            tracing::warn!("VICTORY_MEMORY_OWN=1 does nothing without VICTORY_MEMORY_CORE=1");
+        } else if asked {
+            tracing::info!(
+                "memory core own heaps on (VICTORY_MEMORY_OWN=1): our heaps for the title are watched regions below 128 GiB the card may use in place"
+            );
+        }
+        asked && on()
+    });
+    on || test_own()
+}
+
+/// [`own_on`], for `victory-hle` (`XMemAllocDefault`).
+pub fn memory_own_on() -> bool {
+    own_on()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_OWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn test_own() -> bool {
+    TEST_OWN.with(std::cell::Cell::get) && on()
+}
+
+#[cfg(not(test))]
+fn test_own() -> bool {
+    false
+}
+
+/// Our own heaps since the start: regions made, their bytes, refused by
+/// the host, given back (at a sweep, [`run_own_frees`]), their bytes, given
+/// back that the host refused.
+static OWN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Our own heaps to give back at the next sweep ([`memory_own_free`]), by
+/// base. Its own lock, taken with no other held.
+static OWN_FREES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// `len` zeroed bytes aligned to `align` (a power of two), as a region of
+/// our own: a reservation of its own, committed read-write and
+/// write-watched, below 128 GiB (where the title's GPU memory is, and as
+/// far as `crate::memory`'s directory reaches, so that raw-address shaders
+/// find it too) and above 4 GiB (kept for the title's 32-bit memory), its
+/// length rounded up to
+/// 64 KiB so that no other allocation shares its last 64 KiB page (a home
+/// pins whole 64 KiB pages, and a free of a page under one fails). Told to
+/// the region table as ours. None if the host refuses it; the caller then
+/// takes heap memory as before.
+pub fn memory_own_alloc(len: usize, align: usize) -> Option<std::ptr::NonNull<u8>> {
+    const K64: usize = 64 << 10;
+    /// The host's write watching (not in windows-sys' memory module).
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    if len == 0 || !align.is_power_of_two() {
+        return None;
+    }
+    let bytes = len.checked_next_multiple_of(K64)?;
+    let mut requirements = mem::MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: (4usize << 30) as *mut c_void,
+        // The directory's last page stays empty (`crate::memory`).
+        HighestEndingAddress: ((victory_shader::emit::MEMORY_PAGES as usize - 1) * K64 - 1)
+            as *mut c_void,
+        // Reservations are 64 KiB aligned anyway.
+        Alignment: if align > K64 { align } else { 0 },
+    };
+    let mut parameter = mem::MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: a reservation of our own; the parameter points at
+    // `requirements`, which outlives the call.
+    let at = unsafe {
+        mem::VirtualAlloc2(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            std::ptr::null(),
+            bytes,
+            mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH,
+            mem::PAGE_READWRITE,
+            &mut parameter,
+            1,
+        )
+    };
+    if at.is_null() {
+        if OWN[2].fetch_add(1, Ordering::Relaxed) < 4 {
+            // SAFETY: a plain read of this thread's last error.
+            let error = unsafe { GetLastError() };
+            tracing::warn!(
+                bytes,
+                error,
+                "memory core: no region of our own for a heap; heap memory instead"
+            );
+        }
+        return None;
+    }
+    let base = at as usize;
+    {
+        // Without `FREEING` (we may be called with any lock held): a waiting
+        // free of the title's is of pages the host still holds, which it
+        // cannot have given us, so none is over these.
+        let mut core = core();
+        let end = base + bytes;
+        let stale: Vec<usize> = core
+            .regions
+            .range(..end)
+            .rev()
+            .take_while(|(b, region)| b.saturating_add(region.len) > base)
+            .map(|(b, _)| *b)
+            .collect();
+        for b in stale {
+            core.regions.remove(&b);
+        }
+        core.regions.insert(
+            base,
+            Region::new(
+                bytes,
+                mem::MEM_RESERVE | mem::MEM_COMMIT,
+                0,
+                mem::PAGE_READWRITE,
+                true,
+            ),
+        );
+    }
+    OWN[0].fetch_add(1, Ordering::Relaxed);
+    OWN[1].fetch_add(bytes as u64, Ordering::Relaxed);
+    std::ptr::NonNull::new(at.cast())
+}
+
+/// Gives back a region [`memory_own_alloc`] made, at the next sweep
+/// ([`run_own_frees`]): for a caller that may hold any lock (the drop of
+/// memory of ours with no allocator: heaps, descriptor heaps, resources
+/// made without one), as the release takes the core's path (the homes over it let go
+/// first, the release waiting while a list still holds one), whose lock
+/// comes first. A caller that holds none of ours takes
+/// [`memory_own_free_now`].
+pub fn memory_own_free(at: usize) {
+    OWN_FREES.lock().unwrap_or_else(|e| e.into_inner()).push(at);
+}
+
+/// Gives back a region [`memory_own_alloc`] made now, through the core's
+/// path as [`memory_own_free`]'s sweep does: for a caller that holds no
+/// lock of ours (`XMemFreeDefault`, on the title's threads), so that a
+/// title that frees many big blocks between sweeps does not keep them all
+/// committed.
+pub fn memory_own_free_now(at: usize) {
+    release_own(at);
+}
+
+/// The regions of ours given back since the last sweep are released
+/// ([`release_own`]).
+fn run_own_frees() {
+    let due = std::mem::take(&mut *OWN_FREES.lock().unwrap_or_else(|e| e.into_inner()));
+    for at in due {
+        release_own(at);
+    }
+}
+
+/// The region of ours at `at` is released, as a title's release is
+/// ([`title_virtual_free`]), and counted apart from the title's.
+fn release_own(at: usize) {
+    let len = core()
+        .region_at(at)
+        .filter(|(base, region)| *base == at && region.own)
+        .map_or(0, |(_, region)| region.len);
+    OWN[3].fetch_add(1, Ordering::Relaxed);
+    OWN[4].fetch_add(len as u64, Ordering::Relaxed);
+    if title_virtual_free(at, 0, mem::MEM_RELEASE) == 0
+        && OWN[5].fetch_add(1, Ordering::Relaxed) < 4
+    {
+        // SAFETY: a plain read of this thread's last error.
+        let error = unsafe { GetLastError() };
+        tracing::warn!(
+            at = format_args!("{at:#x}"),
+            error,
+            "memory core: a region of our own could not be released"
+        );
+    }
+}
+
+/// The own heaps' part of the ten-second lines, with the switch on.
+fn own_line() -> Option<String> {
+    if !own_on() {
+        return None;
+    }
+    let o: Vec<u64> = OWN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let waiting = OWN_FREES.lock().unwrap_or_else(|e| e.into_inner()).len();
+    Some(format!(
+        "memory core own heaps: {} regions made ({} MB), {} refused by the host (heap memory instead); {} given back ({} MB, {} refused), {waiting} to give back at the next sweep",
+        o[0],
+        o[1] >> 20,
+        o[2],
+        o[3],
+        o[4] >> 20,
+        o[5],
+    ))
+}
+
+/// Once per sweep (`crate::inplace::tick`): our own heaps given back, the
+/// frees that waited, and the line every ten seconds.
 pub(crate) fn tick() {
     if !on() {
         return;
     }
+    run_own_frees();
     run_pending();
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = crate::host::now_ms();
@@ -1647,7 +1945,9 @@ fn lines() -> Vec<String> {
         .collect();
     // Before the core's lock: `crate::memory` has its own.
     let views = crate::memory::let_go_views_waiting();
+    let directory = crate::memory::line();
     let pool = crate::pool::line();
+    let own = own_line();
     let core = core();
     let (homes, pinned) = core.live.iter().fold((0u64, 0u64), |a, (&(_, bytes), &n)| {
         (a.0 + u64::from(n), a.1 + bytes * u64::from(n))
@@ -1680,12 +1980,16 @@ fn lines() -> Vec<String> {
     )];
     // Slice 4: copies in the card's memory whose CPU side is a home.
     lines.extend(crate::card_home::line());
+    // Slice 3: the directory of raw-address shaders, our own heaps.
+    lines.extend(directory);
+    lines.extend(own);
     // The census: regions by the console's protection above the host's
     // bits, its page-size kind bits and the XMem flags, with the bytes homes
-    // pin in them.
-    let mut census: BTreeMap<(u32, u32, u64), (u64, u64, u64)> = BTreeMap::new();
+    // pin in them; our own heaps (slice 3) apart.
+    let mut census: BTreeMap<(bool, u32, u32, u64), (u64, u64, u64)> = BTreeMap::new();
     for (&base, region) in &core.regions {
         let key = (
+            region.own,
             region.protect & !0x1ff,
             region.kind & 0xe040_0000,
             region.flags,
@@ -1700,7 +2004,15 @@ fn lines() -> Vec<String> {
         entry.1 += region.len as u64;
         entry.2 += in_homes;
     }
-    for ((protect, kind, flags), (n, bytes, in_homes)) in census {
+    for ((own, protect, kind, flags), (n, bytes, in_homes)) in census {
+        if own {
+            lines.push(format!(
+                "memory core census: our own heaps: {n} regions, {} MB, {} MB in homes",
+                bytes >> 20,
+                in_homes >> 20
+            ));
+            continue;
+        }
         lines.push(format!(
             "memory core census: protection bits {protect:#x}, kind bits {kind:#x}, flags {flags:#x}: {n} regions, {} MB, {} MB in homes",
             bytes >> 20,
@@ -1745,8 +2057,10 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             TEST_ON.with(|on| on.set(false));
             NO_DEVICE13.with(|no| no.set(false));
+            TEST_OWN.with(|own| own.set(false));
             crate::pool::set_test(false);
             crate::card_home::set_test(false);
+            crate::memory::set_test(false);
         }
     }
 
@@ -2085,6 +2399,23 @@ pub(crate) mod tests {
     }
 
     impl TestRegion {
+        /// [`TestRegion::new`] below 128 GiB.
+        fn low(bytes: usize) -> TestRegion {
+            let base = low(
+                bytes,
+                mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH,
+                mem::PAGE_READWRITE,
+            );
+            title_memory_region(
+                base as usize,
+                bytes,
+                mem::MEM_RESERVE | mem::MEM_COMMIT,
+                3,
+                0x404,
+            );
+            TestRegion { base }
+        }
+
         fn new(bytes: usize) -> TestRegion {
             // SAFETY: an allocation of the test's own.
             let base = unsafe {
@@ -2801,7 +3132,45 @@ pub(crate) mod tests {
         bytes: usize,
     }
 
+    /// A reservation of `bytes` below 128 GiB (where `crate::memory`'s
+    /// directory reaches), of `kind` and `protect`.
+    fn low(bytes: usize, kind: u32, protect: u32) -> u64 {
+        let mut requirements = mem::MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (4usize << 30) as *mut c_void,
+            HighestEndingAddress: ((1usize << 37) - 1) as *mut c_void,
+            Alignment: 0,
+        };
+        let mut parameter = mem::MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: a reservation of the test's own; the parameter points at
+        // `requirements`, which outlives the call.
+        let base = unsafe {
+            mem::VirtualAlloc2(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                std::ptr::null(),
+                bytes,
+                kind,
+                protect,
+                &mut parameter,
+                1,
+            )
+        } as u64;
+        assert_ne!(base, 0);
+        base
+    }
+
     impl Place {
+        /// [`Place::new`] below 128 GiB.
+        fn low(bytes: usize) -> Place {
+            let base = low(
+                bytes,
+                mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+                mem::PAGE_NOACCESS,
+            );
+            Place { base, bytes }
+        }
+
         fn new(bytes: usize) -> Place {
             // SAFETY: a reservation of the test's own.
             let base = unsafe {
@@ -3285,5 +3654,476 @@ pub(crate) mod tests {
         unregister(0xc0de_24ff, start);
         drop((last, rig));
         place.unmap(0, bytes as u64);
+    }
+
+    // ---- Slice 3: the directory (`crate::memory`) and our own heaps ----
+
+    /// The core, the pool and the directory on for this thread.
+    fn directory() -> Switched {
+        let switched = Switched::pool();
+        crate::memory::set_test(true);
+        switched
+    }
+
+    /// The offset in `place` of the first 4 MiB cell whose next cell is
+    /// still `place`'s (reserved: a dispatch that names an address in the
+    /// cell finds nothing to number after it).
+    fn cell_in(place: &Place) -> u64 {
+        const CELL: u64 = 4 << 20;
+        let at = place.base.next_multiple_of(CELL) - place.base;
+        assert!(at + 2 * CELL <= place.bytes as u64);
+        at
+    }
+
+    /// The buffer placed over all of `chunk`, as its raw pointer.
+    fn chunk_buffer(chunk: &TestChunk) -> *mut c_void {
+        crate::pool::home(chunk.handle, 0, K64)
+            .expect("an opened chunk")
+            .buffer
+            .as_raw()
+    }
+
+    /// With the directory on, view memory of two chunks (no buffer or window
+    /// could be one home for it) is reached by raw-address shaders page by
+    /// page: each page's entry is its chunk's number and its offset in the
+    /// chunk, the chunk's buffer is that number's view, nothing is copied,
+    /// and the card's table takes the entries only at the next submission's
+    /// head.
+    #[test]
+    fn warp_directory_scattered_view_pages_resolve_to_their_chunks() {
+        let Some(host) = warp13() else { return };
+        let _on = directory();
+        let (a, b) = (
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+            TestChunk::new(4 * K64 as usize, crate::pool::PoolChunk::Committed),
+        );
+        let place = Place::low(12 << 20);
+        let at = cell_in(&place);
+        place.map(at, 2 * K64, &a, 0);
+        place.map(at + 2 * K64, 2 * K64, &b, 2 * K64);
+        let start = place.base + at;
+        fill(start, 4 * K64, 5);
+        let scattered = turned(Why::Scattered);
+        let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("a view heap");
+        let list = host.new_list().unwrap();
+        let ready = crate::memory::ready(&list, &heap, &[start + 0x40], &[], false).expect("ready");
+        let entry = |k: u64| crate::memory::entries_of(start + k * K64).unwrap();
+        let (one, two) = (entry(0).1, entry(2).1);
+        assert_ne!(one.0, 0, "a number");
+        assert_ne!(two.0, 0, "a number");
+        assert_ne!(one.0, two.0, "one number per chunk");
+        assert_eq!([entry(0).1, entry(1).1], [(one.0, 0), (one.0, K64 as u32)]);
+        assert_eq!(
+            [entry(2).1, entry(3).1],
+            [(two.0, 2 * K64 as u32), (two.0, 3 * K64 as u32)],
+            "each page at its offset in its chunk, the whole cell at once"
+        );
+        assert_eq!(
+            heap.kept_raw(ready.base + one.0),
+            Some(chunk_buffer(&a)),
+            "the number's view is the chunk's buffer"
+        );
+        assert_eq!(heap.kept_raw(ready.base + two.0), Some(chunk_buffer(&b)));
+        assert!(
+            crate::shadow::copies_over(start, start + 4 * K64).is_empty(),
+            "no copy of the pages"
+        );
+        assert_eq!(turned(Why::Scattered), scattered, "and no ask for one");
+        assert_eq!(entry(0).0, (0, 0), "the card's table not yet");
+        // The card reads the title's bytes at the entries' offsets.
+        let mut rig = Rig::new(&host.device).unwrap();
+        let buffer = crate::pool::home(b.handle, 0, K64).unwrap().buffer;
+        let got = rig.fetch(&buffer, 3 * K64, K64 as usize).unwrap();
+        assert!(same(start + 3 * K64, &got), "the page in place");
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(entry(0).0, one, "the card's table at the submission's head");
+        assert_eq!(entry(3).0, (two.0, 3 * K64 as u32));
+        list.reset();
+        crate::memory::forget_heap(&heap);
+        crate::memory::forget_for_test(start, start + (8 << 20));
+        drop((list, heap, rig, buffer));
+        place.unmap(at, 2 * K64);
+        place.unmap(at + 2 * K64, 2 * K64);
+    }
+
+    /// A remap of a chunk page changes its entry, and only in queue order:
+    /// the card's table keeps the old entry until the next submission, whose
+    /// lists all see the new one (a copy of ours at its head), and a list of
+    /// the submission before saw the old one.
+    #[test]
+    fn warp_directory_remaps_reach_the_card_in_queue_order() {
+        let Some(host) = warp13() else { return };
+        let _on = directory();
+        let (a, b) = (
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+            TestChunk::new(4 * K64 as usize, crate::pool::PoolChunk::Committed),
+        );
+        let place = Place::low(12 << 20);
+        let at = cell_in(&place);
+        place.map(at, K64, &a, K64);
+        let start = place.base + at;
+        let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("a view heap");
+        let list = host.new_list().unwrap();
+        crate::memory::ready(&list, &heap, &[start], &[], false).expect("ready");
+        let table = crate::memory::directory_buffer().unwrap();
+        let (out, data) = host.shared_buffer(16).unwrap();
+        let page = start / K64;
+        // What a list of the submission sees of the entry, copied to `at`.
+        let seen = |list: &crate::host::HostList, at: u64| {
+            // SAFETY: an open list of the host's; live buffers, the ranges
+            // inside both.
+            unsafe { list.list.CopyBufferRegion(&out, at, &table, page * 8, 8) };
+        };
+        let read = |at: usize| {
+            // SAFETY: the mapping holds 16 bytes; the card is done with it.
+            unsafe { std::slice::from_raw_parts(data.add(at).cast::<u32>(), 2).to_vec() }
+        };
+        seen(&list, 0);
+        list.close();
+        host.execute(&[&list]);
+        let old = crate::memory::entries_of(start).unwrap().0;
+        assert_eq!(old.1, K64 as u32, "chunk a at its second page");
+        assert_eq!(
+            read(0),
+            [old.0, old.1],
+            "the list saw the entry made for it"
+        );
+        list.reset();
+        // The title maps chunk b's last page there: the CPU's table changes
+        // at the next submission's head, the card's not before. Chunk b has
+        // no number yet, and none is given at a head (no list of the
+        // submission has its view): the entry is empty for that submission.
+        place.unmap(at, K64);
+        place.map(at, K64, &b, 3 * K64);
+        assert_eq!(crate::memory::entries_of(start).unwrap().0, old, "not yet");
+        seen(&list, 8);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            crate::memory::entries_of(start).unwrap(),
+            ((0, 0), (0, 0)),
+            "no number at a submission's head"
+        );
+        assert_eq!(read(8), [0, 0], "the submission's list saw it whole");
+        // The next list's dispatch numbers chunk b, and writes its view.
+        list.reset();
+        let ready = crate::memory::ready(&list, &heap, &[], &[], false).expect("ready");
+        let numbered = crate::memory::entries_of(start).unwrap().1;
+        assert_eq!(numbered.1, 3 * K64 as u32, "chunk b's last page");
+        assert_ne!(numbered.0, old.0, "chunk b's number");
+        assert_eq!(
+            heap.kept_raw(ready.base + numbered.0),
+            Some(chunk_buffer(&b))
+        );
+        seen(&list, 0);
+        list.close();
+        host.execute(&[&list]);
+        let new = crate::memory::entries_of(start).unwrap();
+        assert_eq!(new.0, new.1, "both tables agree after the submission");
+        assert_eq!(new.0, numbered);
+        assert_eq!(read(0), [new.0.0, new.0.1], "and its list saw it");
+        // Back to chunk a, which has a number: taken at the head itself.
+        list.reset();
+        place.unmap(at, K64);
+        place.map(at, K64, &a, K64);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(crate::memory::entries_of(start).unwrap(), (old, old));
+        // Unmapped: empty, at the next submission.
+        list.reset();
+        place.unmap(at, K64);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(crate::memory::entries_of(start).unwrap(), ((0, 0), (0, 0)));
+        list.reset();
+        crate::memory::forget_heap(&heap);
+        crate::memory::forget_for_test(start, start + (8 << 20));
+        drop((list, heap, out));
+    }
+
+    /// Raw-address shaders that may store reach chunk pages with no copy to
+    /// compare: after the wait, a copy of the same pages at another view is
+    /// told, so it takes them again.
+    #[test]
+    fn warp_directory_raw_writes_into_chunk_pages_are_told_to_copies() {
+        let Some(host) = warp13() else { return };
+        let _on = directory();
+        let chunk = TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed);
+        let (p, q) = (Place::low(12 << 20), Place::low(2 * K64 as usize));
+        let at = cell_in(&p);
+        p.map(at, K64, &chunk, 0);
+        q.map(0, K64, &chunk, 0);
+        let start = p.base + at;
+        let copy = crate::shadow::exact(q.base + 0x100, 0x100).expect("a copy at the other view");
+        assert!(!copy.is_home());
+        let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("a view heap");
+        let list = host.new_list().unwrap();
+        crate::memory::ready(&list, &heap, &[start], &[], true).expect("ready");
+        assert_ne!(crate::memory::entries_of(start).unwrap().1.0, 0);
+        let told = TOLD[8].load(Ordering::Relaxed);
+        list.close();
+        host.execute(&[&list]);
+        assert!(
+            TOLD[8].load(Ordering::Relaxed) > told,
+            "the copy at the other view told"
+        );
+        // A list that only reads tells nothing.
+        list.reset();
+        crate::memory::ready(&list, &heap, &[start], &[], false).expect("ready");
+        let told = TOLD[8].load(Ordering::Relaxed);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(TOLD[8].load(Ordering::Relaxed), told);
+        list.reset();
+        crate::memory::forget_heap(&heap);
+        crate::memory::forget_for_test(start, start + (8 << 20));
+        crate::shadow::let_go_copies_for_test(q.base, q.base + K64);
+        drop((list, heap, copy));
+        p.unmap(at, K64);
+        q.unmap(0, K64);
+    }
+
+    /// A chunk page a host copy holds bytes of (memory of several places
+    /// bound as one view) is reached by raw-address shaders through a copy
+    /// too, so that both kinds of use see the same bytes: one made after the
+    /// page got its chunk's entry takes the page at the next list's
+    /// dispatch.
+    #[test]
+    fn warp_directory_a_copy_over_chunk_pages_takes_them() {
+        let Some(host) = warp13() else { return };
+        let _on = directory();
+        let (a, b) = (
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+            TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed),
+        );
+        let place = Place::low(12 << 20);
+        let at = cell_in(&place);
+        place.map(at, K64, &a, 0);
+        place.map(at + K64, K64, &b, 0);
+        let start = place.base + at;
+        let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("a view heap");
+        let list = host.new_list().unwrap();
+        let ready = crate::memory::ready(&list, &heap, &[start], &[], false).expect("ready");
+        let number = |k: u64| crate::memory::entries_of(start + k * K64).unwrap().1.0;
+        let (one, two) = (number(0), number(1));
+        assert_eq!(heap.kept_raw(ready.base + one), Some(chunk_buffer(&a)));
+        assert_eq!(heap.kept_raw(ready.base + two), Some(chunk_buffer(&b)));
+        // A buffer view over both pages: a copy (two chunks).
+        let copy = crate::shadow::exact(start + K64 - 0x100, 0x200).expect("a copy");
+        assert!(!copy.is_home());
+        let ready = crate::memory::ready(&list, &heap, &[start], &[], false).expect("ready");
+        for k in 0..2 {
+            let n = number(k);
+            assert_ne!(n, 0);
+            assert_ne!(n, [one, two][k as usize], "no longer the chunk's");
+            assert_ne!(heap.kept_raw(ready.base + n), Some(chunk_buffer(&a)));
+            assert_ne!(heap.kept_raw(ready.base + n), Some(chunk_buffer(&b)));
+        }
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        crate::memory::forget_heap(&heap);
+        crate::memory::forget_for_test(start, start + (8 << 20));
+        drop((list, heap, copy));
+        place.unmap(at, K64);
+        place.unmap(at + K64, K64);
+    }
+
+    /// A home's buffer starts before its first title byte (the 64 KiB page
+    /// under it): its entries and its view count from the buffer's start, so
+    /// the card reads the title's bytes at an entry's offset. With the
+    /// directory off the entries go straight into the card's table.
+    #[test]
+    fn warp_directory_entries_of_a_home_count_from_its_buffer() {
+        let Some(host) = warp13() else { return };
+        let _on = Switched::on(false);
+        let region = TestRegion::low(12 << 20);
+        let cell = region.base.next_multiple_of(4 << 20);
+        let (start, len) = (cell + K64 + 0x100, 3 * K64);
+        register(0xc0de_3101, start, len);
+        let home = find(start, len).expect("a home");
+        assert!(home.is_home());
+        let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("a view heap");
+        let list = host.new_list().unwrap();
+        let page = cell + 2 * K64;
+        let ready = crate::memory::ready(&list, &heap, &[page + 0x10], &[], false).expect("ready");
+        let (shaders, next) = crate::memory::entries_of(page).unwrap();
+        assert_eq!(shaders, next, "straight into the card's table");
+        assert_ne!(next.0, 0);
+        assert_eq!(
+            u64::from(next.1),
+            home.offset(page),
+            "from the buffer's start"
+        );
+        assert_eq!(
+            heap.kept_raw(ready.base + next.0),
+            Some(home.buffer.as_raw())
+        );
+        fill(page, K64, 21);
+        let mut rig = Rig::new(&host.device).unwrap();
+        let got = rig
+            .fetch(&home.buffer, u64::from(next.1), K64 as usize)
+            .unwrap();
+        assert!(same(page, &got), "the title's bytes at the entry's offset");
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        crate::memory::forget_heap(&heap);
+        crate::memory::forget_for_test(region.base, region.base + (12 << 20));
+        unregister(0xc0de_3101, start);
+        drop((list, heap, home, rig));
+        region.release();
+        run_pending();
+    }
+
+    /// With `VICTORY_MEMORY_OWN=1` our memory for the title's heaps is a
+    /// region of our own below 128 GiB: a buffer in it gets a home (class O is
+    /// C), and giving it back while a home is held waits for the home, then
+    /// releases the region.
+    #[test]
+    fn warp_own_heap_memory_is_a_region_with_homes() {
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::on(false);
+        TEST_OWN.with(|own| own.set(true));
+        let memory = crate::resource::Memory::zeroed(3 * K64 + 0x123, 64).expect("memory");
+        let base = memory.address();
+        assert!(
+            (4 << 30..1 << 37).contains(&base),
+            "below 128 GiB, above 4 GiB"
+        );
+        assert_eq!(base % K64, 0, "64 KiB aligned");
+        assert_eq!(state(base), mem::MEM_COMMIT);
+        {
+            let mut core = core();
+            let (found, region) = core.region_at(base as usize).expect("a region");
+            assert_eq!(found, base as usize);
+            assert!(region.own, "ours");
+            assert_eq!(region.len as u64, 4 * K64, "whole 64 KiB pages");
+        }
+        // SAFETY: committed memory of ours.
+        let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, 4 * K64 as usize) };
+        assert!(bytes.iter().all(|&x| x == 0), "zeroed");
+        let (start, len) = (base + 0x100, 2 * K64);
+        register(0xc0de_3201, start, len);
+        let held = find(start, len).expect("a home");
+        assert!(held.is_home(), "in place, not a copy");
+        drop(memory);
+        assert_eq!(state(base), mem::MEM_COMMIT, "given back at the sweep");
+        run_own_frees();
+        assert_eq!(state(base), mem::MEM_COMMIT, "waits while the home is held");
+        unregister(0xc0de_3201, start);
+        drop(held);
+        run_pending();
+        assert_eq!(state(base), mem::MEM_FREE, "released once nothing holds it");
+        assert!(
+            core().region_at(base as usize).is_none(),
+            "out of the table"
+        );
+    }
+
+    /// Without `VICTORY_MEMORY_OWN=1` our heap memory stays the process
+    /// heap's: no region, so no home (`Why::NotRegion`).
+    #[test]
+    fn own_heaps_off_keep_heap_memory() {
+        let _on = Switched::on(false);
+        let memory = crate::resource::Memory::zeroed(4 * K64, 64).expect("memory");
+        assert!(core().region_at(memory.address() as usize).is_none());
+        drop(memory);
+        assert!(
+            OWN_FREES.lock().unwrap().is_empty(),
+            "nothing given back through the core"
+        );
+    }
+
+    /// `XMemFreeDefault`'s path: a region of ours given back at once, not at
+    /// the next sweep, through the core (out of the table, counted apart).
+    #[test]
+    fn own_region_given_back_at_once() {
+        let _on = Switched::on(false);
+        let at = memory_own_alloc(K64 as usize + 1, 16).expect("a region of ours");
+        let base = at.as_ptr() as usize;
+        assert!(core().region_at(base).is_some_and(|(_, r)| r.own));
+        let given = OWN[3].load(Ordering::Relaxed);
+        memory_own_free_now(base);
+        assert_eq!(state(base as u64), mem::MEM_FREE, "released now");
+        assert!(core().region_at(base).is_none(), "out of the table");
+        assert!(OWN[3].load(Ordering::Relaxed) > given, "counted as ours");
+    }
+
+    /// A region freed and one of ours made at the same base before the
+    /// release reached the table: the release takes only its own region.
+    #[test]
+    fn a_release_leaves_a_new_region_at_its_base() {
+        let _on = Switched::on(false);
+        let at = memory_own_alloc(K64 as usize, 16).expect("a region of ours");
+        let base = at.as_ptr() as usize;
+        let old = core().region_at(base).map(|(_, r)| r.serial).unwrap();
+        core().regions.insert(
+            base,
+            Region::new(
+                K64 as usize,
+                mem::MEM_RESERVE | mem::MEM_COMMIT,
+                0,
+                mem::PAGE_READWRITE,
+                true,
+            ),
+        );
+        released(base, old);
+        assert!(
+            core().region_at(base).is_some_and(|(_, r)| r.serial != old),
+            "the new region stays"
+        );
+        memory_own_free_now(base);
+        assert!(core().region_at(base).is_none());
+    }
+
+    /// With the directory on, a chunk that goes loses its number at the next
+    /// dispatch: its entries are emptied, the number names nothing, and the
+    /// heap's view of it is made null, so the directory no longer holds the
+    /// chunk's buffer (and with it its heap and section).
+    #[test]
+    fn warp_directory_a_chunk_that_goes_loses_its_number() {
+        let Some(host) = warp13() else { return };
+        let _on = directory();
+        let chunk = TestChunk::new(2 * K64 as usize, crate::pool::PoolChunk::Committed);
+        let place = Place::low(12 << 20);
+        let at = cell_in(&place);
+        place.map(at, 2 * K64, &chunk, 0);
+        let start = place.base + at;
+        let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("a view heap");
+        let list = host.new_list().unwrap();
+        let ready = crate::memory::ready(&list, &heap, &[start], &[], false).expect("ready");
+        let number = crate::memory::entries_of(start).unwrap().1.0;
+        assert_ne!(number, 0);
+        assert!(crate::memory::names(number));
+        assert_eq!(
+            heap.kept_raw(ready.base + number),
+            Some(chunk_buffer(&chunk))
+        );
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        crate::pool::title_memory_pool_chunk_gone(chunk.handle);
+        let ready = crate::memory::ready(&list, &heap, &[], &[], false).expect("ready");
+        assert!(!crate::memory::names(number), "the number names nothing");
+        assert_eq!(heap.kept_raw(ready.base + number), None, "a null view");
+        assert_eq!(
+            crate::memory::entries_of(start + K64).unwrap().1,
+            (0, 0),
+            "every page of it emptied"
+        );
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            crate::memory::entries_of(start).unwrap(),
+            ((0, 0), (0, 0)),
+            "in the card's table at the head"
+        );
+        list.reset();
+        crate::memory::forget_heap(&heap);
+        crate::memory::forget_for_test(start, start + (8 << 20));
+        drop((list, heap));
+        place.unmap(at, 2 * K64);
     }
 }

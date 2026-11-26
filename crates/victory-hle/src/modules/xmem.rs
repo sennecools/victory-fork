@@ -304,12 +304,28 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
-    // shortcut: the host heap's addresses lie above 2^40, unlike the
-    // console's; nothing seen builds ray-tracing structures in this memory
-    // (the title uses its GPU heap). Sub-allocate from a
-    // reservation below 2^40 if one does.
-    // SAFETY: the layout has a non-zero size.
-    let block = unsafe { alloc(layout) };
+    // With `VICTORY_MEMORY_OWN=1` (and the memory core on), a block of
+    // 64 KiB or more is a watched region of its own below 128 GiB, which
+    // the core may use in place for the GPU; its header says so.
+    // shortcut: smaller blocks stay in the host heap (above 2^40, no home):
+    // a region each would waste most of a 64 KiB page, and several in one
+    // page would have a home over one pin the others.
+    // shortcut: every memory type takes this path, CPU-only ones too (one
+    // reservation each, up to 64 KiB of rounding): the memory-type bits of
+    // the attributes are not decoded here yet; the core's census counts
+    // our regions, so the cost shows on its line.
+    let own = (size >= OWN_LEAST && victory_gpu::memory_own_on())
+        .then(|| victory_gpu::memory_own_alloc(layout.size(), layout.align()))
+        .flatten();
+    let (block, mark) = match own {
+        Some(block) => (block.as_ptr(), OWN_BLOCK),
+        // shortcut: the host heap's addresses lie above 2^40, unlike the
+        // console's; nothing seen builds ray-tracing structures in this
+        // memory (the title uses its GPU heap). Sub-allocate from a
+        // reservation below 2^40 if one does.
+        // SAFETY: the layout has a non-zero size.
+        None => (unsafe { alloc(layout) }, 0),
+    };
     if block.is_null() {
         return block.cast();
     }
@@ -319,10 +335,17 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         let user = block.add(layout.align());
         user.sub(HEADER)
             .cast::<[usize; 2]>()
-            .write([layout.size(), layout.align()]);
+            .write([layout.size(), layout.align() | mark]);
         user.cast()
     }
 }
+
+/// The least block [`XMemAllocDefault`] makes a region of its own for with
+/// `VICTORY_MEMORY_OWN=1`.
+const OWN_LEAST: usize = 64 << 10;
+/// In a block header's alignment word: the block is a region of our own
+/// (`victory_gpu::memory_own_alloc`), given back through the memory core.
+const OWN_BLOCK: usize = 1 << (usize::BITS - 1);
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
@@ -344,6 +367,16 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & OWN_BLOCK != 0 {
+            // Now, on the freeing thread: no lock of ours is held here. A
+            // committed resource's memory from the title's allocator comes
+            // here too, but only from the title's own last Release; our
+            // memory that a drop of ours may free with locks held (heaps,
+            // descriptor heaps, resources with no allocator) waits for the
+            // sweep instead.
+            victory_gpu::memory_own_free_now(user.sub(align & !OWN_BLOCK) as usize);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

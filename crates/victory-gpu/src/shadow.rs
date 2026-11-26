@@ -4217,6 +4217,35 @@ pub(crate) fn copies_over(start: u64, end: u64) -> Vec<(usize, usize)> {
     out
 }
 
+/// The host copies of windows and buffer views over `[start, end)` leave
+/// the tables (tests: a test is done with its memory, and the next one may
+/// be given the same addresses).
+#[cfg(test)]
+pub(crate) fn let_go_copies_for_test(start: u64, end: u64) {
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .range((start.saturating_sub(WINDOW), 0)..(end, 0))
+            .filter(|(key, shadow)| shadow.place.is_none() && key.0 + key.1 > start)
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| map.remove(&key))
+            .collect()
+    };
+    let views: Vec<(Arc<Shadow>, u64)> = {
+        let mut exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = (exact.1.range(..(end, 0)))
+            .filter(|(key, _)| key.0 + key.1 > start)
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| exact.1.remove(&key))
+            .collect()
+    };
+    drop((gone, views));
+}
+
 /// The copy the title buffer at `start` has in the tables, if any (tests).
 #[cfg(test)]
 pub(crate) fn tabled_copy(start: u64) -> Option<Arc<Shadow>> {
@@ -4478,6 +4507,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         {
             let shadow = carded_home(on_card.clone(), home, key.0, len, size);
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            crate::memory::copy_made(key.0, len);
             entry.shadow = Some(shadow);
             return entry.shadow.clone();
         }
@@ -4537,6 +4567,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
+        crate::memory::copy_made(key.0, len);
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
@@ -4770,6 +4801,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
     note(&shadow);
+    crate::memory::copy_made(start, len);
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
@@ -4829,6 +4861,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    crate::memory::copy_made(address, len);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
