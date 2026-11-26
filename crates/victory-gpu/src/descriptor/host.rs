@@ -2267,13 +2267,17 @@ impl HostHeap {
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them (the slot claimed, so that no other
         // thread changes it between the two).
-        // With [`HostHeap::quick`], a slot not made from this record says
-        // so before the lock (as a look just before it was made would).
+        // With [`HostHeap::quick`], a slot settled on another record says
+        // so before the lock (as a look just before it was made would). A
+        // slot another thread has claimed goes on to the lock and the
+        // claim, as without it: many claims leave the slot as it was
+        // (`texture_slot_gone` of a null slot, this look's own), and a
+        // "no" for those would count the texture as refused.
         if self.quick
-            && self
-                .made
-                .get(index as usize)
-                .is_some_and(|made| made.load(std::sync::atomic::Ordering::Acquire) != key)
+            && self.made.get(index as usize).is_some_and(|made| {
+                let now = made.load(std::sync::atomic::Ordering::Acquire);
+                now != key && now != CLAIMED
+            })
         {
             return false;
         }
@@ -7003,6 +7007,32 @@ mod made_tests {
     pub(super) fn alive() -> bool {
         // SAFETY: a plain device query.
         host().is_some_and(|host| unsafe { host.device.GetDeviceRemovedReason() }.is_ok())
+    }
+
+    /// With the quick mirror (`VICTORY_QUICK_MIRROR=1`), the texture pass's
+    /// question on a slot another thread holds a claim on that changes
+    /// nothing waits for the claim and answers as without it, not "not
+    /// made" at once: a texture whose slot is made would count as refused.
+    #[test]
+    fn a_quick_look_at_a_claimed_slot_waits_for_the_claim() {
+        let Some(heap) = HostHeap::with_ways(false, SLOTS, true, false, true) else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        let mut records = vec![[0u32; 8]; SLOTS as usize];
+        let at = records.as_mut_ptr() as u64 + 3 * 32;
+        write(at, &views[3]);
+        heap.mirror(3, at, true);
+        let before = heap.texture_slot_made_from(3, at);
+        let answer = std::thread::scope(|scope| {
+            let claim = heap.claim(3, |_| true).expect("not claimed");
+            let asked = scope.spawn(|| heap.texture_slot_made_from(3, at));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!asked.is_finished(), "waits for the claim");
+            drop(claim);
+            asked.join().expect("the look")
+        });
+        assert_eq!(answer, before);
     }
 
     /// Threads that write, mirror and empty the same slot and slots of
