@@ -866,3 +866,87 @@ fn changed_records_are_those_that_differ_one_by_one() {
         assert!(out.is_empty());
     }
 }
+
+/// With passes of its own (`VICTORY_HEAP_SYNC_EARLY`): none before the
+/// first request; some after it while requests are recent, none of which
+/// answers a request (one made during such a pass, held, waits for a pass
+/// of its own); none once requests have stopped. Without them, no pass
+/// past the requested ones.
+#[test]
+fn passes_of_its_own_run_between_requests_and_answer_none() {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc::channel;
+    let passes = std::sync::Arc::new(AtomicU64::new(0));
+    let (came, come) = channel::<u64>();
+    let (go, gone) = channel::<()>();
+    let gone = std::sync::Mutex::new(gone);
+    let ahead = Ahead::start_with(
+        {
+            let passes = passes.clone();
+            move || {
+                // The second pass, of its own, is held until the test lets
+                // it go on.
+                let n = passes.fetch_add(1, Relaxed) + 1;
+                if n == 2 {
+                    let _ = came.send(n);
+                    let _ = gone.lock().unwrap().recv();
+                }
+            }
+        },
+        Some(Duration::from_millis(2)),
+    )
+    .expect("a helper thread");
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(passes.load(Relaxed), 0, "no pass before a request");
+    let first = ahead.request().expect("a request");
+    assert!(ahead.wait(first));
+    // A pass of its own begins, and is held.
+    assert_eq!(
+        come.recv_timeout(Duration::from_secs(30))
+            .expect("a pass of its own"),
+        2
+    );
+    assert_eq!(ahead.behind(first), 0);
+    let second = ahead.request().expect("a request");
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        ahead.behind(second),
+        1,
+        "a pass of its own answers no request"
+    );
+    go.send(()).unwrap();
+    assert!(ahead.wait(second));
+    assert!(
+        passes.load(Relaxed) >= 3,
+        "the request had a pass of its own"
+    );
+    // More passes of its own while requests are recent.
+    let after = passes.load(Relaxed);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(passes.load(Relaxed) > after, "passes between requests");
+    // None once requests have stopped.
+    std::thread::sleep(super::super::ahead::EARLY_WINDOW + Duration::from_millis(100));
+    let stopped = passes.load(Relaxed);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        passes.load(Relaxed),
+        stopped,
+        "no passes long after a request"
+    );
+    drop(ahead);
+
+    // Without passes of its own: the requested ones alone.
+    let passes = std::sync::Arc::new(AtomicU64::new(0));
+    let ahead = Ahead::start({
+        let passes = passes.clone();
+        move || {
+            passes.fetch_add(1, Relaxed);
+        }
+    })
+    .expect("a helper thread");
+    let first = ahead.request().expect("a request");
+    assert!(ahead.wait(first));
+    let after = passes.load(Relaxed);
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(passes.load(Relaxed), after);
+}
