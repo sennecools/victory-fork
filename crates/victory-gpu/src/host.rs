@@ -23,6 +23,8 @@ mod late_homes;
 /// R5's reads of homes on the card (`VICTORY_R5_LIFT=1`), and what its
 /// waits for flights say on the profile.
 mod late_lift;
+/// Lifted reads take along what depends on them (`VICTORY_LIFT_CLOSURE=1`).
+mod lift_closure;
 
 use late_homes::{
     R5_STATS, Writer, home_ranges, join_writers, r5_lift, refresh_over_flight_homes,
@@ -4433,10 +4435,13 @@ enum LiftAbort {
     /// submission refreshes another copy over those bytes, which would take
     /// them on the CPU before the card's copy ([`late_lift::over_lifted_homes`]).
     Viewed,
+    /// With `VICTORY_LIFT_CLOSURE=1`: more steps to lift than
+    /// [`lift_closure::CLOSURE_MOST`].
+    TooMany,
 }
 
 impl LiftAbort {
-    const ALL: [LiftAbort; 11] = [
+    const ALL: [LiftAbort; 12] = [
         LiftAbort::NotSole,
         LiftAbort::SameBuffer,
         LiftAbort::NoBounce,
@@ -4448,6 +4453,7 @@ impl LiftAbort {
         LiftAbort::Twice,
         LiftAbort::Changed,
         LiftAbort::Viewed,
+        LiftAbort::TooMany,
     ];
 
     /// Its name on the frame-rate line (no commas: the names are joined
@@ -4465,6 +4471,7 @@ impl LiftAbort {
             LiftAbort::Twice => "a list named twice",
             LiftAbort::Changed => "a step changed",
             LiftAbort::Viewed => "a copy over a home it writes is refreshed",
+            LiftAbort::TooMany => "too many steps taken along",
         }
     }
 }
@@ -4599,7 +4606,8 @@ fn plan_lifts<T, C>(
 }
 
 /// Since the last frame-rate line, with [`lift_mode`], by the slots below.
-static LIFT_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+static LIFT_STATS: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
 /// [`LIFT_STATS`]: plans made.
 const LIFT_PLANS: usize = 0;
@@ -4617,6 +4625,10 @@ const LIFT_BOUNCED: usize = 5;
 const LIFT_WITH_FILLS: usize = 6;
 /// [`LIFT_STATS`]: waits for flights to land left out.
 const LIFT_WAITS_LEFT: usize = 7;
+/// [`LIFT_STATS`]: with `VICTORY_LIFT_CLOSURE=1`, steps of those plans
+/// taken along (touching neither what flights write nor what a lifted copy
+/// ahead of them writes).
+const LIFT_ALONG: usize = 8;
 
 /// Since the last frame-rate line: plans aborted, by [`LiftAbort`].
 static LIFT_ABORTED: [std::sync::atomic::AtomicU64; LiftAbort::ALL.len()] =
@@ -4675,25 +4687,34 @@ fn lift_reads(runs: &[&HostList]) -> bool {
             })
             .collect()
     };
+    // Steps the closure took along.
+    let mut along = 0;
     let plan = if twice {
         Err(LiftAbort::Twice)
     } else {
-        plan_lifts(
-            &written,
-            steps.iter().copied(),
-            mode != LiftMode::Copies,
-            |at, len| {
-                if homes {
-                    crate::shadow::sole_or_home(at as u64, len as u64)
-                        .map(|s| (s.buffer.as_raw() as usize, s))
-                } else {
-                    crate::shadow::sole(at as u64, len as u64)
-                        .map(|s| (Arc::as_ptr(&s) as usize, s))
-                }
-            },
-            |l, at, len| runs[l].scratch_chunk(at, len),
-        )
-        .and_then(|lifts| {
+        let sole = |at: usize, len: usize| {
+            if homes {
+                crate::shadow::sole_or_home(at as u64, len as u64)
+                    .map(|s| (s.buffer.as_raw() as usize, s))
+            } else {
+                crate::shadow::sole(at as u64, len as u64).map(|s| (Arc::as_ptr(&s) as usize, s))
+            }
+        };
+        let scratch = |l: usize, at: usize, len: usize| runs[l].scratch_chunk(at, len);
+        let fills = mode != LiftMode::Copies;
+        // With the closure, what is in the way is lifted too
+        // (`VICTORY_LIFT_CLOSURE=1`); else such a plan aborts.
+        let planned = if lift_closure::lift_closure() {
+            let join = lift_closure::lift_join();
+            lift_closure::plan_closure(&written, steps.iter().copied(), fills, join, sole, scratch)
+                .map(|(lifts, n)| {
+                    along = n;
+                    lifts
+                })
+        } else {
+            plan_lifts(&written, steps.iter().copied(), fills, sole, scratch)
+        };
+        planned.and_then(|lifts| {
             if homes && late_lift::over_lifted_homes(&lifts, &steps, runs) {
                 return Err(LiftAbort::Viewed);
             }
@@ -4732,6 +4753,7 @@ fn lift_reads(runs: &[&HostList]) -> bool {
         Vec::new()
     };
     LIFT_STATS[LIFT_CLEAN].fetch_add(1, Ordering::Relaxed);
+    LIFT_STATS[LIFT_ALONG].fetch_add(along as u64, Ordering::Relaxed);
     let mut has_fills = false;
     for lift in &lifts {
         match &lift.to {
@@ -5323,6 +5345,8 @@ fn late_threads() {
             tracing::info!(
                 mode = lift_mode().value(),
                 active = relay_exact(),
+                closure = lift_closure::lift_closure(),
+                join = lift_closure::lift_join(),
                 "reads of title memory flights write are planned for the card (VICTORY_LIFT_READS; only with VICTORY_RELAY=2)"
             );
         }
@@ -5618,7 +5642,7 @@ fn late_line(frames: f64) {
         tracing::info!(
             "title memory reads lifted to the card per frame (VICTORY_LIFT_READS={}): {:.2} plans, {:.2} without an abort \
              ({:.2} with fills); {:.1} copies ({:.1} through a bounce buffer) and {:.1} fills, {:.3} MB; {:.2} waits for flights \
-             to land left out; aborted: {}",
+             to land left out; aborted: {}{}",
             lift_mode().value(),
             l[LIFT_PLANS],
             l[LIFT_CLEAN],
@@ -5629,6 +5653,15 @@ fn late_line(frames: f64) {
             l[LIFT_BYTES] / (1 << 20) as f64,
             l[LIFT_WAITS_LEFT],
             if aborted.is_empty() { "none".to_owned() } else { aborted.join(", ") },
+            if lift_closure::lift_closure() {
+                format!(
+                    "; {:.1} steps taken along (VICTORY_LIFT_CLOSURE=1, VICTORY_LIFT_JOIN={})",
+                    l[LIFT_ALONG],
+                    u8::from(lift_closure::lift_join())
+                )
+            } else {
+                String::new()
+            },
         );
     }
     if late_exact() {
