@@ -50,9 +50,27 @@ Notes on adaptation:
 - Tabled skip: cool_fox gates it on VICTORY_HEAP_SYNC; ours has its own
   switch.
 - Early rounds: on our VICTORY_HEAP_SYNC_AHEAD helper, not cool_fox's
-  HEAP_SYNC_ASIDE. 4 ms and on by default there; off here.
+  HEAP_SYNC_ASIDE. 4 ms and on by default there; off here. (History: since
+  S9 of change 1, 26 Nov 2026, the helper is the only path and the early
+  rounds always run, 4 ms after the last; see the note under Switches.)
 
 ## Switches
+
+Since S9 of change 1 (26 Nov 2026) the heap sync's switches of this lane and
+the two it worked with are removed: `VICTORY_HEAP_SYNC_BYTES`,
+`VICTORY_HEAP_SYNC_THREADS`, `VICTORY_HEAP_SYNC_EARLY`,
+`VICTORY_HEAP_SYNC_AHEAD` and `VICTORY_HEAP_SYNC_FAST`. What they turned on
+is now the only path, as the play set ran it: the sync runs on its helper
+thread (`descriptor/ahead.rs`) and the submission waits on its request's
+number before its lists go to the card (in place, at that wait, only if the
+helper cannot run); the helper runs passes of its own 4 ms after the last
+(`EARLY`); the records are kept as bytes and compared 16 at a time
+(`HostHeap::copied_begin`); a heap's changed pages are sorted and its slots
+mirrored on 4 threads (`SYNC_THREADS` in `descriptor.rs`); and a record
+whose slot is made from it already is left before the slot's claim
+(`SKIPPED_MADE`). The sync also looks only at the heaps a submission's
+lists bind. Their rows below are kept as the record of the port.
+`VICTORY_SHOWS_NONE` is still a switch.
 
 | Switch | Default | Values | What it does when on | Depends on | Read in |
 | --- | --- | --- | --- | --- | --- |
@@ -62,16 +80,17 @@ Notes on adaptation:
 | `VICTORY_HEAP_SPREAD` | off | `1` on | Each pass looks at the changed slots plus one of 16 parts of the rest; first pass looks at all. Replaces the every-16th full pass. | - | `draw.rs` `heap_spread` |
 | `VICTORY_HEAP_PASS_TABLED` | off | `1` on | Draws mark their tables' buffer slots (`table_entry`; a fresh table's slots if it has 64 or fewer, else the named ones) in `buffer_tabled`; the pass skips slots marked in the last 8 frames. Skips in `HEAP_PASS_PARTS[2]`, logged per frame when nonzero. The sync and texture queue do not read these marks. | - | `draw.rs` `heap_pass_tabled` |
 | `VICTORY_HEAP_SWEEP_OWN` | off | `1` on | Pass state on the HostHeap under its own lock, dropped with the heap, not in the global `HEAP_RANGES` mutex. | - | `draw.rs` `heap_sweep_own` |
-| `VICTORY_HEAP_SYNC_BYTES` | off | `1` on | Sync keeps the records' bytes (32 B per view slot, made on first use) instead of an 8 B print, and compares 16 records (512 B) at a time. | - | `descriptor/host.rs` `sync_bytes` |
-| `VICTORY_HEAP_SYNC_THREADS` | unset (1) | `0`/`1` one thread; `2`..`16` (clamped) | Sync reads, compares and sorts a heap's changed pages 8 a job, then mirrors the slots 256 a job, on N scoped threads (`each_on`). Slots are mirrored out of slot order, each ordered by its claim. | Keeps `VICTORY_HEAP_SYNC_FAST`'s early skip | `descriptor/host.rs` `sync_threads` |
+| `VICTORY_HEAP_SYNC_BYTES` (removed in S9: always) | off | `1` on | Sync keeps the records' bytes (32 B per view slot, made on first use) instead of an 8 B print, and compares 16 records (512 B) at a time. | - | (was `descriptor/host.rs` `sync_bytes`) |
+| `VICTORY_HEAP_SYNC_THREADS` (removed in S9: always 4) | unset (1) | `0`/`1` one thread; `2`..`16` (clamped) | Sync reads, compares and sorts a heap's changed pages 8 a job, then mirrors the slots 256 a job, on N scoped threads (`each_on`). Slots are mirrored out of slot order, each ordered by its claim. | Keeps `VICTORY_HEAP_SYNC_FAST`'s early skip | (was `descriptor/host.rs` `sync_threads`) |
 | `VICTORY_SHOWS_NONE` | off | `1` on | A changed record that is no view of ours, into a slot with `made` 0 and not claimed, is not mirrored. Counted in `SHOWED_NONE` (frame line, `shows_none` arg on `sync heaps`). | - | `descriptor/host.rs` `shows_none` |
-| `VICTORY_HEAP_SYNC_EARLY` | unset (0: none) | `<ms>` > 0 | The sync helper runs passes of its own after `<ms>` with no request, while the last request is under 500 ms old. They answer no request. Profile: `sync heaps early`. | `VICTORY_HEAP_SYNC_AHEAD=1`, else no effect | `descriptor/ahead.rs` `early` |
+| `VICTORY_HEAP_SYNC_EARLY` (removed in S9: always 4 ms) | unset (0: none) | `<ms>` > 0 | The sync helper runs passes of its own after `<ms>` with no request, while the last request is under 500 ms old. They answer no request. Profile: `sync heaps early`. | `VICTORY_HEAP_SYNC_AHEAD=1`, else no effect | (was `descriptor/ahead.rs` `early`) |
 | `VICTORY_SAME_RECORDS` | off | `1` on | `copy_simple` (and `copy`) skip the write when the destination already holds the source's bytes; records are still mirrored. | - | `descriptor.rs` `same_records` |
 
-Any of SYNC_BYTES, SYNC_THREADS or SHOWS_NONE takes the new sync path
+Any of SYNC_BYTES, SYNC_THREADS or SHOWS_NONE took the new sync path
 (`sort_copied_page` for all pages, then `mirror_synced`). Existing switches
-these work with: `VICTORY_HEAP_SYNC_AHEAD`,
-`VICTORY_HEAP_SYNC_FAST`.
+these worked with: `VICTORY_HEAP_SYNC_AHEAD`,
+`VICTORY_HEAP_SYNC_FAST`. (History: since S9 that path is the only one and
+those switches are gone, see above.)
 
 ## Built here
 
@@ -122,7 +141,9 @@ New, `descriptor::host::made_tests`:
 
 New, `descriptor::host::sync_tests`:
 - `pages_sorted_on_threads_make_what_one_by_one_makes`
-- `pages_sorted_with_bytes_make_what_one_by_one_makes`
+- `pages_sorted_with_bytes_make_what_one_by_one_makes` (removed in S9: the
+  bytes are the only compare, so `pages_sorted_on_threads_*` checks them;
+  the one-by-one reference is now a model in the test, `mirror_one`)
 - `records_of_no_view_left_before_their_mirror_make_what_one_by_one_makes`
 - `changed_records_are_those_that_differ_one_by_one` (from cool_fox 53c5256)
 - `passes_of_its_own_run_between_requests_and_answer_none` (about 1.2 s of
@@ -140,7 +161,8 @@ New, `draw::tests`:
 Existing, re-run (touched paths): (`made_tests::a_slot_at_a_time_makes_what_the_heap_wide_lock_makes`:
 removed in 1f with the heap-wide lock; its checks are in `bits_and_quick_mirrors_*`),
 `made_tests::many_threads_leave_each_slot_with_its_own_word` (now through
-`many_threads_on`), `sync_tests::a_page_at_once_*`, `sync_tests::the_early_skip_*`,
+`many_threads_on`), (`sync_tests::a_page_at_once_*`: removed in S9 with the
+page-by-page sync), `sync_tests::the_early_skip_*`,
 and the ahead tests (`Ahead::start` now goes through `start_with`).
 
 Then run the whole `descriptor` and `draw` modules once with every switch
@@ -149,7 +171,9 @@ above set in the environment. Tests that pick their own way must still pass.
 ### A/B plan for game runs
 
 Same scene, same length, `VICTORY_PROFILE_SAMPLES` as usual. Baseline: all
-off. Then one set at a time against baseline, then combined.
+off. Then one set at a time against baseline, then combined. (History: A9,
+A10 and A12, and the sync switches of C2, cannot be set since S9: what they
+turned on always runs.)
 
 | Run | Switches | Measure |
 | --- | --- | --- |
@@ -174,7 +198,8 @@ garbled geometry, and hangs.
 
 ## Risks to check on the PC
 
-- Threads per heap per pass: PASS_THREADS and SYNC_THREADS spawn scoped
+- Threads per heap per pass: PASS_THREADS and SYNC_THREADS (4, always
+  since S9) spawn scoped
   threads each pass, for each heap, with no pool. Many small passes pay for
   the spawns. Compare against the time saved.
 - PASS_THREADS: (the heap-wide `made` lock the jobs once fought over is gone
@@ -183,7 +208,7 @@ garbled geometry, and hangs.
   lock held, put in the tables by a compare: `RACE_LOST` counts the losers)
   and views from several threads at once. Watch for device removal and, in diagnostics
   builds, `HEAP_VIEWS_ELSEWHERE`.
-- SYNC_BYTES: 32 B per title view slot, against 8 B per print (about 32 MB
+- SYNC_BYTES (always since S9): 32 B per title view slot, against 8 B per print (about 32 MB
   for a 1M-slot heap).
 - PASS_TABLED: a slot a table held, read by index within 8 frames, may be
   stale. After 8 frames it is walked again only on a full or spread pass or
@@ -195,7 +220,7 @@ garbled geometry, and hangs.
   re-created in the same frame still gets its pass.
 - SHOWS_NONE: a draw that makes a slot from an older view at the same moment
   keeps that view until the slot is written again.
-- SYNC_EARLY: a submission can wait for an own pass already running; the
+- SYNC_EARLY (always, 4 ms, since S9): a submission can wait for an own pass already running; the
   helper wakes every `<ms>` while the title submits. Check CPU cost on the
   slow PC.
 - MADE_STRIPES (removed in 1f, measured +35 ms): a thread taking a second
