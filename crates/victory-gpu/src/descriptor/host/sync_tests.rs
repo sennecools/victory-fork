@@ -1,5 +1,5 @@
-//! The heap sync (`super::super::sync_heaps`): a changed page's records at
-//! once and the early skip (`VICTORY_HEAP_SYNC_FAST=1`), and the pass run
+//! The heap sync (`super::super::sync_heaps`): changed pages sorted on
+//! threads, the early skip (`VICTORY_HEAP_SYNC_FAST=1`), and the pass run
 //! ahead on its own thread (`super::super::ahead`).
 
 use super::made_tests::{alive, key, memory, next, record_key, texture, views, write};
@@ -197,96 +197,6 @@ fn title_texture() -> This {
         "no host copy before its first use"
     );
     texture
-}
-
-/// Records over a page, some slots a table's lately, mirrored one by one
-/// (`mirror_copied`) on one heap and a page at once (`mirror_copied_page`)
-/// on another: after every round the same slots made from the same
-/// records, with the same words and the same prints last seen.
-#[test]
-fn a_page_at_once_makes_what_one_by_one_makes() {
-    page_against_one_by_one(false);
-}
-
-/// As above, with the early skip on for the page at once (and off for one
-/// by one): the page and the skip together make what one by one makes.
-#[test]
-fn a_page_at_once_with_the_early_skip_makes_what_one_by_one_makes() {
-    page_against_one_by_one(true);
-}
-
-/// The two tests above: the early skip on for the page at once if `skip`.
-fn page_against_one_by_one(skip: bool) {
-    let (Some(one), Some(page)) = (HostHeap::new(false, SLOTS), HostHeap::new(false, SLOTS)) else {
-        return; // no host GPU
-    };
-    let views = views(memory());
-    let skipped = SKIPPED_MADE.load(Relaxed);
-    let mut records = vec![[0u32; 8]; SLOTS as usize];
-    let base = records.as_mut_ptr() as u64;
-    let step = 32u64;
-    let mut rng = 0x51f1_5eed_0bad_cafeu64;
-    let mut mirrored = 0u64;
-    for round in 0..200 {
-        // Some slots written, some a table's.
-        for _ in 0..8 {
-            let r = next(&mut rng);
-            let s = (r % u64::from(SLOTS)) as u32;
-            write(
-                base + u64::from(s) * step,
-                &views[(r >> 16) as usize % views.len()],
-            );
-            if r >> 40 & 7 == 0 {
-                one.texture_slot_tabled(s, false);
-                page.texture_slot_tabled(s, false);
-            }
-            // Some made by a draw before the sync sees them (what the early
-            // skip leaves).
-            if r >> 44 & 3 == 0 {
-                one.mirror(s, base + u64::from(s) * step, true);
-                page.mirror(s, base + u64::from(s) * step, true);
-            }
-        }
-        // The page as the safe copy (`crate::safecopy`) reads it.
-        // SAFETY: `records` is `SLOTS` records of `step` bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(base as *const u8, (u64::from(SLOTS) * step) as usize)
-        }
-        .to_vec();
-        let mut one_by_one = 0;
-        for index in 0..u64::from(SLOTS) {
-            let at = (index * step) as usize;
-            if one.mirror_copied(
-                index as u32,
-                base + index * step,
-                &bytes[at..at + step as usize],
-            ) {
-                one_by_one += 1;
-            }
-        }
-        let (looked, made) = {
-            let _fast = skip.then(Fast::on);
-            page.mirror_copied_page(0..u64::from(SLOTS), (base, step), base as usize, &bytes)
-        };
-        assert_eq!(looked, u64::from(SLOTS), "round {round}");
-        assert_eq!(made, one_by_one, "round {round}");
-        mirrored += made;
-        for s in 0..SLOTS {
-            assert_eq!(key(&one, s), key(&page, s), "round {round}, slot {s}");
-            assert_eq!(one.word(s), page.word(s), "round {round}, slot {s}");
-            assert_eq!(
-                one.copied_print(s),
-                page.copied_print(s),
-                "round {round}, slot {s}"
-            );
-        }
-        assert_eq!(one.buffer_slots(), page.buffer_slots(), "round {round}");
-    }
-    assert!(mirrored > 0);
-    if skip {
-        assert!(SKIPPED_MADE.load(Relaxed) > skipped, "records skipped");
-    }
-    assert!(alive());
 }
 
 /// The early skip: a slot made from a record of a view still there is done
@@ -674,9 +584,28 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
     assert!(alive());
 }
 
+/// The reference the sorted pass is held to, one record at a time: a
+/// record not the one last seen in its slot (`last`, zeros before the first
+/// look), of a slot no table's lately, is last seen from then on and its
+/// slot mirrored as the sync mirrors it. True if it was.
+fn mirror_one(
+    heap: &HostHeap,
+    last: &mut [Vec<u8>],
+    index: u32,
+    handle: u64,
+    record: &[u8],
+) -> bool {
+    if heap.tabled_lately(index, crate::frame::current()) || last[index as usize] == record {
+        return false;
+    }
+    last[index as usize] = record.to_vec();
+    heap.mirror_synced(index, handle);
+    true
+}
+
 /// Records over a page, some slots a table's lately, some made by a draw,
 /// some written with bytes that are no view, mirrored one by one
-/// (`mirror_copied`) on one heap, and on another sorted in parts of the
+/// ([`mirror_one`]) on one heap, and on another sorted in parts of the
 /// page on four threads (`sort_copied_page`) and the slots found mirrored
 /// on four threads (`mirror_synced`): after every round the same slots
 /// made from the same records, with the same words and buffer sets, and
@@ -694,6 +623,7 @@ fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
     let step = 32u64;
     let mut rng = 0x0dd5_eed5_1f1a_4330u64 ^ u64::from(bytes) ^ u64::from(shows_none) << 1;
     let mut mirrored = 0u64;
+    let mut last = vec![vec![0u8; step as usize]; SLOTS as usize];
     for round in 0..200 {
         for _ in 0..8 {
             let r = next(&mut rng);
@@ -723,11 +653,8 @@ fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
         let mut one_by_one = 0;
         for index in 0..u64::from(SLOTS) {
             let at = (index * step) as usize;
-            if one.mirror_copied(
-                index as u32,
-                base + index * step,
-                &page[at..at + step as usize],
-            ) {
+            let record = &page[at..at + step as usize];
+            if mirror_one(&one, &mut last, index as u32, base + index * step, record) {
                 one_by_one += 1;
             }
         }
@@ -783,16 +710,9 @@ fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
         for s in 0..SLOTS {
             assert_eq!(key(&one, s), key(&sorted, s), "round {round}, slot {s}");
             assert_eq!(one.word(s), sorted.word(s), "round {round}, slot {s}");
-            let print = one.copied_print(s);
             if bytes {
                 let seen = sorted.copied_record(s, step as usize).expect("bytes kept");
-                if print == 0 {
-                    assert!(seen.iter().all(|&b| b == 0), "round {round}, slot {s}");
-                } else {
-                    assert_eq!(record_print(&seen) | 1, print, "round {round}, slot {s}");
-                }
-            } else {
-                assert_eq!(print, sorted.copied_print(s), "round {round}, slot {s}");
+                assert_eq!(seen, last[s as usize], "round {round}, slot {s}");
             }
         }
         assert_eq!(one.buffer_slots(), sorted.buffer_slots(), "round {round}");

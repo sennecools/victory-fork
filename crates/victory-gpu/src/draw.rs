@@ -4427,7 +4427,7 @@ fn walk_spread(
 /// `threads - 1` more made for the call, and returns when every call has.
 /// A panic of one call is the caller's once all have ended. With fewer than
 /// two threads or numbers, on this thread alone. The threads are named
-/// `name-1` on. (Also the heap sync's, `VICTORY_HEAP_SYNC_THREADS`.)
+/// `name-1` on. (Also the heap sync's.)
 pub(crate) fn each_on(threads: usize, count: usize, name: &str, f: &(dyn Fn(usize) + Sync)) {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let run = || {

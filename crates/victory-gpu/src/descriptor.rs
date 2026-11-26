@@ -267,20 +267,19 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
     if crate::host::ending() {
         return;
     }
-    // On the profile: what it did, and its time reading pages (`read_us`)
-    // and mirroring their slots (`mirror_us`, with the waits for slots'
-    // claims), which alternate page by page; `skipped_made`: records whose
-    // slot was made from them already, done with before its slot's claim
-    // (`VICTORY_HEAP_SYNC_FAST=1`).
+    // On the profile: what it did, and its time reading pages (`read_us`,
+    // summed over the threads) and the pass of each heap (`mirror_us`: all
+    // the time it took on the calling thread, that thread's share of the
+    // reading and its waits for the other threads with it, so it overlaps
+    // `read_us`); `skipped_made`: records whose slot was made from them
+    // already, done with before its slot's claim (`VICTORY_HEAP_SYNC_FAST=1`);
+    // `shows_none`: records left with `VICTORY_SHOWS_NONE=1`.
     let mut span = crate::profile::span("sync heaps");
     let (mut read_ticks, mut mirror_ticks) = (0u64, 0u64);
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
+    let (mut pages, mut looked, mut mirrored, mut nothing) = (0u64, 0u64, 0u64, 0u64);
     let fast = host::sync_fast();
     let skipped_before = host::SKIPPED_MADE.load(Relaxed);
-    let parted = host::sync_parted();
-    let mut nothing = 0u64;
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter().filter(|h| bound.contains(&h.2)) {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -296,69 +295,16 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        // With `VICTORY_HEAP_SYNC_BYTES`, `VICTORY_HEAP_SYNC_THREADS` or
-        // `VICTORY_SHOWS_NONE`: the heap's changed pages sorted first, then
-        // the slots found mirrored (`sync_parted_heap`).
-        if parted {
-            let taken = written.take(start as usize, end as usize);
-            let (found, made_ticks) = sync_parted_heap(host, &taken, start, step, mirrored_count);
-            pages += found.pages;
-            looked += found.looked;
-            mirrored += found.make.len() as u64;
-            nothing += found.nothing;
-            read_ticks += found.read_ticks;
-            mirror_ticks += made_ticks;
-            continue;
-        }
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
-            let mut page = range_from & !(crate::watch::PAGE - 1);
-            while page < range_end {
-                let from = page.max(range_from);
-                let to = (page + crate::watch::PAGE).min(range_end);
-                // The page's records are read by the safe copy
-                // (`crate::safecopy`), into a copy: a page the title unmaps
-                // meanwhile fails the read where 2,048 reads in place would
-                // fault.
-                page_bytes.resize(to - from, 0);
-                let reading = crate::profile::stamp();
-                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
-                read_ticks += crate::profile::elapsed(reading);
-                if read {
-                    let mirroring = crate::profile::stamp();
-                    pages += 1;
-                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    // With `VICTORY_HEAP_SYNC_FAST=1` the page's records in
-                    // one go, under one lock (`HostHeap::mirror_copied_page`,
-                    // after fork main a2537066); one by one otherwise.
-                    if fast {
-                        let (seen, made) =
-                            host.mirror_copied_page(slots, (start, step), from, &page_bytes);
-                        looked += seen;
-                        mirrored += made;
-                    } else {
-                        for index in slots {
-                            let handle = start + index * step;
-                            // A record that straddles the range's ends is
-                            // left to the range that holds its first byte.
-                            let Some(at) = (handle as usize).checked_sub(from) else {
-                                continue;
-                            };
-                            let Some(record) = page_bytes.get(at..at + step as usize) else {
-                                continue;
-                            };
-                            looked += 1;
-                            // Only a record that is not the one last seen
-                            // there (`HostHeap::mirror_copied`).
-                            if host.mirror_copied(index as u32, handle, record) {
-                                mirrored += 1;
-                            }
-                        }
-                    }
-                    mirror_ticks += crate::profile::elapsed(mirroring);
-                }
-                page += crate::watch::PAGE;
-            }
-        }
+        // The heap's changed pages sorted first, then the slots found
+        // mirrored (`sync_parted_heap`).
+        let taken = written.take(start as usize, end as usize);
+        let (found, made_ticks) = sync_parted_heap(host, &taken, start, step, mirrored_count);
+        pages += found.pages;
+        looked += found.looked;
+        mirrored += found.make.len() as u64;
+        nothing += found.nothing;
+        read_ticks += found.read_ticks;
+        mirror_ticks += made_ticks;
     }
     drop(heaps);
     if let Some(span) = span.as_mut() {
@@ -373,13 +319,7 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
                 host::SKIPPED_MADE.load(Relaxed) - skipped_before,
             );
         }
-        // Records left with `VICTORY_SHOWS_NONE=1`. With
-        // `VICTORY_HEAP_SYNC_THREADS`, `read_us` is summed over the threads
-        // and `mirror_us` is all the time the calling thread took, the
-        // waits for theirs with it.
-        if parted {
-            span.arg("shows_none", nothing);
-        }
+        span.arg("shows_none", nothing);
     }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
@@ -434,20 +374,25 @@ pub(crate) fn let_go_slots(
     n
 }
 
-/// [`sync_heaps`] of one heap with [`host::sync_parted`]: the pages of the
-/// changed ranges `taken` of the title heap at `start` (records of `step`
-/// bytes, the first `mirrored_count` with host slots) are read by the safe
-/// copy (`crate::safecopy`), compared with what was last seen and sorted
+/// Threads [`sync_parted_heap`] runs its jobs on, the calling one among
+/// them (`crate::draw::each_on`). cool_fox measured 14 ms a frame of one
+/// thread for 160 changed pages (44629de).
+#[cfg(windows)]
+const SYNC_THREADS: usize = 4;
+
+/// [`sync_heaps`] of one heap: the pages of the changed ranges `taken` of
+/// the title heap at `start` (records of `step` bytes, the first
+/// `mirrored_count` with host slots) are read by the safe copy
+/// (`crate::safecopy`), compared with what was last seen and sorted
 /// ([`host::HostHeap::sort_copied_page`]), [`host::SYNC_PAGES`] a job; then
 /// the slots found with new records are mirrored, [`host::SYNC_SLOTS`] a
-/// job. With [`host::sync_threads`] above 1 the jobs run on that many
-/// threads, else on this one. The same slots are mirrored as page by page,
-/// from the same records: only after every page of the heap is read, and
-/// with more than one thread not in slot order (each slot's mirror is
-/// ordered by its claim, as the draws' and the heap buffer pass's are).
+/// job, the jobs on [`SYNC_THREADS`] threads. A slot is mirrored only after
+/// every page of the heap is read, and not in slot order (each slot's
+/// mirror is ordered by its claim, as the draws' and the heap buffer pass's
+/// are).
 ///
-/// Returns what was found, and the profile ticks it took past the reading
-/// (with more than one thread, all of them).
+/// Returns what was found, and the profile ticks it took (all of them: the
+/// reading is on the other threads too).
 ///
 /// Ported from cool_fox 44629de (pages read, compared and sorted on several
 /// threads, the slots made 256 at a time), by local.
@@ -471,7 +416,7 @@ fn sync_parted_heap(
             page += crate::watch::PAGE;
         }
     }
-    let threads = host::sync_threads();
+    let threads = SYNC_THREADS;
     let shows_none = host::shows_none();
     let copied = host.copied_begin(step as usize, host::sync_bytes());
     let jobs: Vec<&[(usize, usize)]> = parts.chunks(host::SYNC_PAGES).collect();
@@ -532,13 +477,7 @@ fn sync_parted_heap(
             }
         },
     );
-    let ticks = crate::profile::elapsed(began);
-    let past_reading = if threads > 1 {
-        ticks
-    } else {
-        ticks.saturating_sub(all.read_ticks)
-    };
-    (all, past_reading)
+    (all, crate::profile::elapsed(began))
 }
 
 /// For the profile's sample (`VICTORY_PROFILE_SAMPLES`): over the host
