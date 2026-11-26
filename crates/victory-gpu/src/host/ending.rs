@@ -26,7 +26,14 @@ static REFUSED: AtomicU64 = AtomicU64::new(0);
 /// No submission reaches the card from now on.
 pub(crate) fn end_submissions() {
     #[cfg(not(test))]
-    ENDING.store(true, Ordering::SeqCst);
+    {
+        ENDING.store(true, Ordering::SeqCst);
+        // The card-awake sends (`VICTORY_CARD_AWAKE`) go on their own queue,
+        // which the release's wait does not cover: none after this, and what
+        // was on the way has run. Not under test, where ENDING is per thread
+        // and the awake tests own the switch.
+        super::awake::end();
+    }
     #[cfg(test)]
     ENDING.with(|ending| ending.set(true));
 }

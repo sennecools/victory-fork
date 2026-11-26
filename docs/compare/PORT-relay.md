@@ -22,6 +22,8 @@ All cool_fox commits named here have the author `local`.
 | 2985292 | review | `VICTORY_LIFT_STALE` widens the look only with `relay_exact` (`VICTORY_RELAY=2`), as documented | ours |
 | 426bdff | review | `awake.rs` comments: a menu keeps the card awake, a title that stands still goes quiet; the thread `sent()` starts is detached for the life of the process. Comments only | 040aa27 (wording) |
 | fd77ae0 | docs | First version of this file | ours |
+| 1868a5c | fix | With `VICTORY_CARD_AWAKE`, a free of the title's refused for a heap while card-awake sends were on the way holds the sends (`awake::hold`), waits for those on the way and asks again (3 tries, 1 ms apart): on WARP the sends kept heaps let go, and frees waited for a sweep | ours |
+| 66d1aae | fix | `awake::end()`: no card-awake send after it, none on the way, the thread ends; for the release at the title's end (not called on this branch, see Known gaps) | ours |
 
 ## Switches
 
@@ -140,6 +142,16 @@ Run on the lane's final code (before this docs commit):
   removal or TDR, power and heat, and whether the 400,000-step loop is
   the right length on the target card. Frame times in `turns` should
   differ between turns.
+- **Card awake and the title's frees**: on WARP the sends keep a heap the
+  host let go until the device's queues at work ran on past it, so a
+  decommit of a home's pages was refused (and waited for a sweep) while
+  they ran. A refused free now holds the sends and waits for those on the
+  way (some 2 ms a send on the card, two on the way) before it waits as
+  before; a free that waits for a flight is tried again at landings
+  without a hold. Whether the card's driver keeps heaps the same way is
+  unknown: in an A/B with the switch, compare the memory core's line
+  (frees waited, ms waited, given up, protections refused) with the
+  switch off, and the title thread's frame time spikes.
 
 ## Known gaps
 
@@ -159,6 +171,12 @@ Run on the lane's final code (before this docs commit):
 - `VICTORY_CARD_AWAKE` hooks only the late path's submissions, as
   cool_fox does; waited submissions and other `ExecuteCommandLists` sites
   are not hooked.
+- `crate::host::ending()` and `end_submissions` are not on this branch.
+  Merged with the release (`crate::release`, R3 line), `end_submissions`
+  in `host/ending.rs` must call `awake::end()` after it sets `ENDING`;
+  until then the card-awake queue may send for up to 250 ms after the
+  release (on its own buffer, nothing of the title's). Its `ENDED` is
+  not read from `ending()`, which is per thread under test there.
 - No unit tests for `VICTORY_LIFT_STALE`, `VICTORY_LIFT_UPLOADS` (cool_fox
   has none) or the `over_lifted_homes` index (needs real shadows): WARP
   tests and game runs only.

@@ -1369,9 +1369,17 @@ pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
         (true, true) => {}
     }
     cpu_touched(from, to - from, Touch::Freeing);
-    let done = host();
+    let mut done = host();
     // SAFETY: a plain read of this thread's last error.
-    let error = unsafe { GetLastError() };
+    let mut error = unsafe { GetLastError() };
+    if done == 0 && error == REFUSED_BY_HEAP {
+        // The heaps let go may be kept for the sends that keep the card
+        // awake: held, and asked again once those on the way ran.
+        let held = crate::host::card_awake_held();
+        if held.waited {
+            (done, error) = ask_again(&host);
+        }
+    }
     if done != 0 || error != REFUSED_BY_HEAP {
         unbusy(base);
         if done != 0 && kind == mem::MEM_RELEASE {
@@ -1508,6 +1516,29 @@ pub fn title_virtual_protect(at: usize, len: usize, new: u32, old: *mut u32) -> 
     // SAFETY: as the host left it.
     unsafe { SetLastError(error) };
     done
+}
+
+/// Tries of [`ask_again`].
+const AWAKE_TRIES: u32 = 3;
+
+/// The host's answer to a free of the title's (`host`) refused for a heap
+/// while the sends that keep the card awake were on the way, and its last
+/// error; the caller holds those sends (`crate::host::card_awake_held`) and
+/// those on the way ran. The software adapter lets the heaps go shortly
+/// after its queues ran on past them, so a refusal for a heap is asked
+/// again, [`AWAKE_TRIES`] times at most, a millisecond apart.
+fn ask_again(host: &dyn Fn() -> i32) -> (i32, u32) {
+    let mut tries = 1;
+    loop {
+        let done = host();
+        // SAFETY: a plain read of this thread's last error.
+        let error = unsafe { GetLastError() };
+        if done != 0 || error != REFUSED_BY_HEAP || tries == AWAKE_TRIES {
+            return (done, error);
+        }
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// A commit of the title's inside a region under way
@@ -3401,6 +3432,110 @@ pub(crate) mod tests {
         drop(again);
         unregister(0xc0de_5602, start);
         drop(hold);
+        region.release();
+    }
+
+    /// Until `at` is decommitted, or a second has passed: the waiting frees
+    /// are tried again as each landing tries them ([`after_landing`]); never
+    /// a sweep.
+    fn done_at_a_later_landing(at: u64) {
+        let since = std::time::Instant::now();
+        while state(at) != mem::MEM_RESERVE && since.elapsed().as_secs() < 1 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            after_landing();
+        }
+    }
+
+    /// The card is kept awake all along (`VICTORY_CARD_AWAKE`: sends of
+    /// another queue of the same device, never to stop meanwhile), which on
+    /// the software adapter keeps a heap let go until the sends on the
+    /// device then ran. The title's decommit of a home's pages that only
+    /// the tables hold waits for those sends: done at once. A protection
+    /// there is made, and the region keeps its homes. A decommit while a
+    /// flight's list holds the home is done at its landing or a later one,
+    /// with no sweep and nothing given up.
+    #[test]
+    fn warp_r5_the_awake_sends_hold_no_free_or_protection() {
+        let Some(host) = warp13() else { return };
+        let awake = crate::host::AwakeForTest::start(host, || true);
+        // Until it sent twice more than `sent`.
+        let sends_after = |sent: u64| {
+            let since = std::time::Instant::now();
+            while awake.sends() < sent + 2 {
+                assert!(since.elapsed().as_secs() < 30, "the card is kept awake");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        sends_after(0);
+        let (_core, flights) = r5_on();
+        let region = TestRegion::new(8 * K64 as usize);
+        // A decommit, only the tables holding the home.
+        let (start, len) = (region.base + K64, K64);
+        register(0xc0de_5f01, start, len);
+        assert!(find(start, len).expect("a home").is_home());
+        assert_eq!(
+            title_virtual_free(start as usize, len as usize, mem::MEM_DECOMMIT),
+            1
+        );
+        assert_eq!(state(start), mem::MEM_RESERVE, "decommitted at once");
+        unregister(0xc0de_5f01, start);
+        // A protection, likewise.
+        let (start, len) = (region.base + 2 * K64, K64);
+        register(0xc0de_5f02, start, len);
+        assert!(find(start, len).expect("a home").is_home());
+        let refused = TOLD[7].load(Ordering::Relaxed);
+        let mut old = 0;
+        assert_eq!(
+            title_virtual_protect(start as usize, 4096, mem::PAGE_READONLY, &mut old),
+            1,
+            "the protection is made"
+        );
+        assert_eq!(
+            title_virtual_protect(start as usize, 4096, mem::PAGE_READWRITE, &mut old),
+            1
+        );
+        assert_eq!(TOLD[7].load(Ordering::Relaxed), refused, "not refused");
+        let again = find(start, len).expect("a home again");
+        assert!(again.is_home(), "the region is not blacklisted");
+        drop(again);
+        unregister(0xc0de_5f02, start);
+        // A decommit while a flight's list holds the home.
+        let (start, len) = (region.base + 4 * K64, K64);
+        register(0xc0de_5f03, start, len);
+        let home = find(start, len).expect("a home");
+        assert!(home.is_home());
+        let hold = QueueHold::new(host);
+        let list = host.new_list().unwrap();
+        home.refresh(&list, start, len);
+        list.close();
+        host.send_owned_for_test(list);
+        drop(home);
+        let (given_up, failed) = (
+            TOLD[9].load(Ordering::Relaxed),
+            TOLD[4].load(Ordering::Relaxed),
+        );
+        assert_eq!(
+            title_virtual_free(start as usize, len as usize, mem::MEM_DECOMMIT),
+            1,
+            "told it was done"
+        );
+        assert_eq!(state(start), mem::MEM_COMMIT, "held by the flight's list");
+        hold.release();
+        flights.land_all();
+        done_at_a_later_landing(start);
+        assert_eq!(
+            state(start),
+            mem::MEM_RESERVE,
+            "decommitted at a landing, with no sweep"
+        );
+        assert_eq!(PENDING.load(Ordering::Relaxed), 0);
+        assert_eq!(TOLD[9].load(Ordering::Relaxed), given_up, "not given up");
+        assert_eq!(TOLD[4].load(Ordering::Relaxed), failed, "not failed");
+        // The sends go on after the holds.
+        sends_after(awake.sends());
+        unregister(0xc0de_5f03, start);
+        drop(hold);
+        drop(awake);
         region.release();
     }
 

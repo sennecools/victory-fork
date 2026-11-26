@@ -46,6 +46,31 @@ pub(crate) use late_homes::{Ring, finished, r5, settle_for_fence_at, wait_for_fl
 #[cfg(test)]
 pub(crate) use late_homes::{flights, test_flights, test_relay_sees};
 
+/// The threads that keep the card awake (`VICTORY_CARD_AWAKE`,
+/// `awake.rs`) send nothing while the result lives, and what they sent has
+/// run: a heap let go may be kept until then.
+pub(crate) fn card_awake_held() -> awake::Held {
+    awake::hold()
+}
+
+/// A thread of `awake.rs` that keeps the card of the host busy while
+/// `wanted`, as `VICTORY_CARD_AWAKE` starts one, until it is dropped
+/// (tests).
+#[cfg(test)]
+pub(crate) struct AwakeForTest(awake::Awake);
+
+#[cfg(test)]
+impl AwakeForTest {
+    pub(crate) fn start(host: &Host, wanted: impl Fn() -> bool + Send + 'static) -> AwakeForTest {
+        AwakeForTest(awake::start(&host.device, wanted).expect("a thread to keep the card awake"))
+    }
+
+    /// Its sends so far.
+    pub(crate) fn sends(&self) -> u64 {
+        self.0.sends()
+    }
+}
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
