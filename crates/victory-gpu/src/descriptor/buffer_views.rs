@@ -185,6 +185,53 @@ fn own_bytes(
     )
 }
 
+/// Where a buffer placed in the same heap as a copy may start so that a
+/// view whose first byte is `a` lies on one of its elements of `e` bytes:
+/// the placed buffer's first byte `P` and the view's first element there.
+/// `b` is the byte at the heap's offset 0. A placed buffer starts on a
+/// 64 KiB line of the heap, and the host counts a view's elements from its
+/// buffer's start, so `P = b + 64 KiB * j` for the smallest `j` with
+/// `(a - P) % e == 0` and `P <= a`. `None` if there is no such `j`: when
+/// the gcd `g` of 64 KiB and `e` does not divide `(a - b) % e` (a raw
+/// view's 16 bytes or a constant buffer's 256 bytes then never move onto
+/// the line by a placement), or when `j` would place the buffer past `a`.
+///
+/// Solved as `(64 KiB / g) * j = r / g (mod e / g)` with `r = (a - b) % e`:
+/// `64 KiB / g` is a power of two and `e / g` has no factor of two left
+/// (or `64 KiB / g` is 1), so the inverse exists and `j < e / g`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn alias_base(a: u64, b: u64, e: u64) -> Option<(u64, u64)> {
+    /// The inverse of `x` modulo `m`, for `x` and `m` coprime (0 for
+    /// `m = 1`).
+    fn inverse(x: u64, m: u64) -> Option<u64> {
+        let (mut old, mut new) = (i128::from(x % m), i128::from(m));
+        let (mut old_s, mut new_s) = (1i128, 0i128);
+        while new != 0 {
+            let q = old / new;
+            (old, new) = (new, old - q * new);
+            (old_s, new_s) = (new_s, old_s - q * new_s);
+        }
+        (old == 1).then(|| old_s.rem_euclid(i128::from(m)) as u64)
+    }
+    const LINE: u64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+    if e == 0 || a < b {
+        return None;
+    }
+    let d = a - b;
+    let r = d % e;
+    let g = 1u64 << e.trailing_zeros().min(LINE.trailing_zeros());
+    if !r.is_multiple_of(g) {
+        return None;
+    }
+    let m = e / g;
+    let j = (u128::from(r / g) * u128::from(inverse(LINE / g, m)?) % u128::from(m)) as u64;
+    if j > d / LINE {
+        return None;
+    }
+    let p = b + LINE * j;
+    Some((p, (a - p) / e))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn own_bytes_if(
     on: bool,
@@ -555,4 +602,110 @@ pub(super) fn buffer_uav(
         desc: Some(desc),
         shadow: Some((shadow, address)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LINE: u64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+
+    /// The smallest `j` that [`alias_base`] solves for, found by trying
+    /// each: the first 64 KiB line from `b` at or before `a` that lies a
+    /// whole number of `e`-byte elements before `a`.
+    fn tried(a: u64, b: u64, e: u64) -> Option<(u64, u64)> {
+        let d = a.checked_sub(b)?;
+        (0..=e.min(d / LINE))
+            .find(|j| (d - LINE * j).is_multiple_of(e))
+            .map(|j| (b + LINE * j, (d - LINE * j) / e))
+    }
+
+    /// What every placement must be: on a 64 KiB line from `b`, between `b`
+    /// and `a`, a whole number of elements before `a`.
+    fn placed_right(a: u64, b: u64, e: u64, (p, first): (u64, u64)) {
+        assert!(
+            (p - b).is_multiple_of(LINE),
+            "{a:#x} {b:#x} {e}: off the line"
+        );
+        assert!(b <= p && p <= a, "{a:#x} {b:#x} {e}: outside");
+        assert_eq!(p + first * e, a, "{a:#x} {b:#x} {e}: not on an element");
+    }
+
+    /// The alias math by rows: structured strides, a raw view's 16-byte
+    /// line, a constant buffer's 256 bytes and the room before the view.
+    #[test]
+    fn alias_base_table() {
+        let raw = u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
+        let constant = u64::from(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        // (view offset from b, element bytes, j, first element there)
+        let rows: [(u64, u64, Option<(u64, u64)>); 16] = [
+            // structured strides with a factor that is not two: a line on
+            (2 * LINE + 0x3008, 12, Some((1, 6486))),
+            (5 * LINE + 0x1238, 20, Some((4, 3510))),
+            (5 * LINE + 0x123c, 20, Some((3, 6787))),
+            (7 * LINE + 0x2008, 24, Some((2, 13995))),
+            (40 * LINE + 0x100c, 36, Some((2, 69291))),
+            (600 * LINE + 0x2a8, 2044, Some((254, 11094))),
+            // stride 2044 = 4 * 511: up to 510 lines, about 33 MiB of room
+            (510 * LINE, 2044, Some((510, 0))),
+            (510 * LINE - 2044, 2044, None),
+            (10 * LINE + 0x2a8, 2044, None),
+            // on an element already: the copy's own start
+            (20 * LINE + 40, 12, Some((0, (20 * LINE + 40) / 12))),
+            // off the power of two of the element: no line helps
+            (LINE + 0x38, 16, None),
+            (LINE + 0x22, 12, None),
+            // a raw view's 16 bytes: on 16 it needs no placement, off 16 none helps
+            (LINE + 0x30, raw, Some((0, (LINE + 0x30) / raw))),
+            (LINE + 0x34, raw, None),
+            // a constant buffer's 256 bytes: the same
+            (
+                3 * LINE + 0x700,
+                constant,
+                Some((0, (3 * LINE + 0x700) / constant)),
+            ),
+            (3 * LINE + 0x740, constant, None),
+        ];
+        // b on a 64 KiB line (a home's line) and off one (a card side's start)
+        for b in [0xd_9000_0000u64, 0x2_3456_7894] {
+            for (d, e, want) in rows {
+                let got = alias_base(b + d, b, e);
+                assert_eq!(
+                    got,
+                    want.map(|(j, first)| (b + j * LINE, first)),
+                    "view at b + {d:#x}, {e}-byte elements"
+                );
+                assert_eq!(got, tried(b + d, b, e), "b + {d:#x}, {e}");
+                if let Some(got) = got {
+                    placed_right(b + d, b, e, got);
+                }
+            }
+        }
+        // no elements, or a view before its heap: none
+        assert_eq!(alias_base(0x1_0000, 0x1_0000, 0), None);
+        assert_eq!(alias_base(0xffff, 0x1_0000, 12), None);
+    }
+
+    /// The alias math against trying every line: for each element size the
+    /// host takes for strides (whole dwords up to 2048), a few odd and
+    /// large sizes, and a raw and a constant buffer view's line, at 64
+    /// pseudo-random offsets of up to 600 lines (about 37 MiB) past `b`.
+    #[test]
+    fn alias_base_is_the_first_line_that_fits() {
+        let mut elements: Vec<u64> = (1..=512).map(|n| 4 * n).collect();
+        elements.extend([1, 2, 3, 6, 256, 3 << 17]);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for e in elements {
+            for _ in 0..64 {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let d = (seed >> 24) % (600 * LINE);
+                let (a, b) = (0x8_0000_0000 + d, 0x8_0000_0000);
+                let got = alias_base(a, b, e);
+                assert_eq!(got, tried(a, b, e), "b + {d:#x}, {e}-byte elements");
+                if let Some(got) = got {
+                    placed_right(a, b, e, got);
+                }
+            }
+        }
+    }
 }
