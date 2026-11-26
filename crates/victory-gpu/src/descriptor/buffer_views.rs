@@ -89,43 +89,127 @@ fn view_extent() -> bool {
 /// part's one), and for buffer objects, a part that also lies in a smaller
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
-pub(crate) fn buffer_copy(
-    view: &View,
-) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+///
+/// Also the host resource the slot shows, when it is not the copy's own
+/// buffer (none yet: every place is on the copy's buffer).
+pub(crate) fn buffer_copy(view: &View) -> Option<BufferCopy> {
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
     }
-    // A view off its buffer's elements is made on a copy of its own bytes
-    // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
-    // of the copy they find, so that the copy brought up to date is the
-    // one the slot shows.
-    if let Some((base, width)) = buffer_extent(view)
-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
-        && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(
-            whole.offset(base),
-            base,
-            first,
-            count,
-            element,
-            stride,
-            unknown,
-        )
-        && let Some(own) = crate::shadow::exact(start, bytes)
-    {
-        return Some((own, start, bytes));
+    // The place `buffer_srv` and `buffer_uav` make the view on
+    // ([`place_view`]), so that the copy brought up to date is the one the
+    // slot shows.
+    let place = place_view(view);
+    if let Some(BufferPlace::Own(own, start, bytes)) = place {
+        return Some((own, None, start, bytes));
     }
     if view_extent()
         && let Some((base, width)) = buffer_extent(view)
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
+        && let Some(BufferPlace::At(shadow, _)) = place
     {
-        return Some((shadow, address, len));
+        return Some((shadow, None, address, len));
     }
-    crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+    crate::shadow::find(address, len).map(|shadow| (shadow, None, address, len))
+}
+
+/// What [`buffer_copy`] finds of a buffer view: the host copy it reads, the
+/// host resource the slot shows when it is not that copy's buffer, and the
+/// title range (address, bytes) it reads.
+pub(crate) type BufferCopy = (
+    std::sync::Arc<crate::shadow::Shadow>,
+    Option<ID3D12Resource>,
+    u64,
+    u64,
+);
+
+/// Where the host view of a buffer view is made ([`place`]).
+// Aliases over a copy's heap come as a third place.
+pub(super) enum BufferPlace {
+    /// On the host copy of the view's buffer, whose first byte lies the
+    /// given number of bytes into it.
+    At(std::sync::Arc<crate::shadow::Shadow>, u64),
+    /// On a copy of the view's own bytes (start, bytes), from its element 0
+    /// ([`own_bytes`]).
+    Own(std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+}
+
+/// The fields of a buffer view its place is decided by ([`place`]).
+#[derive(Clone, Copy)]
+pub(super) struct Fields {
+    /// The first element.
+    first: u64,
+    /// The elements.
+    count: u32,
+    /// The bytes of one (a raw view's: 4).
+    element: u64,
+    /// The structure's stride.
+    stride: u32,
+    /// Whether the view has no format.
+    unknown: bool,
+}
+
+/// [`Fields`] of a shader resource view of a buffer.
+fn srv_fields(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Fields {
+    // SAFETY: a buffer view's union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    Fields {
+        first: b.FirstElement,
+        count: b.NumElements,
+        element: element_size(desc),
+        stride: b.StructureByteStride,
+        unknown: desc.Format == DXGI_FORMAT_UNKNOWN,
+    }
+}
+
+/// [`Fields`] of an unordered access view of a buffer.
+fn uav_fields(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Fields {
+    // SAFETY: a buffer view's union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let element = if b.StructureByteStride > 0 {
+        u64::from(b.StructureByteStride)
+    } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        4
+    } else {
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    };
+    Fields {
+        first: b.FirstElement,
+        count: b.NumElements,
+        element,
+        stride: b.StructureByteStride,
+        unknown: desc.Format == DXGI_FORMAT_UNKNOWN,
+    }
+}
+
+/// Where the host view of a view of the title buffer at `base` (`width`
+/// bytes) is made: the one decision for every site that makes the view or
+/// brings up to date what it shows ([`buffer_copy`], [`buffer_srv`],
+/// [`buffer_uav`]). On the host copy of the buffer, or, for a view off that
+/// copy's elements (`fields`, [`own_bytes`]), on a copy of its own bytes.
+/// `None`: the buffer has no host copy.
+pub(super) fn place(base: u64, width: u64, fields: Option<Fields>) -> Option<BufferPlace> {
+    let whole = crate::shadow::find(base, width)?;
+    let offset = whole.offset(base);
+    if let Some(f) = fields
+        && let Some((start, bytes)) = own_bytes(
+            offset, base, f.first, f.count, f.element, f.stride, f.unknown,
+        )
+        && let Some(own) = crate::shadow::exact(start, bytes)
+    {
+        return Some(BufferPlace::Own(own, start, bytes));
+    }
+    Some(BufferPlace::At(whole, offset))
+}
+
+/// [`place`] of a buffer view, by its whole buffer ([`buffer_extent`]) and
+/// its fields ([`buffer_fields`]).
+pub(super) fn place_view(view: &View) -> Option<BufferPlace> {
+    let (base, width) = buffer_extent(view)?;
+    place(base, width, buffer_fields(view))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -253,10 +337,9 @@ pub(super) fn own_bytes_if(
     Some((start, u64::from(count) * element))
 }
 
-/// Of a buffer view: its first element, its elements, the bytes of one (a
-/// raw view's: 4), its structure's stride, and whether it has no format.
-/// As [`buffer_srv`] and [`buffer_uav`] read them from the same words.
-fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
+/// [`Fields`] of a buffer view, as [`buffer_srv`] and [`buffer_uav`] read
+/// them from the same words.
+fn buffer_fields(view: &View) -> Option<Fields> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -266,36 +349,11 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
         }
         _ => return None,
     };
-    if unordered {
-        let d = uav_desc(words);
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { d.Anonymous.Buffer };
-        let element = if b.StructureByteStride > 0 {
-            u64::from(b.StructureByteStride)
-        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-            4
-        } else {
-            crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-        };
-        Some((
-            b.FirstElement,
-            b.NumElements,
-            element,
-            b.StructureByteStride,
-            d.Format == DXGI_FORMAT_UNKNOWN,
-        ))
+    Some(if unordered {
+        uav_fields(&uav_desc(words))
     } else {
-        let d = srv_desc(words);
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { d.Anonymous.Buffer };
-        Some((
-            b.FirstElement,
-            b.NumElements,
-            element_size(&d),
-            b.StructureByteStride,
-            d.Format == DXGI_FORMAT_UNKNOWN,
-        ))
-    }
+        srv_fields(&srv_desc(words))
+    })
 }
 
 /// A structured buffer view (`first`, `count` elements of `stride` bytes,
@@ -387,31 +445,14 @@ pub(super) fn buffer_srv(
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
 ) -> Option<Resolved> {
-    let shadow = crate::shadow::find(address, len)?;
-    let offset = shadow.offset(address);
-    // Off the elements of that copy: on a copy of its own bytes, from its
-    // element 0 (`own_bytes`).
-    let (shadow, offset) = {
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { desc.Anonymous.Buffer };
-        let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(
-            offset,
-            address,
-            b.FirstElement,
-            b.NumElements,
-            element_size(&desc),
-            b.StructureByteStride,
-            unknown,
-        )
-        .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
-        {
-            Some(own) => {
-                desc.Anonymous.Buffer.FirstElement = 0;
-                (own, 0)
-            }
-            None => (shadow, offset),
+    // Off the elements of its buffer's copy: on a copy of its own bytes,
+    // from its element 0 ([`place`]).
+    let (shadow, offset) = match place(address, len, Some(srv_fields(&desc)))? {
+        BufferPlace::Own(own, ..) => {
+            desc.Anonymous.Buffer.FirstElement = 0;
+            (own, 0)
         }
+        BufferPlace::At(shadow, offset) => (shadow, offset),
     };
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -493,37 +534,14 @@ pub(super) fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
 ) -> Option<Resolved> {
-    let shadow = crate::shadow::find(address, len)?;
-    // Off the elements of that copy: on a copy of its own bytes, from its
-    // element 0 (`own_bytes`).
-    let (shadow, own) = {
-        // SAFETY: a buffer view's union member.
-        let b = unsafe { desc.Anonymous.Buffer };
-        let element = if b.StructureByteStride > 0 {
-            u64::from(b.StructureByteStride)
-        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-            4
-        } else {
-            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-        };
-        let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(
-            shadow.offset(address),
-            address,
-            b.FirstElement,
-            b.NumElements,
-            element,
-            b.StructureByteStride,
-            unknown,
-        )
-        .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
-        {
-            Some(own) => {
-                desc.Anonymous.Buffer.FirstElement = 0;
-                (own, true)
-            }
-            None => (shadow, false),
+    // Off the elements of its buffer's copy: on a copy of its own bytes,
+    // from its element 0 ([`place`]).
+    let (shadow, offset) = match place(address, len, Some(uav_fields(&desc)))? {
+        BufferPlace::Own(own, ..) => {
+            desc.Anonymous.Buffer.FirstElement = 0;
+            (own, 0)
         }
+        BufferPlace::At(shadow, offset) => (shadow, offset),
     };
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -540,7 +558,6 @@ pub(super) fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    let offset = if own { 0 } else { shadow.offset(address) };
     // A structured view as a raw view of the same bytes (see `raw_window`).
     let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
         .then(|| {
@@ -707,5 +724,129 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every site asks [`place`] the same question of a buffer view: the
+    /// copy [`buffer_copy`] brings up to date is the one [`buffer_srv`] and
+    /// [`buffer_uav`] make the view on, for a view on its copy's elements
+    /// and for one off them (a copy of its own bytes).
+    #[test]
+    fn place_view_agrees_across_sites() {
+        use std::sync::Arc;
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        const SIZE: usize = 1 << 16;
+        // SAFETY: new memory, left to the process.
+        let memory = unsafe {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(memory, 0);
+        crate::shadow::register(memory, memory as u64, SIZE as u64);
+        // A buffer the title placed `at` bytes into the memory (dimension
+        // 1, 4096 bytes), and a view of 64 of its 12-byte structures from
+        // element 2: format, dimension (1: buffer), then a shader view's
+        // mapping, a pad, first element, elements, stride and flags, or an
+        // unordered view's first element, elements, stride, counter offset
+        // and flags.
+        let view = |unordered: bool, at: u64| {
+            let base = memory as u64 + at;
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(if unordered {
+                &[0, 1, 2, 0, 64, 12, 0, 0, 0, 0]
+            } else {
+                &[0, 1, 5768, 0, 2, 0, 64, 12, 0, 0]
+            });
+            (desc[10], desc[11]) = (base as u32, (base >> 32) as u32);
+            View::Placed(
+                unordered,
+                [1, 0, 0, 0, 4096, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+                desc,
+            )
+        };
+        let whole = crate::shadow::find(memory as u64, SIZE as u64).expect("a host copy");
+        // On the copy's elements, and off them (and off 16 bytes, so no raw
+        // view of the copy either).
+        let on = (0..12)
+            .find(|at| (whole.offset(memory as u64) + at).is_multiple_of(12))
+            .unwrap();
+        let off = (0..48)
+            .find(|at| {
+                let offset = whole.offset(memory as u64) + at;
+                !offset.is_multiple_of(12) && !(offset + 24).is_multiple_of(16)
+            })
+            .unwrap();
+        for (at, own) in [(on, false), (off, true)] {
+            for unordered in [false, true] {
+                let view = view(unordered, at);
+                let base = memory as u64 + at;
+                let range = buffer_range(&view).expect("a buffer view's range");
+                // The view's own bytes: its 64 structures from element 2.
+                let bytes = (base + 2 * 12, 64 * 12);
+                let (placed, offset) = match place_view(&view).expect("a place") {
+                    BufferPlace::At(shadow, offset) if !own => {
+                        assert_eq!(offset, whole.offset(base), "at {at}: the offset");
+                        (shadow, offset)
+                    }
+                    BufferPlace::Own(shadow, start, len) if own => {
+                        assert_eq!((start, len), bytes, "at {at}: the own bytes");
+                        (shadow, 0)
+                    }
+                    _ => panic!("at {at}: the wrong place"),
+                };
+                assert_eq!(Arc::ptr_eq(&placed, &whole), !own, "at {at}");
+                let (copy, resource, address, len) = buffer_copy(&view).expect("a copy");
+                assert!(Arc::ptr_eq(&copy, &placed), "at {at}: buffer_copy's");
+                assert!(resource.is_none(), "at {at}: the copy's own buffer");
+                // On the buffer's copy the range the view reads; on its own
+                // copy, that copy's bytes (here the same).
+                let want = if own { bytes } else { range };
+                assert_eq!((address, len), want, "at {at}: buffer_copy's range");
+                // The made view's first element, and whether it stayed
+                // structured (not a raw view of the same bytes).
+                let (made, asked, first, structured) = match super::super::resolve(&view) {
+                    Some(Resolved::Srv {
+                        shadow,
+                        resource,
+                        desc,
+                    }) => {
+                        let (shadow, asked) = shadow.expect("a buffer view's copy");
+                        assert_eq!(resource, shadow.buffer, "at {at}");
+                        // SAFETY: a buffer view's union member.
+                        let b = unsafe { desc.expect("a description").Anonymous.Buffer };
+                        (shadow, asked, b.FirstElement, b.StructureByteStride > 0)
+                    }
+                    Some(Resolved::Uav {
+                        shadow,
+                        resource,
+                        desc,
+                    }) => {
+                        let (shadow, asked) = shadow.expect("a buffer view's copy");
+                        assert_eq!(resource, shadow.buffer, "at {at}");
+                        // SAFETY: a buffer view's union member.
+                        let b = unsafe { desc.expect("a description").Anonymous.Buffer };
+                        (shadow, asked, b.FirstElement, b.StructureByteStride > 0)
+                    }
+                    _ => panic!("at {at}, unordered {unordered}: no view made"),
+                };
+                assert!(Arc::ptr_eq(&made, &placed), "at {at}: the view's");
+                assert_eq!(asked, base, "at {at}: the address asked for");
+                if structured {
+                    // On its own copy the view starts at that copy's element 0.
+                    let want = if own { 0 } else { 2 + offset / 12 };
+                    assert_eq!(first, want, "at {at}: the first element");
+                }
+            }
+        }
+        crate::shadow::unregister(memory, memory as u64);
     }
 }
