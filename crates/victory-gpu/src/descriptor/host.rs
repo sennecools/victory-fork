@@ -86,6 +86,13 @@ pub(crate) struct HostHeap {
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
+    /// With `VICTORY_SLOT_BITS=1` ([`slot_bits`]): `buffers` and `changed`
+    /// as bits, changed with no lock and no log; the two sets above stay
+    /// empty then.
+    bits: Option<BufferBits>,
+    /// Whether a mirror of a slot made from its record already is done
+    /// with before any lock or claim ([`quick_mirror`]).
+    quick: bool,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -1319,8 +1326,15 @@ impl HostHeap {
     }
 
     /// [`HostHeap::new`]; `atomic`: `made` is changed a slot at a time
-    /// ([`made_atomic`]).
+    /// ([`made_atomic`]). The rest as the environment says.
     fn with_made(sampler: bool, count: u32, atomic: bool) -> Option<Self> {
+        Self::with_ways(sampler, count, atomic, slot_bits(), quick_mirror())
+    }
+
+    /// [`HostHeap::with_made`]; `bits`: the sets of buffer views are bits
+    /// ([`slot_bits`]); `quick`: a slot made from its record already is
+    /// told so before any lock ([`quick_mirror`]).
+    fn with_ways(sampler: bool, count: u32, atomic: bool, bits: bool, quick: bool) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -1435,6 +1449,11 @@ impl HostHeap {
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
+            bits: bits.then(|| BufferBits {
+                buffers: Slots::new(count as usize),
+                changed: Slots::new(count as usize),
+            }),
+            quick,
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -2195,6 +2214,16 @@ impl HostHeap {
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them (the slot claimed, so that no other
         // thread changes it between the two).
+        // With [`HostHeap::quick`], a slot not made from this record says
+        // so before the lock (as a look just before it was made would).
+        if self.quick
+            && self
+                .made
+                .get(index as usize)
+                .is_some_and(|made| made.load(std::sync::atomic::Ordering::Acquire) != key)
+        {
+            return false;
+        }
         let _made = self.lock_made(Some(hold::MADE_FROM));
         let Ok(claim) = self.claim(index, |_| true) else {
             return false;
@@ -2539,12 +2568,18 @@ impl HostHeap {
 
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
+        if let Some(bits) = &self.bits {
+            return bits.buffers.all();
+        }
         self.buffer_set().iter().copied().collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
+        if let Some(bits) = &self.bits {
+            return bits.changed.take();
+        }
         // The set of buffer views first: what is logged goes into both.
         drop(self.buffer_set());
         let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
@@ -2678,7 +2713,12 @@ impl HostHeap {
             buffer: view.and_then(view_stride).is_some(),
             mark,
         };
-        if self.atomic {
+        if let Some(bits) = &self.bits {
+            // Under the slot's claim, as the log's: two writes of one slot
+            // change its bits in their order, and those of other slots
+            // other bits.
+            note.apply_bits(bits);
+        } else if self.atomic {
             // Applied by the writer once the log is long, as the queue's
             // (`note_textures`): the heap buffer pass runs only for lists
             // whose shaders pick buffers from the heap.
@@ -3155,6 +3195,12 @@ impl HostHeap {
             }
         }
         crate::pool::slots_made_anew(slots.len() as u64);
+        if let Some(bits) = &self.bits {
+            for slot in slots {
+                bits.changed.put(slot);
+            }
+            return;
+        }
         self.changed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3207,15 +3253,26 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        // With `VICTORY_HEAP_SYNC_FAST=1`, for `sync_heaps`: a slot made
-        // from this record already, of a view still there, is done with
-        // before the lock, as the claim below would find it (an unlocked
-        // load: `CLAIMED` is never a key, and a change just after it is the
-        // same race as one just after the locked look). A record whose
-        // resource was released has no view and goes on to the lock, which
-        // makes its slot null.
-        if site == hold::SYNC
-            && sync_fast()
+        // With `VICTORY_HEAP_SYNC_FAST=1`, for `sync_heaps`, and with
+        // `VICTORY_QUICK_MIRROR=1` ([`HostHeap::quick`]) for every mirror
+        // (table binds, the walk of the heap buffer pass, the texture pass,
+        // the title's writes): a slot made from this record already, of a
+        // view still there, is done with before the lock, as the claim
+        // below would find it (an unlocked load: `CLAIMED` is never a key,
+        // and a change just after it is the same race as one just after
+        // the locked look). A record whose resource was released has no
+        // view and goes on to the lock, which makes its slot null.
+        //
+        // `made` itself is what is asked: it holds a key only once the
+        // slot's descriptor, word and kept resource are in place (the
+        // claim stores it last, with release), and every change of the
+        // slot goes through a claim, so no second record of it can say a
+        // key the slot no longer shows. (cool_fox keeps such a second
+        // record beside its `made`, and had to forget it where a slot
+        // flips to its late view, e4d0837; ours has no such record to
+        // forget.)
+        let sync = site == hold::SYNC && sync_fast();
+        if (sync || self.quick)
             && tag == VIEW_TAG
             && self
                 .made
@@ -3223,7 +3280,8 @@ impl HostHeap {
                 .is_some_and(|made| made.load(std::sync::atomic::Ordering::Acquire) == key)
             && let Some(view) = view_at(i, generation)
         {
-            SKIPPED_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let skipped = if sync { &SKIPPED_MADE } else { &QUICK_MIRRORED };
+            skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Some(view);
         }
         // A wait timed only when another thread holds it, and on the
@@ -3699,6 +3757,26 @@ pub(crate) static SYNC_FAST_FOR_TESTS: std::sync::atomic::AtomicBool =
 /// Records `sync_heaps` found its slot made from already, with
 /// [`sync_fast`], and left before the `made` lock. Only grows.
 pub(crate) static SKIPPED_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether every mirror of a slot made from its record already is done
+/// with before the `made` lock or the slot's claim (`VICTORY_QUICK_MIRROR=1`,
+/// off by default: only `sync_heaps` with [`sync_fast`] does so). The same
+/// slots are made either way: what is skipped is a lock, or a claim, that
+/// would have found the slot made from the record and let it be.
+///
+/// Ported from cool_fox 53c5256 and the unlocked first look of 6c17ce9:
+/// there most asks of five recording threads were of slots made already,
+/// behind one lock another thread held to make a descriptor (cool_fox
+/// measured 15 % of a recording thread's time in the title's opening).
+fn quick_mirror() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUICK_MIRROR").is_some_and(|v| v == "1"))
+}
+
+/// Mirrors other than [`SKIPPED_MADE`]'s done with before the lock as their
+/// slot was made from the record already ([`quick_mirror`]). Only grows.
+pub(crate) static QUICK_MIRRORED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
@@ -4425,6 +4503,90 @@ fn made_atomic() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MADE_ATOMIC").is_some_and(|v| v == "1"))
 }
 
+/// Whether a heap's sets of buffer views (the slots holding one, and those
+/// changed since the heap buffer pass took them) are bits of atomic words
+/// ([`BufferBits`]), changed by the writer of a slot with no lock and, with
+/// [`made_atomic`], no log (`VICTORY_SLOT_BITS=1`, off by default: a
+/// `BTreeSet` and a `HashSet` under locks of their own, as before). Either
+/// way the sets hold the same slots; the slots come out in slot order.
+///
+/// Ported from cool_fox c3e643e (its bit sets only; the parallel heap
+/// buffer pass of that commit is another port). cool_fox measured a pass
+/// through a set of 70,000 slots under its lock keeping every writer of
+/// slots waiting for 5 ms of a frame.
+fn slot_bits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_BITS").is_some_and(|v| v == "1"))
+}
+
+/// A heap's sets of buffer views as bits ([`slot_bits`]).
+struct BufferBits {
+    /// [`HostHeap::buffers`].
+    buffers: Slots,
+    /// [`HostHeap::changed`].
+    changed: Slots,
+}
+
+/// A set of a heap's slots, a bit each in atomic words: put, removed and
+/// taken with no lock. A slot past its words (the count it was made for,
+/// rounded up to 64) is never in it.
+struct Slots(Box<[std::sync::atomic::AtomicU64]>);
+
+impl Slots {
+    fn new(count: usize) -> Self {
+        Slots(
+            (0..count.div_ceil(64))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        )
+    }
+
+    fn put(&self, slot: u32) {
+        if let Some(bits) = self.0.get(slot as usize / 64) {
+            bits.fetch_or(1 << (slot % 64), std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// Whether it was there.
+    fn remove(&self, slot: u32) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let bit = 1 << (slot % 64);
+        self.0.get(slot as usize / 64).is_some_and(|bits| {
+            // (A slot not there, most of them, leaves the word unwritten.)
+            bits.load(Acquire) & bit != 0 && bits.fetch_and(!bit, AcqRel) & bit != 0
+        })
+    }
+
+    /// The slots of word `n`, whose bits are `bits`, into `out` in order.
+    fn of(n: usize, mut bits: u64, out: &mut Vec<u32>) {
+        while bits != 0 {
+            out.push(n as u32 * 64 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+    }
+
+    /// Those in the set, in order.
+    fn all(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (n, bits) in self.0.iter().enumerate() {
+            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire), &mut out);
+        }
+        out
+    }
+
+    /// Those in the set, in order, and none is left.
+    fn take(&self) -> Vec<u32> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut out = Vec::new();
+        for (n, bits) in self.0.iter().enumerate() {
+            if bits.load(Acquire) != 0 {
+                Self::of(n, bits.swap(0, AcqRel), &mut out);
+            }
+        }
+        out
+    }
+}
+
 /// A claim on one slot of [`HostHeap::made`] ([`HostHeap::claim`]).
 struct Claimed<'a> {
     slot: &'a std::sync::atomic::AtomicU64,
@@ -4496,6 +4658,19 @@ impl BufferNote {
             buffers.remove(&self.index)
         };
         was && self.mark
+    }
+
+    /// [`BufferNote::apply`] to the sets as bits ([`slot_bits`]).
+    fn apply_bits(self, bits: &BufferBits) {
+        let was = if self.buffer {
+            bits.buffers.put(self.index);
+            true
+        } else {
+            bits.buffers.remove(self.index)
+        };
+        if was && self.mark {
+            bits.changed.put(self.index);
+        }
     }
 }
 
@@ -4956,6 +5131,21 @@ impl Drop for HostHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A set of slots as bits ([`Slots`]) holds what was put in and not
+    /// removed, in slot order, and a take empties it. (Ported from
+    /// cool_fox c3e643e.)
+    #[test]
+    fn a_set_of_slots_holds_what_was_put_in() {
+        let set = Slots::new(200);
+        for slot in [199, 0, 64, 63, 130, 64, 4000] {
+            set.put(slot);
+        }
+        assert_eq!(set.all(), [0, 63, 64, 130, 199], "none past its words");
+        assert!(set.remove(64) && !set.remove(64) && !set.remove(5) && !set.remove(4000));
+        assert_eq!(set.take(), [0, 63, 130, 199]);
+        assert!(set.take().is_empty() && set.all().is_empty());
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
@@ -6182,6 +6372,113 @@ mod made_tests {
         assert!(alive());
     }
 
+    /// One thread's writes, mirrors (of new records and of records already
+    /// made), walks and texture questions over the slots leave heaps whose
+    /// sets of buffer views are bits, or whose mirrors of made slots skip
+    /// the lock, or both (a slot at a time), alike after every step with
+    /// one under the heap-wide lock with neither: what each slot is made
+    /// from, its word, the sets of buffer views and the queue of textures.
+    /// (Four heaps: each takes a whole view heap of the card.)
+    #[test]
+    fn bits_and_quick_mirrors_make_what_the_sets_and_the_lock_make() {
+        // (atomic, bits, quick)
+        let ways = [
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ];
+        let Some(heaps) = ways
+            .iter()
+            .map(|&(atomic, bits, quick)| HostHeap::with_ways(false, SLOTS, atomic, bits, quick))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        let mut records = vec![[0u32; 8]; SLOTS as usize];
+        let base = records.as_mut_ptr() as u64;
+        let mut rng = 0x6a09_e667_f3bc_c908u64;
+        let sorted = |mut slots: Vec<u32>| {
+            slots.sort_unstable();
+            slots
+        };
+        let quick_before = QUICK_MIRRORED.load(std::sync::atomic::Ordering::Relaxed);
+        for step in 0..3_000 {
+            let r = next(&mut rng);
+            let slot = (r % u64::from(SLOTS)) as u32;
+            let at = base + u64::from(slot) * 32;
+            match r >> 8 & 15 {
+                0 => {
+                    let gone: Vec<bool> = heaps
+                        .iter()
+                        .map(|heap| heap.texture_slot_gone(slot))
+                        .collect();
+                    assert!(gone.iter().all(|&g| g == gone[0]), "step {step}");
+                }
+                1 => {
+                    let made: Vec<bool> = heaps
+                        .iter()
+                        .map(|heap| heap.texture_slot_made_from(slot, at))
+                        .collect();
+                    assert!(made.iter().all(|&m| m == made[0]), "step {step}");
+                }
+                2 => {
+                    for heap in &heaps {
+                        heap.mirror_walked(slot, at);
+                    }
+                }
+                // Mirrors of what is there already: the quick ones skip.
+                3 | 4 => {
+                    for heap in &heaps {
+                        heap.mirror(slot, at, r & 1 << 20 != 0);
+                    }
+                }
+                op => {
+                    write(at, &views[(r >> 16) as usize % views.len()]);
+                    for heap in &heaps {
+                        heap.mirror(slot, at, op & 1 == 1);
+                    }
+                }
+            }
+            let first = &heaps[0];
+            for (heap, way) in heaps.iter().zip(ways).skip(1) {
+                for s in 0..SLOTS {
+                    assert_eq!(
+                        key(first, s),
+                        key(heap, s),
+                        "step {step}, slot {s}, {way:?}"
+                    );
+                    assert_eq!(
+                        first.word(s),
+                        heap.word(s),
+                        "step {step}, slot {s}, {way:?}"
+                    );
+                }
+                assert_eq!(
+                    first.buffer_slots(),
+                    heap.buffer_slots(),
+                    "step {step}, {way:?}"
+                );
+                assert_eq!(queued(first), queued(heap), "step {step}, {way:?}");
+            }
+            if step % 5 == 0 {
+                let changes: Vec<Vec<u32>> = heaps
+                    .iter()
+                    .map(|heap| sorted(heap.buffer_changes()))
+                    .collect();
+                for (changed, way) in changes.iter().zip(ways) {
+                    assert_eq!(&changes[0], changed, "step {step}, {way:?}");
+                }
+            }
+        }
+        assert!(
+            QUICK_MIRRORED.load(std::sync::atomic::Ordering::Relaxed) > quick_before,
+            "mirrors done with before the lock"
+        );
+        assert!(alive());
+    }
+
     /// Whether the host device is still there.
     pub(super) fn alive() -> bool {
         // SAFETY: a plain device query.
@@ -6197,10 +6494,26 @@ mod made_tests {
     /// under the heap-wide lock written the same way.
     #[test]
     fn many_threads_leave_each_slot_with_its_own_word() {
+        if let Some(heap) = HostHeap::with_made(false, SLOTS, true) {
+            many_threads_on(heap);
+        }
+    }
+
+    /// The same with the sets of buffer views as bits and the quick mirror
+    /// (`VICTORY_SLOT_BITS=1`, `VICTORY_QUICK_MIRROR=1`), a slot at a time
+    /// and under the heap-wide lock.
+    #[test]
+    fn many_threads_leave_each_slot_with_its_own_word_with_bits_and_quick_mirrors() {
+        for atomic in [true, false] {
+            if let Some(heap) = HostHeap::with_ways(false, SLOTS, atomic, true, true) {
+                many_threads_on(heap);
+            }
+        }
+    }
+
+    /// [`many_threads_leave_each_slot_with_its_own_word`] on `heap`.
+    fn many_threads_on(heap: HostHeap) {
         const THREADS: u64 = 8;
-        let Some(heap) = HostHeap::with_made(false, SLOTS, true) else {
-            return; // no host GPU
-        };
         let heap = std::sync::Arc::new(heap);
         let views = std::sync::Arc::new(views(memory()));
         let (done, finished) = std::sync::mpsc::channel();
