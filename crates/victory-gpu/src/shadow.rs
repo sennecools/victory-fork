@@ -2501,7 +2501,7 @@ mod piece_tests {
 /// missing geometry with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
 fn stale_pages_in(taken: &Taken, a: usize, e: usize) -> Vec<usize> {
     let mut pages = Vec::new();
-    let _ = crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), taken, |page| {
+    let _ = crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), taken, |page, _| {
         pages.push(page);
         ControlFlow::Continue(())
     });
@@ -3613,7 +3613,7 @@ impl Shadow {
         let taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| {
             crate::watch::asked_now(a, e).is_none()
-                || crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), &taken, |_| {
+                || crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), &taken, |_, _| {
                     ControlFlow::Break(())
                 })
                 .is_break()
@@ -3921,7 +3921,7 @@ impl Shadow {
         let _journal = crate::profile::journal_timer();
         let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
         let mut runs: Vec<(usize, usize)> = Vec::new();
-        let _ = crate::watch::stale_words(from / PAGE, to.div_ceil(PAGE), &taken, |page| {
+        let _ = crate::watch::stale_words(from / PAGE, to.div_ceil(PAGE), &taken, |page, _| {
             match runs.last_mut() {
                 Some((_, end)) if *end == page => *end += 1,
                 _ => runs.push((page, page + 1)),
