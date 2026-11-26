@@ -55,7 +55,7 @@ const K64: usize = 64 << 10;
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
 /// `VICTORY_INPLACE_PROBE`: 0 (unset) nothing; 1 the probe on memory of
-/// its own at the first sweep, and the census 30 and 150 seconds later;
+/// its own at the first tick, and the census 30 and 150 seconds later;
 /// 2 also opens one part of the title's own memory for a moment at the
 /// first census.
 pub(crate) fn probe_level() -> u8 {
@@ -1267,10 +1267,10 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
     lines
 }
 
-/// Called once a second by the thread that submits, before a submission
-/// (`host::sweep`): with [`probe_level`], the probe at the first call, the
-/// census (on a thread of its own: it asks Windows about every copy) 30
-/// and 150 seconds later.
+/// Called by the thread that submits, before a submission, when nothing is
+/// in the air (`host::Host::submit`): with [`probe_level`], the probe at
+/// the first call, the census (on a thread of its own: it asks Windows
+/// about every copy) 30 and 150 seconds later.
 pub(crate) fn tick() {
     // The memory core's waiting frees and its line.
     crate::home::tick();

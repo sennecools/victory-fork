@@ -62,8 +62,9 @@
 //! as a copy there keeps the bytes of that pass's refresh; dynamic slots
 //! (made for one list) are not looked at. shortcut: a remap lets a C-pool
 //! home go at once, but its entries in `crate::memory`'s directory go only
-//! at the next sweep (`crate::home::cpu_touched`): a raw-address dispatch
-//! recorded in between reads the old pages through the directory.
+//! at the next submission with nothing in the air (`crate::home::tick`, from
+//! `crate::inplace::tick`): a raw-address dispatch recorded in between reads
+//! the old pages through the directory.
 //!
 //! The GPU's writes into a C-pool home are not seen by the guards: after a
 //! submission's wait, the copies over the same pages at every view are told

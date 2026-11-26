@@ -33,6 +33,9 @@ pub(crate) fn end_submissions() {
         // was on the way has run. Not under test, where ENDING is per thread
         // and the awake tests own the switch.
         super::awake::end();
+        // The sweeper lets nothing go from now on; what it holds waits
+        // for the release's burial (`bury_all`).
+        super::sweeper::stop();
     }
     #[cfg(test)]
     ENDING.with(|ending| ending.set(true));

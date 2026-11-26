@@ -37,6 +37,12 @@ pub(crate) mod r5_flush;
 mod late_lift;
 /// Lifted reads take along what depends on them (`VICTORY_LIFT_CLOSURE=1`).
 mod lift_closure;
+/// The thread that lets go of idle host objects, outside the submission
+/// lock.
+mod sweeper;
+pub(crate) use sweeper::{Budget, sweep_walk};
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) use sweeper::{as_sweeper, bury_own_for_test, own_queue_for_test};
 
 use late_homes::{
     R5_STATS, Writer, home_ranges, join_writers, r5_lift, refresh_over_flight_homes,
@@ -254,283 +260,6 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-/// Once a second, before a submission starts: lets go of what nothing
-/// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
-/// `VICTORY_SWEEP=0` keeps everything, as before.
-///
-/// With `VICTORY_SWEEP_SLICE_MS=<ms>` ([`sweep_slice`]) a pass that starts
-/// once a second runs in slices of about that many milliseconds, one per
-/// submission at the same moment as without it, until it is done; `whole`:
-/// this call runs what is left of it at once (a submission that settled
-/// the flights only for the sweep).
-fn sweep(whole: bool) {
-    // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
-    crate::inplace::tick();
-    static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
-        return;
-    }
-    static PASS: Mutex<Option<Sweep>> = Mutex::new(None);
-    let mut pass = PASS.lock().unwrap_or_else(|e| e.into_inner());
-    if pass.is_none() {
-        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let now = now_ms();
-        let last = LAST.load(Ordering::Relaxed);
-        if now < last + 1000
-            || LAST
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_err()
-        {
-            return;
-        }
-        // The blocks of textures and staging kept empty, by the card's
-        // room (nothing without `VICTORY_TEXTURE_POOL`).
-        crate::texture_pool::room();
-        // Without slices nothing is held: what a pass lets go of is retired
-        // or dropped at once, where it is let go, as before slices.
-        *pass = Some(Sweep {
-            part: SweepPart::default(),
-            gone: LetGo::new(sweep_slice().is_none()),
-        });
-    }
-    let slice = sweep_slice().filter(|_| !whole);
-    let until = slice.map(|slice| std::time::Instant::now() + slice);
-    if pass
-        .as_mut()
-        .is_some_and(|sweep| sweep.go_on(until, &mut LiveParts))
-    {
-        *pass = None;
-    }
-}
-
-/// How long a submission's slice of the sweep may take
-/// (`VICTORY_SWEEP_SLICE_MS=<ms>`, 1 to 1000; off by default: the sweep runs
-/// whole, a pause of tens of milliseconds once a second). Said once in the
-/// log.
-fn sweep_slice() -> Option<std::time::Duration> {
-    static SLICE: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *SLICE.get_or_init(|| {
-        let ms = std::env::var("VICTORY_SWEEP_SLICE_MS")
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|ms| (1..=1000).contains(ms))?;
-        tracing::info!(
-            "the sweep of idle host objects runs in slices of {ms} ms (VICTORY_SWEEP_SLICE_MS)"
-        );
-        Some(std::time::Duration::from_millis(ms))
-    })
-}
-
-/// Where a pass of the sweep is ([`sweep`]): the part it is at, with where
-/// that part goes on from, and what it let go of that is still to be
-/// retired.
-#[derive(Default)]
-struct Sweep {
-    part: SweepPart,
-    gone: LetGo,
-}
-
-/// The parts of a pass of the sweep, in order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SweepPart {
-    /// The pipeline library's mapped file (`crate::pipeline::trim_library`).
-    #[default]
-    Library,
-    /// Copies of windows of title memory, after the key given
-    /// (`crate::shadow::let_go_idle`).
-    Windows(Option<(u64, u64)>),
-    /// Staging buffers of textures (`crate::texture::let_go_idle`).
-    Staging,
-    /// Host copies of textures the title fills, after the address given
-    /// (`crate::resource::let_go_idle`).
-    Textures(Option<usize>),
-    Done,
-}
-
-/// What the parts of a pass of the sweep do ([`SweepPart`]): those of the
-/// layer ([`LiveParts`]), or a test's.
-trait SweepParts {
-    /// `crate::pipeline::trim_library`.
-    fn library(&mut self);
-    /// `crate::shadow::let_go_idle`.
-    fn windows(
-        &mut self,
-        from: Option<(u64, u64)>,
-        until: Option<std::time::Instant>,
-        gone: &mut LetGo,
-    ) -> Option<(u64, u64)>;
-    /// `crate::texture::let_go_idle`.
-    fn staging(&mut self, gone: &mut LetGo);
-    /// `crate::resource::let_go_idle`.
-    fn textures(
-        &mut self,
-        from: Option<usize>,
-        until: Option<std::time::Instant>,
-        gone: &mut LetGo,
-    ) -> Option<usize>;
-}
-
-/// The parts of the sweep the layer runs, each a span on the profile (one
-/// per slice of it).
-struct LiveParts;
-
-impl SweepParts for LiveParts {
-    fn library(&mut self) {
-        let _part = crate::profile::span("sweep: library");
-        crate::pipeline::trim_library();
-    }
-
-    fn windows(
-        &mut self,
-        from: Option<(u64, u64)>,
-        until: Option<std::time::Instant>,
-        gone: &mut LetGo,
-    ) -> Option<(u64, u64)> {
-        let _part = crate::profile::span("sweep: copies");
-        crate::shadow::let_go_idle(from, until, gone)
-    }
-
-    fn staging(&mut self, gone: &mut LetGo) {
-        let _part = crate::profile::span("sweep: staging");
-        crate::texture::let_go_idle(gone);
-    }
-
-    fn textures(
-        &mut self,
-        from: Option<usize>,
-        until: Option<std::time::Instant>,
-        gone: &mut LetGo,
-    ) -> Option<usize> {
-        let _part = crate::profile::span("sweep: resources");
-        crate::resource::let_go_idle(from, until, gone)
-    }
-}
-
-impl Sweep {
-    /// Goes on with the pass until `until` (to its end without one),
-    /// retiring what it let go of before it looks further: whether it is
-    /// done. Each call gets on by one step at least (an object retired or
-    /// looked at, or a part done).
-    fn go_on(&mut self, until: Option<std::time::Instant>, parts: &mut impl SweepParts) -> bool {
-        let mut got_on = false;
-        loop {
-            got_on |= !self.gone.held.is_empty();
-            if !self.gone.retire_until(until) {
-                return false;
-            }
-            if self.part == SweepPart::Done {
-                return true;
-            }
-            if got_on && past(until) {
-                return false;
-            }
-            got_on = true;
-            self.part = match self.part {
-                SweepPart::Library => {
-                    parts.library();
-                    SweepPart::Windows(None)
-                }
-                SweepPart::Windows(from) => match parts.windows(from, until, &mut self.gone) {
-                    Some(at) => SweepPart::Windows(Some(at)),
-                    None => SweepPart::Staging,
-                },
-                SweepPart::Staging => {
-                    parts.staging(&mut self.gone);
-                    SweepPart::Textures(None)
-                }
-                SweepPart::Textures(from) => match parts.textures(from, until, &mut self.gone) {
-                    Some(at) => SweepPart::Textures(Some(at)),
-                    None => SweepPart::Done,
-                },
-                SweepPart::Done => SweepPart::Done,
-            };
-        }
-    }
-}
-
-/// What a pass of the sweep let go of, to be retired ([`retire`]) or
-/// dropped as its time allows: each named by no list and no slot any more,
-/// and by nothing that could hand it out again. With `at_once` (the sweep
-/// runs whole) nothing is held: each is retired or dropped as it is let go.
-#[derive(Default)]
-pub(crate) struct LetGo {
-    /// Each with whether it waits for running submissions ([`retire`]) or
-    /// is dropped as is.
-    held: std::collections::VecDeque<(Retired, bool)>,
-    at_once: bool,
-}
-
-impl LetGo {
-    fn new(at_once: bool) -> Self {
-        Self {
-            held: Default::default(),
-            at_once,
-        }
-    }
-
-    /// `object`, to be retired ([`retire`]).
-    pub(crate) fn push<T: Send + 'static>(&mut self, object: T) {
-        if self.at_once {
-            retire(object);
-        } else {
-            self.held.push_back((Retired(Box::new(object)), true));
-        }
-    }
-
-    /// `object`, to be dropped as is: one no running submission can name
-    /// (a staging buffer a list holds until it is reset).
-    pub(crate) fn push_dropped<T: Send + 'static>(&mut self, object: T) {
-        if self.at_once {
-            drop(object);
-        } else {
-            self.held.push_back((Retired(Box::new(object)), false));
-        }
-    }
-
-    /// Retires or drops what is held, in order, until `until` (all without
-    /// one), one at least: whether none is left.
-    fn retire_until(&mut self, until: Option<std::time::Instant>) -> bool {
-        while let Some((next, retired)) = self.held.pop_front() {
-            if retired {
-                retire_as(next, |next| next);
-            } else {
-                drop(next);
-            }
-            if past(until) {
-                break;
-            }
-        }
-        self.held.is_empty()
-    }
-}
-
-/// Whether `until` has come (never without one).
-fn past(until: Option<std::time::Instant>) -> bool {
-    until.is_some_and(|until| std::time::Instant::now() >= until)
-}
-
-/// Calls `look` on `entries`, keys and values in order, until `until` (all
-/// of them without one), one at least: the key of the last one looked at if
-/// time ran out before the end. A walk of the sweep ([`sweep`]) goes on
-/// after that key at its next slice.
-pub(crate) fn sweep_walk<K: Copy, V>(
-    entries: impl Iterator<Item = (K, V)>,
-    until: Option<std::time::Instant>,
-    mut look: impl FnMut(K, V),
-) -> Option<K> {
-    let mut entries = entries.peekable();
-    while let Some((key, value)) = entries.next() {
-        look(key, value);
-        if past(until) && entries.peek().is_some() {
-            return Some(key);
-        }
-    }
-    None
-}
-
 /// The number of the newest submission begun, and of the newest of which
 /// all before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {
@@ -541,25 +270,23 @@ pub(crate) fn submissions() -> (u64, u64) {
 }
 
 /// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// if none is. On the sweeper's thread it waits in the sweeper's own queue
+/// either way, and is dropped there outside the locks the sweeper holds
+/// ([`sweeper`]).
 pub(crate) fn retire<T: 'static>(object: T) {
-    retire_as(object, |object| Retired(Box::new(object)));
-}
-
-/// [`retire`], with `held` making what is kept of `object` if a submission
-/// is running.
-fn retire_as<T>(object: T, held: impl FnOnce(T) -> Retired) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
-        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+    let running = started > FINISHED.load(Ordering::Acquire);
+    RETIREMENTS[usize::from(running)].fetch_add(1, Ordering::Relaxed);
+    if sweeper::on_sweeper() {
+        sweeper::hold(started, Retired(Box::new(object)));
+    } else if running {
+        RETIRED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((started, Retired(Box::new(object))));
+    } else {
         drop(object);
-        return;
     }
-    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, held(object)));
 }
 
 /// [`bury`] up to the last submission that finished, from any thread (the
@@ -3676,9 +3403,9 @@ fn late_exact() -> bool {
 ///
 /// What is left out with it: the look whether the presented frame is black
 /// (diagnostics; it reads the frame back at once). A frame that is saved
-/// or listed is presented the old way. Once every second and a half a
-/// submission settles the flights all the same, for the sweep that lets
-/// idle host objects go (it needs nothing in the air).
+/// or listed is presented the old way. With the memory core on, once every
+/// second and a half a submission settles the flights all the same, for
+/// the core's waiting frees (they need nothing in the air).
 pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
@@ -3871,207 +3598,6 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// flag it.
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
-}
-
-#[cfg(test)]
-mod sweep_tests {
-    use super::{LetGo, Sweep, SweepPart, sweep_walk};
-
-    /// A moment that has passed: every slice is out of time at once.
-    fn gone_by() -> Option<std::time::Instant> {
-        Some(std::time::Instant::now())
-    }
-
-    /// A walk in slices that run out of time at once looks at one entry
-    /// each, and going on after the key each stops at looks at every entry
-    /// of the pass once, in order, as one walk without a time does; a key
-    /// put in before the place reached waits for the next pass, one taken
-    /// out after it is not looked at.
-    #[test]
-    fn a_sliced_walk_looks_at_what_a_whole_one_does() {
-        use std::ops::Bound::{Excluded, Unbounded};
-        let mut map: std::collections::BTreeMap<u64, u64> = (0..10).map(|k| (k * 10, k)).collect();
-        let mut whole = Vec::new();
-        assert_eq!(sweep_walk(map.iter(), None, |&k, _| whole.push(k)), None);
-        assert_eq!(whole, (0..10).map(|k| k * 10).collect::<Vec<_>>());
-        let (mut sliced, mut from, mut slices) = (Vec::new(), None, 0);
-        loop {
-            slices += 1;
-            let after = from.map_or(Unbounded, Excluded);
-            let mut looked = 0;
-            let stopped = sweep_walk(map.range((after, Unbounded)), gone_by(), |&k, _| {
-                sliced.push(k);
-                looked += 1;
-            })
-            .copied();
-            assert_eq!(looked, 1, "one entry a slice out of time");
-            if slices == 3 {
-                // After 0, 10 and 20: one before, one ahead.
-                map.insert(5, 0);
-                map.remove(&50);
-            }
-            match stopped {
-                Some(at) => from = Some(at),
-                None => break,
-            }
-        }
-        assert_eq!(sliced, [0, 10, 20, 30, 40, 60, 70, 80, 90]);
-        assert_eq!(slices, 9, "no slice is left over after the last entry");
-        let empty: std::collections::BTreeMap<u64, u64> = Default::default();
-        assert_eq!(
-            sweep_walk(empty.iter(), gone_by(), |_, _| panic!("nothing")),
-            None
-        );
-    }
-
-    /// What a pass let go of is retired one at least a slice, all of it
-    /// without a time.
-    #[test]
-    fn what_a_pass_lets_go_of_is_retired_as_time_allows() {
-        let mut gone = LetGo::default();
-        for i in 0..3u32 {
-            gone.push(i);
-        }
-        assert!(!gone.retire_until(gone_by()));
-        assert_eq!(gone.held.len(), 2, "one retired out of time");
-        assert!(!gone.retire_until(gone_by()));
-        assert!(gone.retire_until(gone_by()), "the last one");
-        for i in 0..3u32 {
-            gone.push(i);
-        }
-        assert!(gone.retire_until(None));
-        assert!(gone.held.is_empty());
-    }
-
-    /// What is dropped as is goes with what is retired, in order; without
-    /// slices nothing is held, each is gone as it is let go.
-    #[test]
-    fn what_is_let_go_of_at_once_is_not_held() {
-        let objects: Vec<std::sync::Arc<()>> = (0..4).map(|_| Default::default()).collect();
-        let mut gone = LetGo::default();
-        gone.push(objects[0].clone());
-        gone.push_dropped(objects[1].clone());
-        assert_eq!(gone.held.len(), 2);
-        assert!(!gone.retire_until(gone_by()));
-        assert_eq!(
-            std::sync::Arc::strong_count(&objects[0]),
-            1,
-            "retired first"
-        );
-        assert_eq!(std::sync::Arc::strong_count(&objects[1]), 2, "still held");
-        assert!(gone.retire_until(None));
-        assert_eq!(std::sync::Arc::strong_count(&objects[1]), 1, "dropped");
-        let mut at_once = LetGo::new(true);
-        at_once.push(objects[2].clone());
-        at_once.push_dropped(objects[3].clone());
-        assert!(at_once.held.is_empty());
-        assert!(objects.iter().all(|o| std::sync::Arc::strong_count(o) == 1));
-    }
-
-    /// Parts that look at `steps` entries each, one a call out of time,
-    /// and let go of each window and texture they look at: what they were
-    /// called with, in order.
-    struct Parts {
-        steps: u64,
-        calls: Vec<String>,
-        let_go: std::sync::Arc<()>,
-    }
-
-    impl Parts {
-        fn new(steps: u64) -> Self {
-            Self {
-                steps,
-                calls: Vec::new(),
-                let_go: Default::default(),
-            }
-        }
-
-        /// Where a walk of `steps` entries stops after `from`.
-        fn walk(&self, from: Option<u64>, until: Option<std::time::Instant>) -> Option<u64> {
-            let next = from.map_or(0, |at| at + 1);
-            (until.is_some() && next + 1 < self.steps).then_some(next)
-        }
-    }
-
-    impl super::SweepParts for Parts {
-        fn library(&mut self) {
-            self.calls.push("library".into());
-        }
-
-        fn windows(
-            &mut self,
-            from: Option<(u64, u64)>,
-            until: Option<std::time::Instant>,
-            gone: &mut LetGo,
-        ) -> Option<(u64, u64)> {
-            self.calls.push(format!("windows {from:?}"));
-            gone.push(self.let_go.clone());
-            self.walk(from.map(|(at, _)| at), until).map(|at| (at, 0))
-        }
-
-        fn staging(&mut self, gone: &mut LetGo) {
-            self.calls.push("staging".into());
-            gone.push_dropped(self.let_go.clone());
-        }
-
-        fn textures(
-            &mut self,
-            from: Option<usize>,
-            until: Option<std::time::Instant>,
-            gone: &mut LetGo,
-        ) -> Option<usize> {
-            self.calls.push(format!("textures {from:?}"));
-            gone.push(self.let_go.clone());
-            self.walk(from.map(|at| at as u64), until)
-                .map(|at| at as usize)
-        }
-    }
-
-    /// A pass goes through its parts in order, on from where each slice
-    /// stopped, and ends with all it let go of gone, in slices out of time
-    /// at once and in one call without a time.
-    #[test]
-    fn a_pass_of_the_sweep_ends_in_slices_and_whole() {
-        let mut parts = Parts::new(3);
-        let mut sweep = Sweep::default();
-        let mut slices = 1;
-        while !sweep.go_on(gone_by(), &mut parts) {
-            slices += 1;
-            assert!(slices < 100, "a pass in slices ends");
-        }
-        assert_eq!(sweep.part, SweepPart::Done);
-        assert!(sweep.gone.held.is_empty());
-        assert_eq!(
-            std::sync::Arc::strong_count(&parts.let_go),
-            1,
-            "all let go of is gone"
-        );
-        let walked = |kind: &str, key: &dyn Fn(u64) -> String| {
-            let mut calls = vec![format!("{kind} None")];
-            calls.extend((0..2).map(|at| format!("{kind} Some({})", key(at))));
-            calls
-        };
-        let mut expected = vec!["library".to_string()];
-        expected.extend(walked("windows", &|at| format!("({at}, 0)")));
-        expected.push("staging".into());
-        expected.extend(walked("textures", &|at| at.to_string()));
-        assert_eq!(parts.calls, expected);
-        // One step a slice, what it let go of retired in the same slice.
-        assert_eq!(slices, 8);
-
-        let mut parts = Parts::new(3);
-        let mut whole = Sweep::default();
-        assert!(
-            whole.go_on(None, &mut parts),
-            "a pass without a time ends in one call"
-        );
-        assert_eq!(whole.part, SweepPart::Done);
-        assert_eq!(
-            parts.calls,
-            ["library", "windows None", "staging", "textures None"]
-        );
-        assert_eq!(std::sync::Arc::strong_count(&parts.let_go), 1);
-    }
 }
 
 #[cfg(test)]
@@ -8111,24 +7637,32 @@ impl Host {
         if heap_sync.is_none() {
             crate::descriptor::sync_heaps();
         }
-        let behind = late && flying();
-        // Before this submission counts as started: what the sweep lets go
-        // of is named by no list, and nothing runs now (behind flights the
-        // sweep waits for a submission that finds none in the air: there is
-        // one at every present).
-        static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !behind {
-            let _sweep = crate::profile::span("sweep");
-            sweep(false);
-            SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        // Idle host objects are let go by a thread of their own, outside
+        // this lock and behind flights too (`sweeper`).
+        sweeper::start();
+        // The memory core's waiting frees and the in-place probe
+        // (`crate::inplace::tick`) want nothing in the air: before this
+        // submission counts as started, and behind flights at a submission
+        // that finds none in the air.
+        static QUIET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if !(late && flying()) {
+            crate::inplace::tick();
+            QUIET.store(now_ms(), Ordering::Relaxed);
+        } else if crate::home::on()
+            && late_free_present()
+            && now_ms() > QUIET.load(Ordering::Relaxed) + 1500
+        {
             // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep, which
-            // then runs whole (in slices it would wait for the next).
+            // with nothing in the air: one is made for the memory core
+            // (its directory's entries over what the title freed go only
+            // then, `crate::home::tick`).
+            // shortcut: this settle stays only for the memory core's
+            // frees (`crate::home::tick`: `run_own_frees` and
+            // `run_pending` need nothing in flight), until change 3 keys
+            // them to a fence; without the core there is no settle.
             self.settle(&mut submitted, WHY_SYNC);
-            let _sweep = crate::profile::span("sweep");
-            sweep(true);
-            SWEPT.store(now_ms(), Ordering::Relaxed);
+            crate::inplace::tick();
+            QUIET.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the

@@ -1271,10 +1271,11 @@ pub(crate) fn after_wait(runs: &[&HostList]) {
 ///
 /// A shader of a submission running meanwhile, or of a list recorded before
 /// and submitted after, that reads the home through the directory takes the
-/// fault path for its pages. So the core calls this at the sweep, when no
-/// submission runs ([`forget_homes_over`]), except for a title's
-/// protection, which cannot wait and is counted. (With the directory on, the
-/// shaders' table loses the entries at the next submission's head.)
+/// fault path for its pages. So the core calls this at its tick
+/// (`crate::home::tick`), when no submission runs ([`forget_homes_over`]),
+/// except for a title's protection, which cannot wait and is counted. (With
+/// the directory on, the shaders' table loses the entries at the next
+/// submission's head.)
 pub(crate) fn forget(home: &Arc<Shadow>) -> bool {
     let gone = {
         let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());

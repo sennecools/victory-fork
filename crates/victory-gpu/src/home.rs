@@ -65,7 +65,7 @@
 //! running at the time).
 //!
 //! shortcuts with R5: a home's pages that the title frees, and the
-//! directory's entries for them, still wait for the sweep (with flights in
+//! directory's entries for them, still wait for the core's tick (with flights in
 //! the air, the forced one at most 1.5 s apart), not for the flights that
 //! name them; a protection that is refused waits for every flight in the
 //! air, not only those that name the home; a bottom-of-pipe write into a
@@ -595,12 +595,12 @@ struct Core {
     tabled_longest: u64,
     pending: Vec<Pending>,
     /// Title memory a free or a remap let the homes over go from, whose
-    /// homes in `crate::memory`'s directory go at the next sweep
-    /// ([`run_pending`]), when no submission runs: a shader of one running
-    /// now may read them.
+    /// homes in `crate::memory`'s directory go at the next submission with
+    /// nothing in the air (`crate::inplace::tick`, [`run_pending`]): a
+    /// shader of one running now may read them.
     unnumber: Vec<(u64, u64)>,
     /// Slice 4 (`crate::card_home`): copies in the card's memory let go with
-    /// their home, which go out of the directory at the same sweep, each by
+    /// their home, which go out of the directory at the same moment, each by
     /// itself (not by range: theirs may lie over other homes still in use).
     unnumber_cards: Vec<Weak<Shadow>>,
 }
@@ -1137,14 +1137,14 @@ pub(crate) fn gone(start: u64, len: u64, id: u64, kind: Kind) {
 /// a home anew) and out of the directory of `crate::memory`; its heap goes
 /// when no list and no slot hold it any more. Returns how many were let go.
 ///
-/// The directory is read by shaders of a submission that may run now (this
-/// is called on the title's threads): after a free or a remap its entries go
-/// at the next sweep, when none runs ([`run_pending`]); the free waits for
-/// that anyway, since the directory holds the home. A protection cannot
-/// wait, so it takes them out at once, and is counted: a dispatch running
-/// then, or recorded before and submitted after, that reads the home through
-/// the directory takes the fault path for its pages (reads no title bytes
-/// there) for that once.
+/// The directory is read by shaders of a submission that may run now (this is
+/// called on the title's threads): after a free or a remap its entries go at
+/// the next submission with nothing in the air (`crate::inplace::tick`,
+/// [`run_pending`]); the free waits for that anyway, since the directory
+/// holds the home. A protection cannot wait, so it takes them out at once,
+/// and is counted: a dispatch running then, or recorded before and submitted
+/// after, that reads the home through the directory takes the fault path for
+/// its pages (reads no title bytes there) for that once.
 pub(crate) fn cpu_touched(at: usize, len: usize, how: Touch) -> u64 {
     if how == Touch::Wrote {
         return 0;
@@ -1158,7 +1158,8 @@ pub(crate) fn cpu_touched(at: usize, len: usize, how: Touch) -> u64 {
 }
 
 /// The homes over `[at, at + len)` are let go ([`cpu_touched`]); `now`:
-/// out of `crate::memory`'s directory at once, else at the next sweep.
+/// out of `crate::memory`'s directory at once, else at the next submission
+/// with nothing in the air (`crate::inplace::tick`).
 fn let_go_over(at: usize, len: usize, now: bool) -> u64 {
     let end = at.saturating_add(len) as u64;
     let mut homes = untable_over(at as u64, end);
@@ -1170,7 +1171,7 @@ fn let_go_over(at: usize, len: usize, now: bool) -> u64 {
     let cards = crate::shadow::let_go_homes(&homes);
     if !now {
         // (Weak: held here they would hold the home's heap. The directory
-        // holds a numbered one alive until the sweep forgets it.)
+        // holds a numbered one alive until the core's tick forgets it.)
         core()
             .unnumber_cards
             .extend(cards.iter().map(Arc::downgrade));
@@ -1237,7 +1238,7 @@ pub(crate) fn claims_left() -> (u64, u64) {
 }
 
 /// The homes over the memory frees and remaps let homes go from since the
-/// last sweep go out of `crate::memory`'s directory (at the sweep: no
+/// last tick go out of `crate::memory`'s directory (at the core's tick: no
 /// submission runs).
 fn unnumber() {
     let ranges = std::mem::take(&mut core().unnumber);
@@ -1333,11 +1334,11 @@ fn unbusy(base: usize) {
 /// title's. Otherwise the homes over the pages are let go first
 /// ([`cpu_touched`]); then the host. If it still refuses with error 87 (a
 /// list recorded and not yet submitted, or a descriptor slot, holds a heap
-/// there), the free waits in a list and is done at a sweep once nothing
-/// holds the heap (or given up after [`GIVE_UP_MS`]), and the title is told
-/// it was done (TRUE): the title's pages stay committed until then, and an
-/// allocation of its at that very address would fail meanwhile. A call the
-/// host would refuse for its own shape ([`free_span`]) never waits.
+/// there), the free waits in a list and is done at the core's tick once
+/// nothing holds the heap (or given up after [`GIVE_UP_MS`]), and the title
+/// is told it was done (TRUE): the title's pages stay committed until then,
+/// and an allocation of its at that very address would fail meanwhile. A call
+/// the host would refuse for its own shape ([`free_span`]) never waits.
 pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
     // SAFETY: the title's own arguments, for the host function it called.
     let host = || unsafe { mem::VirtualFree(at as *mut c_void, len, kind) };
@@ -1439,15 +1440,15 @@ fn drop_pending(core: &mut Core, which: impl Fn(&Pending) -> bool) {
 }
 
 /// The title's `VirtualProtect`, with the core on. As
-/// [`title_virtual_free`]; a protection cannot wait for a sweep, so when the
-/// host still refuses after the homes were let go, what the retire queue
-/// holds for finished submissions is dropped and it is asked once more;
-/// with R5 (`crate::host::r5`) the flights in the air when it was refused
-/// are waited for first, and the lists they ran let go, as those may be
-/// what holds the heap (`crate::host::wait_for_flights_now`, bounded by what
-/// is in the air, counted). Refused again, the title gets FALSE with error
-/// 87 (what it got with `VICTORY_INPLACE`), it is counted, and the region is
-/// never given a home again.
+/// [`title_virtual_free`]; a protection cannot wait for the core's tick, so
+/// when the host still refuses after the homes were let go, what the retire
+/// queue holds for finished submissions is dropped and it is asked once more;
+/// with R5 (`crate::host::r5`) the flights in the air when it was refused are
+/// waited for first, and the lists they ran let go, as those may be what
+/// holds the heap (`crate::host::wait_for_flights_now`, bounded by what is in
+/// the air, counted). Refused again, the title gets FALSE with error 87 (what
+/// it got with `VICTORY_INPLACE`), it is counted, and the region is never
+/// given a home again.
 // `old` is the title's own pointer, given to the host function it called as
 // the title gave it.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -1635,24 +1636,26 @@ fn region_rw(at: usize, len: usize) -> bool {
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
 }
 
-/// At the sweep, when no submission runs: the homes frees and remaps let go
-/// leave `crate::memory`'s directory ([`cpu_touched`]), then the frees that
-/// waited ([`title_virtual_free`]) whose heaps are gone are done. One still
-/// refused after [`GIVE_UP_MS`] is given up: said and counted, its pages
-/// zeroed if it was a decommit (a commit of them again reads zeros), and the
-/// region given no home again (something still holds a heap there).
+/// At the core's tick (`crate::home::tick`), when no submission runs: the
+/// homes frees and remaps let go leave `crate::memory`'s directory
+/// ([`cpu_touched`]), then the frees that waited ([`title_virtual_free`])
+/// whose heaps are gone are done. One still refused after [`GIVE_UP_MS`] is
+/// given up: said and counted, its pages zeroed if it was a decommit (a
+/// commit of them again reads zeros), and the region given no home again
+/// (something still holds a heap there).
 fn run_pending() {
     run_pending_after(GIVE_UP_MS);
 }
 
-/// With R5 (`crate::host::r5`), after flights landed and their lists were
-/// let go (`crate::host`'s `land`): a free that waited may find its heaps
-/// gone now, rather than at the next sweep, which behind flights comes only
-/// every second and a half. Nothing if none waits. The directory's entries
-/// over what frees and remaps let go stay for the sweep, when no submission
-/// runs (flights may be in the air here): a free whose heap the directory
-/// holds waits for that sweep as before. Takes [`FREEING`] and the core's
-/// lock, as [`run_pending`] does; the caller holds no lock of ours.
+/// With R5 (`crate::host::r5`), after flights landed and their lists were let
+/// go (`crate::host`'s `land`): a free that waited may find its heaps gone
+/// now, rather than at the next submission with nothing in the air
+/// (`crate::inplace::tick`), which behind flights comes only every second and
+/// a half. Nothing if none waits. The directory's entries over what frees and
+/// remaps let go stay for that moment, when no submission runs (flights may
+/// be in the air here): a free whose heap the directory holds waits for it as
+/// before. Takes [`FREEING`] and the core's lock, as [`run_pending`] does;
+/// the caller holds no lock of ours.
 pub(crate) fn after_landing() {
     if PENDING.load(Ordering::Acquire) == 0 {
         return;
@@ -1667,7 +1670,7 @@ fn run_pending_after(give_up_ms: u64) {
 
 /// [`run_pending`], giving up after `give_up_ms`; `unnumbers`: the
 /// directory's entries over what was let go are emptied first (at the
-/// sweep).
+/// core's tick).
 fn run_pending_with(give_up_ms: u64, unnumbers: bool) {
     let _freeing = freeing();
     let due = if PENDING.load(Ordering::Acquire) == 0 {
@@ -1891,13 +1894,14 @@ fn test_own() -> bool {
     false
 }
 
-/// Our own heaps since the start: regions made, their bytes, refused by
-/// the host, given back (at a sweep, [`run_own_frees`]), their bytes, given
-/// back that the host refused.
+/// Our own heaps since the start: regions made, their bytes, refused by the
+/// host, given back (at the core's tick, [`run_own_frees`]), their bytes,
+/// given back that the host refused.
 static OWN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
-/// Our own heaps to give back at the next sweep ([`memory_own_free`]), by
-/// base. Its own lock, taken with no other held.
+/// Our own heaps to give back at the next submission with nothing in the air
+/// (`crate::inplace::tick`; [`memory_own_free`]), by base. Its own lock,
+/// taken with no other held.
 static OWN_FREES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// `len` zeroed bytes aligned to `align` (a power of two), as a region of
@@ -1987,27 +1991,26 @@ pub fn memory_own_alloc(len: usize, align: usize) -> Option<std::ptr::NonNull<u8
     std::ptr::NonNull::new(at.cast())
 }
 
-/// Gives back a region [`memory_own_alloc`] made, at the next sweep
-/// ([`run_own_frees`]): for a caller that may hold any lock (the drop of
-/// memory of ours with no allocator: heaps, descriptor heaps, resources
-/// made without one), as the release takes the core's path (the homes over it let go
-/// first, the release waiting while a list still holds one), whose lock
-/// comes first. A caller that holds none of ours takes
-/// [`memory_own_free_now`].
+/// Gives back a region [`memory_own_alloc`] made, at the next submission with
+/// nothing in the air (`crate::inplace::tick`) ([`run_own_frees`]): for a
+/// caller that may hold any lock (the drop of memory of ours with no
+/// allocator: heaps, descriptor heaps, resources made without one), as the
+/// release takes the core's path (the homes over it let go first, the release
+/// waiting while a list still holds one), whose lock comes first. A caller
+/// that holds none of ours takes [`memory_own_free_now`].
 pub fn memory_own_free(at: usize) {
     OWN_FREES.lock().unwrap_or_else(|e| e.into_inner()).push(at);
 }
 
-/// Gives back a region [`memory_own_alloc`] made now, through the core's
-/// path as [`memory_own_free`]'s sweep does: for a caller that holds no
-/// lock of ours (`XMemFreeDefault`, on the title's threads), so that a
-/// title that frees many big blocks between sweeps does not keep them all
-/// committed.
+/// Gives back a region [`memory_own_alloc`] made now, through the core's path
+/// as [`memory_own_free`]'s tick does: for a caller that holds no lock of
+/// ours (`XMemFreeDefault`, on the title's threads), so that a title that
+/// frees many big blocks between ticks does not keep them all committed.
 pub fn memory_own_free_now(at: usize) {
     release_own(at);
 }
 
-/// The regions of ours given back since the last sweep are released
+/// The regions of ours given back since the core's last tick are released
 /// ([`release_own`]).
 fn run_own_frees() {
     let due = std::mem::take(&mut *OWN_FREES.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2046,7 +2049,7 @@ fn own_line() -> Option<String> {
     let o: Vec<u64> = OWN.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let waiting = OWN_FREES.lock().unwrap_or_else(|e| e.into_inner()).len();
     Some(format!(
-        "memory core own heaps: {} regions made ({} MB), {} refused by the host (heap memory instead); {} given back ({} MB, {} refused), {waiting} to give back at the next sweep",
+        "memory core own heaps: {} regions made ({} MB), {} refused by the host (heap memory instead); {} given back ({} MB, {} refused), {waiting} to give back at the next submission with nothing in the air",
         o[0],
         o[1] >> 20,
         o[2],
@@ -2056,8 +2059,9 @@ fn own_line() -> Option<String> {
     ))
 }
 
-/// Once per sweep (`crate::inplace::tick`): our own heaps given back, the
-/// frees that waited, and the line every ten seconds.
+/// At every submission with nothing in the air (`crate::inplace::tick`): our
+/// own heaps given back, the frees that waited, and the line every ten
+/// seconds.
 pub(crate) fn tick() {
     if !on() {
         return;
@@ -2767,10 +2771,10 @@ pub(crate) mod tests {
         assert_eq!(buffer.buffer.as_raw(), window.buffer.as_raw());
         // Let go, as the title's free would: out of both tables.
         assert_eq!(cpu_touched(cell as usize, CELL as usize, Touch::Freeing), 1);
-        // The shaders' directory forgets it at the sweep, not now.
+        // The shaders' directory forgets it at the core's tick, not now.
         assert!(core().unnumber.contains(&(cell, cell + CELL)));
         run_pending();
-        assert!(core().unnumber.is_empty(), "at the sweep");
+        assert!(core().unnumber.is_empty(), "at the core's tick");
         unregister(0xc0de_0701, start);
         drop((buffer, window));
         region.release();
@@ -2825,7 +2829,7 @@ pub(crate) mod tests {
     /// The title's decommit of a home's pages: with only the tables holding
     /// the home it is let go and the pages are decommitted at once; with a
     /// list holding it, the title is told TRUE, the pages wait, and they are
-    /// decommitted at the sweep after the list let it go.
+    /// decommitted at the core's tick after the list let it go.
     #[test]
     fn warp_core_free_lets_the_home_go_then_frees() {
         let Some(_host) = warp13() else { return };
@@ -2874,7 +2878,7 @@ pub(crate) mod tests {
     /// C (`VICTORY_R5_FLUSH=1`): a list that refreshes a home records no
     /// refresh step and holds the home once, until it is reset: the title's
     /// decommit of its pages waits while the list is open, also after the
-    /// list ran, and is done at the sweep after the reset. Without the
+    /// list ran, and is done at the core's tick after the reset. Without the
     /// switch the refresh is a step, as before.
     #[test]
     fn warp_r5_flush_a_home_is_held_with_no_refresh_step() {
@@ -2987,9 +2991,9 @@ pub(crate) mod tests {
             )
         };
         assert_eq!(again as u64, start + K64);
-        // The sweep's run of the waiting frees waits for the commit's end.
+        // The tick's run of the waiting frees waits for the commit's end.
         let swept = Arc::new(AtomicBool::new(false));
-        let sweep = std::thread::spawn({
+        let tick = std::thread::spawn({
             let swept = swept.clone();
             move || {
                 run_pending();
@@ -2999,7 +3003,7 @@ pub(crate) mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(!swept.load(Ordering::Relaxed), "held back by the commit");
         drop(committing);
-        sweep.join().unwrap();
+        tick.join().unwrap();
         assert!(swept.load(Ordering::Relaxed));
         assert_eq!(PENDING.load(Ordering::Relaxed), pending + 1, "cut in two");
         assert!(
@@ -3362,9 +3366,10 @@ pub(crate) mod tests {
 
     /// The title frees a home's pages while a flight's list holds the home:
     /// told TRUE, the pages wait, and they are decommitted once the flight
-    /// landed and its list was let go, without a sweep. The title protects
-    /// another home's pages while a flight holds that one: it waits for the
-    /// flights in the air, succeeds, and the region is not blacklisted.
+    /// landed and its list was let go, without a tick of the core. The title
+    /// protects another home's pages while a flight holds that one: it waits
+    /// for the flights in the air, succeeds, and the region is not
+    /// blacklisted.
     #[test]
     fn warp_r5_free_and_protect_with_a_flight_holding_the_home() {
         let Some(host) = warp13() else { return };
@@ -3393,7 +3398,7 @@ pub(crate) mod tests {
         assert_eq!(
             state(start),
             mem::MEM_RESERVE,
-            "decommitted after the landing, with no sweep"
+            "decommitted after the landing, with no tick of the core"
         );
         assert_eq!(PENDING.load(Ordering::Relaxed), 0);
         unregister(0xc0de_5601, start);
@@ -3437,7 +3442,7 @@ pub(crate) mod tests {
 
     /// Until `at` is decommitted, or a second has passed: the waiting frees
     /// are tried again as each landing tries them ([`after_landing`]); never
-    /// a sweep.
+    /// the core's tick.
     fn done_at_a_later_landing(at: u64) {
         let since = std::time::Instant::now();
         while state(at) != mem::MEM_RESERVE && since.elapsed().as_secs() < 1 {
@@ -3453,7 +3458,7 @@ pub(crate) mod tests {
     /// the tables hold waits for those sends: done at once. A protection
     /// there is made, and the region keeps its homes. A decommit while a
     /// flight's list holds the home is done at its landing or a later one,
-    /// with no sweep and nothing given up.
+    /// with no tick of the core and nothing given up.
     #[test]
     fn warp_r5_the_awake_sends_hold_no_free_or_protection() {
         let Some(host) = warp13() else { return };
@@ -3526,7 +3531,7 @@ pub(crate) mod tests {
         assert_eq!(
             state(start),
             mem::MEM_RESERVE,
-            "decommitted at a landing, with no sweep"
+            "decommitted at a landing, with no tick of the core"
         );
         assert_eq!(PENDING.load(Ordering::Relaxed), 0);
         assert_eq!(TOLD[9].load(Ordering::Relaxed), given_up, "not given up");
@@ -3949,7 +3954,7 @@ pub(crate) mod tests {
             core()
                 .unnumber
                 .contains(&(page as u64, (page + 4096) as u64)),
-            "the sweep takes it out of the directory"
+            "the core's tick takes it out of the directory"
         );
         run_pending();
         assert_eq!(PENDING.load(Ordering::Relaxed), 0);
@@ -3975,7 +3980,7 @@ pub(crate) mod tests {
     }
 
     /// A release done while a decommit of the region waits ends that wait:
-    /// after the title reserves the same addresses again the sweep frees
+    /// after the title reserves the same addresses again the core's tick frees
     /// none of its new pages, and the new region is not left busy. Both
     /// ways: the release done at once, and the release itself waiting.
     #[test]
@@ -5079,7 +5084,7 @@ pub(crate) mod tests {
         let held = find(start, len).expect("a home");
         assert!(held.is_home(), "in place, not a copy");
         drop(memory);
-        assert_eq!(state(base), mem::MEM_COMMIT, "given back at the sweep");
+        assert_eq!(state(base), mem::MEM_COMMIT, "given back at the core's tick");
         run_own_frees();
         assert_eq!(state(base), mem::MEM_COMMIT, "waits while the home is held");
         unregister(0xc0de_3201, start);
@@ -5107,7 +5112,8 @@ pub(crate) mod tests {
     }
 
     /// `XMemFreeDefault`'s path: a region of ours given back at once, not at
-    /// the next sweep, through the core (out of the table, counted apart).
+    /// the next submission with nothing in the air (`crate::inplace::tick`),
+    /// through the core (out of the table, counted apart).
     #[test]
     fn own_region_given_back_at_once() {
         let _on = Switched::on(false);

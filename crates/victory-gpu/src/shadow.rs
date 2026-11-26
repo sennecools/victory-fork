@@ -2598,16 +2598,14 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
 ///
 /// The next read of that memory makes a new copy and copies the window
-/// again. Called before a submission starts, by the thread that submits.
+/// again. Called by the sweeper's thread (`crate::host`'s `sweeper`).
 ///
-/// Looks at the windows after the key `from` (all with none) until `until`
-/// (to the end without one; `crate::host::sweep_walk`), and hands what it
-/// lets go of to `gone` to be retired: the key it stopped after, if time
-/// ran out first.
+/// Looks at the windows after the key `from` (all with none) while
+/// `budget` lasts (`crate::host::sweep_walk`), and retires what it lets go
+/// of: the key it stopped after, if the budget ran out first.
 pub(crate) fn let_go_idle(
     from: Option<(u64, u64)>,
-    until: Option<std::time::Instant>,
-    gone: &mut crate::host::LetGo,
+    budget: &mut crate::host::Budget,
 ) -> Option<(u64, u64)> {
     use std::ops::Bound::{Excluded, Unbounded};
     const IDLE_FRAMES: u64 = 4;
@@ -2621,7 +2619,7 @@ pub(crate) fn let_go_idle(
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let mut idle: Vec<(u64, u64)> = Vec::new();
         let after = from.map_or(Unbounded, Excluded);
-        let stopped = crate::host::sweep_walk(map.range((after, Unbounded)), until, |key, s| {
+        let stopped = crate::host::sweep_walk(map.range((after, Unbounded)), budget, |key, s| {
             if Arc::strong_count(s) == 1
                 && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                 && crate::host::references(&s.buffer) == 1
@@ -2645,9 +2643,9 @@ pub(crate) fn let_go_idle(
     for shadow in went {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-        // Nothing runs now and nothing names it: freed when retired, at
-        // once unless a submission is running after all.
-        gone.push(shadow);
+        // Nothing names it: freed once the submissions running now have
+        // finished.
+        crate::host::retire(shadow);
     }
     stopped
 }

@@ -1901,19 +1901,15 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// it; a thread that asked for it and has not yet recorded its use (which
 /// makes the list or the slot hold it) is protected by that idle time alone.
 /// Every caller uses it at once, within the title's call.
-/// Called before a submission starts, by the thread that submits.
+/// Called by the sweeper's thread (`crate::host`'s `sweeper`).
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 ///
-/// Looks at the textures after the address `from` (all with none) until
-/// `until` (to the end without one; `crate::host::sweep_walk`), and hands
-/// the host copies it lets go of to `gone` to be retired: the address it
-/// stopped after, if time ran out first.
+/// Looks at the textures after the address `from` (all with none) while
+/// `budget` lasts (`crate::host::sweep_walk`), and retires the host copies
+/// it lets go of: the address it stopped after, if the budget ran out
+/// first.
 #[cfg(windows)]
-pub(crate) fn let_go_idle(
-    from: Option<usize>,
-    until: Option<std::time::Instant>,
-    gone: &mut crate::host::LetGo,
-) -> Option<usize> {
+pub(crate) fn let_go_idle(from: Option<usize>, budget: &mut crate::host::Budget) -> Option<usize> {
     use std::ops::Bound::{Excluded, Unbounded};
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
@@ -1934,7 +1930,7 @@ pub(crate) fn let_go_idle(
     let after = from.map_or(Unbounded, Excluded);
     let stopped = crate::host::sweep_walk(
         all.range((after, Unbounded)).map(|&at| (at, ())),
-        until,
+        budget,
         |at, ()| {
             // SAFETY: a texture leaves the table before it is freed, under the
             // lock held here (`Drop for Resource`).
@@ -1967,7 +1963,7 @@ pub(crate) fn let_go_idle(
                 if first.is_none() {
                     first = Some(at);
                 }
-                gone.push(host);
+                crate::host::retire(host);
             }
         },
     );

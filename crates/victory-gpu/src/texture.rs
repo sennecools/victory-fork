@@ -1008,59 +1008,123 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
-/// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
-/// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
-/// texture, kept so that an unchanged texture is not uploaded again, and
-/// those of textures no longer sampled were kept for the run (2,246 of
-/// them, 2.1 GB, at the end of run 24). The next list that samples such a
-/// texture makes a staging buffer anew, detiles and uploads once more.
-/// Called before a submission starts, by the thread that submits. What it
-/// lets go of goes to `gone`, to be dropped as is (no list names it, so no
-/// running submission does; and a staging buffer itself waits for the
-/// submissions running when it goes, [`Buf`]): at once when the sweep runs
-/// whole, under the lock as before slices. With [`transient`] it also gives
-/// back to the pool the buffers whose upload has run.
-pub(crate) fn let_go_idle(gone: &mut crate::host::LetGo) {
+/// How long a staging buffer must have gone unused to be let go: as long as
+/// the host's copies in system memory ([`crate::host::ram_idle_ms`]) and
+/// this many frames.
+const STAGING_IDLE_FRAMES: u64 = 4;
+
+/// Whether `s` is idle: only the table holds it (a list that recorded an
+/// upload or a check holds the staging until it is reset, so one only the
+/// table holds is named by no list, recorded or running) and no list
+/// recorded a use of it for `idle_ms` and [`STAGING_IDLE_FRAMES`] frames.
+fn staging_idle(s: &Arc<Staging>, idle_ms: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
+    Arc::strong_count(s) == 1
+        && crate::host::long_ago(s.used.load(Relaxed), idle_ms, STAGING_IDLE_FRAMES)
+}
+
+/// The start of the sweep's pass over staging buffers (`crate::host`'s
+/// `sweeper`): the keys of those idle now ([`staging_idle`]), the longest
+/// idle first, for [`let_go_staging`]. A staging buffer is system memory the
+/// size of its texture, kept so that an unchanged texture is not uploaded
+/// again, and those of textures no longer sampled were kept for the run
+/// (2,246 of them, 2.1 GB, at the end of run 24). With [`transient`] it
+/// also gives back to the pool the buffers whose upload has run.
+///
+/// shortcut: the table is a hash map, with no place to go on from, so this
+/// looks at all of it under its lock once a pass (two loads an entry); the
+/// whole table counts against `budget`.
+pub(crate) fn idle_staging(budget: &mut crate::host::Budget) -> Vec<usize> {
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    idle_staging_by(budget, |_, s| staging_idle(s, idle_ms))
+}
+
+/// [`idle_staging`], with `idle` saying which are (tests).
+fn idle_staging_by(
+    budget: &mut crate::host::Budget,
+    idle: impl Fn(usize, &Arc<Staging>) -> bool,
+) -> Vec<usize> {
+    use std::sync::atomic::Ordering::Relaxed;
     if transient() {
         pool_orphans();
     }
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
+    let mut idle: Vec<(u64, usize)> = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_ref() else {
+            return Vec::new();
+        };
+        if transient() {
+            release_uploaded(map.values());
+        }
+        budget.looked(map.len());
+        map.iter()
+            .filter(|&(&key, s)| idle(key, s))
+            .map(|(key, s)| (s.used.load(Relaxed) & 0xffff_ffff, *key))
+            .collect()
     };
-    if map.is_empty() {
-        return;
-    }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    // A list that recorded an upload or a check holds the staging until it
-    // is reset: one only the table holds is named by no list, recorded or
-    // running.
-    let idle: Vec<usize> = map
-        .iter()
-        .filter(|(_, s)| {
-            Arc::strong_count(s) == 1
-                && crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-        })
-        .map(|(key, _)| *key)
-        .collect();
-    let (mut went, mut bytes) = (0u64, 0u64);
-    for s in idle.into_iter().filter_map(|key| map.remove(&key)) {
-        LET_GO[0].fetch_add(1, Relaxed);
-        LET_GO[1].fetch_add(s.bytes, Relaxed);
-        went += 1;
-        bytes += s.bytes;
-        gone.push_dropped(s);
-    }
-    if went > 0 {
-        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
-    }
-    if transient() {
-        release_uploaded(map.values());
-    }
+    idle.sort_unstable();
+    idle.into_iter().map(|(_, key)| key).collect()
 }
 
+/// Lets go of the staging buffers of `keys` (from [`idle_staging`], the
+/// longest idle first) that are idle still, while `budget` lasts, and as
+/// many bytes as it allows: how many keys it looked at, one at least. The
+/// next list that samples such a texture makes a staging buffer anew,
+/// detiles and uploads once more. Called by the sweeper's thread.
+///
+/// Each is looked at again under the table's lock, which hands them out: a
+/// list may have used it since the pass began. What goes is dropped as is
+/// once the lock is let go: no list names it, so no running submission
+/// does, and a staging buffer itself waits for the submissions running
+/// when it goes ([`Buf`]).
+pub(crate) fn let_go_staging(keys: &[usize], budget: &mut crate::host::Budget) -> usize {
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let_go_staging_by(keys, budget, |s| staging_idle(s, idle_ms))
+}
+
+/// [`let_go_staging`], with `idle` saying which are (tests).
+fn let_go_staging_by(
+    keys: &[usize],
+    budget: &mut crate::host::Budget,
+    idle: impl Fn(&Arc<Staging>) -> bool,
+) -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut went: Vec<Arc<Staging>> = Vec::new();
+    let mut looked = 0;
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_mut() else {
+            return keys.len();
+        };
+        for key in keys {
+            if looked > 0 && (budget.spent() || budget.bytes_spent()) {
+                break;
+            }
+            looked += 1;
+            budget.looked(1);
+            if map.get(key).is_some_and(&idle)
+                && let Some(s) = map.remove(key)
+            {
+                budget.let_go(s.bytes);
+                went.push(s);
+            }
+        }
+    }
+    if !went.is_empty() {
+        let bytes: u64 = went.iter().map(|s| s.bytes).sum();
+        LET_GO[0].fetch_add(went.len() as u64, Relaxed);
+        LET_GO[1].fetch_add(bytes, Relaxed);
+        let went = went.len();
+        crate::host::trail(|| {
+            format!(
+                "sweep: {went} staging buffers of textures let go ({} KiB), held by no list",
+                bytes >> 10
+            )
+        });
+    }
+    drop(went);
+    looked
+}
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
@@ -3253,6 +3317,99 @@ pub(crate) mod staging_warp_tests {
         drop(running);
         assert_eq!(references(&buffer), 1 + pool, "and goes once that submission has finished");
         assert_eq!(given(), piece.map(|_| (true, true)), "its piece back in the pool");
+    }
+
+    /// The sweeper's pass over staging buffers: the idle ones the longest
+    /// idle first, not one a list holds; a step lets go of no more bytes than
+    /// its budget allows, one at least; and a staging buffer it lets go of
+    /// while a submission runs keeps its D3D12 buffer until that submission
+    /// has finished, dropped by the sweeper (its own queue), not where it was
+    /// let go.
+    #[test]
+    fn warp_the_sweeper_lets_staging_go_oldest_first_and_after_the_submission() {
+        use crate::host::{Budget, as_sweeper, bury_own_for_test, own_queue_for_test};
+        let _one = own_queue_for_test();
+        let f = Fixture::new();
+        let (old, young, held) = (f.staging(false), f.staging(false), f.staging(false));
+        // (By the tenths since the start: `crate::host::moment`.)
+        held.used.store(1, Relaxed);
+        old.used.store(2, Relaxed);
+        young.used.store(3, Relaxed);
+        let buffer = buffer_of(&old).expect("a staging buffer");
+        let pool = u32::from(
+            old.buf
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|b| b.piece.is_some()),
+        );
+        // A list's hold.
+        let holder = held.clone();
+        let base = f.memory as usize;
+        let mine = [base, base + 1, base + 2];
+        {
+            let mut map = super::STAGING.lock().unwrap();
+            let map = map.get_or_insert_with(Default::default);
+            map.insert(mine[0], old);
+            map.insert(mine[1], young);
+            map.insert(mine[2], held);
+        }
+        let in_table = |key: usize| {
+            super::STAGING
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|m| m.contains_key(&key))
+        };
+        let unheld = |s: &Arc<Staging>| Arc::strong_count(s) == 1;
+        let mut budget = Budget::new(usize::MAX, u64::MAX);
+        let keys = super::idle_staging_by(&mut budget, |key, s| mine.contains(&key) && unheld(s));
+        assert_eq!(
+            keys,
+            [mine[0], mine[1]],
+            "the longest idle first; not the one a list holds"
+        );
+        assert_eq!(bury_own_for_test(), 0);
+        let running = crate::host::Running::start();
+        // One byte a step: one goes all the same, the oldest.
+        let mut budget = Budget::new(usize::MAX, 1);
+        assert_eq!(
+            as_sweeper(|| super::let_go_staging_by(&keys, &mut budget, unheld)),
+            1
+        );
+        assert!(budget.bytes_spent());
+        assert!(!in_table(mine[0]) && in_table(mine[1]) && in_table(mine[2]));
+        assert_eq!(
+            references(&buffer),
+            2 + pool,
+            "the buffer waits for the submission running when it was let go"
+        );
+        assert_eq!(
+            bury_own_for_test(),
+            1 + pool as usize,
+            "in the sweeper's queue"
+        );
+        drop(running);
+        assert_eq!(bury_own_for_test(), 0);
+        assert_eq!(
+            references(&buffer),
+            1 + pool,
+            "and goes once that submission has finished"
+        );
+        // The rest of the pass, with room for it.
+        let mut budget = Budget::new(usize::MAX, u64::MAX);
+        assert_eq!(
+            as_sweeper(|| super::let_go_staging_by(&keys[1..], &mut budget, unheld)),
+            1
+        );
+        assert!(!in_table(mine[1]));
+        assert_eq!(bury_own_for_test(), 0, "none ran: dropped at once");
+        super::STAGING
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|m| m.remove(&mine[2]));
+        drop(holder);
     }
 
     /// Transient staging buffers: given for the copy a list records, filled
