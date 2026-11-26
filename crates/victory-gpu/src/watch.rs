@@ -1207,10 +1207,10 @@ fn set_rest_in_test(rest: std::time::Duration) {
 }
 
 /// Whether one of the switches that change how [`guard`] goes through a
-/// range is on: [`guard_bits`], [`open_one_view`], [`rest`],
+/// range is on: [`guard_bits`], [`light`], [`open_one_view`], [`rest`],
 /// [`known_holes`].
 fn switched() -> bool {
-    guard_bits() || covering() || known_holes()
+    guard_bits() || light() || covering() || known_holes()
 }
 
 /// Whether a block read-only by our hand whose page has other views can be
@@ -1220,11 +1220,20 @@ fn covering() -> bool {
     open_one_view() || !rest().is_zero()
 }
 
-/// With [`covering`]: makes the other views of `block`'s page read-only,
-/// as [`protect`] does; whether all of them are now (none rests or failed).
-/// Without it true, as before: the views were guarded with the block.
+/// With [`covering`] or [`light`]: makes the other views of `block`'s page
+/// read-only, as [`protect`] does; whether all of them are now (none rests
+/// or failed). Without them true, as before: the views were guarded with
+/// the block, and a write told at one that could not be is found by
+/// [`open`] through the guards' lock.
+///
+/// With [`light`] a block is clean, and so known by its bits, only while
+/// every other view of its page is read-only by our hand: a write told at
+/// one that is not ([`writing`], [`title_memory_written`]) takes no lock
+/// and opens nothing. [`protect`] keeps such a block from being clean; the
+/// next asking, finding it read-only and not clean, must not note it clean
+/// either until the other views are guarded.
 fn cover(g: &mut Guards, block: usize) -> bool {
-    if !covering() || !view_guard() {
+    if !(covering() || light()) || !view_guard() {
         return true;
     }
     let shown = crate::inplace::pages_of(block * BLOCK);
@@ -1673,7 +1682,8 @@ pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     // With `VICTORY_LIGHT_REFRESH=1` the guards' lock only if a block of it
     // is read-only by our hand (an other view's is opened only with its own;
-    // [`protect`] leaves no view clean beside one it could not guard).
+    // [`protect`] and [`cover`] leave no view clean beside one they could
+    // not guard).
     let end = at.saturating_add(len);
     if !light() || PROTECTED.any(at / BLOCK, end.div_ceil(BLOCK)) {
         open(&mut guards(), at, end);
@@ -2973,6 +2983,84 @@ mod tests {
     #[test]
     fn no_write_through_another_view_is_lost_between_askers() {
         writes_to_views_are_not_lost::<3>(0);
+    }
+
+    /// A page with a view beside the guarded one that cannot be made
+    /// read-only (partly committed: one kernel page of its block): a write
+    /// told there (`writing`) is told at the guarded view, at every asking,
+    /// whichever switches are on. With `VICTORY_LIGHT_REFRESH=1` the guarded
+    /// block must not be noted clean, nor known by its bits, while the other
+    /// view is writable: the told write takes no lock there and would open
+    /// nothing. (Which view shows which pages is what the runtime tells; the
+    /// test tells it so of a view of another section.)
+    #[test]
+    fn a_write_told_at_a_view_that_cannot_be_guarded_is_not_lost() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            SEC_RESERVE, UnmapViewOfFile,
+        };
+        set_rest_in_test(std::time::Duration::ZERO);
+        // SAFETY: two fresh pagefile sections of one block, the second
+        // reserved with one kernel page committed; each mapped once. The
+        // views keep the sections alive once the handles are closed.
+        let (guarded, other) = unsafe {
+            let map = |flags: u32| {
+                let section = CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | flags,
+                    0,
+                    BLOCK as u32,
+                    std::ptr::null(),
+                );
+                assert!(!section.is_null());
+                let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+                assert_ne!(view, 0);
+                (section, view)
+            };
+            let (section, guarded) = map(0);
+            let (reserved, other) = map(SEC_RESERVE);
+            CloseHandle(reserved);
+            let committed = VirtualAlloc(other as _, KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE);
+            assert_eq!(committed as usize, other);
+            crate::inplace::title_memory_view(guarded, BLOCK, section as usize, 0);
+            crate::inplace::title_memory_view(other, BLOCK, section as usize, 0);
+            CloseHandle(section);
+            (guarded, other)
+        };
+        let page = guarded / PAGE;
+        assert_eq!(guard(guarded, guarded + BLOCK), Some(vec![page]));
+        // Without the bits, nor a view left open by a switch, the block is
+        // clean as before (a told write finds it through the guards' lock).
+        let unsure = light() || covering();
+        for asking in 1..3 {
+            let expect = if unsure { vec![page] } else { Vec::new() };
+            assert_eq!(
+                guard(guarded, guarded + BLOCK),
+                Some(expect),
+                "asking {asking}: another view of it is writable"
+            );
+            assert!(!published(guarded, guarded + BLOCK), "asking {asking}");
+        }
+        assert!(writable(other));
+        writing(other + 8, 8);
+        // SAFETY: the committed kernel page of the other view.
+        unsafe { ((other + 8) as *mut u64).write_volatile(1) };
+        assert_eq!(
+            guard(guarded, guarded + BLOCK),
+            Some(vec![page]),
+            "the told write"
+        );
+        for view in [guarded, other] {
+            title_memory_remapped(view, BLOCK);
+            // SAFETY: a view mapped above.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                })
+            };
+        }
     }
 
     /// A range of a placeholder with views in it is told as written right
