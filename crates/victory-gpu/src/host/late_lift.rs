@@ -183,6 +183,15 @@ pub(super) fn over_lifted_homes<C>(
     steps: &[(usize, usize, Seen)],
     runs: &[&HostList],
 ) -> bool {
+    // Where each list's steps start in `steps`: they stand list by list,
+    // each step at its place in its list, so a lift's step is found at
+    // once (a plan can hold thousands of lifts over as many steps).
+    let mut starts: Vec<usize> = Vec::new();
+    for (i, &(list, _, _)) in steps.iter().enumerate() {
+        if starts.len() <= list {
+            starts.resize(list + 1, i);
+        }
+    }
     let mut homes = Vec::new();
     for lift in lifts {
         let LiftTo::Copy { dst, .. } = &lift.to else {
@@ -191,9 +200,13 @@ pub(super) fn over_lifted_homes<C>(
         if dst.home_kind().is_none() {
             continue;
         }
-        let seen = steps
-            .iter()
-            .find(|&&(list, step, _)| list == lift.list && step == lift.step);
+        let at = |&&(list, step, _): &&(usize, usize, Seen)| list == lift.list && step == lift.step;
+        let seen = starts
+            .get(lift.list)
+            .and_then(|start| steps.get(start + lift.step))
+            .filter(at)
+            // (Steps not in that order are looked for one by one.)
+            .or_else(|| steps.iter().find(at));
         if let Some(&(_, _, Seen::Copy(at, _, len))) = seen {
             join_ranges(&mut homes, [(at, at + len)]);
         }
