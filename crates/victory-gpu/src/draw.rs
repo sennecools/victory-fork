@@ -2421,7 +2421,10 @@ impl State {
             // streamed texture of the heap held a staging buffer of its full
             // size for good.)
             let memory = if again.is_none() && heap_recheck() {
+                // (An upload left out as the host copy holds those bytes
+                // has no staging state: looked at again all the same.)
                 crate::texture::staged_memory(resource)
+                    .or_else(|| crate::texture::left_out_memory(resource))
             } else {
                 None
             };

@@ -216,7 +216,7 @@ pub(crate) struct Staging {
 /// What tells a texture's memory changed (see [`content_hash`]). Kept in
 /// memory only: no hash of it is stored anywhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hash {
+pub(crate) enum Hash {
     Blake3(blake3::Hash),
     Digest(Digest),
 }
@@ -1174,6 +1174,18 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if host_written || !list.first_use(resource as usize) {
         return;
     }
+    // The pass over textures picked by index, for a texture without a
+    // staging state: nothing to upload if its host copy holds these bytes.
+    if PICKING.get() && same() && !is_staged(resource) && unchanged(resource) {
+        let n = SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(10_000) {
+            tracing::info!(
+                so_far = n,
+                "uploads of textures picked by index left out: the host copy holds those bytes (VICTORY_TEXTURE_SAME=1)"
+            );
+        }
+        return;
+    }
     let Some(staging) = staging(resource, texture) else {
         return;
     };
@@ -1270,8 +1282,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // memory, which the card drops).
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     let Some(on_demand) = on_demand else {
+        // Then what the list's copy puts in the host copy is known
+        // ([`unchanged`]).
+        let noted = same()
+            .then(|| crate::resource::host_copy(resource))
+            .flatten()
+            .map(|copy| (staging.clone(), copy));
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging, true);
+        if let Some((staging, copy)) = noted {
+            list.defer_host(move || staging.note_held(&copy));
+        }
         return;
     };
     list.defer_texture(staging.clone(), true);
@@ -1608,6 +1629,14 @@ impl Staging {
             }
         }
         held
+    }
+
+    /// The host copy `copy` holds what the staging buffer was filled from
+    /// ([`unchanged`]): called after the check at a submission whose list
+    /// copies the staging buffer into it.
+    fn note_held(&self, copy: &crate::resource::HostTexture) {
+        let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
+        *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash;
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -1948,6 +1977,59 @@ fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64)
         .saturating_mul(depth as usize);
     let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
     padded.min(remaining)
+}
+
+/// Whether the pass over textures picked by index leaves out the upload of
+/// a texture whose host copy was filled from the bytes title memory holds
+/// now (`VICTORY_TEXTURE_SAME=1`; off by default: uploaded, as before).
+/// cool_fox measured half of the repeated uploads of a frame that streams
+/// equal in every byte, and an upload costs a staging buffer, a detiling
+/// and a copy more than the look. What the host copy holds is known from
+/// checks that hash the memory (not from the write watch's, which do not:
+/// with `VICTORY_TEXTURE_ONCE=1` the pass's own uploads hash it).
+fn same() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_some_and(|v| v == "1"))
+}
+
+/// Uploads [`same`] left out, since the start.
+static SAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `resource`'s host copy was filled from the bytes its title
+/// memory holds now (all of it mapped, and of the same hash): an upload
+/// would bring nothing new. Not for a texture of levels on demand.
+pub(crate) fn unchanged(resource: This) -> bool {
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return false;
+    };
+    if copy.tiled.is_some() {
+        return false;
+    }
+    let Some(held) = *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) else {
+        return false;
+    };
+    let Some((memory, desc)) = crate::resource::texture_memory(resource) else {
+        return false;
+    };
+    let Some(layout) = crate::resource::texture_layout(&desc) else {
+        return false;
+    };
+    let size = layout.planes[0].layout.size as usize;
+    with_read(size, |read| {
+        crate::host::read_into(memory, read) && content_hash(read) == held
+    })
+}
+
+/// With [`same`]: where a title texture's memory is, address and bytes, as
+/// [`staged_memory`] says it of a staged one (for the look again at a
+/// texture whose upload was left out). `None` with the switch off.
+pub(crate) fn left_out_memory(resource: This) -> Option<(u64, u64)> {
+    if !same() {
+        return None;
+    }
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?;
+    Some((memory as u64, layout.planes[0].layout.size))
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an

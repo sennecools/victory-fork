@@ -1160,6 +1160,9 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// With `VICTORY_TEXTURE_SAME=1`: the hash of the title memory its last
+    /// upload was detiled from (`crate::texture::unchanged`).
+    pub(crate) holds: std::sync::Mutex<Option<crate::texture::Hash>>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -2135,6 +2138,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            holds: std::sync::Mutex::new(None),
         }
     }
 
@@ -2152,6 +2156,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            holds: std::sync::Mutex::new(None),
         }
     }
 }
