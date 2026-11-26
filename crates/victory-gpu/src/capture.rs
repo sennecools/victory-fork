@@ -372,11 +372,9 @@ pub(crate) fn save_read_back(
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
 #[cfg(feature = "diagnostics")]
-#[cfg(feature = "diagnostics")]
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -384,7 +382,6 @@ fn dump_on() -> bool {
 }
 
 /// Notes a title texture the frame being built renders to or writes.
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
@@ -399,7 +396,6 @@ pub(crate) fn note_target(resource: crate::object::This) {
 }
 
 /// At the present of frame `frame`: saves the noted targets.
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -418,7 +414,6 @@ pub(crate) fn dump_targets(frame: u64) {
     }
 }
 
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 fn dump_one(
     host: &crate::host::Host,
@@ -507,7 +502,6 @@ fn dump_one(
 /// (the most common first), how many texels have each of its bits, and the
 /// box of the texels with bit 3 (0x08).
 #[cfg(feature = "diagnostics")]
-#[cfg(feature = "diagnostics")]
 fn stencil_values(
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -567,7 +561,6 @@ fn stencil_values(
 }
 
 #[cfg(feature = "diagnostics")]
-#[cfg(feature = "diagnostics")]
 fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
@@ -580,7 +573,6 @@ fn half(h: u16) -> f32 {
 
 /// A float packed in `bits` with a 5-bit exponent and `man` mantissa bits
 /// (the 11- and 10-bit floats of R11G11B10).
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
@@ -595,7 +587,6 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
@@ -753,17 +744,14 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 
 /// Pixels per side of the grid [`probe`] reads.
 #[cfg(feature = "diagnostics")]
-#[cfg(feature = "diagnostics")]
 const GRID: u32 = 4;
 /// Bytes between the grid's pixels in the readback buffer (placement
 /// alignment).
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 const SLOT: u64 = 512;
 
 /// Records copies of a grid of pixels of `texture` (8-bit color, in the
 /// copy-source state) into a readback buffer, to tell black frames.
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 pub(crate) fn probe(
     device: &ID3D12Device,
@@ -851,7 +839,6 @@ pub(crate) fn probe(
 
 /// Whether every pixel [`probe`] read is (near) black.
 #[cfg(feature = "diagnostics")]
-#[cfg(feature = "diagnostics")]
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for).
@@ -879,11 +866,9 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
 /// The brightest probed channel of the last frames, oldest first: a fade
 /// darkens over several, a glitch drops at once.
 #[cfg(feature = "diagnostics")]
-#[cfg(feature = "diagnostics")]
 static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
-#[cfg(feature = "diagnostics")]
 #[cfg(feature = "diagnostics")]
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
@@ -897,8 +882,6 @@ mod tests {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
     }
 
-    /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
-    /// not B8G8R8A8.
     /// A saved frame's PNG (release builds too): half size, RGB, BGRA
     /// swapped, every other pixel of every other row.
     #[test]
@@ -933,6 +916,8 @@ mod tests {
         assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
     }
 
+    /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
+    /// not B8G8R8A8.
     #[cfg(feature = "diagnostics")]
     #[test]
     fn unorm16_and_xr_bias_targets_decode_as_their_formats() {
