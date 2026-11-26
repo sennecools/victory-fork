@@ -316,18 +316,11 @@ fn the_early_skip_takes_no_claim_and_still_nulls_a_released_view() {
     );
     // Seen again by the sync: done at once.
     let skipped = SKIPPED_MADE.load(Relaxed);
-    let (done, finished) = std::sync::mpsc::channel();
-    {
-        let heap = heap.clone();
-        std::thread::spawn(move || {
-            let view = heap.mirror_marking(0, live, false, true, hold::SYNC);
-            let _ = done.send(view);
-        });
-        let view = finished
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a slot made from its record is done with");
-        assert_eq!(view, Some(View::Constant(0x7d_5000_0000, 256)));
-    }
+    // (Called before any claim of the slot: left uncalled.)
+    BEFORE_CLAIM.set(Some(|_| {}));
+    let view = heap.mirror_marking(0, live, false, true, hold::SYNC);
+    assert!(BEFORE_CLAIM.take().is_some(), "no claim asked for");
+    assert_eq!(view, Some(View::Constant(0x7d_5000_0000, 256)));
     assert_eq!(SKIPPED_MADE.load(Relaxed), skipped + 1);
     // A view of a resource the title releases: its slot made from it (as a
     // draw would have made it), then the resource released.

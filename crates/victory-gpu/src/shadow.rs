@@ -4797,6 +4797,17 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// A copy, a home or a placement is about to be found or made: no claim of
+/// a descriptor slot is held (debug builds count the claims), as nothing
+/// made here may keep the threads that wait for the slot waiting.
+fn unclaimed() {
+    debug_assert_eq!(
+        crate::descriptor::host::claims_held(),
+        0,
+        "a copy made under a claim of a descriptor slot"
+    );
+}
+
 /// A host buffer is about to be made for a copy, with no table lock held
 /// ([`MAKING`] in tests).
 fn making() {
@@ -4837,6 +4848,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// with no table lock held, then put in the table ([`publish`]). `Ok(None)`:
 /// the host has no memory for it.
 fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone> {
+    unclaimed();
     // Rounded up so that views ending in the buffer's last 256 bytes fit.
     // Shaders write some buffers (unordered access), so not upload memory.
     let size = len.next_multiple_of(1 << 16);
@@ -5177,6 +5189,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
         span
     };
+    unclaimed();
     // The memory core (`crate::home`): the home that holds the window (a
     // window let go by the sweep while a buffer inside it kept it), or a new
     // one. A window is never offered the card here. Found or made, and
@@ -5373,6 +5386,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
         now
     };
+    unclaimed();
     making();
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::label(&buffer, "view host copy", len.next_multiple_of(256));

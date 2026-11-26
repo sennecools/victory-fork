@@ -566,6 +566,7 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    host::claims_line(frames);
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;

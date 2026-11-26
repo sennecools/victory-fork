@@ -1388,8 +1388,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || !may_make(refused, now) {
             return None;
         }
-        // Under the caller's locks, which may be a view heap's `made`
-        // (`HostHeap::mirror`): counted for its `made long hold`.
+        // Never under a claim of a view heap's slot: a mirror makes it
+        // before the claim (`descriptor::host::resolve`). Counted for the
+        // `made long hold` of whatever slot work runs meanwhile.
+        debug_assert!(
+            crate::descriptor::host::claims_held() == 0,
+            "a host texture made under a claim of a view heap's slot"
+        );
         let mut making = crate::profile::span("host texture make");
         if making.is_some() {
             crate::profile::texture_made();
