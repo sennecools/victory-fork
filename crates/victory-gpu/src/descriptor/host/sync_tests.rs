@@ -1,0 +1,686 @@
+//! The heap sync (`super::super::sync_heaps`): a changed page's records at
+//! once and the early skip (`VICTORY_HEAP_SYNC_FAST=1`), and the pass run
+//! ahead on its own thread (`VICTORY_HEAP_SYNC_AHEAD=1`,
+//! `super::super::ahead`).
+
+use super::made_tests::{alive, key, memory, next, record_key, texture, views, write};
+use super::*;
+use crate::descriptor::ahead::Ahead;
+use crate::descriptor::{self as descriptor, HeapDesc, Placement};
+use crate::object::{S_OK, This, slot};
+use std::sync::atomic::Ordering::{Acquire, Relaxed};
+use std::time::Duration;
+
+/// Slots of the heaps these tests make.
+const SLOTS: u32 = 64;
+
+/// [`sync_fast`] on until dropped.
+struct Fast;
+
+impl Fast {
+    fn on() -> Self {
+        SYNC_FAST_FOR_TESTS.store(true, Relaxed);
+        Self
+    }
+}
+
+impl Drop for Fast {
+    fn drop(&mut self) {
+        SYNC_FAST_FOR_TESTS.store(false, Relaxed);
+    }
+}
+
+/// A title heap placed in write-watched memory of its own: the heap, the
+/// memory, and the host heap behind it (`None`: no host GPU).
+struct Placed {
+    heap: This,
+    memory: *mut std::ffi::c_void,
+}
+
+impl Placed {
+    /// A shader-visible heap of `kind` ([`descriptor::VIEWS_KIND`] or
+    /// [`descriptor::SAMPLERS`]) with [`SLOTS`] slots.
+    fn new(kind: u32) -> Self {
+        Self::with_slots(kind, SLOTS)
+    }
+
+    /// [`Placed::new`] with `slots` slots (in one page of memory).
+    fn with_slots(kind: u32, slots: u32) -> Self {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: new memory.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        #[repr(C)]
+        struct Extended(HeapDesc, Placement);
+        let step = u64::from(descriptor::increment(kind).expect("a kind with records"));
+        assert!(u64::from(slots) * step <= crate::watch::PAGE as u64);
+        let extended = Extended(
+            HeapDesc {
+                kind,
+                count: slots,
+                flags: descriptor::SHADER_VISIBLE,
+                nodes: 1,
+            },
+            Placement {
+                address: memory as u64,
+                size: u64::from(slots) * step,
+            },
+        );
+        let mut heap: This = std::ptr::null();
+        assert_eq!(
+            descriptor::create_heap(
+                std::ptr::null(),
+                &extended.0,
+                &descriptor::HEAP_IIDS[0],
+                &mut heap
+            ),
+            S_OK
+        );
+        Self { heap, memory }
+    }
+
+    fn host(&self) -> Option<&HostHeap> {
+        descriptor::heap(self.heap).host()
+    }
+
+    /// The handle of slot `index`.
+    fn at(&self, index: u32) -> u64 {
+        descriptor::heap(self.heap)
+            .handle(index)
+            .expect("a slot of the heap")
+    }
+
+    /// Where the heap stands in the list of shader-visible heaps.
+    fn registered(&self) -> usize {
+        std::ptr::from_ref(descriptor::heap(self.heap)) as usize
+    }
+
+    /// The title's last release of the heap.
+    fn release(heap: This) -> u32 {
+        slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap)
+    }
+}
+
+impl Drop for Placed {
+    fn drop(&mut self) {
+        if !self.heap.is_null() {
+            Self::release(self.heap);
+        }
+        // SAFETY: this allocation belongs to the test.
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualFree(
+                self.memory,
+                0,
+                windows_sys::Win32::System::Memory::MEM_RELEASE,
+            )
+        };
+    }
+}
+
+/// Copies the `n` bytes of the record at `from` to `to`, as a title does.
+fn copy_record(from: u64, to: u64, n: usize) {
+    // SAFETY: both are records of at least `n` bytes, apart.
+    unsafe { std::ptr::copy_nonoverlapping(from as *const u8, to as *mut u8, n) };
+}
+
+/// Every made slot of `heap` holds its view's word: never a word of
+/// another kind than the descriptor under it (the null slot crash).
+fn words_agree(heap: &HostHeap) {
+    for s in 0..heap.count() {
+        let key = key(heap, s);
+        if key != 0 {
+            let view = view_at(key as u32, (key >> 32) as u32).expect("made from a view");
+            assert_eq!(heap.word(s), Some(slot_word(Some(&view))), "slot {s}");
+        }
+    }
+}
+
+/// A title texture object of 16x16 texels the title fills, whose host copy
+/// is made on first use (`crate::resource::host_waits` until then). Left
+/// to the process.
+fn title_texture() -> This {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC,
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+    let props = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Alignment: 0,
+        Width: 16,
+        Height: 16,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+    };
+    let iid = crate::object::guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+    let mut texture: This = std::ptr::null();
+    assert_eq!(
+        crate::resource::create_committed(
+            std::ptr::null(),
+            (&raw const props).cast(),
+            0,
+            (&raw const desc).cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut texture,
+        ),
+        S_OK
+    );
+    assert!(
+        crate::resource::host_waits(texture),
+        "no host copy before its first use"
+    );
+    texture
+}
+
+/// Records over a page, some slots a table's lately, mirrored one by one
+/// (`mirror_copied`) on one heap and a page at once (`mirror_copied_page`)
+/// on another: after every round the same slots made from the same
+/// records, with the same words and the same prints last seen.
+#[test]
+fn a_page_at_once_makes_what_one_by_one_makes() {
+    page_against_one_by_one(false);
+}
+
+/// As above, with the early skip on for the page at once (and off for one
+/// by one): the page and the skip together make what one by one makes.
+#[test]
+fn a_page_at_once_with_the_early_skip_makes_what_one_by_one_makes() {
+    page_against_one_by_one(true);
+}
+
+/// The two tests above: the early skip on for the page at once if `skip`.
+fn page_against_one_by_one(skip: bool) {
+    let (Some(one), Some(page)) = (
+        HostHeap::with_made(false, SLOTS, false),
+        HostHeap::with_made(false, SLOTS, false),
+    ) else {
+        return; // no host GPU
+    };
+    let views = views(memory());
+    let skipped = SKIPPED_MADE.load(Relaxed);
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let step = 32u64;
+    let mut rng = 0x51f1_5eed_0bad_cafeu64;
+    let mut mirrored = 0u64;
+    for round in 0..200 {
+        // Some slots written, some a table's.
+        for _ in 0..8 {
+            let r = next(&mut rng);
+            let s = (r % u64::from(SLOTS)) as u32;
+            write(
+                base + u64::from(s) * step,
+                &views[(r >> 16) as usize % views.len()],
+            );
+            if r >> 40 & 7 == 0 {
+                one.texture_slot_tabled(s, false);
+                page.texture_slot_tabled(s, false);
+            }
+            // Some made by a draw before the sync sees them (what the early
+            // skip leaves).
+            if r >> 44 & 3 == 0 {
+                one.mirror(s, base + u64::from(s) * step, true);
+                page.mirror(s, base + u64::from(s) * step, true);
+            }
+        }
+        // The page as read through the kernel.
+        // SAFETY: `records` is `SLOTS` records of `step` bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(base as *const u8, (u64::from(SLOTS) * step) as usize)
+        }
+        .to_vec();
+        let mut one_by_one = 0;
+        for index in 0..u64::from(SLOTS) {
+            let at = (index * step) as usize;
+            if one.mirror_copied(
+                index as u32,
+                base + index * step,
+                &bytes[at..at + step as usize],
+            ) {
+                one_by_one += 1;
+            }
+        }
+        let (looked, made) = {
+            let _fast = skip.then(Fast::on);
+            page.mirror_copied_page(0..u64::from(SLOTS), (base, step), base as usize, &bytes)
+        };
+        assert_eq!(looked, u64::from(SLOTS), "round {round}");
+        assert_eq!(made, one_by_one, "round {round}");
+        mirrored += made;
+        for s in 0..SLOTS {
+            assert_eq!(key(&one, s), key(&page, s), "round {round}, slot {s}");
+            assert_eq!(one.word(s), page.word(s), "round {round}, slot {s}");
+            assert_eq!(
+                one.copied_print(s),
+                page.copied_print(s),
+                "round {round}, slot {s}"
+            );
+        }
+        assert_eq!(one.buffer_slots(), page.buffer_slots(), "round {round}");
+    }
+    assert!(mirrored > 0);
+    if skip {
+        assert!(SKIPPED_MADE.load(Relaxed) > skipped, "records skipped");
+    }
+    assert!(alive());
+}
+
+/// The early skip: a slot made from a record of a view still there is done
+/// with without the heap-wide lock (held here by the test the whole time);
+/// a slot made from a record whose resource was released since goes on to
+/// the lock and is made null, as without the skip.
+#[test]
+fn the_early_skip_takes_no_lock_and_still_nulls_a_released_view() {
+    let Some(heap) = HostHeap::with_made(false, SLOTS, false) else {
+        return; // no host GPU
+    };
+    let _fast = Fast::on();
+    let heap = std::sync::Arc::new(heap);
+    let mut records = vec![[0u32; 8]; 2];
+    let (live, gone) = (
+        records.as_mut_ptr() as u64,
+        records.as_mut_ptr() as u64 + 32,
+    );
+    // A constant buffer view, made in slot 0.
+    write(live, &Some(View::Constant(0x7d_5000_0000, 256)));
+    heap.mirror(0, live, true);
+    assert_eq!(
+        key(&heap, 0),
+        record_key(live),
+        "slot 0 made from its record"
+    );
+    // Seen again by the sync with the lock held elsewhere: done at once.
+    let skipped = SKIPPED_MADE.load(Relaxed);
+    let (done, finished) = std::sync::mpsc::channel();
+    {
+        let _held = heap.made_lock.lock().unwrap();
+        let heap = heap.clone();
+        std::thread::spawn(move || {
+            let view = heap.mirror_marking(0, live, false, true, hold::SYNC);
+            let _ = done.send(view);
+        });
+        let view = finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("no made lock taken for a slot made from its record");
+        assert_eq!(view, Some(View::Constant(0x7d_5000_0000, 256)));
+    }
+    assert_eq!(SKIPPED_MADE.load(Relaxed), skipped + 1);
+    // A view of a resource the title releases: its slot made from it (as a
+    // draw would have made it), then the resource released.
+    let resource = 0x7d_7777_0000usize;
+    write(gone, &Some(View::Shader(resource, None)));
+    let stale = record_key(gone);
+    {
+        let _made = heap.lock_made(None);
+        let mut claim = heap.claim(1, |_| true).expect("not claimed");
+        claim.value = stale;
+        heap.write_word(1, slot_word(Some(&View::Constant(0, 256))));
+    }
+    descriptor::forget(resource);
+    assert_eq!(
+        view_at(stale as u32, (stale >> 32) as u32),
+        None,
+        "stale after release"
+    );
+    assert_eq!(heap.mirror_marking(1, gone, false, true, hold::SYNC), None);
+    assert_eq!(key(&heap, 1), 0, "a released view's slot made null");
+    assert_eq!(heap.word(1), Some(0));
+    assert_eq!(SKIPPED_MADE.load(Relaxed), skipped + 1, "not skipped");
+    assert!(alive());
+}
+
+/// A record the title copied into a placed heap as bytes, then a request
+/// and its wait: the slot is made (as a direct call of `sync_heaps` makes
+/// it).
+#[test]
+fn a_request_and_its_wait_leave_a_copied_record_made() {
+    let placed = Placed::new(descriptor::SAMPLERS);
+    let Some(host) = placed.host() else {
+        return; // no host GPU
+    };
+    let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
+    let mut elsewhere = [0u64; 2];
+    let source = elsewhere.as_mut_ptr() as u64;
+    let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+    descriptor::create_sampler(std::ptr::null(), &sampler, source);
+    copy_record(source, placed.at(5), 16);
+    assert!(!host.made(5));
+    let seq = ahead.request().expect("a request");
+    assert!(ahead.wait(seq));
+    assert!(host.made(5));
+    assert_eq!(ahead.behind(seq), 0);
+}
+
+/// A pass that began before a request does not answer it: with the first
+/// pass held, what is written and asked for meanwhile waits for a second
+/// pass, which sees it.
+#[test]
+fn a_pass_begun_before_a_request_does_not_answer_it() {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc::channel;
+    let written = std::sync::Arc::new(AtomicU64::new(0));
+    let (came, come) = channel::<u64>();
+    let (go, gone) = channel::<()>();
+    let gone = std::sync::Mutex::new(gone);
+    let ahead = Ahead::start({
+        let written = written.clone();
+        move || {
+            // What the pass sees as it begins.
+            let _ = came.send(written.load(Acquire));
+            let _ = gone.lock().unwrap().recv();
+        }
+    })
+    .expect("a helper thread");
+    let first = ahead.request().expect("a request");
+    let seen = come
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the first pass");
+    assert_eq!(seen, 0);
+    // The title writes, and the next submission asks, while the pass runs.
+    written.store(1, std::sync::atomic::Ordering::Release);
+    let second = ahead.request().expect("a request");
+    assert_eq!(ahead.behind(second), 2);
+    go.send(()).unwrap();
+    assert!(ahead.wait(first));
+    // The second pass has begun (or is about to) and is held: not answered.
+    let seen = come
+        .recv_timeout(Duration::from_secs(30))
+        .expect("a second pass");
+    assert_eq!(seen, 1, "the second pass sees the write");
+    assert_eq!(
+        ahead.behind(second),
+        1,
+        "the first pass does not answer the second request"
+    );
+    go.send(()).unwrap();
+    assert!(ahead.wait(second));
+    assert_eq!(ahead.behind(second), 0);
+}
+
+/// A heap the title releases while the pass walks it: the heap's drop
+/// waits for the pass (the list of heaps is read-locked through it), and
+/// nothing reads freed memory.
+#[test]
+fn a_heap_dropped_while_the_pass_walks_it_waits_for_it() {
+    let mut placed = Placed::new(descriptor::SAMPLERS);
+    if placed.host().is_none() {
+        return; // no host GPU
+    }
+    let mut elsewhere = [0u64; 2];
+    let source = elsewhere.as_mut_ptr() as u64;
+    let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+    descriptor::create_sampler(std::ptr::null(), &sampler, source);
+    copy_record(source, placed.at(9), 16);
+    let (came, come) = std::sync::mpsc::channel();
+    let (go, gone) = std::sync::mpsc::channel();
+    *descriptor::tests_hook::AT.lock().unwrap() = Some((placed.registered(), came, gone));
+    let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
+    let seq = ahead.request().expect("a request");
+    come.recv_timeout(Duration::from_secs(30))
+        .expect("the pass comes to the heap");
+    // The title's last release, on a thread of its own.
+    let heap = std::mem::replace(&mut placed.heap, std::ptr::null()) as usize;
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let releasing = {
+        let dropped = dropped.clone();
+        std::thread::spawn(move || {
+            Placed::release(heap as This);
+            dropped.store(true, Relaxed);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!dropped.load(Relaxed), "the heap's drop waits for the pass");
+    go.send(()).unwrap();
+    assert!(ahead.wait(seq));
+    releasing.join().unwrap();
+    assert!(dropped.load(Relaxed));
+    assert!(alive());
+}
+
+/// The submitting thread waits for the pass, and makes the slots left
+/// waiting, while it holds the host's submission lock, as a submission
+/// does (`Host::submit`). The pass mirrors a placed texture's view, whose
+/// host texture it looks up and makes, and more views of one title texture
+/// object without a host copy than may wait for it, so that it makes that
+/// texture's host copy (`descriptor::wait_for`): the wait ends, so nothing
+/// on the pass's way takes the submission lock.
+#[test]
+fn a_wait_under_the_submission_lock_ends() {
+    /// Slots that view the title texture: more than the 64 that may wait.
+    const VIEWING: u32 = 72;
+    let placed = Placed::with_slots(descriptor::VIEWS_KIND, VIEWING + 8);
+    let (Some(_), Some(gpu)) = (placed.host(), crate::host::host()) else {
+        return; // no host GPU
+    };
+    let placed_view = texture(memory(), 64);
+    let title = title_texture();
+    let title_view = View::Shader(title as usize, None);
+    let mut elsewhere = [0u64; 8];
+    let (source, other) = (
+        elsewhere.as_mut_ptr() as u64,
+        elsewhere.as_mut_ptr() as u64 + 32,
+    );
+    write(source, &Some(placed_view.clone()));
+    copy_record(source, placed.at(VIEWING + 3), 32);
+    write(other, &Some(title_view.clone()));
+    for s in 0..VIEWING {
+        copy_record(other, placed.at(s), 32);
+    }
+    let ahead = std::sync::Arc::new(Ahead::start(descriptor::sync_heaps).expect("a helper thread"));
+    let (done, finished) = std::sync::mpsc::channel();
+    {
+        let ahead = ahead.clone();
+        std::thread::spawn(move || {
+            let seq = ahead.request().expect("a request");
+            let held = crate::host::flights::submission_lock(gpu);
+            crate::descriptor::ahead::wait_and_make(Some(&ahead), seq);
+            drop(held);
+            let _ = done.send(());
+        });
+    }
+    if finished.recv_timeout(Duration::from_secs(120)).is_err() {
+        // The pass is stuck in the heap: its drop would wait for it.
+        std::mem::forget(placed);
+        panic!("the wait under the submission lock does not end");
+    }
+    assert!(
+        !crate::resource::host_waits(title),
+        "the pass made the title texture's host copy"
+    );
+    let host = placed.host().unwrap();
+    assert_eq!(host.word(VIEWING + 3), Some(slot_word(Some(&placed_view))));
+    for s in 0..VIEWING {
+        assert!(host.made(s), "slot {s} made");
+        assert_eq!(host.word(s), Some(slot_word(Some(&title_view))), "slot {s}");
+    }
+    words_agree(host);
+    assert!(alive());
+}
+
+/// A pass leaves slots that view a title texture without a host copy
+/// waiting for it; the texture is made meanwhile (a draw uses it). The
+/// next submission's wait makes them before it returns
+/// (`descriptor::ahead::wait_and_make`), though its pass sees their records
+/// as the ones it saw last.
+#[test]
+fn slots_left_waiting_are_made_by_the_next_wait() {
+    let placed = Placed::new(descriptor::VIEWS_KIND);
+    let Some(host) = placed.host() else {
+        return; // no host GPU
+    };
+    let title = title_texture();
+    let view = View::Shader(title as usize, None);
+    let mut elsewhere = [0u64; 4];
+    let source = elsewhere.as_mut_ptr() as u64;
+    write(source, &Some(view.clone()));
+    for s in 0..4 {
+        copy_record(source, placed.at(s), 32);
+    }
+    let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
+    let seq = ahead.request().expect("a request");
+    crate::descriptor::ahead::wait_and_make(Some(&ahead), seq);
+    assert!(crate::resource::host_waits(title));
+    for s in 0..4 {
+        assert!(!host.made(s), "slot {s} waits for its texture");
+    }
+    // Made by a draw before the next submission.
+    assert!(crate::resource::host_copy(title).is_some());
+    let seq = ahead.request().expect("a request");
+    crate::descriptor::ahead::wait_and_make(Some(&ahead), seq);
+    for s in 0..4 {
+        assert!(host.made(s), "slot {s} made with its texture");
+        assert_eq!(host.word(s), Some(slot_word(Some(&view))), "slot {s}");
+    }
+    words_agree(host);
+    assert!(alive());
+}
+
+/// Four threads write views into a placed heap (`Create*View`), copy
+/// records into it as bytes and by calls (`CopyDescriptorsSimple`) and
+/// make slots for draws that read them through tables, while submissions
+/// ask the helper for passes and wait for them under the submission lock,
+/// with the early skip on: all finish, and every slot's word is of the kind
+/// of the descriptor under it, during and after.
+#[test]
+fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
+    const THREADS: u64 = 4;
+    let placed = Placed::new(descriptor::VIEWS_KIND);
+    let Some(host) = placed.host() else {
+        return; // no host GPU
+    };
+    let _fast = Fast::on();
+    let views = views(memory());
+    let heap_at: Vec<u64> = (0..SLOTS).map(|s| placed.at(s)).collect();
+    let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let skipped = SKIPPED_MADE.load(Relaxed);
+    let (looks, wrong, passes) = std::thread::scope(|scope| {
+        let (done, finished) = std::sync::mpsc::channel();
+        for t in 0..THREADS {
+            let (views, heap_at, done) = (&views, &heap_at, done.clone());
+            scope.spawn(move || {
+                // Records of its own to copy from.
+                let mut records = vec![[0u32; 8]; 8];
+                let base = records.as_mut_ptr() as u64;
+                let mut rng = 0x2545_f491_4f6c_dd1d ^ (t + 1).wrapping_mul(0x9e37_79b9);
+                for _ in 0..20_000 {
+                    let r = next(&mut rng);
+                    let slot = (r % u64::from(SLOTS)) as u32;
+                    let at = heap_at[slot as usize];
+                    let view = &views[(r >> 16) as usize % views.len()];
+                    let from = base + (r >> 32) % 8 * 32;
+                    match r >> 8 & 7 {
+                        // A view written by a call, mirrored at once.
+                        0 | 1 => write(at, view),
+                        // A draw reads the slot through a table.
+                        2..=4 => {
+                            host.mirror(slot, at, true);
+                        }
+                        // A record copied as bytes: only the pass sees it.
+                        5 | 6 => {
+                            write(from, view);
+                            copy_record(from, at, 32);
+                        }
+                        // A record copied by a call (`CopyDescriptorsSimple`),
+                        // mirrored at once: the heap list read as the pass
+                        // reads it.
+                        _ => {
+                            write(from, view);
+                            descriptor::copy_simple(
+                                std::ptr::null(),
+                                1,
+                                at,
+                                from,
+                                descriptor::VIEWS_KIND,
+                            );
+                        }
+                    }
+                }
+                let _ = done.send(());
+            });
+        }
+        let submitting = scope.spawn(|| {
+            let gpu = crate::host::host().expect("the host GPU of the heap");
+            let mut passes = 0u64;
+            while !stop.load(Relaxed) {
+                let seq = ahead.request().expect("a request");
+                // As a submission waits: under the submission lock.
+                let _held = crate::host::flights::submission_lock(gpu);
+                assert!(ahead.wait(seq));
+                passes += 1;
+            }
+            passes
+        });
+        // Meanwhile: a slot that shows the same record before and after its
+        // word is read has that record's word, or 0, never another.
+        let (mut looks, mut wrong) = (0u64, Vec::new());
+        let mut ended = 0;
+        while ended < THREADS {
+            match finished.recv_timeout(Duration::from_millis(1)) {
+                Ok(()) => ended += 1,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(e) => {
+                    // (The submissions stop first: else the scope waits.)
+                    stop.store(true, Relaxed);
+                    panic!("a writer failed: {e}");
+                }
+            }
+            for s in 0..SLOTS {
+                let before = host.made[s as usize].load(Acquire);
+                let word = host.word(s);
+                if before == 0 || before == CLAIMED || host.made[s as usize].load(Acquire) != before
+                {
+                    continue;
+                }
+                looks += 1;
+                let view = view_at(before as u32, (before >> 32) as u32);
+                if word != Some(0) && word != Some(slot_word(view.as_ref())) && wrong.len() < 8 {
+                    wrong.push((s, before, word));
+                }
+            }
+        }
+        stop.store(true, Relaxed);
+        let passes = submitting.join().expect("every wait ends");
+        (looks, wrong, passes)
+    });
+    assert!(passes > 0);
+    // A last pass over what was copied last.
+    let seq = ahead.request().expect("a request");
+    assert!(ahead.wait(seq));
+    assert!(looks > 0);
+    assert!(
+        SKIPPED_MADE.load(Relaxed) > skipped,
+        "records skipped before the lock"
+    );
+    assert_eq!(wrong, [], "slots whose word is not their record's");
+    words_agree(host);
+    assert!(alive());
+}

@@ -11,7 +11,11 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+mod ahead;
+#[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) use ahead::{sync_ahead, sync_ahead_wait};
 
 /// The bytes of a title's constant buffer of `size` that the host can see:
 /// at most the 64 KiB a shader can index, so only those are staged. The
@@ -133,8 +137,44 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
+///
+/// Read by every lookup and by [`sync_heaps`], written only when a heap is
+/// made or dropped (a dropped heap waits for a [`sync_heaps`] that walks
+/// it). It was a mutex, and [`sync_heaps`] holds it for its whole pass:
+/// fork main counted the title's recording threads waiting 48.5 ms a frame
+/// for it in [`shader_slot`] (run 225), each lookup itself a few
+/// nanoseconds. Readers no longer wait for each other. Nothing a holder
+/// calls takes it again. (Adapted from fork main a2537066.)
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// One [`sync_heaps`] at a time, as when the list above was a mutex.
+#[cfg(windows)]
+static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Who reads [`SHADER_HEAPS`] for a slot (`site` of `heap list wait`): a
+/// `Create*View` call, a descriptor copy, a slot that waited for its
+/// texture ([`make_waiting`]), dynamic slots given back
+/// ([`release_dynamic`]).
+#[cfg(windows)]
+mod list_site {
+    pub(super) const VIEW: u64 = 0;
+    pub(super) const COPY: u64 = 1;
+    pub(super) const WAITING: u64 = 2;
+    pub(super) const RELEASE: u64 = 3;
+}
+
+/// [`SHADER_HEAPS`] read-locked for one of the [`list_site`] sites. On the
+/// profile, a wait for it of 50 us or more is `heap list wait` (`site`):
+/// readers no longer wait for each other, but still for a heap made or
+/// dropped, and behind such a writer that waits for a [`sync_heaps`].
+#[cfg(windows)]
+fn heap_list(site: u64) -> std::sync::RwLockReadGuard<'static, Vec<(u64, u64, usize)>> {
+    let asked = crate::profile::stamp();
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    crate::profile::since("heap list wait", asked, 50, &[("site", site)]);
+    heaps
+}
 
 /// An owned COM reference to a shader-visible [`Heap`], keeping it (and its
 /// host heap and backing memory) alive past the [`SHADER_HEAPS`] lookup.
@@ -158,10 +198,11 @@ impl Drop for HeapRef {
     }
 }
 
-/// The shader-visible heap holding `handle`, and the descriptor's index.
+/// The shader-visible heap holding `handle`, and the descriptor's index,
+/// looked up for `site` ([`list_site`]).
 #[cfg(windows)]
-fn shader_slot(handle: u64) -> Option<(HeapRef, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+fn shader_slot(handle: u64, site: u64) -> Option<(HeapRef, u32)> {
+    let heaps = heap_list(site);
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -177,10 +218,10 @@ fn shader_slot(handle: u64) -> Option<(HeapRef, u32)> {
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap.
+/// is in a shader-visible heap (`site`: [`list_site`]).
 #[cfg(windows)]
-fn mirror(handle: u64) {
-    let Some((heap, index)) = shader_slot(handle) else {
+fn mirror(handle: u64, site: u64) {
+    let Some((heap, index)) = shader_slot(handle, site) else {
         return;
     };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -211,18 +252,25 @@ pub(crate) fn sync_heaps() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
+    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     // On the profile: what it did, and its time reading pages (`read_us`)
     // and mirroring their slots (`mirror_us`, with the waits for the heaps'
-    // `made` locks), which alternate page by page.
+    // `made` locks), which alternate page by page; `skipped_made`: records
+    // whose slot was made from them already, done with before the `made`
+    // lock (`VICTORY_HEAP_SYNC_FAST=1`).
     let mut span = crate::profile::span("sync heaps");
     let (mut read_ticks, mut mirror_ticks) = (0u64, 0u64);
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let fast = host::sync_fast();
+    let skipped_before = host::SKIPPED_MADE.load(Relaxed);
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
+        #[cfg(test)]
+        tests_hook::walking(at);
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
         else {
@@ -248,21 +296,31 @@ pub(crate) fn sync_heaps() {
                     let mirroring = crate::profile::stamp();
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
+                    // With `VICTORY_HEAP_SYNC_FAST=1` the page's records in
+                    // one go, under one lock (`HostHeap::mirror_copied_page`,
+                    // after fork main a2537066); one by one otherwise.
+                    if fast {
+                        let (seen, made) =
+                            host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                        looked += seen;
+                        mirrored += made;
+                    } else {
+                        for index in slots {
+                            let handle = start + index * step;
+                            // A record that straddles the range's ends is
+                            // left to the range that holds its first byte.
+                            let Some(at) = (handle as usize).checked_sub(from) else {
+                                continue;
+                            };
+                            let Some(record) = page_bytes.get(at..at + step as usize) else {
+                                continue;
+                            };
+                            looked += 1;
+                            // Only a record that is not the one last seen
+                            // there (`HostHeap::mirror_copied`).
+                            if host.mirror_copied(index as u32, handle, record) {
+                                mirrored += 1;
+                            }
                         }
                     }
                     mirror_ticks += crate::profile::elapsed(mirroring);
@@ -278,6 +336,12 @@ pub(crate) fn sync_heaps() {
         span.arg("mirrored", mirrored);
         span.arg("read_us", crate::profile::micros(read_ticks));
         span.arg("mirror_us", crate::profile::micros(mirror_ticks));
+        if fast {
+            span.arg(
+                "skipped_made",
+                host::SKIPPED_MADE.load(Relaxed) - skipped_before,
+            );
+        }
     }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
@@ -314,7 +378,7 @@ pub(crate) fn let_go_slots(
 /// and counted after.
 #[cfg(windows)]
 pub(crate) fn live_keys() -> (u64, u64) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut keys: Vec<u64> = Vec::new();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -344,6 +408,21 @@ pub(crate) fn sync_line(frames: f64) {
     if pages == 0 {
         return;
     }
+    // With `VICTORY_HEAP_SYNC_FAST=1` a record's print is compared before
+    // the question whether its slot was a table's, so "left to the draws"
+    // counts only records that changed there.
+    if host::sync_fast() {
+        // (`SKIPPED_MADE` only grows: the line's part since the last line.)
+        static LINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let skipped = host::SKIPPED_MADE.load(std::sync::atomic::Ordering::Relaxed);
+        let since = skipped.wrapping_sub(LINED.swap(skipped, std::sync::atomic::Ordering::Relaxed));
+        tracing::info!(
+            "heap sync with VICTORY_HEAP_SYNC_FAST=1: per frame {:.0} records whose slot was \
+             made from them already, done with before the made lock; the count left to the \
+             draws below is of changed records only",
+            since as f64 / frames
+        );
+    }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
@@ -353,6 +432,33 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+}
+
+/// For tests: a heap [`sync_heaps`] stops at, until the test lets it go
+/// on (a pass held while it walks that heap).
+#[cfg(all(windows, test))]
+pub(crate) mod tests_hook {
+    use std::sync::mpsc::{Receiver, Sender};
+
+    /// The heap's address, where to say the pass came to it, and where it
+    /// is told to go on. Taken by the first pass that comes to it.
+    pub(crate) static AT: std::sync::Mutex<Option<(usize, Sender<()>, Receiver<()>)>> =
+        std::sync::Mutex::new(None);
+
+    /// [`super::sync_heaps`] comes to the heap at `at`.
+    pub(crate) fn walking(at: usize) {
+        let held = {
+            let mut hook = AT.lock().unwrap_or_else(|e| e.into_inner());
+            match hook.as_ref() {
+                Some(&(heap, _, _)) if heap == at => hook.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, came, go)) = held {
+            let _ = came.send(());
+            let _ = go.recv();
+        }
+    }
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
@@ -376,7 +482,7 @@ fn changed_slots(
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heap_list(list_site::RELEASE);
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -389,7 +495,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
         drop(heaps);
         if let Some(Some(host)) = self.host.get() {
@@ -910,7 +1016,7 @@ pub(crate) fn make_waiting() {
             // texture without a host copy must go on waiting).
             // (Looked up first: the handle is read only while its heap is
             // there.)
-            let Some((heap, index)) = shader_slot(handle) else {
+            let Some((heap, index)) = shader_slot(handle, list_site::WAITING) else {
                 continue;
             };
             let same = match view(handle) {
@@ -934,7 +1040,7 @@ pub(crate) fn record(handle: u64, view: View) {
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     #[cfg(windows)]
-    mirror(handle);
+    mirror(handle, list_site::VIEW);
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -1077,7 +1183,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
         for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+            mirror(dst + i * step, list_site::COPY);
         }
     }
 }
@@ -1202,7 +1308,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -1567,7 +1673,8 @@ mod tests {
         assert_eq!(create(desc, none, &mut h), S_OK);
         let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
 
-        let (guard, index) = shader_slot(start + 32).expect("registered shader-visible heap");
+        let (guard, index) =
+            shader_slot(start + 32, list_site::VIEW).expect("registered shader-visible heap");
         assert_eq!(index, 1);
 
         // Title drops its reference while `guard` is still held: heap must stay alive.
@@ -1581,7 +1688,7 @@ mod tests {
 
         // Dropping the guard releases the final reference and unregisters the heap.
         drop(guard);
-        assert!(shader_slot(start + 32).is_none());
+        assert!(shader_slot(start + 32, list_site::VIEW).is_none());
 
         // `try_add_ref` refuses to resurrect a zero-refcount object.
         let dead = Object::new(&FUNCTIONS);

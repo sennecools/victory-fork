@@ -7723,6 +7723,9 @@ impl Host {
         // For the critical path on the profile: when each wait before
         // preparing ended (`gate_args`).
         let entered = crate::profile::stamp();
+        // With `VICTORY_HEAP_SYNC_AHEAD=1`: the heap sync below runs on its
+        // own thread from here, while this one waits and prepares.
+        let heap_sync = crate::descriptor::sync_ahead();
         // Lists whose binds lost the heap buffer pass's claim: not before
         // its walk has ended, and before the submission lock.
         wait_for_walks(runs);
@@ -7797,8 +7800,11 @@ impl Host {
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted. (Its span,
-        // `sync heaps`, is its own.)
-        crate::descriptor::sync_heaps();
+        // `sync heaps`, is its own.) Ahead of the submission, waited for
+        // before its lists go to the card (`heap_sync`).
+        if heap_sync.is_none() {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -7962,6 +7968,14 @@ impl Host {
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+        }
+        // The heap sync run ahead (`heap_sync`) has seen what the title
+        // copied into its heaps before this submission, before anything of
+        // it goes to the card. The submission lock is held: the sync's
+        // thread takes nothing this one holds. Slots it left waiting for a
+        // texture made meanwhile are made then too.
+        if let Some(seq) = heap_sync {
+            crate::descriptor::sync_ahead_wait(seq);
         }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
