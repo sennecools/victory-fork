@@ -20,6 +20,11 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 /// The card's clocks kept up between submissions (`VICTORY_CARD_AWAKE=1`).
 mod awake;
+/// The copy queue and its uploader thread; the wait the direct queue is
+/// given for them ([`Host::run_lists`]).
+pub(crate) mod copyq;
+/// The upload ring the copy queue carries from.
+pub(crate) mod ring;
 /// R5 (`VICTORY_R5=1`): what only the core's homes under the relay use.
 mod late_homes;
 /// The release at the title's end (`crate::release`): submissions refused
@@ -116,6 +121,9 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// The copy queue and its upload ring, made at device start; `None` if
+    /// the device refused them (lists then go to the queue as before).
+    copy: Option<copyq::CopyQueue>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -786,6 +794,18 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        // The upload ring (charged to commit once, here) and the copy queue
+        // that carries from it. After the self-tests above: they send on
+        // the queue directly, before any copy can exist.
+        let copy = ring::UploadRing::new(&device)
+            .and_then(|ring| copyq::CopyQueue::new(&device, &fence, std::sync::Arc::new(ring)));
+        let copy = match copy {
+            Ok(copy) => Some(copy),
+            Err(e) => {
+                tracing::warn!(error = %e, "no copy queue or upload ring");
+                None
+            }
+        };
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -802,6 +822,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            copy,
         })
     }
 }
@@ -6322,7 +6343,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    self.run_lists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
             };
@@ -6398,7 +6419,7 @@ impl Host {
             };
             if let Some(list) = list {
                 // SAFETY: a closed list of ours; it goes ahead of the lists.
-                unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+                unsafe { self.run_lists(&[Some(list)]) };
             }
             for (&i, place) in homed.iter().zip(places) {
                 plan.ranges[i].reference = Some(place);
@@ -6699,7 +6720,7 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
+                self.run_lists(&lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
@@ -7152,10 +7173,10 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    self.run_lists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
-                    self.queue.Signal(&self.fence, *submitted)?;
+                    self.signal_submitted(*submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     let _wait = crate::profile::span_args("card fetch wait", &[("bytes", total)]);
@@ -7903,7 +7924,7 @@ impl Host {
             && let Some(list) = crate::memory::before_submission(self, this_submission)
         {
             // SAFETY: a closed list of ours; it goes ahead of the lists.
-            unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+            unsafe { self.run_lists(&[Some(list)]) };
         }
         let card_before = crate::profile::span("card_before");
         let card = self.card_before(runs, flown, this_submission);
@@ -7936,8 +7957,8 @@ impl Host {
             let execute = crate::profile::span_args("ExecuteCommandLists", &[("lists", lists.len() as u64)]);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+                self.run_lists(&lists);
+                self.signal_submitted(*submitted)
             };
             awake::sent(&self.device);
             self.card_sent();
@@ -8005,11 +8026,10 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 let execute = crate::profile::span_args("ExecuteCommandLists", &[("lists", group.len() as u64)]);
-                self.queue.ExecuteCommandLists(group);
+                self.run_lists(group);
                 self.card_sent();
                 let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
+                    .signal_submitted(*submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 drop(execute);
                 match waited {
@@ -10306,6 +10326,35 @@ impl Host {
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
         &self.queue
+    }
+
+    /// The one way closed lists of ours go to the direct queue: behind a
+    /// GPU wait for every copy batch signalled so far, which is skipped
+    /// when none was signalled since the last (`copyq::execute`).
+    ///
+    /// # Safety
+    /// `lists` are closed; what they use lives until they ran.
+    unsafe fn run_lists(&self, lists: &[Option<ID3D12CommandList>]) {
+        // SAFETY: as the caller promised.
+        unsafe { copyq::execute(&self.queue, self.copy.as_ref(), lists) }
+    }
+
+    /// Signals `value` on the direct fence after what was sent; once the
+    /// signal is issued, copy batches may wait for it (`copyq`, invariant
+    /// 3).
+    fn signal_submitted(&self, value: u64) -> windows::core::Result<()> {
+        // SAFETY: our queue and fence.
+        unsafe { self.queue.Signal(&self.fence, value) }?;
+        if let Some(copy) = &self.copy {
+            copy.direct_signalled(value);
+        }
+        Ok(())
+    }
+
+    /// The copy queue and its upload ring (T6 posts texture levels there).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn copy_queue(&self) -> Option<&copyq::CopyQueue> {
+        self.copy.as_ref()
     }
 
     /// A buffer in the upload heap, mapped for writing.
