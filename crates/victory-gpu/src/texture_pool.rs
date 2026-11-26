@@ -530,6 +530,26 @@ mod d3d {
         methods: &'static [*const (); 3],
         references: AtomicU32,
         piece: Piece,
+        /// The texture's address, while it is in [`UNTOUCHED`].
+        texture: usize,
+    }
+
+    /// Pooled textures the card has neither uploaded into nor written by a
+    /// copy (by address): what their piece held before still shows in them
+    /// ([`first_write`]).
+    static UNTOUCHED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+    /// Whether `texture` is a pooled one the card writes for the first
+    /// time, which it no longer is after this (false with the texture half
+    /// off, without taking a lock). The caller records the aliasing barrier
+    /// and gives every texel a value before anything else uses it.
+    pub(crate) fn first_write(texture: &ID3D12Resource) -> bool {
+        if !super::textures_on() {
+            return false;
+        }
+        let mut set = lock(&UNTOUCHED);
+        set.as_mut()
+            .is_some_and(|set| set.remove(&(texture.as_raw() as usize)))
     }
 
     struct Methods([*const (); 3]);
@@ -583,6 +603,10 @@ mod d3d {
                 - 1;
             if left == 0 {
                 let gone = Box::from_raw(this.cast::<Reclaim>());
+                // Before the texture's address can be another's.
+                if let Some(set) = lock(&UNTOUCHED).as_mut() {
+                    set.remove(&gone.texture);
+                }
                 HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
                 lock(&TEXTURES).give(gone.piece, now());
             }
@@ -610,6 +634,7 @@ mod d3d {
             methods: &RECLAIM.0,
             references: AtomicU32::new(1),
             piece,
+            texture: texture.as_raw() as usize,
         }));
         // SAFETY: a COM object of ours with one reference, which this takes
         // and drops at the end; the texture takes its own.
@@ -619,8 +644,13 @@ mod d3d {
                 // Never given back: the piece stays taken, nothing is reused
                 // under a texture that may be alive.
                 std::mem::forget(object);
+                return;
             }
         }
+        // (Taken out again when it goes, which only a held object says.)
+        lock(&UNTOUCHED)
+            .get_or_insert_with(Default::default)
+            .insert(texture.as_raw() as usize);
     }
 
     /// A texture of `desc` (no target, depth or unordered access) in a

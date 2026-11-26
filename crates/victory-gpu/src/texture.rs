@@ -1254,7 +1254,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     match staging.record_copies(list, texture, resource) {
-        Recorded::Copies => staging.later.store(false, Relaxed),
+        Recorded::Copies => {
+            staging.later.store(false, Relaxed);
+            // Every subresource is written by this list: a host copy into
+            // the texture later needs no zeros ([`first_written`]).
+            crate::texture_pool::first_write(texture);
+        }
         Recorded::Later => {
             // Only the check, which fills the buffer the texture was given;
             // the next list that uploads the texture copies it (the pass
@@ -1342,6 +1347,10 @@ impl Drop for Claimed {
 /// other order than recorded, lose the first one's write under the zeros
 /// of the other; so does an upload recorded and not yet submitted.
 pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resource, level: Option<u32>) {
+    // (`None`: a copy of the whole resource, which writes every texel.)
+    if crate::texture_pool::first_write(texture) {
+        first_written(list, resource, texture, level.is_some());
+    }
     let Some(on_demand) = crate::resource::host_tiled(resource) else {
         return;
     };
@@ -1419,6 +1428,90 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
         step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
         step.on_demand.card_wrote(levels, memory);
     });
+}
+
+/// A texture cut from a block of `crate::texture_pool` that a host copy or
+/// resolve writes before any upload did (after which [`upload`] records
+/// none): the aliasing barrier that makes it the block's occupant, and
+/// zeros in every subresource, so that what the write does not cover reads
+/// as in a texture of its own, not as what the piece held before (without
+/// `zero`, the barrier only: the write covers every texel). A subresource
+/// whose zeros find no upload buffer keeps those bytes (logged).
+fn first_written(list: &HostList, resource: This, texture: &ID3D12Resource, zero: bool) {
+    let aliasing = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                pResourceBefore: std::mem::ManuallyDrop::new(None),
+                // SAFETY: a borrowed pointer the barrier never releases.
+                pResourceAfter: unsafe { std::mem::transmute_copy(texture) },
+            }),
+        },
+    };
+    // SAFETY: an open list and a live texture.
+    unsafe { list.list.ResourceBarrier(&[aliasing]) };
+    let Some(host) = host().filter(|_| zero) else {
+        return;
+    };
+    const COPY_DEST: u32 = 0x400;
+    crate::list::ensure_state(list, resource, COPY_DEST);
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    // One plane (pooled textures have one).
+    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(d.DepthOrArraySize)
+    };
+    let mut unzeroed = 0u32;
+    for sub in 0..u32::from(d.MipLevels).max(1) * layers {
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0u64;
+        // SAFETY: outputs for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                sub,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        let Some((buffer, data)) = list.upload(host, bytes) else {
+            unzeroed += 1;
+            continue;
+        };
+        // SAFETY: a mapped buffer of `bytes` bytes, just made.
+        unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: sub,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above; the list holds the buffer until it is reset.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    if unzeroed != 0 {
+        tracing::warn!(
+            subresources = unzeroed,
+            "a pooled texture written by a host copy first could not be zeroed: no upload buffer (VICTORY_TEXTURE_POOL)"
+        );
+    }
 }
 
 /// What [`Staging::record_copies`] recorded.

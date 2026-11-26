@@ -2347,9 +2347,11 @@ fn host_texture_as(
         ..Default::default()
     };
     // A texture the title fills, whose every subresource is uploaded from
-    // its staging buffer before anything reads it: cut from a block of
-    // `crate::texture_pool` (`VICTORY_TEXTURE_POOL`; what the piece held
-    // before shows in no texel). One plane only: the upload writes plane 0.
+    // its staging buffer before anything reads it, or zeroed before a host
+    // copy that comes first (`crate::texture::card_writes`): cut from a
+    // block of `crate::texture_pool` (`VICTORY_TEXTURE_POOL`; what the piece
+    // held before shows in no texel). One plane only: the upload writes
+    // plane 0.
     if !reserved
         && crate::texture_pool::textures_on()
         && fills(desc)
