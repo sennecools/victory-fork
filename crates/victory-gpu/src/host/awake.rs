@@ -9,14 +9,18 @@
 //! One group of 64 threads counts on a compute queue of its own, over and
 //! over: it takes one or two of the card's few thousand wave slots, and the
 //! card is never idle. Nothing is sent once no submission has gone out for
-//! [`QUIET_MS`] (a menu at a low rate, a minimized window).
+//! [`QUIET_MS`]: a title that stands still, not a menu, which goes on
+//! drawing and so keeps the card awake too (cool_fox saw the compute queue
+//! at 100 % there as well).
 //!
 //! `VICTORY_CARD_AWAKE=turns`: [`TURN_MS`] on, as long off, by turns, to
 //! compare the two in one run (the log says when each turn starts).
 //!
-//! The counting thread is started at the first submission and runs as long
-//! as the process does; [`Awake`] stops it, waits for what it sent and
-//! closes its event when dropped.
+//! The counting thread is started at the first submission ([`sent`]) and
+//! is detached: its handle is forgotten, so it is never stopped and keeps
+//! its own reference to the device for the life of the process. Dropping
+//! an [`Awake`] stops the thread, waits for what it sent and closes its
+//! event, but only for callers of [`start`] that keep the handle.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -116,7 +120,8 @@ pub(super) fn sent(device: &ID3D12Device) {
     });
 }
 
-/// The thread that keeps the card busy; it ends when this is dropped.
+/// The thread that keeps the card busy; it ends when this is dropped
+/// ([`sent`] forgets its own, so that one runs as long as the process).
 pub(super) struct Awake {
     stop: std::sync::Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
