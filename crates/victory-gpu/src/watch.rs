@@ -727,28 +727,21 @@ fn publish(pages: &[usize]) {
     }
 }
 
-/// Whether the holes of placeholders are known for what they are
-/// (`VICTORY_KNOWN_HOLES=1`; off by default: every hole is looked at at
-/// every asking, as before): a block noted absent that lies in a placeholder
-/// is taken as absent until the runtime tells of a mapping there
-/// ([`title_memory_remapped`]) or an allocation ([`title_memory_allocated`]);
-/// the other holes are asked about with the guards' lock not held. Such
-/// holes are known by their bits too.
-///
-/// cool_fox measured, before its change, most ranges asked about having
-/// holes, reservations the title maps its pages into as it streams (1,125 of
-/// a frame's 1,530 asked view ranges): each asking put a question to Windows
-/// for each hole, under the guards' lock, and 111 ms a frame of all threads'
-/// time went into waiting for that lock. Ported from cool_fox 74045e4 (on
-/// there, with its light refresh).
-fn known_holes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_HOLES").is_some_and(|v| v == "1"))
-}
-
 /// Whether `block` lies in a placeholder: a reservation in which pages come
 /// to be only by mapping a view (or an allocation) in its place, which an
 /// ordinary commit cannot do.
+///
+/// The holes of placeholders are known for what they are (`Guards::held`):
+/// a block noted absent that lies in a placeholder is taken as absent until
+/// the runtime tells of a mapping there ([`title_memory_remapped`]) or an
+/// allocation ([`title_memory_allocated`]), and is known by its bits
+/// ([`PUBLISHED`]); the other holes are asked about with the guards' lock
+/// not held. cool_fox measured, before its change, most ranges asked about
+/// having holes, reservations the title maps its pages into as it streams
+/// (1,125 of a frame's 1,530 asked view ranges): each asking put a question
+/// to Windows for each hole, under the guards' lock, and 111 ms a frame of
+/// all threads' time went into waiting for that lock. Ported from cool_fox
+/// 74045e4 (its `VICTORY_KNOWN_HOLES`).
 fn placeholder(block: usize) -> bool {
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
@@ -793,30 +786,24 @@ fn placeholder(block: usize) -> bool {
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed (`victory-hle` xmem): what was known of holes there is asked
-/// again ([`known_holes`]).
+/// again ([`placeholder`]).
 pub fn title_memory_allocated(at: usize, len: usize) {
-    if len == 0 || !known_holes() {
+    if len == 0 {
         return;
     }
-    let mut g = guards();
-    let blocks = g
-        .held
-        .iter(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK))
-        .collect::<Vec<_>>();
-    for block in blocks {
-        g.held.remove(block);
-        PUBLISHED.clear(block);
-    }
+    guards().held.remove_range(
+        at / BLOCK,
+        at.saturating_add(len).div_ceil(BLOCK),
+        |block| PUBLISHED.clear(block),
+    );
 }
 
-/// Once a frame ([`known_holes`]): a hundredth of the known holes are looked
-/// at, in case one was filled with nobody telling ([`title_memory_allocated`],
-/// [`title_memory_remapped`]), which no title we know does.
+/// Once a frame: a hundredth of the known holes ([`placeholder`]) are
+/// looked at, in case one was filled with nobody telling
+/// ([`title_memory_allocated`], [`title_memory_remapped`]), which no title
+/// we know does.
 pub(crate) fn look_at_holes() {
     const PARTS: usize = 100;
-    if !known_holes() {
-        return;
-    }
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let blocks: Vec<usize> = {
         let g = guards();
@@ -843,7 +830,7 @@ pub(crate) fn look_at_holes() {
                 SAID.call_once(|| {
                     tracing::warn!(
                         address = format_args!("{:#x}", block * BLOCK),
-                        "a placeholder of the title's was filled with nobody telling (VICTORY_KNOWN_HOLES=1 takes its holes as known)"
+                        "a placeholder of the title's was filled with nobody telling (its holes are taken as known)"
                     );
                 });
             }
@@ -954,8 +941,7 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: Blocks,
-    /// Of those, the ones in placeholders (`VICTORY_KNOWN_HOLES=1`,
-    /// [`known_holes`]).
+    /// Of those, the ones in placeholders ([`placeholder`]).
     held: Blocks,
     /// Blocks whose physical page was guarded together with its other views
     /// (those views' blocks are in it too): a write to one opens them all.
@@ -1129,47 +1115,33 @@ fn cover(g: &mut Guards, block: usize) -> bool {
 /// written at the next asking; one forgotten is made read-only again, as
 /// any block that is not clean.
 fn guard_blocks(first: usize, last: usize) -> Vec<usize> {
-    let mut g = guards();
+    let g = guards();
     if g.clean.all(first, last) {
         // Nothing written, mapped or new since the range was last taken.
         return Vec::new();
     }
     // Holes that an ordinary commit may have filled, with no word of the
-    // runtime's: one question for the blocks of a region. With
-    // `VICTORY_KNOWN_HOLES=1` not those of placeholders, and the questions
-    // are put with the lock let go: what the runtime tells meanwhile takes a
-    // block out of the set, and it is looked at as any other below.
-    let holes = known_holes();
-    let unsure: Vec<usize> = if holes {
-        let unsure = g.absent.iter(first, last).collect::<Vec<_>>();
-        unsure
-            .into_iter()
-            .filter(|&block| !g.held.contains(block))
-            .collect()
-    } else {
-        g.absent.iter(first, last).collect::<Vec<_>>()
-    };
-    let came = |unsure: Vec<usize>| {
-        let mut came = Vec::new();
-        let mut uncommitted_until = first;
-        for block in unsure {
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
-            }
-            if block >= uncommitted_until {
-                came.push(block);
-            }
+    // runtime's: one question for the blocks of a region, none for those of
+    // placeholders ([`placeholder`]). The questions are put with the lock
+    // let go: what the runtime tells meanwhile takes a block out of the set,
+    // and it is looked at as any other below.
+    let unsure: Vec<usize> = g
+        .absent
+        .iter(first, last)
+        .filter(|&block| !g.held.contains(block))
+        .collect();
+    drop(g);
+    let mut came = Vec::new();
+    let mut uncommitted_until = first;
+    for block in unsure {
+        if block >= uncommitted_until {
+            uncommitted_until = uncommitted_end(block);
         }
-        came
-    };
-    let came = if holes {
-        drop(g);
-        let came = came(unsure);
-        g = guards();
-        came
-    } else {
-        came(unsure)
-    };
+        if block >= uncommitted_until {
+            came.push(block);
+        }
+    }
+    let mut g = guards();
     for block in came {
         g.absent.remove(block);
     }
@@ -1400,7 +1372,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         PROTECTED.clear(block);
         if block < uncommitted_end(block) {
             g.absent.insert(block);
-            if known_holes() && placeholder(block) {
+            if placeholder(block) {
                 g.held.insert(block);
             }
         }
@@ -3055,8 +3027,8 @@ mod tests {
 
     /// A range of a placeholder with views in it is told as written right
     /// whatever is mapped into it, unmapped from it or allocated there, and
-    /// with `VICTORY_KNOWN_HOLES=1` it is known
-    /// whole by its bits, its holes among it, until the runtime tells of
+    /// it is known whole by its bits, its holes among it, until the runtime
+    /// tells of
     /// such a change. Ported from cool_fox 74045e4 (our runtime tells of an
     /// unmapping as of any change, `title_memory_remapped`).
     #[test]
@@ -3069,7 +3041,6 @@ mod tests {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
         no_rest();
-        let bits = known_holes();
         // SAFETY (all): a placeholder and a section of our own, which stay.
         let (at, section) = unsafe {
             let at = VirtualAlloc2(
@@ -3125,7 +3096,7 @@ mod tests {
         };
         let (first, all) = ask(0);
         assert_eq!(all, (0..BLOCKS).collect::<Vec<_>>());
-        assert_eq!(published(at, end), bits, "with its holes");
+        assert!(published(at, end), "with its holes");
         // Written; mapped into; unmapped.
         // SAFETY (all): views of the test's own.
         unsafe { ((at + 5 * PAGE) as *mut u8).write_volatile(1) };
@@ -3148,7 +3119,7 @@ mod tests {
         }
         let (fifth, all) = ask(fourth);
         assert_eq!(all, [5]);
-        assert_eq!(published(at, end), bits);
+        assert!(published(at, end));
         // Told of memory there, though there is none: asked about again.
         title_memory_allocated(at, PAGE);
         assert!(!published(at, end));
@@ -3159,11 +3130,7 @@ mod tests {
             unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
         assert!(!placeholder(plain / PAGE));
         look_at_holes();
-        assert_eq!(
-            published(at + PAGE, end),
-            bits,
-            "the others are as they were"
-        );
+        assert!(published(at + PAGE, end), "the others are as they were");
         title_memory_remapped(at, BLOCKS * PAGE);
     }
 
