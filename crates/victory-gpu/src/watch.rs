@@ -148,21 +148,22 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    let left;
-    let ranges = if crate::host::r5_flush::on() {
-        left = without_known_views(ranges);
-        &left[..]
-    } else if light() {
-        left = without_guarded(ranges);
-        &left[..]
+    ask_ahead_in(&JOURNAL, &left_to_ask(ranges));
+}
+
+/// `ranges` without those the kernel would refuse, for the askings ahead
+/// ([`without_known_views`] with `VICTORY_R5_FLUSH=1`, else
+/// [`without_guarded`]).
+fn left_to_ask(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if crate::host::r5_flush::on() {
+        without_known_views(ranges)
     } else {
-        ranges
-    };
-    ask_ahead_in(&JOURNAL, ranges);
+        without_guarded(ranges)
+    }
 }
 
 /// `ranges` without those of which a block is read-only by our hand, by the
-/// bits (`VICTORY_LIGHT_REFRESH=1`, [`PROTECTED`]), for the askings ahead:
+/// bits ([`PROTECTED`]), for the askings ahead:
 /// the kernel would refuse the asking, and, asked together with others,
 /// theirs (cool_fox 2aa8134). [`writes`] answers them from the bits or the
 /// guards.
@@ -331,17 +332,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    let left;
-    let ranges = if crate::host::r5_flush::on() {
-        left = without_known_views(ranges);
-        &left[..]
-    } else if light() {
-        left = without_guarded(ranges);
-        &left[..]
-    } else {
-        ranges
-    };
-    ask_once_in(&JOURNAL, ranges);
+    ask_once_in(&JOURNAL, &left_to_ask(ranges));
 }
 
 /// [`ask_once`] in `journal`, whatever [`once`] says.
@@ -554,8 +545,7 @@ fn writes_in(
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((j.ahead_asked, j.pages(first, last, since)));
     }
-    // Read-only since an asking noted it (`VICTORY_LIGHT_REFRESH=1`): the
-    // journal has every write of it.
+    // Read-only since an asking noted it: the journal has every write of it.
     if guarded && published(first * PAGE, last * PAGE) {
         j.asked += 1;
         return Some((j.asked, j.pages(first, last, since)));
@@ -568,7 +558,7 @@ fn writes_in(
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
-    // (With `VICTORY_LIGHT_REFRESH=1`, any block of the range by the bits.)
+    // (Any block of the range, by the bits.)
     let known_view =
         guarded && (protected_bits(first * PAGE, last * PAGE) || known_view(first * PAGE));
     let asking = crate::profile::refresh_stamp();
@@ -615,8 +605,6 @@ fn writes_in(
     } else {
         Vec::new()
     };
-    // What the guards made clean of it is published once noted, below.
-    let publishing = (failed && light()).then(|| guarded.clone());
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -633,10 +621,11 @@ fn writes_in(
             .chain(guarded.iter().copied()),
         now,
     );
-    // Noted: from now on the bits tell of it (the journal's lock is still
-    // held, no other asking of it came between).
-    if let Some(pages) = publishing {
-        publish(&pages);
+    // What the guards made clean of it is noted: from now on the bits tell
+    // of it (the journal's lock is still held, no other asking of it came
+    // between).
+    if failed {
+        publish(&guarded);
     }
     Some((now, j.pages(first, last, since)))
 }
@@ -682,37 +671,19 @@ impl Tracked {
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
-/// Whether view memory the guards hold is known by bits read with no lock
-/// (`VICTORY_LIGHT_REFRESH=1`; off by default, as before):
+/// The blocks that are read-only by our hand, not written since, and of
+/// which the journal holds every write from before that: for those, what
+/// [`writes`] answers is in the journal, and neither the kernel nor the
+/// guards need be asked; what [`nothing_new`] knows of view memory, it knows
+/// from these bits.
 ///
-/// - [`writes`] answers for view memory nothing wrote since an asking noted
-///   it ([`PUBLISHED`]) from the journal, with neither the guards' lock nor
-///   their walk of the range;
-/// - the kernel is not asked about a range of which a block is read-only by
-///   our hand ([`PROTECTED`]; it would refuse), whether or not its first
-///   block is, nor about such a range among the askings ahead
-///   ([`without_guarded`]);
-/// - who writes title memory, or faults on it, and finds no block of it
-///   read-only by our hand ([`writing`], [`title_memory_written`], the
-///   handler of [`install`]) does not wait for the guards' lock;
-/// - what [`nothing_new`] knows of view memory, it knows from the bits.
-///
-/// cool_fox measured, before its change, a frame asking about view memory
+/// cool_fox measured, before these bits, a frame asking about view memory
 /// some 1,500 times, nearly always to hear that nothing was written, on up
 /// to seven threads at once, each under the guards' one lock: 94 ms a frame
 /// of all threads' time, most of it waiting. Ported from cool_fox 2aa8134
-/// (its `VICTORY_LIGHT_REFRESH`, on there; only its watch part), 74045e4
-/// (`PROTECTED`) and 7bc7c07 (the handler), with the race fixes of
+/// (its `VICTORY_LIGHT_REFRESH`; only its watch part), 74045e4
+/// ([`PROTECTED`]) and 7bc7c07 (the handler), with the race fixes of
 /// 2be0515/689df31 ([`unguard`]).
-pub(crate) fn light() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIGHT_REFRESH").is_some_and(|v| v == "1"))
-}
-
-/// The blocks that are read-only by our hand, not written since, and of
-/// which the journal holds every write from before that ([`light`]): for
-/// those, what [`writes`] answers is in the journal, and neither the kernel
-/// nor the guards need be asked.
 ///
 /// Why that is so: a block's bit is set under the guards' lock while the
 /// block is clean, by the asking that made it clean, after that asking noted
@@ -728,10 +699,16 @@ pub(crate) fn light() -> bool {
 /// comes just after an asking: the next asking finds the block open.
 static PUBLISHED: Bits = Bits::new();
 
-/// The blocks read-only by our hand, or about to be ([`light`]): set under
-/// the guards' lock ahead of the protection, cleared under it once the block
-/// is open again. Who finds none set has no guard to open and need not wait
-/// for the lock.
+/// The blocks read-only by our hand, or about to be: set under the guards'
+/// lock ahead of the protection, cleared under it once the block is open
+/// again (or forgotten, [`title_memory_remapped`]), on every path. So a
+/// block read-only by our hand always has its bit set, and every block in
+/// `Guards::protected` does. Who finds none set has no guard to open and
+/// need not wait for the lock: the kernel is not asked about such a range
+/// (it would refuse), nor such a range among the askings ahead
+/// ([`without_guarded`]), and who writes title memory, or faults on it, and
+/// finds no block of it set ([`writing`], [`title_memory_written`], the
+/// handler of [`install`]) takes no lock.
 static PROTECTED: Bits = Bits::new();
 
 /// An asking made blocks of `pages` clean and noted them in the journal
@@ -755,8 +732,8 @@ fn publish(pages: &[usize]) {
 /// every asking, as before): a block noted absent that lies in a placeholder
 /// is taken as absent until the runtime tells of a mapping there
 /// ([`title_memory_remapped`]) or an allocation ([`title_memory_allocated`]);
-/// the other holes are asked about with the guards' lock not held. With
-/// `VICTORY_LIGHT_REFRESH=1` such holes are known by their bits too.
+/// the other holes are asked about with the guards' lock not held. Such
+/// holes are known by their bits too.
 ///
 /// cool_fox measured, before its change, most ranges asked about having
 /// holes, reservations the title maps its pages into as it streams (1,125 of
@@ -877,21 +854,21 @@ pub(crate) fn look_at_holes() {
 /// Whether nothing of `[start, end)` can have been written since an asking
 /// noted it in the journal ([`PUBLISHED`]).
 fn published(start: usize, end: usize) -> bool {
-    light() && PUBLISHED.all(start / BLOCK, end.div_ceil(BLOCK))
+    PUBLISHED.all(start / BLOCK, end.div_ceil(BLOCK))
 }
 
 /// Whether a block of `[start, end)` is read-only by our hand, by the bits
-/// ([`PROTECTED`]): always false without [`light`].
+/// ([`PROTECTED`]).
 fn protected_bits(start: usize, end: usize) -> bool {
-    light() && PROTECTED.any(start / BLOCK, end.div_ceil(BLOCK))
+    PROTECTED.any(start / BLOCK, end.div_ceil(BLOCK))
 }
 
 /// Whether a flush of host copies leaves out those that it knows have
 /// nothing new, before any thread is woken and anything asked for them
 /// (`VICTORY_NOTHING_NEW=1`; off by default, as before;
 /// `crate::shadow::Shadow::nothing_new`, [`nothing_new`]). What it knows is
-/// the submission's asking ahead (write-watched memory), and with
-/// `VICTORY_LIGHT_REFRESH=1` the bits of view memory ([`PUBLISHED`]).
+/// the submission's asking ahead (write-watched memory) and the bits of view
+/// memory ([`PUBLISHED`]).
 ///
 /// Ported from cool_fox 2aa8134, where it is part of `VICTORY_LIGHT_REFRESH`.
 pub(crate) fn skip_unchanged() -> bool {
@@ -1108,27 +1085,21 @@ fn set_rest_in_test(rest: std::time::Duration) {
     REST_IN_TEST.set(Some(rest));
 }
 
-/// Whether a block read-only by our hand whose page has other views can be
-/// left with one of those writable ([`open_one_view`], [`rest`]): then the
-/// block is clean only once they are read-only too ([`cover`]).
-fn covering() -> bool {
-    open_one_view() || !rest().is_zero()
-}
-
-/// With [`covering`] or [`light`]: makes the other views of `block`'s page
-/// read-only, as [`protect`] does; whether all of them are now (none rests
-/// or failed). Without them true, as before: the views were guarded with
-/// the block, and a write told at one that could not be is found by
-/// [`open`] through the guards' lock.
+/// Makes the other views of `block`'s page read-only, as [`protect`] does;
+/// whether all of them are now (none rests or failed).
 ///
-/// With [`light`] a block is clean, and so known by its bits, only while
-/// every other view of its page is read-only by our hand: a write told at
-/// one that is not ([`writing`], [`title_memory_written`]) takes no lock
-/// and opens nothing. [`protect`] keeps such a block from being clean; the
-/// next asking, finding it read-only and not clean, must not note it clean
-/// either until the other views are guarded.
+/// A block read-only by our hand whose page has other views can be left
+/// with one of those writable: a write fault may open only the view it came
+/// through ([`open_one_view`]), and a view that rests ([`rest`]) or cannot be
+/// guarded stays open. A block is clean, and so known by its bits, only
+/// while every other view of its page is read-only by our hand: a write
+/// told at one that is not ([`writing`], [`title_memory_written`]) takes no
+/// lock and opens nothing. [`protect`] keeps such a block from being clean;
+/// the next asking, finding it read-only and not clean, must not note it
+/// clean either until the other views are guarded. With
+/// `VICTORY_VIEW_GUARD=0` the other views are left as they are: true.
 fn cover(g: &mut Guards, block: usize) -> bool {
-    if !(covering() || light()) || !view_guard() {
+    if !view_guard() {
         return true;
     }
     let shown = crate::inplace::pages_of(block * BLOCK);
@@ -1315,11 +1286,10 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             for alias in shown {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
-                // With `VICTORY_LIGHT_REFRESH=1` (or [`covering`]), a block
-                // with a view beside it that could not be guarded, or rests,
-                // is not clean: a write through that view is not seen, nor
-                // (by the bits) one told there.
-                if alias != block && !protect_alias(g, alias) && (light() || covering()) {
+                // A block with a view beside it that could not be guarded,
+                // or rests, is not clean: a write through that view is not
+                // seen, nor (by the bits) one told there.
+                if alias != block && !protect_alias(g, alias) {
                     g.clean.remove(block);
                 }
             }
@@ -1361,11 +1331,8 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     if g.rests(block, rest()) {
         return false;
     }
-    let light = light();
-    if light {
-        // Ahead of the protection.
-        PROTECTED.set(block);
-    }
+    // Ahead of the protection.
+    PROTECTED.set(block);
     let mut old = 0;
     let timed = protect_timer();
     // SAFETY: title view memory; only its protection changes.
@@ -1374,7 +1341,7 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     protected(timed, usize::from(done));
     if done {
         g.protected.insert(block);
-    } else if light {
+    } else {
         PROTECTED.clear(block);
     }
     done
@@ -1419,11 +1386,8 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);
     };
-    let light = light();
-    if light {
-        // Ahead of the protection (`PROTECTED`).
-        (from..to).for_each(|block| PROTECTED.set(block));
-    }
+    // Ahead of the protection (`PROTECTED`).
+    (from..to).for_each(|block| PROTECTED.set(block));
     if set(from, to) {
         note(g, from, to);
         return;
@@ -1433,9 +1397,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
             continue;
         }
-        if light {
-            PROTECTED.clear(block);
-        }
+        PROTECTED.clear(block);
         if block < uncommitted_end(block) {
             g.absent.insert(block);
             if known_holes() && placeholder(block) {
@@ -1462,41 +1424,14 @@ fn uncommitted_end(block: usize) -> usize {
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded. The same physical pages at
-/// every other view of them are opened too: the write that faulted (or is
-/// ours, `crate::host::copy_mapped`) goes through one view, and every
-/// guard over the pages must copy them again.
+/// notes them written; true if any was guarded. The blocks of `[start, end)`
+/// and those of the other views of their pages are opened together
+/// ([`unguard`]); with [`open_one_view`] the other views stay read-only and
+/// are no longer clean (told as written before the first block is
+/// writable). The write that faulted (or is ours, `crate::host::copy_mapped`)
+/// goes through one view, and every guard over the pages must copy them
+/// again.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    if light() || open_one_view() {
-        return open_together(g, start, end);
-    }
-    let any = open_here(g, start, end);
-    if start >= end || g.aliased.len() == 0 {
-        return any;
-    }
-    let aliased: Vec<usize> = g
-        .aliased
-        .iter(start / BLOCK, end.div_ceil(BLOCK))
-        .collect::<Vec<_>>();
-    for block in aliased {
-        g.aliased.remove(block);
-        for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
-                #[cfg(feature = "diagnostics")]
-                ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            g.aliased.remove(alias / BLOCK);
-        }
-    }
-    any
-}
-
-/// [`open`] with `VICTORY_LIGHT_REFRESH=1` or `VICTORY_OPEN_ONE_VIEW=1`:
-/// the blocks of `[start, end)` and those of the other views of their pages
-/// are opened together ([`unguard`]); with [`open_one_view`] the other views
-/// stay read-only and are no longer clean (told as written before the first
-/// block is writable).
-fn open_together(g: &mut Guards, start: usize, end: usize) -> bool {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return false;
@@ -1525,17 +1460,15 @@ fn open_together(g: &mut Guards, start: usize, end: usize) -> bool {
     any
 }
 
-/// Gives write access back to `blocks`, guarded ones, with
-/// `VICTORY_LIGHT_REFRESH=1`: all of them are told as written
-/// ([`PUBLISHED`]) before the first can be written, for a write through one
-/// is a write of the others' bytes, and who asks about one by its bits takes
-/// no lock. Their [`PROTECTED`] bits go once they are writable.
+/// Gives write access back to `blocks`, guarded ones: all of them are told
+/// as written ([`PUBLISHED`]) before the first can be written, for a write
+/// through one is a write of the others' bytes, and who asks about one by
+/// its bits takes no lock. Their [`PROTECTED`] bits go once they are
+/// writable.
 ///
 /// The race fix of cool_fox 2be0515 (also 689df31, the same change on
 /// another line): opened one range after another, one view was writable
-/// for some microseconds while another was still known by its bits. Our
-/// line without the bits does not have that race: who looks at a block
-/// waits for the guards' lock, held until every view is open.
+/// for some microseconds while another was still known by its bits.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     for &block in blocks {
@@ -1551,35 +1484,17 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     }
 }
 
-/// [`open`] for one range, without the other views of its pages.
-fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .iter(start / BLOCK, end.div_ceil(BLOCK))
-        .collect::<Vec<_>>();
-    for &block in &blocks {
-        g.protected.remove(block);
-        g.clean.remove(block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
-    }
-    !blocks.is_empty()
-}
-
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    // With `VICTORY_LIGHT_REFRESH=1` the guards' lock only if a block of it
-    // is read-only by our hand (an other view's is opened only with its own;
-    // [`protect`] and [`cover`] leave no view clean beside one they could
-    // not guard).
+    // The guards' lock only if a block of it is read-only by our hand (an
+    // other view's is opened only with its own; [`protect`] and [`cover`]
+    // leave no view clean beside one they could not guard).
     let end = at.saturating_add(len);
-    if !light() || PROTECTED.any(at / BLOCK, end.div_ceil(BLOCK)) {
+    if PROTECTED.any(at / BLOCK, end.div_ceil(BLOCK)) {
         open(&mut guards(), at, end);
     }
     // A placed texture there changes with no descriptor written.
@@ -1649,9 +1564,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             return;
         }
     }
-    // With `VICTORY_LIGHT_REFRESH=1`, nothing to count or open if no block
-    // of it is read-only by our hand.
-    if !light() || PROTECTED.any(at / BLOCK, end.div_ceil(BLOCK)) {
+    // Nothing to count or open if no block of it is read-only by our hand.
+    if PROTECTED.any(at / BLOCK, end.div_ceil(BLOCK)) {
         let mut g = guards();
         let guarded = g.protected.count(at / BLOCK, end.div_ceil(BLOCK)) as u64;
         if pages {
@@ -1680,31 +1594,21 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
         return;
     }
     let mut g = guards();
-    if light() {
-        // All views together, under the lock: none may be writable while
-        // another is known by its bits (cool_fox 2be0515, [`unguard`]).
-        let blocks: Vec<usize> = ranges
-            .iter()
-            .flat_map(|&(at, n)| {
-                g.protected
-                    .iter(at / BLOCK, at.saturating_add(n).div_ceil(BLOCK))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        #[cfg(feature = "diagnostics")]
-        ALIASES[2].fetch_add(
-            u64::from(!blocks.is_empty()),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        unguard(&mut g, &blocks);
-        return;
-    }
-    for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
-            #[cfg(feature = "diagnostics")]
-            ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
+    // All views together, under the lock: none may be writable while
+    // another is known by its bits (cool_fox 2be0515, [`unguard`]).
+    let blocks: Vec<usize> = ranges
+        .iter()
+        .flat_map(|&(at, n)| {
+            g.protected
+                .iter(at / BLOCK, at.saturating_add(n).div_ceil(BLOCK))
+        })
+        .collect();
+    #[cfg(feature = "diagnostics")]
+    ALIASES[2].fetch_add(
+        u64::from(!blocks.is_empty()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    unguard(&mut g, &blocks);
 }
 
 /// Held shared by a read of title memory in place, and alone by the runtime
@@ -1881,24 +1785,25 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::memory::remapped(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.iter(range.start, range.end).collect::<Vec<_>>();
-    for block in absent {
-        g.absent.remove(block);
-        if g.held.remove(block) {
+    let Guards {
+        protected,
+        clean,
+        absent,
+        held,
+        aliased,
+        ..
+    } = &mut *g;
+    absent.remove_range(range.start, range.end, |block| {
+        if held.remove(block) {
             PUBLISHED.clear(block);
         }
-    }
-    let blocks: Vec<usize> = g.protected.iter(range.start, range.end).collect::<Vec<_>>();
-    let light = light();
-    for block in blocks {
-        g.protected.remove(block);
-        g.clean.remove(block);
-        if light {
-            PUBLISHED.clear(block);
-            PROTECTED.clear(block);
-        }
-    }
-    g.aliased.remove_range(range.start, range.end, |_| {});
+    });
+    protected.remove_range(range.start, range.end, |block| {
+        clean.remove(block);
+        PUBLISHED.clear(block);
+        PROTECTED.clear(block);
+    });
+    aliased.remove_range(range.start, range.end, |_| {});
     // What rested there was the old mapping's (`VICTORY_GUARD_REST`,
     // [`rest`]): the new one is guarded at the next asking, as any other.
     if !g.opened.is_empty() {
@@ -1950,10 +1855,10 @@ pub(crate) fn install() {
             };
         }
         let at = r.ExceptionInformation[1];
-        // With `VICTORY_LIGHT_REFRESH=1`: another thread opened the block
-        // since this one faulted, nothing to wait for the guards' lock for
-        // (cool_fox 7bc7c07).
-        if light() && !PROTECTED.any(at / BLOCK, at / BLOCK + 1) && writable(at) {
+        // Another thread opened the block since this one faulted ([`PROTECTED`]
+        // is cleared only once a block is writable again): nothing to wait for
+        // the guards' lock for (cool_fox 7bc7c07).
+        if !PROTECTED.any(at / BLOCK, at / BLOCK + 1) && writable(at) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Held across both checks: another thread may have opened the block
@@ -2593,8 +2498,7 @@ mod tests {
     /// A range nothing wrote is known to be as it was without asking
     /// (`nothing_new`), and is so no more once something wrote it: in
     /// write-watched memory from the submission's asking, in view memory
-    /// from the bits (`VICTORY_LIGHT_REFRESH=1`; without it view memory is
-    /// never known so). Ported from cool_fox 2aa8134's
+    /// from the bits. Ported from cool_fox 2aa8134's
     /// `unchanged_ranges_are_known`, at the watch's level (ours copies the
     /// ends of a range as before, so the range is whole pages).
     #[test]
@@ -2646,8 +2550,6 @@ mod tests {
                 ask_once_end();
                 known
             };
-            // Whether it is known, as it should be.
-            let expect = !view || light();
             assert!(
                 !nothing_new(start, end, start / PAGE, &copied),
                 "view {view}: never taken"
@@ -2655,16 +2557,16 @@ mod tests {
             take(start, end, view, &mut copied);
             // (Taken twice: the first asking of view memory guards it.)
             take(start, end, view, &mut copied);
-            assert_eq!(known(&copied), expect, "view {view}: taken");
+            assert!(known(&copied), "view {view}: taken");
             // SAFETY: the test's own memory.
             unsafe { ((at + 2 * PAGE + 8) as *mut u8).write_volatile(1) };
             assert!(!known(&copied), "view {view}: written");
             take(start, end, view, &mut copied);
-            assert_eq!(known(&copied), expect, "view {view}: taken again");
+            assert!(known(&copied), "view {view}: taken again");
             // Outside the range: as it was.
             // SAFETY: as above.
             unsafe { ((at + (PAGES - 1) * PAGE + 8) as *mut u8).write_volatile(1) };
-            assert_eq!(known(&copied), expect, "view {view}: written outside it");
+            assert!(known(&copied), "view {view}: written outside it");
             // A longer range was never taken whole.
             assert!(!nothing_new(
                 start,
@@ -2683,8 +2585,7 @@ mod tests {
     /// through any of its views, or by us after telling of it (`writing`),
     /// and with views of its pages mapped and unmapped meanwhile: every
     /// asking after a write tells of it, at every view, whatever is known by
-    /// the bits (`VICTORY_LIGHT_REFRESH=1`) and whichever switches of the
-    /// guards are on. Ported from cool_fox 2aa8134/7bc7c07/2be0515's
+    /// the bits and whichever switches of the guards are on. Ported from cool_fox 2aa8134/7bc7c07/2be0515's
     /// `writes_to_views_are_not_lost` (without its writes past the guards,
     /// which our line does not have).
     fn writes_to_views_are_not_lost<const VIEWS: usize>(rest_us: u64) {
@@ -2823,30 +2724,28 @@ mod tests {
                 });
             }
         });
-        if light() {
-            // A block that rests after a write (`VICTORY_GUARD_REST`) is not
-            // clean, so not known by its bits, until an asking after its
-            // rest; here the title writes every page again within
-            // milliseconds, and with three views a page is clean only once
-            // none of its views rests: with a rest of milliseconds the bits
-            // may answer none of the askings above. Without a rest they
-            // must.
-            if super::rest().is_zero() {
-                assert!(by_bits.into_inner() > 0, "the bits answered none");
-            }
-            // Either way: once nothing has been written for longer than any
-            // rest, one asking at each view has every view known by its
-            // bits.
-            std::thread::sleep(super::rest().max(rest) + std::time::Duration::from_millis(1));
-            for &at in &all {
-                writes(at, at + PAGES * PAGE, true, 0).expect("a view");
-            }
-            for &at in &all {
-                assert!(
-                    published(at, at + PAGES * PAGE),
-                    "nothing written since: the bits know the view at {at:x}"
-                );
-            }
+        // A block that rests after a write (`VICTORY_GUARD_REST`) is not
+        // clean, so not known by its bits, until an asking after its
+        // rest; here the title writes every page again within
+        // milliseconds, and with three views a page is clean only once
+        // none of its views rests: with a rest of milliseconds the bits
+        // may answer none of the askings above. Without a rest they
+        // must.
+        if super::rest().is_zero() {
+            assert!(by_bits.into_inner() > 0, "the bits answered none");
+        }
+        // Either way: once nothing has been written for longer than any
+        // rest, one asking at each view has every view known by its
+        // bits.
+        std::thread::sleep(super::rest().max(rest) + std::time::Duration::from_millis(1));
+        for &at in &all {
+            writes(at, at + PAGES * PAGE, true, 0).expect("a view");
+        }
+        for &at in &all {
+            assert!(
+                published(at, at + PAGES * PAGE),
+                "nothing written since: the bits know the view at {at:x}"
+            );
         }
     }
 
@@ -2976,9 +2875,9 @@ mod tests {
 
     /// A page with a view beside the guarded one that cannot be made
     /// read-only (partly committed: one kernel page of its block): a write
-    /// told there (`writing`) is told at the guarded view, at every asking,
-    /// whichever switches are on. With `VICTORY_LIGHT_REFRESH=1` the guarded
-    /// block must not be noted clean, nor known by its bits, while the other
+    /// told there (`writing`) is told at the guarded view, at every asking.
+    /// The guarded block must not be noted clean, nor known by its bits,
+    /// while the other
     /// view is writable: the told write takes no lock there and would open
     /// nothing. (Which view shows which pages is what the runtime tells; the
     /// test tells it so of a view of another section.)
@@ -3020,14 +2919,10 @@ mod tests {
         };
         let page = guarded / PAGE;
         assert_eq!(guard(guarded, guarded + BLOCK), Some(vec![page]));
-        // Without the bits, nor a view left open by a switch, the block is
-        // clean as before (a told write finds it through the guards' lock).
-        let unsure = light() || covering();
         for asking in 1..3 {
-            let expect = if unsure { vec![page] } else { Vec::new() };
             assert_eq!(
                 guard(guarded, guarded + BLOCK),
-                Some(expect),
+                Some(vec![page]),
                 "asking {asking}: another view of it is writable"
             );
             assert!(!published(guarded, guarded + BLOCK), "asking {asking}");
@@ -3054,7 +2949,7 @@ mod tests {
 
     /// A range of a placeholder with views in it is told as written right
     /// whatever is mapped into it, unmapped from it or allocated there, and
-    /// with `VICTORY_KNOWN_HOLES=1` and `VICTORY_LIGHT_REFRESH=1` it is known
+    /// with `VICTORY_KNOWN_HOLES=1` it is known
     /// whole by its bits, its holes among it, until the runtime tells of
     /// such a change. Ported from cool_fox 74045e4 (our runtime tells of an
     /// unmapping as of any change, `title_memory_remapped`).
@@ -3068,7 +2963,7 @@ mod tests {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
         no_rest();
-        let bits = light() && known_holes();
+        let bits = known_holes();
         // SAFETY (all): a placeholder and a section of our own, which stay.
         let (at, section) = unsafe {
             let at = VirtualAlloc2(
