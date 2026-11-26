@@ -992,6 +992,14 @@ pub(crate) fn resolve(
     big: bool,
     card: &mut dyn FnMut() -> bool,
 ) -> Found {
+    // After the release at the title's end no home is made or found.
+    // (Asked without the core's lock: a resolve that passed this just
+    // before the flag was set can table its home after `release_all`. It is
+    // a leak, not a fault: no submission runs then, and the home keeps its
+    // heap and claim, counted as `claims_left` or `chunks_held`.)
+    if crate::release::released() {
+        return Found::Copy;
+    }
     resolve_with(Gate::process(), start, len, window, big, card)
 }
 
@@ -1189,6 +1197,43 @@ fn let_go_over(at: usize, len: usize, now: bool) -> u64 {
         crate::host::retire(home);
     }
     gone
+}
+
+/// At the title's end (`crate::release`): the buffers of every home in the
+/// tables (their COM pointers), for the view heap slots that name them.
+pub(crate) fn home_buffers() -> std::collections::HashSet<usize> {
+    let homes: Vec<Arc<Shadow>> = core()
+        .tabled
+        .values()
+        .flatten()
+        .filter_map(|(_, _, home)| home.upgrade())
+        .collect();
+    // (Dropped without the core's lock: a home's end takes it.)
+    homes
+        .iter()
+        .map(|home| home.buffer.as_raw() as usize)
+        .collect()
+}
+
+/// At the title's end (`crate::release`): every home is let go as a
+/// protection lets the homes over its pages go (out of the tables and the
+/// directory at once, retired), and so are `VICTORY_INPLACE`'s placements,
+/// every one of them. A home of [`Kind::Private`] gives its claim back when
+/// its `Shadow` goes ([`gone`]). Not asked of [`on`]: with the core off the
+/// tables are empty. Returns how many were let go.
+pub(crate) fn release_all() -> u64 {
+    crate::inplace::let_go_all(0, usize::MAX) + let_go_over(0, usize::MAX, true)
+}
+
+/// The claims of homes of [`Kind::Private`] still standing, and their
+/// bytes: homes something still holds (`crate::release` reports them).
+pub(crate) fn claims_left() -> (u64, u64) {
+    let core = core();
+    core.live
+        .iter()
+        .fold((0, 0), |(n, bytes), (&(_, len), &count)| {
+            (n + u64::from(count), bytes + len * u64::from(count))
+        })
 }
 
 /// The homes over the memory frees and remaps let homes go from since the

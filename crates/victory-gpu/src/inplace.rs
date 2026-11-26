@@ -358,6 +358,18 @@ pub(crate) fn let_go(at: usize, len: usize) -> u64 {
     gone
 }
 
+/// [`let_go`] over every title buffer placed in `[at, at + len)`, not only
+/// those a lookup near its end would find: at the title's end
+/// (`crate::release`).
+pub(crate) fn let_go_all(at: usize, len: usize) -> u64 {
+    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let gone = crate::shadow::in_place_let_go_all(at as u64, len as u64);
+    STATS[7].fetch_add(gone, Ordering::Relaxed);
+    gone
+}
+
 /// The line of what is in place, every ten seconds while [`level`] is on.
 fn say() {
     static LAST: AtomicU64 = AtomicU64::new(0);
@@ -1555,6 +1567,36 @@ mod tests {
             assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// At the title's end every placed title buffer is let go, not only the
+    /// 256 that a lookup near the end of a range finds: of 300 placed in a
+    /// row, the lookup's window lets 256 go and [`let_go_all`] the rest.
+    #[test]
+    fn warp_every_placed_title_buffer_is_let_go_at_the_end() {
+        const N: usize = 300;
+        let Some(host) = crate::host::host() else { return };
+        if host.device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        let switches = Switches { level: 2, late: false, core: false };
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), N * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as u64;
+            assert_ne!(base, 0);
+            let starts: Vec<u64> = (0..N).map(|i| base + (i * K64) as u64).collect();
+            for &start in &starts {
+                let placed = place_for_with(switches, start, K64 as u64, false).expect("placed");
+                crate::shadow::table_placed_for_test(start as usize, placed, start, K64 as u64);
+            }
+            assert_eq!(let_go(base as usize, N * K64), 256, "the lookup's window");
+            assert_eq!(let_go_all(base as usize, N * K64), (N - 256) as u64, "the rest");
+            for &start in &starts {
+                assert!(crate::shadow::tabled_copy(start).is_none(), "{start:#x} let go");
+                crate::shadow::unregister(start as usize, start);
+            }
+            mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 

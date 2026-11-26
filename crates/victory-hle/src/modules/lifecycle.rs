@@ -3,7 +3,10 @@
 //! routines run, and it has a second to save) and then ends the process.
 //! Closing the window (the title's, or the one `victory-gpu` presents in)
 //! does the same here; a new launch then starts `victory` again, which
-//! waits for this process to be gone.
+//! waits for this process to be gone. So does the run's tooling's orderly
+//! stop (`VICTORY_STOP_EVENT`, [`watch_stop_event`]). Before the process
+//! ends, the title's memory the GPU side opened as heaps is released
+//! (`victory_gpu::release`).
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -21,6 +24,11 @@ use windows_sys::core::{PCSTR, PCWSTR, w};
 
 use crate::{HleModule, hle_export};
 
+/// The run's tooling's orderly stop (`VICTORY_STOP_EVENT`).
+mod stop;
+
+pub use stop::watch_stop_event;
+
 type Routine = extern "system" fn(quiesced: u8, context: *mut c_void);
 
 /// Registration id, routine and context of each suspend routine.
@@ -32,6 +40,11 @@ fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
 
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
+
+/// How long the release of the title's memory at its end waits for the card
+/// (`victory_gpu::release::title_memory`): well within the 30 s the run's
+/// tooling gives an orderly stop.
+const RELEASE_DEADLINE: Duration = Duration::from_secs(5);
 
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
@@ -334,10 +347,31 @@ pub fn wait_for_previous() {
     }
 }
 
+/// The orderly stop was asked for ([`watch_stop_event`]): the title ends as
+/// when its window is closed.
+fn stop_requested() {
+    end_title("stop requested", Box::new(|| {}));
+}
+
+/// Tests: the times the process would have ended ([`end`]).
+#[cfg(test)]
+static ENDS: AtomicUsize = AtomicUsize::new(0);
+
 fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // Tests: the process goes on (and its GPU side is left as it is).
+    if cfg!(test) {
+        #[cfg(test)]
+        ENDS.fetch_add(1, Ordering::SeqCst);
+        return;
+    }
+    // The heaps opened on the title's memory, which a process ended with
+    // them standing leaves charged to the system's commit. (`end_title`'s
+    // second finisher waits on its lock meanwhile, up to the deadline and
+    // the release's grace: as it should, the process ends once.)
+    victory_gpu::release::title_memory(RELEASE_DEADLINE);
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
@@ -363,6 +397,37 @@ mod tests {
     use super::*;
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
+
+    /// The orderly stop's event, set from another thread, ends the title
+    /// the way a closed window does: suspended, then the end path (a test
+    /// stand-in for the end of the process). The only test that ends it.
+    #[test]
+    fn a_stop_event_ends_the_title() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+        let name = format!("Local\\victory-stop-test-end-{}", std::process::id());
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: a nul-terminated name; no attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
+        assert!(!event.is_null());
+        assert!(stop::watch(&name, stop_requested));
+        assert_eq!(ENDS.load(Ordering::SeqCst), 0, "not before it is set");
+        let event = event as usize;
+        // SAFETY: our own event.
+        std::thread::spawn(move || unsafe { SetEvent(event as _) })
+            .join()
+            .unwrap();
+        let began = std::time::Instant::now();
+        while ENDS.load(Ordering::SeqCst) == 0 {
+            assert!(
+                began.elapsed() < Duration::from_secs(10),
+                "the end path ran"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: our own handle.
+        unsafe { CloseHandle(event as _) };
+    }
 
     #[test]
     fn registrations_come_and_go() {

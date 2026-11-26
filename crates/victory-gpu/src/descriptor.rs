@@ -284,6 +284,29 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// At the title's end (`crate::release`): the slots of every shader-visible
+/// heap whose host resource `ours` names let it go (`HostHeap::let_go_kept`).
+/// Returns how many did.
+#[cfg(windows)]
+pub(crate) fn let_go_slots(
+    ours: &dyn Fn(&windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool,
+) -> u64 {
+    let mut out = Vec::new();
+    {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed when dropped).
+            let heap = unsafe { &*(at as *const Heap) };
+            if let Some(Some(host)) = heap.host.get() {
+                host.let_go_kept(ours, &mut out);
+            }
+        }
+    }
+    let n = out.len() as u64;
+    drop(out);
+    n
+}
+
 /// For the profile's sample (`VICTORY_PROFILE_SAMPLES`): over the host
 /// heaps of shader-visible heaps, the distinct views their made slots were
 /// made from (which sizes a pool of one descriptor per distinct record),

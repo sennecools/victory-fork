@@ -4154,6 +4154,19 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// tables, so that the next ask makes a copy or opens the memory anew, and
 /// goes when no list and no slot holds it any more. Returns how many.
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
+    let_go_placed(at, len, Some(256))
+}
+
+/// [`in_place_let_go`] over every title buffer that starts below the end,
+/// not only the 256 nearest: at the title's end (`crate::release`), over
+/// the whole address space.
+pub(crate) fn in_place_let_go_all(at: u64, len: u64) -> u64 {
+    let_go_placed(at, len, None)
+}
+
+/// [`in_place_let_go`]: `look`, the title buffers starting below the end
+/// that are looked at (`None`: all of them).
+fn let_go_placed(at: u64, len: u64, look: Option<usize>) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
@@ -4166,9 +4179,14 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
-        // As `lookup` finds a buffer: among the 256 that start below.
+        // As `lookup` finds a buffer: among the 256 that start below (or,
+        // at the title's end, all of them).
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        for (_, entry) in map
+            .range_mut(..(end, 0))
+            .rev()
+            .take(look.unwrap_or(usize::MAX))
+        {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
@@ -4281,6 +4299,20 @@ pub(crate) fn let_go_copies_for_test(start: u64, end: u64) {
             .collect()
     };
     drop((gone, views));
+}
+
+/// A title buffer at `start` (`len` bytes, named `resource`) whose copy is
+/// `placed`, in place, as `lookup` tables it (tests).
+#[cfg(test)]
+pub(crate) fn table_placed_for_test(resource: usize, placed: crate::inplace::Placed, start: u64, len: u64) {
+    let shadow = Arc::new(Shadow::placed(placed, start, len, false, None));
+    buffers().insert(
+        (start, resource),
+        Entry {
+            end: start + len,
+            shadow: Some(shadow),
+        },
+    );
 }
 
 /// The copy the title buffer at `start` has in the tables, if any (tests).

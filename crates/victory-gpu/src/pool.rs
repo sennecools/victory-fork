@@ -538,6 +538,39 @@ pub fn title_memory_pool_chunk_gone(section: usize) {
     drop(old);
 }
 
+/// What [`release_all`] let go: the chunks opened as heaps, their bytes,
+/// and those whose buffer something else still held then (a list or slot
+/// the release did not reach, a home still alive), which keep their heap
+/// and the section's commit until that goes too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Released {
+    pub(crate) opened: u64,
+    pub(crate) bytes: u64,
+    pub(crate) held: u64,
+}
+
+/// At the title's end (`crate::release`): every chunk leaves the table and
+/// the heaps and buffers of the opened ones are let go (their places in
+/// [`CHUNK_BUFFERS`] with them, `Opened::drop`). Chunks `xmem` tells after
+/// it are tabled again but never opened ([`home`]).
+pub(crate) fn release_all() -> Released {
+    let all = std::mem::take(&mut *chunks());
+    let mut released = Released::default();
+    for chunk in all.values() {
+        forget(chunk);
+        if let Some(opened) = &chunk.opened {
+            released.opened += 1;
+            released.bytes += chunk.bytes;
+            // Ours is one of them.
+            if crate::host::references(&opened.buffer) > 1 {
+                released.held += 1;
+            }
+        }
+    }
+    drop(all);
+    released
+}
+
 /// `xmem`, with `VICTORY_MEMORY_POOL_OPEN_PCT` ([`memory_pool_open_pct`]):
 /// the title now maps at least that share of the pages of the chunk with
 /// section `section` (`enough`), or no longer does. Told when the share
@@ -591,6 +624,13 @@ pub(crate) fn home(section: usize, offset: u64, len: u64) -> Result<crate::inpla
         gpu: opened.gpu + offset,
         bias: offset,
     };
+    // After the release at the title's end nothing is opened again. (An
+    // opening under way then finds the table emptied and is let go; a home
+    // handed out just before can be tabled after `crate::home::release_all`
+    // and hold its chunk: counted as `chunks_held`, a leak, not a fault.)
+    if crate::release::released() {
+        return Err(Why::ChunkRefused);
+    }
     let (bytes, serial) = {
         let chunks = chunks();
         let Some(chunk) = chunks.get(&section) else {

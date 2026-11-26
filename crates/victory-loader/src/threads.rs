@@ -78,6 +78,20 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 /// (a thread ended while holding a lock their detach code wants).
 const DETACH_DEADLINE: Duration = Duration::from_secs(5);
 
+/// What runs at process exit before the other threads end
+/// ([`before_exit`]).
+static BEFORE_EXIT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Sets what runs at process exit once the exit watchdog runs and before
+/// every other thread is ended (the GPU side's release of the title's
+/// memory, which needs the host's threads). Its time comes out of the
+/// watchdog's 5 s, which the title images' detach needs too: it must
+/// finish well within it (the release takes at most 2.5 s), or the process
+/// ends with code 1 instead of the title's. Set once.
+pub fn before_exit(run: fn()) {
+    let _ = BEFORE_EXIT.set(run);
+}
+
 /// Process exit (the CRT's `exit`, which titles call), in `ExitProcess`'s
 /// order: the title's exit functions have run; every other thread ends
 /// (title threads and ours); every attached image gets
@@ -133,6 +147,11 @@ extern "C" fn detach_all() {
             }
         };
         keep_len = 1;
+    }
+    // Not under the loader lock (an exit function of the CRT's), and with
+    // the other threads still running: they may be needed for it.
+    if let Some(run) = BEFORE_EXIT.get() {
+        run();
     }
     end_other_threads(&keep[..keep_len]);
     for image in dlls.iter().chain(&exes) {

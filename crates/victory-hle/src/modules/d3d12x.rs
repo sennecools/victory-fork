@@ -21,6 +21,9 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
+    // The title's own exit (`exit`) releases its memory first too.
+    #[cfg(windows)]
+    victory_loader::before_exit(release_at_exit);
     // Closing the window the device presents in ends the title.
     #[cfg(windows)]
     victory_gpu::window::on_close(super::lifecycle::window_closed);
@@ -28,15 +31,28 @@ extern "system" fn create_device(
 }
 
 /// A host GPU failure ends the run like a crash: reported to the crash log,
-/// then the process ends as the console ends a title.
+/// then the title's memory is released (on a removed device without waiting
+/// for it; a failure reported from inside a submission holds its lock, and
+/// the release then ends at its deadline) and the process ends as the
+/// console ends a title.
 #[cfg(windows)]
 fn host_gpu_failed(what: &str) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
     victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
+    victory_gpu::release::title_memory(std::time::Duration::from_secs(2));
     const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
     // SAFETY: ends our own process.
     unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };
     unreachable!("the process has ended")
+}
+
+/// At the title's own exit, before the loader ends the other threads: the
+/// title's memory is released, within the loader's exit watchdog (5 s): at
+/// most 2 s and the release's grace, so the title images' detach keeps
+/// 2.5 s of it.
+#[cfg(windows)]
+fn release_at_exit() {
+    victory_gpu::release::title_memory(std::time::Duration::from_secs(2));
 }
 
 /// The offline warm-up: see `victory_gpu::shader_cache::warm`.

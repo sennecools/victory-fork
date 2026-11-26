@@ -2786,6 +2786,25 @@ impl HostHeap {
         }
     }
 
+    /// At the title's end (`crate::release`, with the card done with
+    /// everything sent): the slots whose host resource `ours` names hold it
+    /// no longer. The resources go to `out`, for the caller to drop with no
+    /// lock held.
+    pub(crate) fn let_go_kept(
+        &self,
+        ours: &dyn Fn(&ID3D12Resource) -> bool,
+        out: &mut Vec<ID3D12Resource>,
+    ) {
+        for shard in &self.kept {
+            let mut kept = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for slot in kept.iter_mut() {
+                if slot.as_ref().is_some_and(ours) {
+                    out.extend(slot.take());
+                }
+            }
+        }
+    }
+
     /// `look` at what slot `index` views ([`HostHeap::kept`]); false past
     /// the heap.
     fn kept_at(&self, index: u32, look: impl FnOnce(Option<&ID3D12Resource>) -> bool) -> bool {
@@ -4993,6 +5012,32 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    /// At the title's end the slots that view a resource the release names
+    /// let it go, and only those: the others keep theirs.
+    #[test]
+    fn let_go_kept_takes_only_the_named_resources() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let (ours, _) = host.upload_buffer(64 << 10).expect("an upload buffer");
+        let (theirs, _) = host.upload_buffer(64 << 10).expect("an upload buffer");
+        heap.keep(0, Some(ours.clone()));
+        heap.keep(2, Some(theirs.clone()));
+        heap.keep(3, Some(ours.clone()));
+        let before = crate::host::references(&ours);
+        let mut out = Vec::new();
+        heap.let_go_kept(&|resource| resource == &ours, &mut out);
+        assert_eq!(out.len(), 2, "both slots that view it");
+        drop(out);
+        assert_eq!(crate::host::references(&ours), before - 2, "the slots hold it no longer");
+        assert!(!heap.kept_at(0, |kept| kept.is_some()));
+        assert!(!heap.kept_at(3, |kept| kept.is_some()));
+        assert!(heap.kept_at(2, |kept| kept == Some(&theirs)), "the other one stays");
     }
 
     /// The texture that stands for missing ones can be made and viewed.

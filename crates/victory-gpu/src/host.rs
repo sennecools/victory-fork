@@ -20,6 +20,14 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 /// R5 (`VICTORY_R5=1`): what only the core's homes under the relay use.
 mod late_homes;
+/// The release at the title's end (`crate::release`): submissions refused
+/// after it, the bounded wait for the queue.
+mod ending;
+pub(crate) use ending::{
+    Drained, bury_all, end_submissions, ending, host_made, let_go_flights,
+};
+#[cfg(test)]
+pub(crate) use ending::{refused_count, reset_for_test};
 
 #[cfg(test)]
 pub(crate) use late_homes::{flights, test_flights, test_relay_sees};
@@ -863,10 +871,12 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// The host GPU once [`host`] made it (or found none).
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -6705,6 +6715,14 @@ impl Host {
     /// flights' own compare lists put them ([`Host::relay_card_inflight`]);
     /// only a landing that cannot take them from there fetches, as here.
     fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+        // After the release (`crate::release`) no fetch is sent. (Asked
+        // without the submission lock: a fetch that passed this just before
+        // the flag was set can still go after the drain. Its plans hold
+        // their copies, which are never chunk-placed, so it reads nothing
+        // the release lets go.)
+        if ending::ending() {
+            return;
+        }
         // Copies whose CPU side is a home (with R5): merged on the card in
         // their flights, nothing to fetch. The rest below leaves them out.
         relay_card_homed(plans);
@@ -7378,7 +7396,8 @@ impl Host {
             self.submit(&runs, true)
         };
         let Some((mut submitted, sent)) = sent else {
-            // (Not reached: a submission sent ahead always comes back.)
+            // Only after the release (`crate::release`): a submission sent
+            // ahead otherwise always comes back.
             crate::list::recycle(lists, &order);
             return;
         };
@@ -7507,7 +7526,9 @@ impl Host {
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
     fn settle(&self, submitted: &mut u64, why: usize) {
-        if !late() {
+        // After the release (`crate::release`) nothing is left to settle,
+        // and nothing may be sent to the card for it.
+        if !late() || ending::ending() {
             return;
         }
         // (With the relay too: its wait, `relay wait`, lies inside.)
@@ -7715,6 +7736,10 @@ impl Host {
         let lock_wait = crate::profile::span("submission lock wait");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         drop(lock_wait);
+        // After the title's memory was released (`crate::release`): dropped.
+        if ending::refused(runs.len()) {
+            return None;
+        }
         let locked = crate::profile::stamp();
         let was_working = working(true);
         submitting(1, runs.len());

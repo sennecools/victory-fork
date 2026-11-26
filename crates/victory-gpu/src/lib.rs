@@ -48,6 +48,8 @@ pub mod pipeline;
 mod pool;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+pub mod release;
 pub mod profile;
 pub mod query;
 pub mod queue;

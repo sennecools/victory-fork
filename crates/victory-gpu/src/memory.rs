@@ -852,6 +852,13 @@ pub(crate) fn ready(
     writes: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    // After the release at the title's end the directory is not made again:
+    // the draw is dropped, as no submission runs it. Asked under the lock
+    // the release takes the directory with ([`release_all`], after the flag
+    // is set), so a draw that passed it is done with the directory first.
+    if crate::release::released() {
+        return None;
+    }
     if guard.is_none() {
         *guard = Memory::new();
     }
@@ -1286,6 +1293,20 @@ pub(crate) fn forget(home: &Arc<Shadow>) -> bool {
     // Dropped without the lock.
     drop(gone);
     true
+}
+
+/// At the title's end (`crate::release`): the directory goes whole, with
+/// the copies and homes it numbers and the buffers of the chunks gone since
+/// it last looked ([`chunk_gone`]). Returns the numbers it held.
+pub(crate) fn release_all() -> u64 {
+    let memory = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let gone = std::mem::take(&mut *GONE.lock().unwrap_or_else(|e| e.into_inner()));
+    let numbered = memory.as_ref().map_or(0, |m| {
+        m.copies.iter().filter(|c| c.is_some()).count() as u64
+    });
+    // Dropped without the locks.
+    drop((memory, gone));
+    numbered
 }
 
 /// [`forget`] for every home of the memory core with a number whose pinned

@@ -18,6 +18,8 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    // The run's tooling asks for an orderly stop through an event.
+    victory_hle::modules::lifecycle::watch_stop_event();
     let cfg = victory_core::Config::load()?;
     // Before any window exists: sizes in screen pixels, then the window size.
     {
