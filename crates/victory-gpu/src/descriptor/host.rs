@@ -112,6 +112,11 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// What the heap buffer pass keeps of this heap from pass to pass
+    /// (`crate::draw::HeapRanges`) with `VICTORY_HEAP_SWEEP_OWN=1`: under a
+    /// lock of its own, not the one of every heap's, and let go with the
+    /// heap. Unused with the switch off.
+    pub(crate) buffer_sweep: Mutex<crate::draw::HeapRanges>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -895,6 +900,11 @@ const TABLED_FRAMES: u64 = 240;
 /// (435 begun in the 353 s of run 52's, for some 140 presented).
 const TABLED_GRACE: u64 = 8;
 
+/// Frames for which a slot a draw read through a table is left to such a
+/// draw by the heap buffer pass (`VICTORY_HEAP_PASS_TABLED=1`,
+/// [`HostHeap::buffer_slot_tabled_lately`]); cool_fox's `COPIED_FRAMES`.
+const TABLED_BUFFER_FRAMES: u32 = 8;
+
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
 
@@ -1458,6 +1468,7 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            buffer_sweep: Mutex::new(crate::draw::HeapRanges::new()),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -2423,6 +2434,24 @@ impl HostHeap {
         }
     }
 
+    /// Title slot `index`, a buffer view's or none, lies in a table a draw
+    /// reads or had made afresh: what it holds is the draw's to make
+    /// ([`HostHeap::buffer_slot_tabled_lately`]; `VICTORY_HEAP_PASS_TABLED=1`
+    /// alone calls this).
+    pub(crate) fn buffer_slot_tabled(&self, index: u32) {
+        self.tabled_in(index, false, crate::frame::current());
+    }
+
+    /// Whether title slot `index` was a table's within the last
+    /// [`TABLED_BUFFER_FRAMES`] frames before `frame`: the heap buffer pass
+    /// leaves it to the draws that read it through their tables
+    /// (`VICTORY_HEAP_PASS_TABLED=1`). Not asked with the switch off.
+    pub(crate) fn buffer_slot_tabled_lately(&self, index: u32, frame: u64) -> bool {
+        let stamp = self.tabled_stamp(index) & !TABLED_READ;
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        stamp != 0 && now.wrapping_sub(stamp) & !TABLED_READ <= TABLED_BUFFER_FRAMES
+    }
+
     /// Whether title slot `index` was a table's within the last
     /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
     /// to be queued as any other).
@@ -2572,6 +2601,14 @@ impl HostHeap {
             return bits.buffers.all();
         }
         self.buffer_set().iter().copied().collect()
+    }
+
+    /// Of [`HostHeap::buffer_slots`], those of one of `parts` parts: every
+    /// slot is in the same part each time (`VICTORY_HEAP_SPREAD=1`).
+    pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32) -> Vec<u32> {
+        let mut slots = self.buffer_slots();
+        slots.retain(|slot| slot % parts == part);
+        slots
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -6084,6 +6121,34 @@ mod tests {
         heap.pool_slots_let_go();
         assert_eq!(heap.buffer_changes(), [2]);
         assert_eq!(heap.pool_noted.load(Relaxed), 0);
+    }
+
+    /// A slot of a draw's table is left to the draws by the heap buffer
+    /// pass (`VICTORY_HEAP_PASS_TABLED=1`) for [`TABLED_BUFFER_FRAMES`]
+    /// frames after the last table that held it, read or not, and a slot
+    /// never a table's is not. (After cool_fox 1f1a433's `copied_tabled`.)
+    #[test]
+    fn a_table_s_buffer_slot_is_left_to_its_draws_for_some_frames() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let frame = 1000;
+        assert!(!heap.buffer_slot_tabled_lately(3, frame), "never a table's");
+        heap.tabled_in(3, false, frame);
+        heap.tabled_in(4, true, frame);
+        for at in frame..=frame + u64::from(TABLED_BUFFER_FRAMES) {
+            assert!(heap.buffer_slot_tabled_lately(3, at), "frame {at}");
+            assert!(heap.buffer_slot_tabled_lately(4, at), "read, frame {at}");
+        }
+        let after = frame + u64::from(TABLED_BUFFER_FRAMES) + 1;
+        assert!(!heap.buffer_slot_tabled_lately(3, after));
+        assert!(!heap.buffer_slot_tabled_lately(4, after));
+        // A table again: the frames count from it.
+        heap.tabled_in(3, false, after);
+        assert!(heap.buffer_slot_tabled_lately(3, after + 1));
+        assert!(!heap.buffer_slot_tabled_lately(2, after), "another slot");
+        // Past the heap's slots: never.
+        assert!(!heap.buffer_slot_tabled_lately(8, after));
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

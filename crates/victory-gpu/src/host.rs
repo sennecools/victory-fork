@@ -10489,6 +10489,13 @@ impl Meter {
                 texture_us as f64 / 1e3 / frames,
                 slots as f64 / frames
             );
+            let tabled = crate::draw::HEAP_PASS_PARTS[2].swap(0, Ordering::Relaxed);
+            if tabled > 0 {
+                tracing::info!(
+                    "of those, {:.0} per frame left to the draws that read them through their tables (VICTORY_HEAP_PASS_TABLED=1)",
+                    tabled as f64 / frames
+                );
+            }
         }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
