@@ -1,7 +1,7 @@
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+Runs an Xbox Series X|S title natively on Windows, from files the user
+supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
@@ -17,8 +17,9 @@ be) offered to the project it came from.
 
 ### What is in it
 
-- **Base:** `fxceless/victory-fork` `main`, taken as it is at the last sync.
-- **On top of it** (161 commits at the last count; the figures below are approximate and not meant to add up):
+- **Base:** `fxceless/victory-fork` `main` as of 24 Nov 2026 (`ffe310eb`). The fork has moved on since; its newer
+  commits are not in this version.
+- **On top of it** (180 commits at the last count; the figures below are approximate and not meant to add up):
   - pull requests of `fxceless/victory-fork`, ported one by one (92 of them, from 37 authors, in the table below);
   - pull requests of the upstream project (`Marvisak/VIctory`) and commits of its main branch;
   - pull requests and commits of the AMD-focused fork `myokex/victory-amd`;
@@ -27,6 +28,98 @@ be) offered to the project it came from.
 - **Left out on purpose:** every part that is derived from code under GPL-2.0-only. This project is GPL-3.0,
   which cannot take such code, so nothing from it is in this line, not even adapted. Where a pull request mixed such
   parts with other work, only the other work was ported.
+
+### New in this version (26 Nov 2026)
+
+A progress snapshot for testers, not a release: most of what is new is behind a switch and off by default, and the
+title is still far from playable speed. Most switches are described in the table under [Debugging](#debugging).
+
+- **Clamp and card hash set:** `VICTORY_INDIRECT_READABLE=1`, `VICTORY_CLAMP_GROUP=1`,
+  `VICTORY_INDIRECT_CARD_BUDGET=1`, `VICTORY_CLAMP_LEAN=1`, `VICTORY_CARD_HASH_WIDE=1`: fewer barriers and cheaper
+  budget checks around indirect draws, and the card's change hashes run a thread group per piece.
+- **`VICTORY_BACK_BRIDGE=page`:** shader results written back to title memory join runs less than 4 KiB apart into
+  one write.
+- **Heap buffer pass:** claimed per heap, waited for at submit, each slot walked once (on by default; `=0` on
+  `VICTORY_HEAP_CLAIM`, `VICTORY_HEAP_WAIT_AT_SUBMIT` or `VICTORY_HEAP_WALK_ONCE` for the old way).
+- **Relay best set:** the settings in [Recommended settings](#recommended-settings) below.
+- **`VICTORY_GROUPED_MESH_CLAMP=1`:** runs of one-record mesh draws share one argument clamp. It removed the device in
+  some runs on an RX 9070 XT, so it is off by default and not in the recommended set.
+- **Root constant buffer views:** bound as one-view tables that hold only what their host copy has, and near a
+  window's end from a window that holds all 64 KiB they can read; fixes device removals on page faults (on by default;
+  `VICTORY_ROOT_CBV_TABLES=0` and `VICTORY_ROOT_CBV_REACH=0` give the old binding).
+- **`VICTORY_UPSCALE_STANDIN=1` with `VICTORY_CLEAR_TARGETS_ONLY=1`:** a pass of ours stands in for the title's
+  upscaler in Series S mode (see below).
+- **`VICTORY_EPOCH_JOURNAL=1`:** the write-watch journal is kept as a number per 4 KiB page, locked per 16 MB span
+  instead of by one lock.
+- **`VICTORY_MADE_ATOMIC=1`:** a view heap's host slots are made a slot at a time, with no heap-wide lock.
+- **`VICTORY_CLAMP_PRECISE=1`:** an indirect argument clamp keeps only the waits it needs.
+- **`VICTORY_SWEEP_SLICE_MS=<ms>`:** the once-a-second sweep of idle host objects runs in slices of about that many
+  milliseconds instead of one pause of tens of milliseconds.
+- **`VICTORY_LIFT_READS=count|1|2`:** with `VICTORY_RELAY=2`, title memory reads that would wait for submissions in
+  the air run on the card behind them (not yet measured in the game).
+- **Profiler counters:** with `VICTORY_PROFILE=1`, per-frame counters (barriers by origin, refresh split, view slot
+  changes), `VICTORY_PROFILE_FLIGHT_STAMPS=1` (card stamps of submissions sent ahead), `VICTORY_PROFILE_SAMPLES=1`
+  (memory split and thread time), and the relay wait, relay thread and made lock holders named in the trace.
+
+### Measured here
+
+RX 9070 XT (RDNA4) with a Ryzen 7 9800X3D, Series X mode:
+
+| Settings | Frame time | Frame rate |
+|---|---|---|
+| Recommended settings below | about 215-235 ms | about 4-5 fps |
+| The same plus `VICTORY_EPOCH_JOURNAL=1 VICTORY_MADE_ATOMIC=1 VICTORY_CLAMP_PRECISE=1` | same median | fewer spikes |
+
+### Recommended settings
+
+The best set measured here (Series X mode), for a command prompt before `victory.exe run`:
+
+```
+set VICTORY_RELAY=2
+set VICTORY_CARD_FETCH_INFLIGHT=1
+set VICTORY_TEXTURE_STAGE_MS=40
+set VICTORY_TEXTURE_STAGE_MB=64
+set VICTORY_TEXTURE_CATCHUP=0
+set VICTORY_INDIRECT_READABLE=1
+set VICTORY_CLAMP_GROUP=1
+set VICTORY_INDIRECT_CARD_BUDGET=1
+set VICTORY_CLAMP_LEAN=1
+set VICTORY_CARD_HASH_WIDE=1
+set VICTORY_BACK_BRIDGE=page
+set VICTORY_JOIN_COPIES=1
+set VICTORY_CARD_REHASH_RUNS=1
+set VICTORY_SWEEP_SLICE_MS=2
+```
+
+The window's caption shows the frame rate and the frame time while the title runs.
+
+### Series S mode (testers wanted)
+
+In Series S mode the title renders at a lower resolution and upscales with AMD FidelityFX, whose console-compiled
+passes do not run here, so the picture stays black. The stand-in replaces each upscale with one pass of ours that
+stretches the rendered picture over the output with linear filtering (softer than the real upscaler); every other
+use of the upscaler is passed on unchanged. `VICTORY_CLEAR_TARGETS_ONLY=1` is needed with it: without it the host
+refuses the upscaler's output texture.
+
+```
+set VICTORY_UPSCALE_STANDIN=1
+set VICTORY_CLEAR_TARGETS_ONLY=1
+victory.exe run <game dir>\<the title's exe> --execute --console series-s
+```
+
+The recommended settings above can be added. No other switch is needed: the window shows the first plane of each
+present, as in Series X mode; nothing composes further planes, so anything the title puts on a second plane would be
+missing.
+
+**Untested on our card:** the stand-in passes its tests on the software adapter (WARP) but has not yet run on an
+RX 9070 XT. If you try it, please report:
+
+- GPU and driver version (and CPU);
+- the frame rate and frame time from the window's caption, after a minute in the first rooms;
+- whether a picture shows (black, partly drawn, or whole) and whether the interface text shows;
+- any device removal or crash, and after how long.
+
+No game files or screenshots are needed.
 
 ### It is rebuilt and force-updated
 
@@ -125,6 +218,22 @@ small shadow buffers into their window copy.
 
 The base itself, and one later commit of its main (faster defaults, textures on the card before the decoration bake)
 that is replayed separately because the base was cut earlier.
+
+#### `joshuudev/victory-amd`
+
+Commits by Joshua Odom: one change of the mapping per scatter of physical pages, a remap lock per 16 MB, their
+diagnostics, logging of refused pipelines, and descriptors read only for their size.
+
+#### Reimplemented from other forks
+
+These were ported by hand behind switches, so the commits are ours; each names its source in the message:
+
+| Author | Source | What |
+|---|---|---|
+| Vyacheslav Venglovsky | his fork branch | indirect scratch buffer kept readable; clamp budget once per thread group and in the card's memory |
+| TG0000 | his fork branch | card hash passes with a thread group per piece |
+| shadowdog00 | `vi-pc-combo` | the Series S upscaler stand-in and clear values for render targets only; the grouped mesh clamp |
+| Trexies | `VIwork` | ideas for running title memory reads on the card (`VICTORY_LIFT_READS`; no code taken) |
 
 #### Our own changes
 
