@@ -4188,18 +4188,22 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
-/// `ranges` with `more`, in order, joined where they overlap or touch.
+/// `ranges` with `more`, in order, joined where they overlap or touch. It
+/// joins in place: nothing is allocated beyond what `ranges` grows by.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    let mut kept = 0;
+    for at in 0..ranges.len() {
+        let (from, to) = ranges[at];
+        if kept > 0 && from <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
+        } else {
+            ranges[kept] = (from, to);
+            kept += 1;
         }
     }
-    *ranges = out;
+    ranges.truncate(kept);
 }
 
 /// Whether anything is in the air.
@@ -6599,7 +6603,11 @@ impl Host {
                         let mut every = true;
                         // (A copy whose CPU side is a home is merged into it
                         // on the card, below: nothing of it comes down.)
-                        for r in plan.ranges.iter().filter(|r| r.compared && r.reference.is_none()) {
+                        for r in plan
+                            .ranges
+                            .iter()
+                            .filter(|r| r.compared && r.reference.is_none())
+                        {
                             let Some((_, Some(_), size)) = r.shadow.card_sides() else {
                                 every = false;
                                 continue;

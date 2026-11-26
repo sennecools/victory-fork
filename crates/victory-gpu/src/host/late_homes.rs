@@ -199,6 +199,8 @@ pub(super) fn retake_flight_homes(writers: &[Writer], runs: &[&HostList]) {
     if writers.is_empty() {
         return;
     }
+    // One buffer for every refresh step (`join_ranges` joins in place).
+    let mut others = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             for (shadow, at, len) in step.refreshes() {
@@ -206,7 +208,7 @@ pub(super) fn retake_flight_homes(writers: &[Writer], runs: &[&HostList]) {
                     continue;
                 }
                 let end = at.saturating_add(len);
-                let mut others = Vec::new();
+                others.clear();
                 join_ranges(
                     &mut others,
                     writers
@@ -220,7 +222,7 @@ pub(super) fn retake_flight_homes(writers: &[Writer], runs: &[&HostList]) {
                         .filter(|&(from, to)| from < end && at < to)
                         .map(|(from, to)| (from.max(at), to.min(end))),
                 );
-                for (from, to) in others {
+                for &(from, to) in &others {
                     shadow.card_home_written(from, to);
                 }
             }

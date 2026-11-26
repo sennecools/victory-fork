@@ -1810,10 +1810,11 @@ mod tests {
         let was = flow_now();
         host.send_for_test(&second);
         let now = flow_now();
-        assert!(
-            now[flow::UPLOADED] - was[flow::UPLOADED] < len,
-            "the copy's own declared range does not go up again ({} bytes did)",
-            now[flow::UPLOADED] - was[flow::UPLOADED]
+        // (Nothing else changed between the two sends: no byte goes up.)
+        assert_eq!(
+            now[flow::UPLOADED] - was[flow::UPLOADED],
+            0,
+            "the copy's own declared range does not go up again, not even in part"
         );
         hold.release();
         flights.land_all();
@@ -1833,9 +1834,10 @@ mod tests {
         region.release();
     }
 
-    /// With R5, the kept references a flight's list copies into stay in
-    /// [`Before::filling`] while its submission has not finished, and are
-    /// let go once it has.
+    /// [`let_go_filled`], the rule [`let_go_kept`] applies to
+    /// [`Before::filling`] with R5: a submission's kept references stay while
+    /// it has not finished, and go once it has. (This tests the rule only, not
+    /// how `before()` fills and empties the list.)
     #[test]
     fn a_flights_filled_references_go_once_it_finished() {
         let mut filling: Vec<(u64, Vec<ID3D12Resource>)> = vec![(5, Vec::new()), (7, Vec::new())];
