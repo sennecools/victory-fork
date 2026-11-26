@@ -16,7 +16,7 @@
 //! size, place and closing of the window the title is shown in. Planned:
 //! `present` (swap chain).
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod capture;
 #[cfg(windows)]
 mod card_home;

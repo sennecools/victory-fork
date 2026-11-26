@@ -11349,10 +11349,11 @@ impl Host {
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
+            let save = crate::capture::wanted(frame);
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = save || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
+            let read_now = save;
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -11381,8 +11382,9 @@ impl Host {
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )]);
             list.CopyResource(&back, raw);
-            #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            // A saved frame's copy, on this list: `read_now` kept it from
+            // being sent ahead, so it is waited for below.
+            let capture = save
                 .then(|| crate::capture::read_back(&self.device, list, raw))
                 .flatten();
             #[cfg(feature = "diagnostics")]
@@ -11391,8 +11393,6 @@ impl Host {
             } else {
                 crate::capture::probe(&self.device, list, raw)
             };
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
             list.ResourceBarrier(&[transition(
                 &back,
                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -11407,7 +11407,6 @@ impl Host {
                 }
                 None => self.execute(&[copy]),
             }
-            #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }

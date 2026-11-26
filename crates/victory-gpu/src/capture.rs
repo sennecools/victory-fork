@@ -1,7 +1,18 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size, and so are the frames [`wanted`] and [`listed`] pick
+//! (`VICTORY_CAPTURE_FRAMES`, `VICTORY_CAPTURE_WORLD`,
+//! `VICTORY_CAPTURE_WORLD_ALSO`, `VICTORY_CAPTURE_MENUS`).
+//!
+//! The saving is in release builds too, so the timed runs, which use them,
+//! keep their frames. A saved frame's read-back copy is recorded on the
+//! present's own list, which is waited for (the frame is presented the old
+//! way, not sent ahead); every other frame is sent as without capturing,
+//! and without `VICTORY_CAPTURE` the cost is the cached lookup of the
+//! variable. The draw-list text dumps ([`op`]), the render-target dumps
+//! (`VICTORY_DUMP_TARGETS`) and the look whether a frame is black are only
+//! in builds with diagnostics.
 
 use std::path::PathBuf;
 
@@ -50,12 +61,12 @@ pub(crate) fn listed(n: u64) -> bool {
     named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
-/// With a capture folder, for the frames [`listed`]: `what` is added to
-/// the frame's `frame-<n>-ops.txt`, one line per draw, dispatch, copy or
-/// drop in the order recorded (the title records on several threads, so
-/// lines of different lists interleave; each names its list). The file
-/// says which pass writes which target, to find the pass whose output
-/// stays empty.
+/// With a capture folder, for the frames [`listed`] (diagnostics builds):
+/// `what` is added to the frame's `frame-<n>-ops.txt`, one line per draw,
+/// dispatch, copy or drop in the order recorded (the title records on
+/// several threads, so lines of different lists interleave; each names its
+/// list). The file says which pass writes which target, to find the pass
+/// whose output stays empty.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
@@ -126,10 +137,12 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    if !world_on() {
+        return;
+    }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
-    if world_on()
-        && drawn.saturating_sub(before) >= 500
+    if drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
     {
         tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
@@ -144,6 +157,10 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    // Without a folder, nothing more is looked at.
+    if folder().is_none() {
+        return false;
+    }
     // Two frames in a row each time: the title draws to two buffers in turn,
     // and every 8th or 16th frame alone only ever showed one of them.
     // Before the world, with `VICTORY_CAPTURE_WORLD` and
@@ -162,7 +179,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first) % 8 < 2;
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    n.is_power_of_two() || listed(n) || before_world || in_world
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -173,6 +190,17 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
+    let png = png(width, height, pitch, bgra, rows);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::write(&path, png) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// 8-bit RGBA or BGRA rows (`pitch` bytes apart) as an RGB PNG file of
+/// half their size.
+fn png(width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) -> Vec<u8> {
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -199,11 +227,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -347,15 +371,21 @@ pub(crate) fn save_read_back(
 /// structure: floats scaled by their largest value, depth by its range).
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
 /// Notes a title texture the frame being built renders to or writes.
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
@@ -369,6 +399,8 @@ pub(crate) fn note_target(resource: crate::object::This) {
 }
 
 /// At the present of frame `frame`: saves the noted targets.
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
@@ -386,6 +418,8 @@ pub(crate) fn dump_targets(frame: u64) {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -472,6 +506,8 @@ fn dump_one(
 /// Logs which values a stencil plane read back by [`read_back_of`] holds
 /// (the most common first), how many texels have each of its bits, and the
 /// box of the texels with bit 3 (0x08).
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 fn stencil_values(
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
@@ -530,6 +566,8 @@ fn stencil_values(
     }
 }
 
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
@@ -542,6 +580,8 @@ fn half(h: u16) -> f32 {
 
 /// A float packed in `bits` with a 5-bit exponent and `man` mantissa bits
 /// (the 11- and 10-bit floats of R11G11B10).
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
@@ -555,6 +595,8 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
@@ -710,13 +752,19 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
 }
 
 /// Pixels per side of the grid [`probe`] reads.
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 const GRID: u32 = 4;
 /// Bytes between the grid's pixels in the readback buffer (placement
 /// alignment).
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 const SLOT: u64 = 512;
 
 /// Records copies of a grid of pixels of `texture` (8-bit color, in the
 /// copy-source state) into a readback buffer, to tell black frames.
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn probe(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
@@ -802,6 +850,8 @@ pub(crate) fn probe(
 }
 
 /// Whether every pixel [`probe`] read is (near) black.
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for).
@@ -828,9 +878,13 @@ pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
 
 /// The brightest probed channel of the last frames, oldest first: a fade
 /// darkens over several, a glitch drops at once.
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 static LEVELS: std::sync::Mutex<std::collections::VecDeque<u8>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
+#[cfg(feature = "diagnostics")]
+#[cfg(feature = "diagnostics")]
 pub(crate) fn recent_levels() -> Vec<u8> {
     let levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
     levels.iter().copied().collect()
@@ -845,6 +899,41 @@ mod tests {
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
     /// not B8G8R8A8.
+    /// A saved frame's PNG (release builds too): half size, RGB, BGRA
+    /// swapped, every other pixel of every other row.
+    #[test]
+    fn frames_encode_as_half_size_rgb_png() {
+        // 4 x 2 BGRA pixels, rows 20 bytes apart (padding at the end).
+        let mut rows = vec![0u8; 40];
+        for (i, p) in rows
+            .chunks_mut(20)
+            .flat_map(|r| r[..16].chunks_mut(4))
+            .enumerate()
+        {
+            p.copy_from_slice(&[i as u8, 10 + i as u8, 20 + i as u8, 255]);
+        }
+        let png = super::png(4, 2, 20, true, &rows);
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        // IHDR: 2 x 1, 8-bit RGB.
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(&png[16..29], &[0, 0, 0, 2, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+        let crc = u32::from_be_bytes(png[29..33].try_into().unwrap());
+        assert_eq!(crc, super::crc32(&png[12..29]));
+        let len = u32::from_be_bytes(png[33..37].try_into().unwrap()) as usize;
+        assert_eq!(&png[37..41], b"IDAT");
+        let mut raw = [0u8; 7];
+        let (out, rc) = zlib_rs::decompress_slice(
+            &mut raw,
+            &png[41..41 + len],
+            zlib_rs::InflateConfig::default(),
+        );
+        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+        // Filter 0, then pixels 0 and 2 of row 0, as RGB.
+        assert_eq!(out, &[0, 20, 10, 0, 22, 12, 2]);
+        assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
+    }
+
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn unorm16_and_xr_bias_targets_decode_as_their_formats() {
         // Red 0x8000 (a half-float -0), green 0x4000, blue 0.
