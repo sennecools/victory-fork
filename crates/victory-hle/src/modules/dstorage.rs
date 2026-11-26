@@ -224,13 +224,42 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails. The limit on staging
+/// bytes in flight is what it asks for, or the floor if that is more
+/// ([`staging_floor`]).
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let limit = staging_limit(u64::from(size), staging_floor());
+    tracing::info!(size, limit, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = limit;
     }
     S_OK
+}
+
+/// A floor on the staging bytes compressed and buffered reads may hold in
+/// flight (`VICTORY_DSTORAGE_STAGING_MB`, in MiB; unset or 0: none, the
+/// limit is the staging buffer the title asks for, as before). The console
+/// holds the staging buffer for its decompression hardware; here it only
+/// bounds how many buffered reads the workers run at once, so with requests
+/// of a few MiB a buffer of 32 MiB leaves most workers waiting. cool_fox
+/// uses 256.
+fn staging_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let mb = std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if mb > 0 {
+            tracing::info!(mb, "dstorage: staging floor (VICTORY_DSTORAGE_STAGING_MB)");
+        }
+        mb.saturating_mul(1 << 20)
+    })
+}
+
+/// The limit on staging bytes in flight for a staging buffer of `size`.
+fn staging_limit(size: u64, floor: u64) -> u64 {
+    size.max(floor)
 }
 
 fn text(name: *const c_char) -> String {
@@ -505,7 +534,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_limit(STAGING, staging_floor()),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -1827,6 +1856,21 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn the_staging_floor_only_raises_the_limit() {
+        assert_eq!(staging_limit(32 << 20, 0), 32 << 20, "no floor: as asked");
+        assert_eq!(staging_limit(32 << 20, 256 << 20), 256 << 20);
+        assert_eq!(staging_limit(512 << 20, 256 << 20), 512 << 20);
+        // A raised limit lets more buffered reads run at once.
+        let mut l = lanes(staging_limit(100, 200));
+        l.lanes.insert(0, Lane::new(0, 64));
+        (0..4).for_each(|_| read(&mut l, 0, ZLIB, 60));
+        l.submit(0);
+        let started: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
+        assert!(l.start().is_none(), "60 * 4 > 200");
+        assert_eq!(started.iter().map(|j| j.staging).sum::<u64>(), 180);
     }
 
     #[test]
