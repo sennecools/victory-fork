@@ -1921,57 +1921,25 @@ pub(crate) fn let_go_idle(
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return None;
     }
+    // The idle tiers do not count the pool's empty blocks (0 with its
+    // texture half off).
     let memory = crate::host::host().and_then(|h| h.video_memory());
-    // With `VICTORY_TEXTURE_KEEP=1` kept for minutes while the card has
-    // room, and past it the longest idle first, as many bytes as must go
-    // (`crate::host::vram_keep`).
-    let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if crate::host::texture_keep() => {
-            crate::host::vram_keep(budget, kept_used(used))
-        }
-        // The idle tiers do not count the pool's empty blocks either (0 with
-        // its texture half off: as before).
-        _ => {
-            let spare = crate::texture_pool::texture_room();
-            let memory =
-                memory.map(|[budget, used, a, b]| [budget, used.saturating_sub(spare), a, b]);
-            (crate::host::vram_idle_ms(memory), u64::MAX)
-        }
-    };
+    let spare = crate::texture_pool::texture_room();
+    let memory = memory.map(|[budget, used, a, b]| [budget, used.saturating_sub(spare), a, b]);
+    let idle_ms = crate::host::vram_idle_ms(memory);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
     let after = from.map_or(Unbounded, Excluded);
-    // With a limit, the textures idle long enough, the longest idle first,
-    // all in this slice (a pass that started without one ends here).
-    let by_age: Option<Vec<usize>> = (most != u64::MAX).then(|| {
-        let mut by_age: Vec<(u64, usize)> = all
-            .iter()
-            .filter_map(|&at| {
-                // SAFETY: as below.
-                let r = unsafe { &*(at as *const Resource) };
-                let used = r.host.used.load(Relaxed);
-                (fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES))
-                    .then_some((used & 0xffff_ffff, at))
-            })
-            .collect();
-        by_age.sort_unstable();
-        by_age.into_iter().map(|(_, at)| at).collect()
-    });
-    let in_order = if by_age.is_some() { 0 } else { usize::MAX };
     let stopped = crate::host::sweep_walk(
-        by_age
-            .iter()
-            .flatten()
-            .chain(all.range((after, Unbounded)).take(in_order))
-            .map(|&at| (at, ())),
-        until.filter(|_| by_age.is_none()),
+        all.range((after, Unbounded)).map(|&at| (at, ())),
+        until,
         |at, ()| {
             // SAFETY: a texture leaves the table before it is freed, under the
             // lock held here (`Drop for Resource`).
             let r = unsafe { &*(at as *const Resource) };
-            if bytes >= most || !fills(&r.desc) || crate::texture::host_wrote(at) {
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
                 return;
             }
             let taken = {

@@ -194,41 +194,6 @@ pub(crate) fn adapter_summary() -> Option<(String, u64)> {
     ))
 }
 
-/// Whether host copies of textures the title fills are kept while the card
-/// has room ([`vram_keep`]; `VICTORY_TEXTURE_KEEP=1`, off by default: those
-/// idle for [`vram_idle_ms`] go, all of them, as before).
-pub(crate) fn texture_keep() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_some_and(|v| v == "1"))
-}
-
-/// With [`texture_keep`]: how long host copies of textures the title fills
-/// must have been idle to be let go, in milliseconds, and how many bytes of
-/// them go at most (the longest idle first): none but those idle for ten
-/// minutes while what is in use of the card (`used`, without what our own
-/// blocks of textures have free) is under 88 % of its `budget`, else enough
-/// to come down to 85 %.
-///
-/// (cool_fox measured, by the older times, everything idle for 2.5 s let
-/// go from 75 % of the budget on: 61,000 copies in the first 300 s of a
-/// play at 78 to 80 %, of which 13,000 were made and uploaded again.)
-pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
-    const KEPT_MS: u64 = 600_000;
-    const IDLE_MS: u64 = 5_000;
-    const SHORT_MS: u64 = 1_500;
-    if budget == 0 {
-        return (IDLE_MS, u64::MAX);
-    }
-    let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
-        (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
-    } else {
-        (SHORT_MS, used - share(85))
-    }
-}
-
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
@@ -12405,19 +12370,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
-    }
-
-    #[test]
-    fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
-        let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
-        assert_eq!(vram_keep(100 * gib, 87 * gib).1, u64::MAX);
-        // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
-        assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
-        assert_eq!(vram_keep(0, 7), (5_000, u64::MAX));
     }
 
     #[test]

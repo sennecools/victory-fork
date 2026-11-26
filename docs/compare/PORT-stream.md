@@ -51,7 +51,7 @@ All off by default: unset is exactly r5-s1. Each is read once per process
 |---|---|---|---|---|
 | `VICTORY_TEXTURE_POOL` | off | `1` both halves; `texture`; `staging` | Host textures (1 sample, 1 plane, no clear value, no XOR layout) placed in 64 MiB default-heap blocks; staging buffers as pieces of 64 MiB upload blocks. A piece rests 2.5 s before reuse. Up to 64 empty blocks kept below 85 % of budget, else 2 (staging at most 8). After a refused block, none asked for 500 ms. | Staging half: only the non-transient path (not with `VICTORY_TEXTURE_STAGING_TRANSIENT=1`) |
 | `VICTORY_RIPE_BLOCKS` | 12 while the texture half is on; 0 otherwise | `<n>`; `0` = none | n blocks made ahead; textures cut from blocks older than every running submission | Texture half of the pool; no effect with it off |
-| `VICTORY_TEXTURE_KEEP` | off | `1` | `host::vram_keep`: host copies stay 10 min while use (less the pool's empty blocks, plus the kept room) is under 88 % of budget; above it the longest idle go first down to 85 % (5 s idle, 1.5 s from 95 %), in one unsliced sorted pass | Uses `texture_pool::texture_room` when the pool is on |
+| `VICTORY_TEXTURE_KEEP` (removed: a measured loser, host copies go by idle time alone) | off | `1` | `host::vram_keep`: host copies stay 10 min while use (less the pool's empty blocks, plus the kept room) is under 88 % of budget; above it the longest idle go first down to 85 % (5 s idle, 1.5 s from 95 %), in one unsliced sorted pass | Uses `texture_pool::texture_room` when the pool is on |
 | `VICTORY_TEXTURE_AWAY_MS` | off | `<ms>`; `0` = off; cool_fox 3000 | A slot keeps its view until its memory has been unmapped that long, instead of null at the first look | None |
 | `VICTORY_TEXTURE_DIGEST` | off (blake3) | `1` | cool_fox's 128-bit digest for the in-memory change hash and the recheck fingerprint. Nothing on disk uses these hashes. | None |
 | `VICTORY_TEXTURE_ONCE` | off | `1` | A staging state made by the index-picked pass (untabled textures) is detiled once at submission without the write watch or the guards | None |
@@ -135,7 +135,7 @@ Same scene, same route, `VICTORY_FRAMETIME_DUMP=1` on every run.
 1. Baseline: no switch. Must match r5-s1.
 2. One at a time:
    - `VICTORY_TEXTURE_POOL=1` (ripe 12), then `=texture`, then `=staging`
-   - `VICTORY_TEXTURE_KEEP=1`
+   - `VICTORY_TEXTURE_KEEP=1` (since removed)
    - `VICTORY_TEXTURE_AWAY_MS=3000`
    - `VICTORY_TEXTURE_DIGEST=1`
    - `VICTORY_TEXTURE_ONCE=1`
