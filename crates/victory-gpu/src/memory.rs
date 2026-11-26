@@ -387,8 +387,8 @@ pub(crate) fn forget(home: &Arc<Shadow>) -> bool {
     true
 }
 
-/// [`forget`] for every home of the memory core with a number that lies
-/// over title memory `[start, end)`.
+/// [`forget`] for every home of the memory core with a number whose pinned
+/// pages (`crate::home::pinned`) lie over title memory `[start, end)`.
 pub(crate) fn forget_homes_over(start: u64, end: u64) {
     let gone: Vec<Arc<Shadow>> = {
         let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -398,8 +398,12 @@ pub(crate) fn forget_homes_over(start: u64, end: u64) {
         let over: Vec<usize> = (m.copies.iter().enumerate())
             .filter_map(|(n, c)| {
                 let c = c.as_ref()?;
+                if !c.is_home() {
+                    return None;
+                }
                 let (first, len) = c.span();
-                (c.is_home() && first < end && start < first + len).then_some(n)
+                let (from, to) = crate::home::pinned(first, len);
+                (from < end && start < to).then_some(n)
             })
             .collect();
         over.into_iter().filter_map(|n| m.forget_at(n)).collect()

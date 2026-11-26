@@ -222,16 +222,19 @@ pub(crate) enum Why {
     /// Not inside an `XMemVirtualAlloc` region (the process heap, memory
     /// from elsewhere).
     NotRegion,
-    /// The region's protection was refused while a home stood, or the title
-    /// is freeing it.
+    /// The region's protection was refused while a home stood, or a free
+    /// of the title's there was given up.
     Blacklisted,
+    /// A free or protection of the title's in the region is under way or
+    /// waiting.
+    Busy,
     /// Not private memory of the region committed read-write over the span.
     NotCommitted,
     Budget,
     Refused,
 }
 
-const WHYS: [(Why, &str); 10] = [
+const WHYS: [(Why, &str); 11] = [
     (Why::Late, "late waits"),
     (Why::NoDevice13, "no ID3D12Device13"),
     (Why::Latched, "after the host's refusals"),
@@ -239,13 +242,14 @@ const WHYS: [(Why, &str); 10] = [
     (Why::View, "view memory"),
     (Why::NotRegion, "not an XMemVirtualAlloc region"),
     (Why::Blacklisted, "blacklisted region"),
+    (Why::Busy, "region busy with a title free or protection"),
     (Why::NotCommitted, "not committed read-write"),
     (Why::Budget, "over VICTORY_MEMORY_CORE_MB"),
     (Why::Refused, "refused by the host"),
 ];
 
 /// Ranges that kept a copy since the start, by [`WHYS`].
-static TURNED_DOWN: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static TURNED_DOWN: [AtomicU64; WHYS.len()] = [const { AtomicU64::new(0) }; WHYS.len()];
 
 fn turned_down(why: Why) {
     if let Some(i) = WHYS.iter().position(|w| w.0 == why) {
@@ -289,12 +293,15 @@ pub(crate) trait Ask {
     /// Whether the range is view memory.
     fn view(&mut self) -> bool;
     /// The region that holds the range's pages: `None` if none does,
-    /// `Some(true)` if it may not be given a home.
-    fn region(&mut self) -> Option<bool>;
+    /// `Some(Err(why))` if it may not be given a home now
+    /// ([`Why::Blacklisted`], [`Why::Busy`]).
+    fn region(&mut self) -> Option<Result<(), Why>>;
     /// Whether the pages are the region's, committed read-write.
     fn committed(&mut self) -> bool;
-    /// Claims the pages for a home: the budget and the region's say.
-    fn claim(&mut self) -> bool;
+    /// Claims the pages for a home: the region's say, asked again
+    /// ([`Why::NotRegion`], [`Why::Blacklisted`], [`Why::Busy`]), then the
+    /// budget ([`Why::Budget`]).
+    fn claim(&mut self) -> Result<(), Why>;
 }
 
 /// What [`classify`] decides for a range.
@@ -324,7 +331,8 @@ pub(crate) enum Class<H> {
 ///    same bytes, or one over two homes, could not be one buffer).
 /// 4. View memory (the page pool's views) keeps its copy in this slice.
 /// 5. The range's pages lie in one `XMemVirtualAlloc` region that the title
-///    is not freeing or protecting and whose protection was never refused.
+///    is not freeing or protecting ([`Why::Busy`]) and whose protection was
+///    never refused ([`Why::Blacklisted`]).
 /// 6. Those pages are private memory of that allocation, committed
 ///    read-write.
 /// 7. The pages fit in `VICTORY_MEMORY_CORE_MB`: they are claimed, and the
@@ -355,14 +363,14 @@ pub(crate) fn classify<A: Ask>(gate: Gate, big: bool, ask: &mut A) -> Class<A::H
     }
     match ask.region() {
         None => return Class::Copy(Why::NotRegion),
-        Some(true) => return Class::Copy(Why::Blacklisted),
-        Some(false) => {}
+        Some(Err(why)) => return Class::Copy(why),
+        Some(Ok(())) => {}
     }
     if !ask.committed() {
         return Class::Copy(Why::NotCommitted);
     }
-    if !ask.claim() {
-        return Class::Copy(Why::Budget);
+    if let Err(why) = ask.claim() {
+        return Class::Copy(why);
     }
     Class::Place
 }
@@ -385,6 +393,19 @@ struct Region {
     busy: u32,
     /// A protection was refused while a home stood: no home again.
     blacklisted: bool,
+}
+
+impl Region {
+    /// Whether a home may be claimed in the region now.
+    fn may_home(&self) -> Result<(), Why> {
+        if self.blacklisted {
+            Err(Why::Blacklisted)
+        } else if self.busy > 0 {
+            Err(Why::Busy)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// A free of the title's the host refused while a heap stood, done later:
@@ -436,7 +457,11 @@ fn core() -> std::sync::MutexGuard<'static, Core> {
 /// call, and by a commit of the title's inside a region from cancelling the
 /// waiting decommits of its pages to the host's commit
 /// ([`title_memory_committing`]): a decommit that waited never runs after
-/// the title committed its pages again. Taken before any other lock.
+/// the title committed its pages again. Held too by a release of the
+/// title's ([`title_virtual_free`]) and by a new region
+/// ([`title_memory_region`]) while they drop the waiting frees of a region
+/// that ended: none of those runs against a reservation made at the same
+/// addresses since. Taken before any other lock.
 static FREEING: Mutex<()> = Mutex::new(());
 
 fn freeing() -> std::sync::MutexGuard<'static, ()> {
@@ -456,13 +481,22 @@ impl Core {
 
 /// `XMemVirtualAlloc` reserved `[at, at + len)` (with the console's words
 /// as the title gave them). A region already in the table that overlaps is
-/// gone (the title freed it some way the hooks did not see).
+/// gone (the title freed it some way the hooks did not see), and its frees
+/// that wait go with it.
+///
+/// shortcut: a decommit of the title's refused while a release of the same
+/// region on another thread is done, and the addresses reserved again
+/// meanwhile, can put its wait in the list after the new region came; the
+/// title would have to free one region on two threads at once.
 pub fn title_memory_region(at: usize, len: usize, kind: u32, flags: u64, protect: u32) {
     if len == 0 {
         return;
     }
     let len = len.next_multiple_of(PAGE_4K);
     let end = at.saturating_add(len);
+    // No waiting free runs meanwhile ([`run_pending`]): one of a stale
+    // region would free the new region's pages.
+    let _freeing = freeing();
     let mut core = core();
     let stale: Vec<usize> = core
         .regions
@@ -471,6 +505,11 @@ pub fn title_memory_region(at: usize, len: usize, kind: u32, flags: u64, protect
         .take_while(|(base, region)| base.saturating_add(region.len) > at)
         .map(|(base, _)| *base)
         .collect();
+    // The frees of a stale region, or over these pages, that wait: the host
+    // freed those pages already, since it gave them out again.
+    drop_pending(&mut core, |p| {
+        stale.contains(&p.region) || (p.pages.0 < end && at < p.pages.1)
+    });
     for base in stale {
         core.regions.remove(&base);
     }
@@ -486,11 +525,6 @@ pub fn title_memory_region(at: usize, len: usize, kind: u32, flags: u64, protect
             blacklisted: false,
         },
     );
-}
-
-/// The region `base` was released.
-fn forget_region(base: usize) {
-    core().regions.remove(&base);
 }
 
 /// The homes in the tables, for the one-home rule: `home` was put there.
@@ -529,13 +563,24 @@ fn holder(start: u64, end: u64) -> Held<Arc<Shadow>> {
     if part { Held::Part } else { Held::None }
 }
 
-/// Takes the homes over `[at, end)` out of [`Core::tabled`] and returns
-/// them (alive).
+/// The pages a home over title memory `[first, first + len)` pins: the
+/// 64 KiB pages its heap is opened over ([`resolve`]), which the host's
+/// frees and protections of any of their 4 KiB pages run into.
+pub(crate) fn pinned(first: u64, len: u64) -> (u64, u64) {
+    let (at, bytes) = crate::inplace::aligned_span(first, len).unwrap_or((first, len));
+    (at, at.saturating_add(bytes))
+}
+
+/// Takes the homes whose pinned pages ([`pinned`]) lie over `[at, end)`
+/// out of [`Core::tabled`] and returns them (alive).
 fn untable_over(at: u64, end: u64) -> Vec<Arc<Shadow>> {
+    const K64: u64 = 64 << 10;
     let mut core = core();
+    // A home's pinned pages start up to 64 KiB before its first byte and
+    // end up to 64 KiB after its last.
     let firsts: Vec<u64> = core
         .tabled
-        .range(at.saturating_sub(core.tabled_longest)..end)
+        .range(at.saturating_sub(core.tabled_longest.saturating_add(K64))..end.saturating_add(K64))
         .map(|(&first, _)| first)
         .collect();
     let mut taken = Vec::new();
@@ -543,8 +588,9 @@ fn untable_over(at: u64, end: u64) -> Vec<Arc<Shadow>> {
         let Some(homes) = core.tabled.get_mut(&first) else {
             continue;
         };
-        homes.retain(|(len, _, home)| {
-            if first + len <= at {
+        homes.retain(|&(len, _, ref home)| {
+            let (from, to) = pinned(first, len);
+            if to <= at || from >= end {
                 return true;
             }
             taken.extend(home.upgrade());
@@ -585,21 +631,21 @@ impl Ask for LiveAsk<'_> {
             != crate::inplace::Cover::None
     }
 
-    fn region(&mut self) -> Option<bool> {
+    fn region(&mut self) -> Option<Result<(), Why>> {
         let mut core = core();
         let (base, region) = core.region_at(self.at as usize)?;
         if (self.at + self.bytes) as usize > base + region.len {
             return None;
         }
         self.base = base;
-        Some(region.blacklisted || region.busy > 0)
+        Some(region.may_home())
     }
 
     fn committed(&mut self) -> bool {
         region_whole(self.base, self.at as usize, self.bytes as usize)
     }
 
-    fn claim(&mut self) -> bool {
+    fn claim(&mut self) -> Result<(), Why> {
         let mut core = core();
         // Asked again under the core's lock, which a free or protection of
         // the title's in the region takes to mark it busy before it calls the
@@ -608,18 +654,18 @@ impl Ask for LiveAsk<'_> {
         // marked the region first and nothing is claimed in it until the
         // call is done.
         match core.region_at(self.base) {
-            Some((base, region))
-                if base == self.base && !region.blacklisted && region.busy == 0 => {}
-            _ => return false,
+            Some((base, region)) if base == self.base => region.may_home()?,
+            // Released or replaced since `region` found it.
+            _ => return Err(Why::NotRegion),
         }
         if !crate::inplace::try_reserve_at(&RESERVED, self.bytes, most()) {
-            return false;
+            return Err(Why::Budget);
         }
         if let Some((_, region)) = core.region_at(self.base) {
             region.homes_ever += 1;
         }
         *core.live.entry((self.at, self.bytes)).or_default() += 1;
-        true
+        Ok(())
     }
 }
 
@@ -756,7 +802,13 @@ fn resolve_with(
             }
             Err(error) => {
                 unclaim(at, bytes);
+                // A free or protection of the title's that came in after the
+                // claim is not the host refusing to open: not in the row.
+                let went_busy = core()
+                    .region_at(ask.base)
+                    .is_none_or(|(base, region)| base != ask.base || region.busy > 0);
                 match error {
+                    _ if went_busy => turned_down(Why::Busy),
                     Some(error) => refused(&error, start, len),
                     None => turned_down(Why::Refused),
                 }
@@ -958,9 +1010,17 @@ fn unbusy(base: usize) {
 pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
     // SAFETY: the title's own arguments, for the host function it called.
     let host = || unsafe { mem::VirtualFree(at as *mut c_void, len, kind) };
+    // SAFETY: a plain read of this thread's last error.
+    let before = unsafe { GetLastError() };
     let Some((from, to, base)) = free_span(at, len, kind) else {
         return host();
     };
+    // A release ends the region and its waiting frees: from before the
+    // host's call to the region's end in the table, no waiting free runs
+    // ([`run_pending`]) and no region is told ([`title_memory_region`]), so
+    // neither can meet a reservation of the title's made at these addresses
+    // meanwhile. Taken first, as [`run_pending`] takes it.
+    let _freeing = (kind == mem::MEM_RELEASE).then(freeing);
     match busy(base, 0) {
         (false, _) => return host(),
         (true, false) => {
@@ -969,7 +1029,7 @@ pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
             let error = unsafe { GetLastError() };
             unbusy(base);
             if done != 0 && kind == mem::MEM_RELEASE {
-                forget_region(base);
+                released(base);
             }
             // SAFETY: as the host left it.
             unsafe { SetLastError(error) };
@@ -984,24 +1044,54 @@ pub fn title_virtual_free(at: usize, len: usize, kind: u32) -> i32 {
     if done != 0 || error != REFUSED_BY_HEAP {
         unbusy(base);
         if done != 0 && kind == mem::MEM_RELEASE {
-            forget_region(base);
+            released(base);
         }
         // SAFETY: as the host left it.
         unsafe { SetLastError(error) };
         return done;
     }
     TOLD[2].fetch_add(1, Ordering::Relaxed);
-    let mut core = core();
-    core.pending.push(Pending {
-        at,
-        len,
-        kind,
-        pages: (from, to),
-        region: base,
-        since: crate::host::now_ms(),
-    });
-    PENDING.fetch_add(1, Ordering::Release);
+    {
+        let mut core = core();
+        core.pending.push(Pending {
+            at,
+            len,
+            kind,
+            pages: (from, to),
+            region: base,
+            since: crate::host::now_ms(),
+        });
+        PENDING.fetch_add(1, Ordering::Release);
+    }
+    // Done, as the title is told: its last error as it was before.
+    // SAFETY: a plain write of this thread's last error.
+    unsafe { SetLastError(before) };
     1
+}
+
+/// The region at `base` was released: it leaves the table, and the frees of
+/// it that wait go with it (the host freed their pages with the rest).
+/// Called with [`FREEING`] held.
+fn released(base: usize) {
+    let mut core = core();
+    core.regions.remove(&base);
+    drop_pending(&mut core, |p| p.region == base);
+}
+
+/// Drops the waiting frees `which` picks, with their marks of their
+/// regions' busy counts.
+fn drop_pending(core: &mut Core, which: impl Fn(&Pending) -> bool) {
+    let pending = std::mem::take(&mut core.pending);
+    let (gone, kept): (Vec<Pending>, Vec<Pending>) = pending.into_iter().partition(&which);
+    core.pending = kept;
+    for p in &gone {
+        if let Some((found, region)) = core.region_at(p.region)
+            && found == p.region
+        {
+            region.busy = region.busy.saturating_sub(1);
+        }
+    }
+    PENDING.fetch_sub(gone.len() as u64, Ordering::Release);
 }
 
 /// The title's `VirtualProtect`, with the core on. As
@@ -1018,7 +1108,13 @@ pub fn title_virtual_protect(at: usize, len: usize, new: u32, old: *mut u32) -> 
     let host = || unsafe { mem::VirtualProtect(at as *const c_void, len, new, old) };
     let base = {
         let mut core = core();
-        let Some((base, _)) = core.region_at(at) else {
+        // A protection past the region's end (over two regions) goes to the
+        // host as it is: one region's busy mark could not cover it.
+        let Some(base) = core
+            .region_at(at)
+            .filter(|(base, region)| at.checked_add(len).is_some_and(|e| e <= base + region.len))
+            .map(|(base, _)| base)
+        else {
             drop(core);
             return host();
         };
@@ -1185,8 +1281,15 @@ fn run_pending_after(give_up_ms: u64) {
         cpu_touched(p.pages.0, p.pages.1 - p.pages.0, Touch::Freeing);
     }
     unnumber();
-    let mut kept = Vec::new();
+    let mut kept: Vec<Pending> = Vec::new();
+    // Regions a waiting release ended this pass: their other waiting frees
+    // go with them (the host freed their pages), never to the host.
+    let mut ended: Vec<usize> = Vec::new();
     for p in due {
+        if ended.contains(&p.region) {
+            PENDING.fetch_sub(1, Ordering::Release);
+            continue;
+        }
         // SAFETY: the title's own arguments, as it gave them.
         let done = unsafe { mem::VirtualFree(p.at as *mut c_void, p.len, p.kind) };
         // SAFETY: a plain read of this thread's last error.
@@ -1226,10 +1329,15 @@ fn run_pending_after(give_up_ms: u64) {
             );
         }
         unbusy(p.region);
-        if done != 0 && p.kind == mem::MEM_RELEASE {
-            forget_region(p.region);
-        }
         PENDING.fetch_sub(1, Ordering::Release);
+        if done != 0 && p.kind == mem::MEM_RELEASE {
+            ended.push(p.region);
+            let before = kept.len();
+            kept.retain(|k| k.region != p.region);
+            PENDING.fetch_sub((before - kept.len()) as u64, Ordering::Release);
+            // With those put in the list since this pass took it.
+            released(p.region);
+        }
     }
     core().pending.extend(kept);
 }
@@ -1411,9 +1519,9 @@ pub(crate) mod tests {
         holder: Option<bool>,
         card: bool,
         view: bool,
-        region: Option<bool>,
+        region: Option<Result<(), Why>>,
         committed: bool,
-        claim: bool,
+        claim: Result<(), Why>,
         asked: Vec<&'static str>,
     }
 
@@ -1423,9 +1531,9 @@ pub(crate) mod tests {
                 holder: None,
                 card: false,
                 view: false,
-                region: Some(false),
+                region: Some(Ok(())),
                 committed: true,
-                claim: true,
+                claim: Ok(()),
                 asked: Vec::new(),
             }
         }
@@ -1449,7 +1557,7 @@ pub(crate) mod tests {
             self.asked.push("view");
             self.view
         }
-        fn region(&mut self) -> Option<bool> {
+        fn region(&mut self) -> Option<Result<(), Why>> {
             self.asked.push("region");
             self.region
         }
@@ -1457,7 +1565,7 @@ pub(crate) mod tests {
             self.asked.push("committed");
             self.committed
         }
-        fn claim(&mut self) -> bool {
+        fn claim(&mut self) -> Result<(), Why> {
             self.asked.push("claim");
             self.claim
         }
@@ -1567,10 +1675,18 @@ pub(crate) mod tests {
             ),
             (
                 Fixed {
-                    region: Some(true),
+                    region: Some(Err(Why::Blacklisted)),
                     ..Fixed::good()
                 },
                 Why::Blacklisted,
+                "region",
+            ),
+            (
+                Fixed {
+                    region: Some(Err(Why::Busy)),
+                    ..Fixed::good()
+                },
+                Why::Busy,
                 "region",
             ),
             (
@@ -1583,7 +1699,15 @@ pub(crate) mod tests {
             ),
             (
                 Fixed {
-                    claim: false,
+                    claim: Err(Why::Busy),
+                    ..Fixed::good()
+                },
+                Why::Busy,
+                "claim",
+            ),
+            (
+                Fixed {
+                    claim: Err(Why::Budget),
                     ..Fixed::good()
                 },
                 Why::Budget,
@@ -2142,9 +2266,9 @@ pub(crate) mod tests {
             base,
             card: &mut card,
         };
-        assert!(!ask.claim(), "busy: nothing claimed");
+        assert_eq!(ask.claim(), Err(Why::Busy), "busy: nothing claimed");
         unbusy(base);
-        assert!(ask.claim(), "claimed once the call is done");
+        assert_eq!(ask.claim(), Ok(()), "claimed once the call is done");
         unclaim(region.base, K64);
         region.release();
     }
@@ -2184,6 +2308,128 @@ pub(crate) mod tests {
         unregister(0xc0de_1301, start);
         drop(held);
         region.release();
+    }
+
+    /// A small buffer's home pins the whole 64 KiB page around it: the
+    /// title's protection and decommit of a neighbour 4 KiB page in that
+    /// page, outside the buffer, let the home go too and are done at once.
+    #[test]
+    fn warp_core_a_neighbour_page_in_a_homes_64k_lets_it_go() {
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::on(false);
+        let region = TestRegion::new(8 * K64 as usize);
+        let (start, len) = (region.base + K64 + 0x100, 0x200);
+        let page = (region.base + K64 + 0x8000) as usize;
+        register(0xc0de_1501, start, len);
+        assert!(find(start, len).expect("a home").is_home());
+        let mut old = 0;
+        assert_eq!(
+            title_virtual_protect(page, 4096, mem::PAGE_READONLY, &mut old),
+            1,
+            "the protection of a neighbour page is made"
+        );
+        assert_eq!(
+            title_virtual_protect(page, 4096, mem::PAGE_READWRITE, &mut old),
+            1
+        );
+        assert!(find(start, len).expect("a home again").is_home());
+        let waiting = TOLD[2].load(Ordering::Relaxed);
+        assert_eq!(title_virtual_free(page, 4096, mem::MEM_DECOMMIT), 1);
+        assert_eq!(state(page as u64), mem::MEM_RESERVE, "decommitted at once");
+        assert_eq!(TOLD[2].load(Ordering::Relaxed), waiting, "nothing waited");
+        assert!(
+            core()
+                .unnumber
+                .contains(&(page as u64, (page + 4096) as u64)),
+            "the sweep takes it out of the directory"
+        );
+        run_pending();
+        assert_eq!(PENDING.load(Ordering::Relaxed), 0);
+        unregister(0xc0de_1501, start);
+        region.release();
+    }
+
+    /// Reserves `bytes` at `at` again, as the title's next `XMemVirtualAlloc`
+    /// may, and tells the core: the region a release ended, reused.
+    fn reuse(at: u64, bytes: usize) -> TestRegion {
+        // SAFETY: addresses the test's own allocation released.
+        let again = unsafe {
+            mem::VirtualAlloc(
+                at as *const c_void,
+                bytes,
+                mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH,
+                mem::PAGE_READWRITE,
+            )
+        } as u64;
+        assert_eq!(again, at, "the released addresses are free");
+        title_memory_region(at as usize, bytes, mem::MEM_RESERVE, 3, 0x404);
+        TestRegion { base: at }
+    }
+
+    /// A release done while a decommit of the region waits ends that wait:
+    /// after the title reserves the same addresses again the sweep frees
+    /// none of its new pages, and the new region is not left busy. Both
+    /// ways: the release done at once, and the release itself waiting.
+    #[test]
+    fn warp_core_a_release_ends_the_regions_waiting_frees() {
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::on(false);
+        const BYTES: usize = 8 * K64 as usize;
+        for release_waits in [false, true] {
+            let region = TestRegion::new(BYTES);
+            let base = region.base;
+            let (start, len) = (base + K64, K64);
+            register(0xc0de_1601, start, len);
+            let held = find(start, len).expect("a home");
+            assert!(held.is_home());
+            if release_waits {
+                assert_eq!(title_virtual_free(base as usize, 0, mem::MEM_RELEASE), 1);
+            }
+            assert_eq!(
+                title_virtual_free(start as usize, len as usize, mem::MEM_DECOMMIT),
+                1
+            );
+            assert_eq!(
+                PENDING.load(Ordering::Relaxed),
+                1 + u64::from(release_waits),
+                "waiting"
+            );
+            unregister(0xc0de_1601, start);
+            drop(held);
+            let failed = TOLD[4].load(Ordering::Relaxed);
+            if release_waits {
+                run_pending();
+            } else {
+                assert_eq!(title_virtual_free(base as usize, 0, mem::MEM_RELEASE), 1);
+            }
+            assert_eq!(state(base), mem::MEM_FREE, "released");
+            assert_eq!(
+                PENDING.load(Ordering::Relaxed),
+                0,
+                "the decommit went with it"
+            );
+            assert!(core().pending.is_empty());
+            assert_eq!(
+                TOLD[4].load(Ordering::Relaxed),
+                failed,
+                "never asked of the host"
+            );
+            let again = reuse(base, BYTES);
+            fill(start, len, 11);
+            run_pending();
+            assert_eq!(state(start), mem::MEM_COMMIT, "the new pages stay");
+            let mut want = vec![0u8; len as usize];
+            for (i, b) in want.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(13).wrapping_add(11);
+            }
+            assert!(same(start, &want), "with the title's bytes");
+            assert_eq!(
+                core().region_at(base as usize).map(|(_, r)| r.busy),
+                Some(0),
+                "the new region is not busy"
+            );
+            again.release();
+        }
     }
 
     /// A free still refused after it waited long enough is given up: the
