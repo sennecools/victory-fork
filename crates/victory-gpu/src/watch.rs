@@ -2910,7 +2910,29 @@ mod tests {
             }
         });
         if light() {
-            assert!(by_bits.into_inner() > 0, "the bits answered none");
+            // A block that rests after a write (`VICTORY_GUARD_REST`) is not
+            // clean, so not known by its bits, until an asking after its
+            // rest; here the title writes every page again within
+            // milliseconds, and with three views a page is clean only once
+            // none of its views rests: with a rest of milliseconds the bits
+            // may answer none of the askings above. Without a rest they
+            // must.
+            if super::rest().is_zero() {
+                assert!(by_bits.into_inner() > 0, "the bits answered none");
+            }
+            // Either way: once nothing has been written for longer than any
+            // rest, one asking at each view has every view known by its
+            // bits.
+            std::thread::sleep(super::rest().max(rest) + std::time::Duration::from_millis(1));
+            for &at in &all {
+                writes(at, at + PAGES * PAGE, true).expect("a view");
+            }
+            for &at in &all {
+                assert!(
+                    published(at, at + PAGES * PAGE),
+                    "nothing written since: the bits know the view at {at:x}"
+                );
+            }
         }
     }
 
