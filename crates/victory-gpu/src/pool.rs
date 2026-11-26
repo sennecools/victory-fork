@@ -347,7 +347,8 @@ struct Chunk {
 static MADE_CHUNKS: AtomicU64 = AtomicU64::new(0);
 
 /// The chunks by their section's handle. Taken after every other lock of
-/// the runtime's that is held when a home is resolved (the shadow tables);
+/// the runtime's that is held when a home is resolved (`crate::shadow`'s
+/// `HOMING`);
 /// nothing that takes another lock of ours runs with it held.
 static CHUNKS: Mutex<BTreeMap<usize, Chunk>> = Mutex::new(BTreeMap::new());
 

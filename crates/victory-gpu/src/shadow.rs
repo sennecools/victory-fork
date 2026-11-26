@@ -4362,6 +4362,8 @@ fn let_go_placed(at: u64, len: u64, look: Option<usize>) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
+        // A placement made meanwhile is in the tables first ([`HOMING`]).
+        let _homing = homing(homes_made());
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
@@ -4369,8 +4371,7 @@ fn let_go_placed(at: u64, len: u64, look: Option<usize>) -> u64 {
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
-    }
-    {
+        drop(map);
         // As `lookup` finds a buffer: among the 256 that start below (or,
         // at the title's end, all of them).
         let mut map = buffers();
@@ -4398,6 +4399,8 @@ fn let_go_placed(at: u64, len: u64, look: Option<usize>) -> u64 {
 /// CPU side is one of them (`crate::card_home`) goes too, and is returned:
 /// it holds the home, so the caller lets it go as one.
 pub(crate) fn let_go_homes(homes: &[Arc<Shadow>]) -> Vec<Arc<Shadow>> {
+    // A home found or made meanwhile is in the tables first ([`HOMING`]).
+    let _homing = homing(homes_made());
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         for home in homes {
@@ -4738,157 +4741,277 @@ fn carded_home(on_card: ID3D12Resource, home: Arc<Shadow>, start: u64, len: u64,
     Arc::new(shadow)
 }
 
+/// Held from the making of a copy that is the title's own memory (a home of
+/// the memory core, `crate::home`, or a placement, `crate::inplace`) until
+/// it is in the tables, and by the let-goes of such copies
+/// ([`let_go_placed`], [`let_go_homes`]) while they look at the tables: a
+/// copy made while its memory is let go is either in the tables before
+/// the let-go looks, or made after it, from what the memory is then. One
+/// home made at a time also keeps the core's one-home rule: a second ask
+/// for the same bytes finds the first home in the core's tables, as when
+/// [`BUFFERS`] was held across it. Taken before [`BUFFERS`] and [`LOOSE`],
+/// never while either is held; the copies of our own (host buffers) are
+/// made without it.
+static HOMING: Mutex<()> = Mutex::new(());
+
+/// [`HOMING`], if `on` (the memory core or placements in use: nothing to
+/// order otherwise).
+fn homing(on: bool) -> Option<std::sync::MutexGuard<'static, ()>> {
+    on.then(|| HOMING.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Whether homes or placements are made at all ([`homing`]).
+fn homes_made() -> bool {
+    crate::home::on() || crate::inplace::level() > 0
+}
+
+/// Copies made with no table lock held that another thread's copy of the
+/// same bytes beat into the tables, and their bytes: each was dropped, and
+/// its ask got the other. Only grows.
+pub(crate) static RACE_LOST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Asks for a title buffer's copy that got none: the title released the
+/// buffer, or registered it anew with another length, while each of
+/// [`lookup`]'s tries made a copy (each copy was dropped). Only grows.
+pub(crate) static GONE_WHILE_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// The entry of a title buffer whose copy was made went, or changed, while
+/// the copy was made ([`publish`]): the ask looks again.
+struct Gone;
+
+/// `made` lost the race to the tables ([`RACE_LOST`]).
+fn lost(made: &Shadow) {
+    RACE_LOST[0].fetch_add(1, Ordering::Relaxed);
+    RACE_LOST[1].fetch_add(made.len, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: called once, just before this thread next makes a host
+    /// buffer for a copy (with no table lock held, which the hook may
+    /// check).
+    static MAKING: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+    /// Tests: if set, every copy this thread offers a title buffer's table
+    /// entry ([`publish`]), won or lost.
+    static MADE_HERE: std::cell::RefCell<Option<Vec<std::sync::Weak<Shadow>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A host buffer is about to be made for a copy, with no table lock held
+/// ([`MAKING`] in tests).
+fn making() {
+    #[cfg(test)]
+    if let Some(hook) = MAKING.take() {
+        hook();
+    }
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    /// Copies made for an entry that went or changed meanwhile ([`Gone`])
+    /// before the ask gives up: each try looks at the table anew.
+    const TRIES: usize = 3;
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
-        return loose(address, end, len <= 1, any);
-    };
-    let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let size = len.next_multiple_of(1 << 16);
-        // In place, if asked for and the memory can be opened
-        // (`crate::inplace::place_for`): the buffer is the title's own
-        // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
-        // The memory core (`crate::home`, `VICTORY_MEMORY_CORE=1`): the
-        // home that holds the buffer, or a new one, or a copy; a big buffer
-        // is offered the card first, and the card's answer is kept for the
-        // copy made below.
-        let mut card_asked: Option<Option<ID3D12Resource>> = None;
-        if crate::home::on() {
-            let mut card = || {
-                let on_card = card_for(size);
-                let given = on_card.is_some();
-                card_asked = Some(on_card);
-                given
-            };
-            match crate::home::resolve(key.0, len, false, big, &mut card) {
-                crate::home::Found::Home(home) => {
-                    entry.shadow = Some(home);
-                    return entry.shadow.clone();
-                }
-                crate::home::Found::New(new) => {
-                    entry.shadow = Some(new.home(key.0, len, false));
-                    return entry.shadow.clone();
-                }
-                crate::home::Found::Card | crate::home::Found::Copy => {}
-            }
-        }
-        // Folded (`VICTORY_FOLD_BUFFERS=1`, off by default): a small buffer
-        // inside one window cell takes the cell's window as its copy, so that
-        // the buffer and the memory around it, which the title also reaches by
-        // address, are one copy. Two copies of the same bytes made every
-        // submission that refreshed one while a flight's shaders wrote the
-        // other wait for the card to drain: ~2.8 times a frame in the world,
-        // for 10-40 KB each (a 6.4 KB ring and a 465 KB buffer inside 4 MiB
-        // windows). One copy's own pending writes are left alone by its
-        // refresh and need no such wait.
-        if !big
-            && !crate::home::on()
-            && fold_buffers()
-            && !fine()
-            && key.0 & !(WINDOW - 1) == (entry.end - 1) & !(WINDOW - 1)
-        {
-            if let Some(window) = loose(key.0, entry.end, false, false) {
-                if FOLDED.fetch_add(1, Ordering::Relaxed) < 24 {
-                    tracing::info!(
-                        start = format_args!("{:#x}", key.0),
-                        len,
-                        "a buffer's copy is its window's (VICTORY_FOLD_BUFFERS)"
-                    );
-                }
-                entry.shadow = Some(window);
-                return entry.shadow.clone();
-            }
-        }
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false, None)));
-            return entry.shadow.clone();
-        }
-        // The card took a copy that the core offered it first: its CPU side
-        // is the home of the buffer's bytes if they can have one
-        // (`VICTORY_MEMORY_CARDS=1`), with no staging buffer of ours.
-        if let Some(Some(on_card)) = &card_asked
-            && let Some(home) = card_side(key.0, len)
-        {
-            let shadow = carded_home(on_card.clone(), home, key.0, len, size);
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-            crate::memory::copy_made(key.0, len);
-            entry.shadow = Some(shadow);
-            return entry.shadow.clone();
-        }
-        if let Some(Some(_)) = &card_asked {
-            crate::card_home::kept();
-        }
-        let Some((buffer, data)) = host().and_then(|host| host.shared_buffer(size)) else {
-            // A card side the core asked for first is given back.
-            if let Some(Some(_)) = &card_asked {
-                CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-            }
-            return None;
+    for _ in 0..TRIES {
+        // The table is held only to look: the copy is made without it.
+        let found = buffers()
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            .map(|(key, e)| (*key, e.end, e.shadow.clone()));
+        let Some((key, buffer_end, shadow)) = found else {
+            return loose(address, end, len <= 1, any);
         };
-        crate::host::label(&buffer, "title buffer host copy", size);
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_asked.unwrap_or_else(|| card_for(size)) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    size,
-                    home: None,
-                    staging_at: 0,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
+        if shadow.is_some() {
+            return shadow;
+        }
+        if let Ok(copy) = buffer_copy(key, buffer_end - key.0) {
+            return copy;
+        }
+    }
+    GONE_WHILE_MADE.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+/// The copy of title buffer `key` (`len` bytes), which has none yet: made
+/// with no table lock held, then put in the table ([`publish`]). `Ok(None)`:
+/// the host has no memory for it.
+fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone> {
+    // Rounded up so that views ending in the buffer's last 256 bytes fit.
+    // Shaders write some buffers (unordered access), so not upload memory.
+    let size = len.next_multiple_of(1 << 16);
+    // In place, if asked for and the memory can be opened
+    // (`crate::inplace::place_for`): the buffer is the title's own
+    // memory. Not the big ones `cards` puts in the card's memory: those
+    // are read too often to stay in the PC's.
+    let big = cards() && size >= card_limits().0;
+    // The memory core (`crate::home`, `VICTORY_MEMORY_CORE=1`): the
+    // home that holds the buffer, or a new one, or a copy; a big buffer
+    // is offered the card first, and the card's answer is kept for the
+    // copy made below. A home is found or made, and tabled, under one hold
+    // of [`HOMING`].
+    let mut card_asked: Option<Option<ID3D12Resource>> = None;
+    if crate::home::on() {
+        let _homing = homing(true);
+        let mut card = || {
+            let on_card = card_for(size);
+            let given = on_card.is_some();
+            card_asked = Some(on_card);
+            given
         };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
+        match crate::home::resolve(key.0, len, false, big, &mut card) {
+            crate::home::Found::Home(home) => return publish(key, len, home, false).map(Some),
+            crate::home::Found::New(new) => {
+                return publish(key, len, new.home(key.0, len, false), false).map(Some);
+            }
+            crate::home::Found::Card | crate::home::Found::Copy => {}
+        }
+    }
+    // Folded (`VICTORY_FOLD_BUFFERS=1`, off by default): a small buffer
+    // inside one window cell takes the cell's window as its copy, so that
+    // the buffer and the memory around it, which the title also reaches by
+    // address, are one copy. Two copies of the same bytes made every
+    // submission that refreshed one while a flight's shaders wrote the
+    // other wait for the card to drain: ~2.8 times a frame in the world,
+    // for 10-40 KB each (a 6.4 KB ring and a 465 KB buffer inside 4 MiB
+    // windows). One copy's own pending writes are left alone by its
+    // refresh and need no such wait.
+    let end = key.0 + len;
+    if !big
+        && !crate::home::on()
+        && fold_buffers()
+        && !fine()
+        && key.0 & !(WINDOW - 1) == (end - 1) & !(WINDOW - 1)
+        && let Some(window) = loose(key.0, end, false, false)
+    {
+        if FOLDED.fetch_add(1, Ordering::Relaxed) < 24 {
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
                 len,
-                "large buffer copied to the host"
+                "a buffer's copy is its window's (VICTORY_FOLD_BUFFERS)"
             );
-        } else {
-            tracing::debug!(
+        }
+        return publish(key, len, window, false).map(Some);
+    }
+    if !big {
+        let _homing = homing(crate::inplace::level() > 0);
+        if let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+            let placed = Arc::new(Shadow::placed(placed, key.0, len, false, None));
+            return publish(key, len, placed, false).map(Some);
+        }
+    }
+    // The card took a copy that the core offered it first: its CPU side
+    // is the home of the buffer's bytes if they can have one
+    // (`VICTORY_MEMORY_CARDS=1`), with no staging buffer of ours. Let go
+    // with that home ([`let_go_homes`]), so tabled under [`HOMING`] too.
+    if let Some(Some(on_card)) = &card_asked {
+        let _homing = homing(true);
+        if let Some(home) = card_side(key.0, len) {
+            let shadow = carded_home(on_card.clone(), home, key.0, len, size);
+            return publish(key, len, shadow, true).map(Some);
+        }
+        crate::card_home::kept();
+    }
+    making();
+    let Some((buffer, data)) = host().and_then(|host| host.shared_buffer(size)) else {
+        // A card side the core asked for first is given back.
+        if let Some(Some(_)) = &card_asked {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        }
+        return Ok(None);
+    };
+    crate::host::label(&buffer, "title buffer host copy", size);
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match card_asked.unwrap_or_else(|| card_for(size)) {
+        Some(on_card) => {
+            crate::host::name(&on_card, || {
+                format!("title buffer {:#x}+{len:#x} on the card", key.0)
+            });
+            tracing::info!(
                 start = format_args!("{:#x}", key.0),
                 len,
-                "buffer copied to the host"
+                "a buffer's host copy is in the card's memory"
             );
+            let card = Card {
+                staging: buffer,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                size,
+                home: None,
+                staging_at: 0,
+            };
+            (on_card, Some(card))
         }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-        }
-        crate::memory::copy_made(key.0, len);
-        entry.shadow = Some(shadow);
+        None => (buffer, None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "buffer copied to the host"
+        );
     }
-    entry.shadow.clone()
+    let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+    shadow.card = card;
+    publish(key, len, Arc::new(shadow), true).map(Some)
+}
+
+/// Puts `made`, just made or found for title buffer `key` of `len` bytes,
+/// in the table as its copy, and returns it; unless another thread's copy
+/// got there first (that one is returned, and `made` is dropped:
+/// [`RACE_LOST`]), or the title released the buffer meanwhile, or
+/// registered it anew with another length ([`Gone`]; `made` is dropped: a
+/// copy out of the table would be a second copy of the bytes, which the
+/// refreshes, finding copies by address, never see, and one of the old
+/// length under the new entry would be too short). `ours`: a host buffer
+/// of ours made for it, counted with the copies made.
+fn publish(
+    key: (u64, usize),
+    len: u64,
+    made: Arc<Shadow>,
+    ours: bool,
+) -> Result<Arc<Shadow>, Gone> {
+    #[cfg(test)]
+    MADE_HERE.with_borrow_mut(|here| {
+        if let Some(here) = here {
+            here.push(Arc::downgrade(&made));
+        }
+    });
+    let mut map = buffers();
+    let Some(entry) = map.get_mut(&key).filter(|entry| entry.end == key.0 + len) else {
+        drop(map);
+        return Err(Gone);
+    };
+    if let Some(other) = &entry.shadow {
+        let other = other.clone();
+        drop(map);
+        if !Arc::ptr_eq(&other, &made) {
+            lost(&made);
+        }
+        return Ok(other);
+    }
+    if ours {
+        if made.card.is_some() {
+            CARDED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Arc::downgrade(&made));
+        }
+        crate::memory::copy_made(key.0, made.len);
+    }
+    entry.shadow = Some(made.clone());
+    Ok(made)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -5027,48 +5150,61 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    // The table is held only to look: the window is made without it.
+    let (start, len) = {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let (cell, _) = window_of(address, end, WINDOW);
+        let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+        let span = if unsized_ask && tails() {
+            let there = map
+                .range((cell, 0)..=(address, u64::MAX))
+                .map(|(key, _)| *key);
+            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if any && fine() && !unsized_ask {
+            // The windows that begin in the ask's cell at or below the ask (one
+            // that begins in a cell below and reaches this far is passed over:
+            // the ask then makes its own).
+            let there = map
+                .range((cell, 0)..=(address, u64::MAX))
+                .map(|(key, _)| *key);
+            holder(there, address, end).unwrap_or(named)
+        } else {
+            named
+        };
+        if let Some(shadow) = map.get(&span) {
+            noted(shadow, address, end, unsized_ask);
+            return Some(shadow.clone());
         }
+        span
     };
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
-    }
     // The memory core (`crate::home`): the home that holds the window (a
     // window let go by the sweep while a buffer inside it kept it), or a new
-    // one. A window is never offered the card here.
+    // one. A window is never offered the card here. Found or made, and
+    // tabled, under one hold of [`HOMING`].
     if crate::home::on() {
+        let _homing = homing(true);
         let home = match crate::home::resolve(start, len, true, false, &mut || false) {
             crate::home::Found::Home(home) => Some(home),
             crate::home::Found::New(new) => Some(new.home(start, len, true)),
             crate::home::Found::Card | crate::home::Found::Copy => None,
         };
-        // A home found for the window's exact span is the window; one that
-        // holds it from further out is handed out without being tabled as a
-        // window of this span.
         if let Some(home) = home {
-            note(&home);
+            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            // A window of this span made meanwhile (by an ask the core gave
+            // a copy): that one.
+            if let Some(window) = map.get(&(start, len)) {
+                let window = window.clone();
+                noted(&window, address, end, unsized_ask);
+                drop(map);
+                if !Arc::ptr_eq(&window, &home) {
+                    lost(&home);
+                }
+                return Some(window);
+            }
+            // A home found for the window's exact span is the window; one
+            // that holds it from further out is handed out without being
+            // tabled as a window of this span.
+            noted(&home, address, end, unsized_ask);
             if home.span() == (start, len) {
                 map.insert((start, len), home.clone());
             }
@@ -5077,12 +5213,21 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true, None));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+    {
+        let _homing = homing(crate::inplace::level() > 0);
+        if let Some(placed) = crate::inplace::place_for(start, len, true) {
+            let shadow = Arc::new(Shadow::placed(placed, start, len, true, None));
+            return Some(window_made(
+                (start, len),
+                shadow,
+                address,
+                end,
+                unsized_ask,
+                false,
+            ));
+        }
     }
+    making();
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::label(&buffer, "window host copy", len);
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -5090,7 +5235,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // buffer there, and the one just made is the CPU's side.
     let (buffer, card) = match window_card_for(len) {
         Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+            crate::host::name(&on_card, || {
+                format!("title memory {start:#x}+{len:#x} on the card")
+            });
             let card = Card {
                 staging: buffer,
                 before: Mutex::default(),
@@ -5114,14 +5261,61 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
-    let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    Some(window_made(
+        (start, len),
+        Arc::new(shadow),
+        address,
+        end,
+        unsized_ask,
+        true,
+    ))
+}
+
+/// An ask of `[address, end)` takes window `shadow` (`unsized_ask`: one
+/// without a length). Under [`LOOSE`]'s lock, with the handing out: see
+/// `let_go_idle`.
+fn noted(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
     }
-    note(&shadow);
-    crate::memory::copy_made(start, len);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
+}
+
+/// Puts `made`, just made as the window `span` for an ask of `[address,
+/// end)`, in the table, and returns it; unless another thread's window of
+/// the span got there first (that one is returned, and `made` is dropped:
+/// [`RACE_LOST`]). `ours`: a host buffer of ours, counted with the copies
+/// made.
+fn window_made(
+    span: (u64, u64),
+    made: Arc<Shadow>,
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    ours: bool,
+) -> Arc<Shadow> {
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(other) = map.get(&span) {
+        let other = other.clone();
+        noted(&other, address, end, unsized_ask);
+        drop(map);
+        lost(&made);
+        return other;
+    }
+    if ours {
+        if made.card.is_some() {
+            CARDED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Arc::downgrade(&made));
+        }
+        crate::memory::copy_made(span.0, span.1);
+    }
+    noted(&made, address, end, unsized_ask);
+    map.insert(span, made.clone());
+    made
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
@@ -5157,28 +5351,47 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
-    }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
+    // The table is held to look and to prune: the copy is made without it.
+    let now = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        if map.len() >= MANY {
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), and not asked for lately.
+            map.retain(|_, (shadow, used)| {
+                Arc::strong_count(shadow) > 1
+                    || crate::host::references(&shadow.buffer) > 1
+                    || *used + LATELY > now
+            });
+        }
+        now
+    };
+    making();
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::label(&buffer, "view host copy", len.next_multiple_of(256));
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = &mut guard.1;
+    // Another thread's copy of the same bytes, made meanwhile: that one
+    // ([`RACE_LOST`]).
+    if let Some((other, used)) = map.get_mut(&(address, len)) {
+        *used = (*used).max(now);
+        other.used.store(crate::host::moment(), Ordering::Relaxed);
+        let other = other.clone();
+        drop(guard);
+        lost(&shadow);
+        return Some(other);
+    }
     crate::memory::copy_made(address, len);
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -5187,8 +5400,30 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// With the frame line: the buffer views that got a copy of their own
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
-/// Nothing while there are none.
+/// Nothing while there are none. And copies made with no table lock held
+/// that lost the race to the tables ([`RACE_LOST`]) or whose title buffer
+/// went meanwhile ([`GONE_WHILE_MADE`]), since the last line, if any.
 pub(crate) fn exact_line(frames: f64) {
+    static SAID: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let raced = [
+        RACE_LOST[0].load(Ordering::Relaxed),
+        RACE_LOST[1].load(Ordering::Relaxed),
+        GONE_WHILE_MADE.load(Ordering::Relaxed),
+    ];
+    let since: Vec<u64> = raced
+        .iter()
+        .zip(&SAID)
+        .map(|(&now, said)| now - said.swap(now, Ordering::Relaxed))
+        .collect();
+    if since.iter().any(|&n| n > 0) {
+        tracing::info!(
+            "copies made with no table lock held: {} lost the race to another thread's copy of the same bytes \
+             ({} KiB, dropped), {} of title buffers released meanwhile (dropped)",
+            since[0],
+            since[1] >> 10,
+            since[2]
+        );
+    }
     let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
@@ -5200,6 +5435,215 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+/// Copies made with no table lock held, then put in the tables.
+#[cfg(test)]
+mod race_tests {
+    use super::{
+        Arc, BUFFERS, EXACT, LOOSE, MADE_HERE, MAKING, Mutex, Ordering, Shadow, exact, find, host,
+        let_go_copies_for_test, register, tabled_copy, unregister,
+    };
+    use std::sync::atomic::AtomicU64;
+
+    /// Memory of its own, `len` bytes, committed; freed by [`free`].
+    fn memory(len: usize) -> u64 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // SAFETY: new memory.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as u64;
+        assert_ne!(at, 0);
+        at
+    }
+
+    fn free(at: u64) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: memory from `memory`, which nothing reads any more.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Whether `table` can be locked within two seconds: a lock another
+    /// test's thread holds is given back by then; one this thread holds,
+    /// while it waits here, never.
+    fn frees<T>(table: &Mutex<T>) -> bool {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match table.try_lock() {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return true,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() > until {
+                        return false;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// Threads that ask at once for parts of a title buffer with no copy
+    /// yet all get one copy, the one in the table, and every other copy
+    /// made for it is gone (dropped as it lost the race). The same for a
+    /// buffer big enough for a copy in the card's memory.
+    #[test]
+    fn racing_asks_share_one_copy() {
+        const THREADS: usize = 8;
+        if host().is_none() {
+            return; // no host GPU
+        }
+        for len in [256u64 << 10, 2 << 20] {
+            let at = memory(4 << 20);
+            register(at as usize, at, len);
+            let start = std::sync::Barrier::new(THREADS);
+            let asked: Vec<(Arc<Shadow>, Vec<std::sync::Weak<Shadow>>)> =
+                std::thread::scope(|scope| {
+                    let threads: Vec<_> = (0..THREADS as u64)
+                        .map(|k| {
+                            let start = &start;
+                            scope.spawn(move || {
+                                MADE_HERE.set(Some(Vec::new()));
+                                start.wait();
+                                let copy = find(at + k * 256, 256).expect("a copy");
+                                (copy, MADE_HERE.take().unwrap_or_default())
+                            })
+                        })
+                        .collect();
+                    threads.into_iter().map(|t| t.join().unwrap()).collect()
+                });
+            let first = asked[0].0.clone();
+            assert!(
+                asked.iter().all(|(c, _)| Arc::ptr_eq(c, &first)),
+                "{len}: one copy"
+            );
+            let tabled = tabled_copy(at).expect("in the table");
+            assert!(Arc::ptr_eq(&tabled, &first), "{len}: the table's");
+            // Of every copy made for the buffer, only the table's is left.
+            let made: Vec<std::sync::Weak<Shadow>> = asked
+                .iter()
+                .flat_map(|(_, made)| made.iter().cloned())
+                .collect();
+            assert!(!made.is_empty(), "{len}: a copy was made");
+            let alive: Vec<Arc<Shadow>> =
+                made.iter().filter_map(std::sync::Weak::upgrade).collect();
+            assert_eq!(alive.len(), 1, "{len}: the losers' copies are gone");
+            assert!(Arc::ptr_eq(&alive[0], &first));
+            drop((asked, first, tabled, alive));
+            unregister(at as usize, at);
+            assert!(
+                made.iter().all(|weak| weak.upgrade().is_none()),
+                "{len}: the copy goes with its buffer"
+            );
+            free(at);
+        }
+    }
+
+    /// Host buffers for a title buffer's copy, a window's and a buffer
+    /// view's own bytes are made with none of the three tables held by the
+    /// thread that makes them.
+    #[test]
+    fn copies_are_made_without_the_table_locks() {
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        fn free_tables() {
+            assert!(
+                frees(&BUFFERS),
+                "the buffer table held while a copy is made"
+            );
+            assert!(frees(&LOOSE), "the window table held while a copy is made");
+            assert!(frees(&EXACT), "the view table held while a copy is made");
+            MADE.fetch_add(1, Ordering::Relaxed);
+        }
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let at = memory(8 << 20);
+        register(at as usize, at, 64 << 10);
+        let before = MADE.load(Ordering::Relaxed);
+        MAKING.set(Some(free_tables));
+        assert!(find(at + 16, 16).is_some(), "the buffer's copy");
+        // Outside the buffer: a window (in the next 4 MiB cell).
+        MAKING.set(Some(free_tables));
+        assert!(find(at + (4 << 20) + 16, 16).is_some(), "a window");
+        MAKING.set(Some(free_tables));
+        assert!(exact(at + 0x100, 0x40).is_some(), "a view's own bytes");
+        MAKING.set(None);
+        assert_eq!(MADE.load(Ordering::Relaxed) - before, 3);
+        let_go_copies_for_test(at, at + (8 << 20));
+        unregister(at as usize, at);
+        free(at);
+    }
+
+    /// A title buffer the title releases while its copy is made: the ask
+    /// looks again and gets what is there now (a window), and the copy
+    /// made for the buffer is gone.
+    #[test]
+    fn a_buffer_released_while_its_copy_is_made_is_looked_up_again() {
+        thread_local! {
+            static AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        fn release() {
+            let at = AT.get();
+            unregister(at as usize, at);
+        }
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let at = memory(1 << 20);
+        AT.set(at);
+        register(at as usize, at, 64 << 10);
+        MADE_HERE.set(Some(Vec::new()));
+        MAKING.set(Some(release));
+        let copy = find(at, 256).expect("a window");
+        let made = MADE_HERE.take().unwrap_or_default();
+        assert!(copy.window, "the memory's window, the buffer gone");
+        assert!(tabled_copy(at).is_none());
+        assert!(
+            made.iter()
+                .all(|weak| weak.upgrade().is_none_or(|m| Arc::ptr_eq(&m, &copy))),
+            "the buffer's copy is gone"
+        );
+        drop(copy);
+        let_go_copies_for_test(at, at + (1 << 20));
+        free(at);
+    }
+
+    /// A title buffer released and registered again under the same start
+    /// and resource with another length while its copy is made: the copy
+    /// made for the old length is not tabled under the new entry; the ask
+    /// looks again and gets a copy of the new length.
+    #[test]
+    fn a_buffer_registered_anew_while_its_copy_is_made_gets_its_own_copy() {
+        const OLD: u64 = 64 << 10;
+        const NEW: u64 = 192 << 10;
+        thread_local! {
+            static AT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        fn anew() {
+            let at = AT.get();
+            unregister(at as usize, at);
+            register(at as usize, at, NEW);
+        }
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let at = memory(1 << 20);
+        AT.set(at);
+        register(at as usize, at, OLD);
+        MAKING.set(Some(anew));
+        let copy = find(at, 256).expect("a copy");
+        assert_eq!(copy.len, NEW, "a copy of the buffer as it is now");
+        let tabled = tabled_copy(at).expect("in the table");
+        assert!(Arc::ptr_eq(&tabled, &copy));
+        drop((copy, tabled));
+        unregister(at as usize, at);
+        free(at);
+    }
 }
 
 #[cfg(test)]

@@ -816,8 +816,9 @@ impl Ask for LiveAsk<'_> {
             Cover::Holes | Cover::Scattered => return Viewed::Copy(Why::Scattered),
             Cover::Run(..) => {}
         }
-        // Not waited for: the caller holds the shadow tables, which a remap
-        // under way takes to let homes go (`crate::shadow::let_go_homes`).
+        // Not waited for: the caller holds `crate::shadow`'s `HOMING`, which
+        // a remap under way takes to let homes go
+        // (`crate::shadow::let_go_homes`).
         let Some(reading) = crate::watch::title_memory_reading_now(start, len) else {
             return Viewed::Copy(Why::Remapping);
         };
