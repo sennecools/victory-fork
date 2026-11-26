@@ -453,10 +453,32 @@ mod d3d {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Pieces of textures that went, and when, not yet in [`TEXTURES`]:
+    /// a texture gives its piece back from inside the runtime's destruction
+    /// of it ([`release`]), which may hold locks of the runtime's own, while
+    /// [`TEXTURES`] is held across the making of a block (`CreateHeap`).
+    /// Taking only this, never held across a call to the runtime, keeps
+    /// the two from waiting on each other.
+    static GIVEN: Mutex<Vec<(u64, Piece)>> = Mutex::new(Vec::new());
+
+    /// [`TEXTURES`], with the pieces given back meanwhile in it.
+    fn textures() -> std::sync::MutexGuard<'static, Pool<ID3D12Heap>> {
+        let mut pool = lock(&TEXTURES);
+        given_into(&mut pool);
+        pool
+    }
+
+    fn given_into(pool: &mut Pool<ID3D12Heap>) {
+        for (at, piece) in std::mem::take(&mut *lock(&GIVEN)) {
+            pool.give(piece, at);
+        }
+    }
+
     /// [`super::room`]'s look at the pools, passed over while one is busy.
     pub(super) fn reclaim(limit: usize) {
         let tick = now();
         if let Ok(mut pool) = TEXTURES.try_lock() {
+            given_into(&mut pool);
             pool.reclaim(tick, limit, true);
         }
         if let Ok(mut pool) = STAGING.try_lock() {
@@ -608,7 +630,7 @@ mod d3d {
                     set.remove(&gone.texture);
                 }
                 HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-                lock(&TEXTURES).give(gone.piece, now());
+                lock(&GIVEN).push((now(), gone.piece));
             }
             left
         }
@@ -695,7 +717,7 @@ mod d3d {
         if info.SizeInBytes == u64::MAX {
             return None;
         }
-        let (piece, heap, _) = lock(&TEXTURES).take_ripe(
+        let (piece, heap, _) = textures().take_ripe(
             info.SizeInBytes,
             info.Alignment.max(1),
             now(),
@@ -774,7 +796,7 @@ mod d3d {
                 1,
                 "what the texture holds is no reference to it"
             );
-            let resting = || lock(&TEXTURES).resting.len();
+            let resting = || textures().resting.len();
             let before = resting();
             let other = t.clone();
             drop(t);
