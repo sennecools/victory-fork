@@ -230,7 +230,13 @@ fn mirror(handle: u64, site: u64) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
+                // The key of what is mirrored, read before the mirror: a
+                // record copied over it meanwhile is not taken as seen.
+                let key = host::record_key(handle);
                 host.mirror(index, handle, false);
+                // Seen as mirrored: the next pass leaves the record if the
+                // slot still shows it.
+                host.saw_key(index, key);
             }
         }
     }
@@ -271,13 +277,13 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
     // summed over the threads) and the pass of each heap (`mirror_us`: all
     // the time it took on the calling thread, that thread's share of the
     // reading and its waits for the other threads with it, so it overlaps
-    // `read_us`); `skipped_made`: records whose slot was made from them
-    // already, done with before its slot's claim (`host::SKIPPED_MADE`);
-    // `shows_none`: records left with `VICTORY_SHOWS_NONE=1`.
+    // `read_us`); `skipped_made`: mirrors done with before their slot's
+    // claim, the slot made from the record already (`host::SKIPPED_MADE`,
+    // every mirror's, the pass's among them).
     let mut span = crate::profile::span("sync heaps");
     let (mut read_ticks, mut mirror_ticks) = (0u64, 0u64);
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored, mut nothing) = (0u64, 0u64, 0u64, 0u64);
+    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let skipped_before = host::SKIPPED_MADE.load(Relaxed);
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter().filter(|h| bound.contains(&h.2)) {
@@ -301,7 +307,6 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
         pages += found.pages;
         looked += found.looked;
         mirrored += found.make.len() as u64;
-        nothing += found.nothing;
         read_ticks += found.read_ticks;
         mirror_ticks += made_ticks;
     }
@@ -316,7 +321,6 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
             "skipped_made",
             host::SKIPPED_MADE.load(Relaxed) - skipped_before,
         );
-        span.arg("shows_none", nothing);
     }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
@@ -380,13 +384,13 @@ const SYNC_THREADS: usize = 4;
 /// [`sync_heaps`] of one heap: the pages of the changed ranges `taken` of
 /// the title heap at `start` (records of `step` bytes, the first
 /// `mirrored_count` with host slots) are read by the safe copy
-/// (`crate::safecopy`), compared with what was last seen and sorted
-/// ([`host::HostHeap::sort_copied_page`]), [`host::SYNC_PAGES`] a job; then
-/// the slots found with new records are mirrored, [`host::SYNC_SLOTS`] a
-/// job, the jobs on [`SYNC_THREADS`] threads. A slot is mirrored only after
-/// every page of the heap is read, and not in slot order (each slot's
-/// mirror is ordered by its claim, as the draws' and the heap buffer pass's
-/// are).
+/// (`crate::safecopy`), their keys compared with the ones last seen and
+/// what each slot shows, and sorted ([`host::HostHeap::sort_copied_page`]),
+/// [`host::SYNC_PAGES`] a job; then the slots found with new records are
+/// mirrored, [`host::SYNC_SLOTS`] a job, the jobs on [`SYNC_THREADS`]
+/// threads. A slot is mirrored only after every page of the heap is read,
+/// and not in slot order (each slot's mirror is ordered by its claim, as
+/// the draws' and the heap buffer pass's are).
 ///
 /// Returns what was found, and the profile ticks it took (all of them: the
 /// reading is on the other threads too).
@@ -414,8 +418,6 @@ fn sync_parted_heap(
         }
     }
     let threads = SYNC_THREADS;
-    let shows_none = host::shows_none();
-    let copied = host.copied_begin(step as usize);
     let jobs: Vec<&[(usize, usize)]> = parts.chunks(host::SYNC_PAGES).collect();
     let found: Vec<std::sync::Mutex<host::SyncPart>> =
         jobs.iter().map(|_| Default::default()).collect();
@@ -436,19 +438,7 @@ fn sync_parted_heap(
             }
             part.pages += 1;
             let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-            // SAFETY: the parts are ranges of the heap apart from one
-            // another, and a record is the part's that holds its first byte.
-            unsafe {
-                host.sort_copied_page(
-                    &copied,
-                    slots,
-                    (start, step),
-                    from,
-                    &page_bytes,
-                    shows_none,
-                    &mut part,
-                )
-            };
+            host.sort_copied_page(slots, (start, step), from, &page_bytes, &mut part);
         }
         *found[n].lock().unwrap_or_else(|e| e.into_inner()) = part;
     });
@@ -458,17 +448,13 @@ fn sync_parted_heap(
         let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
         all.pages += part.pages;
         all.looked += part.looked;
-        all.tabled += part.tabled;
-        all.nothing += part.nothing;
         all.read_ticks += part.read_ticks;
         all.make.append(&mut part.make);
         left.append(&mut part.left);
     }
     // The slots left to tables before whose marks have aged: read again,
     // whether or not their pages were written since.
-    // SAFETY: the parts are done; this thread alone has the records now.
-    unsafe { host.retake_left(&copied, &left, (start, step), &mut all) };
-    drop(copied);
+    host.retake_left(&left, (start, step), &mut all);
     let make = &all.make;
     crate::draw::each_on(
         threads,
@@ -521,29 +507,18 @@ pub(crate) fn sync_line(frames: f64) {
     if pages == 0 {
         return;
     }
-    // A record is compared with the one last seen before the question
-    // whether its slot was a table's, so "left to the draws" counts only
-    // records that changed there.
+    // A record whose key is the one last seen, in a slot that shows it or
+    // nothing, is left before the question whether its slot was a table's,
+    // so "left to the draws" below counts only the others.
     {
         // (`SKIPPED_MADE` only grows: the line's part since the last line.)
         static LINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let skipped = host::SKIPPED_MADE.load(std::sync::atomic::Ordering::Relaxed);
         let since = skipped.wrapping_sub(LINED.swap(skipped, std::sync::atomic::Ordering::Relaxed));
         tracing::info!(
-            "heap sync: per frame {:.0} records whose slot was made from them already, done \
-             with before their slot's claim; the count left to the draws below is of changed \
-             records only",
-            since as f64 / frames
-        );
-    }
-    if host::shows_none() {
-        // (`SHOWED_NONE` only grows: the line's part since the last line.)
-        static LINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let none = host::SHOWED_NONE.load(std::sync::atomic::Ordering::Relaxed);
-        let since = none.wrapping_sub(LINED.swap(none, std::sync::atomic::Ordering::Relaxed));
-        tracing::info!(
-            "heap sync with VICTORY_SHOWS_NONE=1: per frame {:.0} changed records of no view \
-             into slots made from none, left before their mirror (not counted as mirrored below)",
+            "view heap slots: per frame {:.0} mirrors whose slot was made from the record \
+             already, done with before the slot's claim; the count left to the draws below is \
+             of records the heap sync did not leave",
             since as f64 / frames
         );
     }
@@ -1325,14 +1300,18 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
-        // With `VICTORY_SAME_RECORDS=1` (`same_records`), records copied onto
-        // the same bytes are not written: their page stays unwritten for the
-        // write watch, and the heap sync does not read it for them. They are
-        // mirrored as before.
+        // Records copied onto the same bytes are not written: their page stays
+        // unwritten for the write watch, and the heap sync does not read it
+        // for them. They are mirrored all the same. The title copies its
+        // tables' records into its heaps each frame, many of them onto what
+        // is there already; a write of the same bytes would still mark the
+        // page written. What the title reads back is the same either way.
+        // (Ported from the `VICTORY_SAME_RECORDS` check of cool_fox e8d3d91,
+        // by local, there in its own write of the title's bytes, which this
+        // port leaves out.)
         // SAFETY: both ranges are descriptor slots the title owns (they may
         // overlap: only read here).
-        let same = same_records()
-            && len > 0
+        let same = len > 0
             && unsafe {
                 std::slice::from_raw_parts(dst as *const u8, len as usize)
                     == std::slice::from_raw_parts(src as *const u8, len as usize)
@@ -1346,34 +1325,6 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             mirror(dst + i * step, list_site::COPY);
         }
     }
-}
-
-/// Whether [`copy_simple`] (and so [`copy`]) leaves records that are copied
-/// onto the same bytes unwritten (`VICTORY_SAME_RECORDS=1`, off by default:
-/// written, as before). The title copies its tables' records into its heaps
-/// each frame, many of them onto what is there already; a write of the same
-/// bytes still marks the page written, and the heap sync then reads and
-/// compares it (`sync_heaps`). What the title reads back is the same either
-/// way.
-///
-/// Ported from the `VICTORY_SAME_RECORDS` check of cool_fox e8d3d91, by
-/// local (there in its own write of the title's bytes, which this port
-/// leaves out).
-fn same_records() -> bool {
-    #[cfg(test)]
-    if let Some(on) = SAME_RECORDS_HERE.get() {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_some_and(|v| v == "1"))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Tests: [`same_records`] as a test on this thread sets it, whatever
-    /// the switch says; other threads' tests are left as the switch says.
-    pub(crate) static SAME_RECORDS_HERE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
