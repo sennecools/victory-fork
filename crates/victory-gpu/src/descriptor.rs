@@ -1004,6 +1004,16 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// For the frame budget's line (`crate::frame_budget`): the view table's
+/// entries in use and its length. Freed entries are used again before the
+/// table grows, so its length is the most entries ever in use at once.
+#[cfg(windows)]
+pub(crate) fn views_in_use() -> [u64; 2] {
+    let views = views_read();
+    let len = views.list.len() as u64;
+    [len.saturating_sub(views.free.len() as u64), len]
+}
+
 /// For the memory line: the distinct views kept ([`Views`]), those of them
 /// free for reuse, and the bytes the table and its index hold for them (an
 /// estimate: an entry of the table, and one of the index with its share of

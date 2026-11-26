@@ -115,6 +115,14 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         }
         return S_OK;
     }
+    #[cfg(windows)]
+    {
+        use crate::frame_budget::{Part, count};
+        count(Part::FenceWaits, 1);
+        if event.is_null() {
+            count(Part::FenceBlocking, 1);
+        }
+    }
     if event.is_null() {
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are

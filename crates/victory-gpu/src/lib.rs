@@ -32,6 +32,8 @@ pub mod fence;
 #[cfg(windows)]
 mod flip;
 pub mod frame;
+#[cfg(windows)]
+mod frame_budget;
 pub mod frametime;
 #[cfg(windows)]
 mod home;
