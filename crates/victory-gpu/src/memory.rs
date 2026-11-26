@@ -110,7 +110,22 @@
 //! them it did not happen. Aligned structure accesses do not cross.
 //!
 //! The switch needs every submission waited for (no `VICTORY_LATE_WAIT`,
-//! no relay): the copy's source is one buffer reused at every submission.
+//! no relay), or R5 (`crate::host::r5`): each copy at a submission's head
+//! reads a staging buffer and runs a list that only that submission uses
+//! until it has finished ([`crate::host::Ring`]), so a flight still in the
+//! air when the next submission's entries are laid out keeps its own, and on
+//! the one host queue every flight sees the table as it was when it was
+//! sent.
+//!
+//! shortcuts with R5: [`after_wait`] tells the copies over chunk pages as
+//! the table maps them at the flight's landing, not as the flight saw them,
+//! so a remap between its send and its landing can leave copies at the old
+//! views untold; and [`ready`], on the title's recording threads, makes the
+//! view of a number let go null while flights in the air may still reach
+//! that number through their own table (their reads there give zeros and
+//! their stores are dropped, as for a protection and for one submission
+//! without R5, but now for every flight in the air).
+//!
 //! shortcut: a home's pages are numbered when a dispatch names them or a
 //! fault asks, not when the home is made.
 
@@ -138,19 +153,19 @@ const PAGE: u64 = 1 << 16;
 const CELL_PAGES: u64 = CELL / PAGE;
 
 /// `VICTORY_MEMORY_DIRECTORY=1` with the memory core on, every submission
-/// waited for. Read once.
+/// waited for or R5 on (`crate::host::r5`). Read once.
 pub(crate) fn directory_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| {
         let asked = std::env::var_os("VICTORY_MEMORY_DIRECTORY").is_some_and(|v| v == "1");
-        let on = asked && crate::home::on() && !crate::host::late();
+        let on = asked && crate::home::on() && (!crate::host::late() || crate::host::r5());
         if on {
             tracing::info!(
                 "memory directory on (VICTORY_MEMORY_DIRECTORY=1): raw-address shaders reach pool pages page by page in place, and the directory changes on remap, at the head of each submission"
             );
         } else if asked {
             tracing::warn!(
-                "VICTORY_MEMORY_DIRECTORY=1 does nothing without VICTORY_MEMORY_CORE=1, or with late waits or the relay"
+                "VICTORY_MEMORY_DIRECTORY=1 does nothing without VICTORY_MEMORY_CORE=1, or with late waits or the relay unless VICTORY_R5=1"
             );
         }
         on
@@ -211,9 +226,17 @@ struct Next {
     entries: Vec<u32>,
     /// The pages changed since the last copy.
     dirty: BTreeSet<u32>,
-    /// The changed entries, laid out for the copy: buffer, mapping, bytes.
+    /// What the copies at submissions' heads use, each taken again once its
+    /// submission has finished.
+    copiers: crate::host::Ring<Copier>,
+}
+
+/// What one copy at a submission's head uses ([`record`]): the changed
+/// entries laid out for it (buffer, mapping, bytes), and the list that
+/// copies them, with its allocator.
+struct Copier {
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
-    copier: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+    list: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
 }
 
 struct Memory {
@@ -416,8 +439,7 @@ impl Memory {
             self.next = Some(Next {
                 entries,
                 dirty: BTreeSet::new(),
-                staging: None,
-                copier: None,
+                copiers: crate::host::Ring::new(),
             });
             NEXT_MADE.store(true, Ordering::Relaxed);
         }
@@ -1013,14 +1035,17 @@ pub(crate) fn chunk_gone(section: usize, buffer: &ID3D12Resource) {
         .push(Gone(section, buffer.clone()));
 }
 
-/// At a submission, before its lists go to the card (`Host::submit`, with
-/// every submission waited for): with the directory on, the chunks that
-/// went lose their numbers ([`chunk_gone`]), the chunk pages remapped
-/// since get their entries anew ([`remapped`]), then the entries
+/// At submission `number`, before its lists go to the card (`Host::submit`,
+/// with every submission waited for, or with R5): with the directory on, the
+/// chunks that went lose their numbers ([`chunk_gone`]), the chunk pages
+/// remapped since get their entries anew ([`remapped`]), then the entries
 /// changed since the last submission are copied into the shaders' table by
 /// a list of ours that the caller runs ahead of the submission's lists.
 /// None if nothing changed (or the switch is off).
-pub(crate) fn before_submission(host: &crate::host::Host) -> Option<ID3D12CommandList> {
+pub(crate) fn before_submission(
+    host: &crate::host::Host,
+    number: u64,
+) -> Option<ID3D12CommandList> {
     if !NEXT_MADE.load(Ordering::Relaxed) {
         return None;
     }
@@ -1053,7 +1078,10 @@ pub(crate) fn before_submission(host: &crate::host::Host) -> Option<ID3D12Comman
             let from = first as usize * 2;
             let to = from + count as usize * 2;
             // SAFETY: inside the directory's mapping; nothing of the card's
-            // reads it now (every submission is waited for).
+            // reads it now (every submission is waited for). shortcut: with
+            // R5 a flight in the air may read it meanwhile, and see some of
+            // these entries early (only when no memory or list could be
+            // had for the copy, counted).
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     next.entries[from..to].as_ptr(),
@@ -1069,7 +1097,7 @@ pub(crate) fn before_submission(host: &crate::host::Host) -> Option<ID3D12Comman
         return None;
     }
     let bytes: u64 = runs.iter().map(|&(_, count)| u64::from(count) * 8).sum();
-    let recorded = record(host, directory, next, &runs, bytes);
+    let recorded = record(host, directory, next, &runs, bytes, number);
     DIR[at::UPDATES].fetch_add(1, Ordering::Relaxed);
     DIR[at::UPDATED].fetch_add(bytes / 8, Ordering::Relaxed);
     if recorded.is_none() {
@@ -1084,58 +1112,89 @@ pub(crate) fn before_submission(host: &crate::host::Host) -> Option<ID3D12Comman
 }
 
 /// The list that copies the entries of `runs` (first page, pages) of
-/// `next` into `directory`, through `next`'s staging buffer, `bytes` long.
+/// `next` into `directory`, through a staging buffer `bytes` long, for
+/// submission `number`: a [`Copier`] whose last submission has finished
+/// (`crate::host::finished`), or a new one. It is that submission's until
+/// it finishes.
 fn record(
     host: &crate::host::Host,
     directory: &(ID3D12Resource, *mut u32, u64),
     next: &mut Next,
     runs: &[(u32, u32)],
     bytes: u64,
+    number: u64,
 ) -> Option<ID3D12CommandList> {
-    if next.staging.as_ref().is_none_or(|s| s.2 < bytes) {
+    let mut copier = match next.copiers.take(crate::host::finished()) {
+        Some(copier) => copier,
+        None => Copier {
+            staging: None,
+            list: new_copier(host)?,
+        },
+    };
+    let recorded = record_with(host, directory, &next.entries, &mut copier, runs, bytes);
+    // Its list may go to the card: kept until this submission finishes.
+    next.copiers.put(number, copier);
+    recorded
+}
+
+/// A list of ours (and its allocator), closed, for [`record`].
+fn new_copier(
+    host: &crate::host::Host,
+) -> Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+    // SAFETY: plain object creation.
+    let made = unsafe {
+        (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.Close()?;
+            Ok((allocator, list))
+        })()
+    };
+    made.ok()
+}
+
+/// [`record`] with `copier`, whose last submission has finished.
+fn record_with(
+    host: &crate::host::Host,
+    directory: &(ID3D12Resource, *mut u32, u64),
+    entries: &[u32],
+    copier: &mut Copier,
+    runs: &[(u32, u32)],
+    bytes: u64,
+) -> Option<ID3D12CommandList> {
+    if copier.staging.as_ref().is_none_or(|s| s.2 < bytes) {
         let size = bytes.next_power_of_two().max(64 << 10);
         let (buffer, data) = host.shared_buffer(size)?;
         crate::host::label(&buffer, "title memory by address", size);
         crate::host::name(&buffer, || "title memory by address: changes".to_string());
-        next.staging = Some((buffer, data, size));
+        // (The one it replaces: its last copy has run.)
+        copier.staging = Some((buffer, data, size));
     }
-    if next.copier.is_none() {
-        // SAFETY: plain object creation.
-        let made = unsafe {
-            (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
-                let allocator: ID3D12CommandAllocator = host
-                    .device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &allocator,
-                    None,
-                )?;
-                list.Close()?;
-                Ok((allocator, list))
-            })()
-        };
-        next.copier = Some(made.ok()?);
-    }
-    let (staging, data, _) = next.staging.as_ref()?;
+    let (staging, data, _) = copier.staging.as_ref()?;
     let mut at = 0usize;
     for &(first, count) in runs {
         let from = first as usize * 2;
         let dwords = count as usize * 2;
         // SAFETY: the staging mapping holds `bytes`; the card does not read
-        // it now (its last copy ran in a submission that was waited for).
+        // it now (its last copy ran in a submission that has finished).
         unsafe {
             std::ptr::copy_nonoverlapping(
-                next.entries[from..from + dwords].as_ptr(),
+                entries[from..from + dwords].as_ptr(),
                 data.add(at).cast::<u32>(),
                 dwords,
             )
         };
         at += dwords * 4;
     }
-    let (allocator, list) = next.copier.as_ref()?;
-    // SAFETY: the list's last run finished (its submission was waited for
+    let (allocator, list) = &copier.list;
+    // SAFETY: the list's last run finished (its submission has finished
     // before this one was prepared); live buffers, the ranges inside both.
     let recorded = unsafe {
         (|| -> windows::core::Result<ID3D12CommandList> {
@@ -1154,7 +1213,8 @@ fn record(
     recorded.ok()
 }
 
-/// After a submission's wait (`Host::submit`): if one of its lists could
+/// After a submission's wait (`Host::submit`; with R5 at its flight's
+/// landing, `Host::relay_land`): if one of its lists could
 /// store through the directory into chunk pages ([`ready`]), the copies
 /// over those pages, at every view of them, take them again
 /// (`crate::home::directory_written`): the guards do not see the card's

@@ -52,7 +52,27 @@
 //!
 //! What it assumes is what `crate::inplace` assumes: every submission is
 //! waited for. With `VICTORY_LATE_WAIT` or the relay nothing is given a
-//! home ([`Why::Late`]).
+//! home ([`Why::Late`]), unless R5 is on (`VICTORY_R5=1` with the relay's
+//! second stage, `crate::host::r5`): then the flights land what homes need
+//! too. At each landing, before the title is told anything, the copies over
+//! the bytes their shaders wrote are told ([`after_wait`]); a copy over a
+//! home is not refreshed while a flight may write the home; a protection of
+//! the title's over a home a flight holds waits for the flights in the air
+//! before it is refused ([`title_virtual_protect`]); frees that waited are
+//! looked at again after each landing ([`after_landing`]); and a home let go
+//! goes only once the flights that may name it are done
+//! (`crate::host::retire`, dropped when `FINISHED` passes the submissions
+//! running at the time).
+//!
+//! shortcuts with R5: a home's pages that the title frees, and the
+//! directory's entries for them, still wait for the sweep (with flights in
+//! the air, the forced one at most 1.5 s apart), not for the flights that
+//! name them; a protection that is refused waits for every flight in the
+//! air, not only those that name the home; a bottom-of-pipe write into a
+//! home is done on the CPU at its flight's landing, while a later flight may
+//! already read the home on the card; and a title buffer copy done on the
+//! CPU into a home is not ordered after a flight in the air that reads it,
+//! as the relay already assumes for host copies.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -143,7 +163,8 @@ thread_local! {
 
 #[cfg(test)]
 fn test_on() -> bool {
-    TEST_ON.with(std::cell::Cell::get)
+    // (And the relay's threads, landing a test's flights.)
+    TEST_ON.with(std::cell::Cell::get) || crate::host::test_relay_sees()
 }
 
 #[cfg(not(test))]
@@ -176,6 +197,9 @@ pub(crate) struct Gate {
     pub(crate) on: bool,
     /// Late waits or the relay: submissions are not all waited for.
     pub(crate) late: bool,
+    /// R5 (`crate::host::r5`): the flights land what homes need, so late
+    /// submissions do not keep ranges out of homes.
+    pub(crate) flights_safe: bool,
     /// The device can open parts of an allocation (`ID3D12Device13`).
     pub(crate) device13: bool,
     /// The host refused three openings in a row with the same error.
@@ -190,6 +214,7 @@ impl Gate {
         Gate {
             on: on(),
             late: crate::host::late(),
+            flights_safe: crate::host::r5(),
             device13: device13(),
             latched: LATCHED.load(Ordering::Relaxed),
             pool: crate::pool::on(),
@@ -227,16 +252,16 @@ fn device13() -> bool {
 static DEVICE13: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether something that stops every home of the core is known to hold
-/// now: late waits or the relay, a device that is no `ID3D12Device13`
-/// (once asked), the host's refusals latched. Creates no device
-/// (`crate::pool::memory_pool_homes_possible`).
+/// now: late waits or the relay without R5, a device that is no
+/// `ID3D12Device13` (once asked), the host's refusals latched. Creates no
+/// device (`crate::pool::memory_pool_homes_possible`).
 pub(crate) fn homes_ruled_out() -> bool {
     ruled_out().is_some()
 }
 
 /// [`homes_ruled_out`], with the reason.
 pub(crate) fn ruled_out() -> Option<Why> {
-    if crate::host::late() {
+    if crate::host::late() && !crate::host::r5() {
         Some(Why::Late)
     } else if DEVICE13.load(Ordering::Relaxed) == 2 {
         Some(Why::NoDevice13)
@@ -371,8 +396,9 @@ static MADE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// that failed; the title's protections of GPU regions, of them in regions
 /// that had a home, refused; GPU writes into homes told to copies; frees
 /// that waited given up ([`GIVE_UP_MS`]); homes a protection took out of
-/// `crate::memory`'s directory at once.
-static TOLD: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// `crate::memory`'s directory at once; with R5, protections refused at
+/// first that waited for the flights in the air, and their microseconds.
+static TOLD: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 /// How long a free of the title's waits for the heaps over its pages to go
 /// before it is given up ([`run_pending`]).
@@ -441,7 +467,8 @@ pub(crate) enum Class<H, P> {
 /// The rules of the memory core, in order. `big`: a title buffer large
 /// enough to be offered a card copy.
 ///
-/// 1. The process: the switch on, every submission waited for, a device
+/// 1. The process: the switch on, every submission waited for (or the
+///    flights landing what homes need, [`Gate::flights_safe`]), a device
 ///    that opens parts of an allocation, the host not latched off.
 /// 2. A big buffer is offered a copy in the card's memory first (G): the
 ///    card reads it there far faster than from the PC's memory, also when a
@@ -464,7 +491,7 @@ pub(crate) fn classify<A: Ask>(gate: Gate, big: bool, ask: &mut A) -> Class<A::H
     if !gate.on {
         return Class::Copy(Why::Off);
     }
-    if gate.late {
+    if gate.late && !gate.flights_safe {
         return Class::Copy(Why::Late);
     }
     if !gate.device13 {
@@ -1359,11 +1386,15 @@ fn drop_pending(core: &mut Core, which: impl Fn(&Pending) -> bool) {
 }
 
 /// The title's `VirtualProtect`, with the core on. As
-/// [`title_virtual_free`]; a protection cannot wait, so when the host still
-/// refuses after the homes were let go, what the retire queue holds for
-/// finished submissions is dropped and it is asked once more; refused again,
-/// the title gets FALSE with error 87 (what it got with `VICTORY_INPLACE`),
-/// it is counted, and the region is never given a home again.
+/// [`title_virtual_free`]; a protection cannot wait for a sweep, so when the
+/// host still refuses after the homes were let go, what the retire queue
+/// holds for finished submissions is dropped and it is asked once more;
+/// with R5 (`crate::host::r5`) the flights in the air when it was refused
+/// are waited for first, and the lists they ran let go, as those may be
+/// what holds the heap (`crate::host::wait_for_flights_now`, bounded by what
+/// is in the air, counted). Refused again, the title gets FALSE with error
+/// 87 (what it got with `VICTORY_INPLACE`), it is counted, and the region is
+/// never given a home again.
 // `old` is the title's own pointer, given to the host function it called as
 // the title gave it.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -1402,6 +1433,12 @@ pub fn title_virtual_protect(at: usize, len: usize, new: u32, old: *mut u32) -> 
     // SAFETY: a plain read of this thread's last error.
     let mut error = unsafe { GetLastError() };
     if done == 0 && error == REFUSED_BY_HEAP {
+        // Flights in the air may hold the heap (their lists, the homes let
+        // go retired behind them): those are waited for, then let go.
+        if let Some(us) = crate::host::wait_for_flights_now() {
+            TOLD[11].fetch_add(1, Ordering::Relaxed);
+            TOLD[12].fetch_add(us, Ordering::Relaxed);
+        }
         crate::host::bury_finished();
         done = host();
         // SAFETY: as above.
@@ -1532,8 +1569,30 @@ fn run_pending() {
     run_pending_after(GIVE_UP_MS);
 }
 
+/// With R5 (`crate::host::r5`), after flights landed and their lists were
+/// let go (`crate::host`'s `land`): a free that waited may find its heaps
+/// gone now, rather than at the next sweep, which behind flights comes only
+/// every second and a half. Nothing if none waits. The directory's entries
+/// over what frees and remaps let go stay for the sweep, when no submission
+/// runs (flights may be in the air here): a free whose heap the directory
+/// holds waits for that sweep as before. Takes [`FREEING`] and the core's
+/// lock, as [`run_pending`] does; the caller holds no lock of ours.
+pub(crate) fn after_landing() {
+    if PENDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    run_pending_with(GIVE_UP_MS, false);
+}
+
 /// [`run_pending`], giving up after `give_up_ms` (tests).
 fn run_pending_after(give_up_ms: u64) {
+    run_pending_with(give_up_ms, true);
+}
+
+/// [`run_pending`], giving up after `give_up_ms`; `unnumbers`: the
+/// directory's entries over what was let go are emptied first (at the
+/// sweep).
+fn run_pending_with(give_up_ms: u64, unnumbers: bool) {
     let _freeing = freeing();
     let due = if PENDING.load(Ordering::Acquire) == 0 {
         Vec::new()
@@ -1544,7 +1603,9 @@ fn run_pending_after(give_up_ms: u64) {
     for p in &due {
         cpu_touched(p.pages.0, p.pages.1 - p.pages.0, Touch::Freeing);
     }
-    unnumber();
+    if unnumbers {
+        unnumber();
+    }
     let mut kept: Vec<Pending> = Vec::new();
     // Regions a waiting release ended this pass: their other waiting frees
     // go with them (the host freed their pages), never to the host.
@@ -1606,9 +1667,10 @@ fn run_pending_after(give_up_ms: u64) {
     core().pending.extend(kept);
 }
 
-/// After a submission's wait: the shaders of its lists may have written
-/// these homes' ranges (`declared`: each copy with its ranges, as
-/// `Host::submit` gathers them). Write watching does not see GPU writes, so
+/// After a submission's wait (with R5, at the landing of the flights that
+/// declared them, before the title is told they are done): the shaders of
+/// its lists may have written these homes' ranges (`declared`: each copy
+/// with its ranges, as `Host::submit` gathers them). Write watching does not see GPU writes, so
 /// a copy over the same bytes elsewhere (a buffer view's exact copy, a
 /// buffer partly in a home) is told: its pages there count as written and
 /// its next refresh takes them again (`crate::watch::gpu_wrote`). Normally
@@ -1960,10 +2022,20 @@ fn lines() -> Vec<String> {
     let (homes, pinned) = core.live.iter().fold((0u64, 0u64), |a, (&(_, bytes), &n)| {
         (a.0 + u64::from(n), a.1 + bytes * u64::from(n))
     });
+    // (Only with R5 do protections wait for flights.)
+    let waited = if crate::host::r5() {
+        format!(
+            "{} waited for flights in the air ({} ms), ",
+            told[11],
+            told[12] / 1000
+        )
+    } else {
+        String::new()
+    };
     let mut lines = vec![format!(
         "memory core: {homes} homes pin {} MB (made {} windows, {} buffers; {} asks joined a home; {} big buffers given a card copy first; {} opens, {} us); \
          kept a copy: {}; title frees of GPU regions {} ({} in regions that had a home, {} done later, {} ms waited, {} failed later, {} given up, {} waiting), \
-         protections {} ({} in regions that had a home, {} refused, {} homes taken out of the shaders' directory at once); \
+         protections {} ({} in regions that had a home, {waited}{} refused, {} homes taken out of the shaders' directory at once); \
          GPU writes into homes told to copies over them {}; view heaps whose slots still hold a let-go home {views}; {pool}",
         pinned >> 20,
         made[0],
@@ -2149,10 +2221,64 @@ pub(crate) mod tests {
     const OPEN: Gate = Gate {
         on: true,
         late: false,
+        flights_safe: false,
         device13: true,
         latched: false,
         pool: true,
     };
+
+    /// R5: with flights in the air the rules go on as with every submission
+    /// waited for once the flights land what homes need
+    /// (`flights_safe`); without it late submissions keep every range a
+    /// copy, asking nothing. The switch alone, with nothing late, changes
+    /// nothing.
+    #[test]
+    fn classify_lets_homes_under_safe_flights() {
+        let safe = Gate {
+            late: true,
+            flights_safe: true,
+            ..OPEN
+        };
+        let mut f = Fixed::good();
+        assert_eq!(classify(safe, false, &mut f), Class::Place);
+        assert_eq!(f.asked, ["holder", "view", "region", "committed", "claim"]);
+        let mut f = Fixed {
+            holder: Some(true),
+            ..Fixed::good()
+        };
+        assert_eq!(classify(safe, false, &mut f), Class::Home(7));
+        let mut f = Fixed::good();
+        assert_eq!(
+            classify(Gate { late: true, ..OPEN }, false, &mut f),
+            Class::Copy(Why::Late)
+        );
+        assert!(f.asked.is_empty());
+        let mut f = Fixed::good();
+        assert_eq!(
+            classify(
+                Gate {
+                    flights_safe: true,
+                    ..OPEN
+                },
+                false,
+                &mut f
+            ),
+            Class::Place
+        );
+        // The gate's other rules still come first.
+        let mut f = Fixed::good();
+        assert_eq!(
+            classify(
+                Gate {
+                    device13: false,
+                    ..safe
+                },
+                false,
+                &mut f
+            ),
+            Class::Copy(Why::NoDevice13)
+        );
+    }
 
     /// Every rule of [`classify`], in its order, and that a rule asks
     /// nothing it does not need (the card is asked only for a big buffer,
@@ -2845,6 +2971,593 @@ pub(crate) mod tests {
         });
         assert!(matches!(found, Found::Copy));
         assert_eq!(turned(Why::Late), before + 1);
+        region.release();
+    }
+
+    // ---- R5 (`crate::host::r5`): homes under flights in the air ----
+
+    use crate::host::flights::{QueueHold, TestFlights};
+
+    /// The core on, and flights with R5 (in that order, so that the flights
+    /// land before the core goes off).
+    fn r5_on() -> (Switched, TestFlights) {
+        let core = Switched::on(false);
+        (core, TestFlights::on(true, true))
+    }
+
+    /// A buffer of ours in the PC's memory holding `bytes`, for a list to
+    /// copy from as a shader would write.
+    fn source(
+        host: &crate::host::Host,
+        bytes: &[u8],
+    ) -> windows::Win32::Graphics::Direct3D12::ID3D12Resource {
+        let (buffer, data) = host
+            .shared_buffer(bytes.len().next_multiple_of(256) as u64)
+            .unwrap();
+        // SAFETY: the mapping holds that many bytes; the card does not use it yet.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
+        buffer
+    }
+
+    /// A list whose "shader" writes `bytes` into `home` at title address
+    /// `at` (a copy on the card), declared as shaders' writes over
+    /// `[at, at + bytes)`; closed.
+    fn writer(
+        host: &crate::host::Host,
+        home: &Arc<Shadow>,
+        at: u64,
+        from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        bytes: u64,
+    ) -> crate::host::HostList {
+        let list = host.new_list().unwrap();
+        list.defer_refresh(home, at as usize, bytes as usize);
+        // SAFETY: an open list of the host's; live buffers, the range in both.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&home.buffer, home.offset(at), from, 0, bytes)
+        };
+        list.defer_gpu_write(home, at as usize, bytes as usize);
+        list.close();
+        list
+    }
+
+    /// A flight's shaders write a home's range; the next submission fills
+    /// upload memory from that range: it waits for that flight (a read of
+    /// what flights write), and once it is prepared its fill holds the
+    /// card's bytes, not the title's from before.
+    #[test]
+    fn warp_r5_fill_of_a_home_waits_for_the_flight_that_writes_it() {
+        let Some(host) = warp13() else { return };
+        let (_core, flights) = r5_on();
+        let region = TestRegion::new(4 * K64 as usize);
+        let (start, len) = (region.base + K64, K64);
+        register(0xc0de_5201, start, len);
+        let home = find(start, len).expect("a home under flights");
+        assert!(home.is_home(), "R5: a home while submissions fly");
+        fill(start, len, 1);
+        let written = [0xa5u8; 64];
+        let from = source(host, &written);
+        let hold = QueueHold::new(host);
+        let one = writer(host, &home, start + 0x100, &from, 64);
+        host.send_for_test(&one);
+        assert_eq!(crate::host::flights::in_air(), 1, "held on the queue");
+        let mut out = vec![0u8; 64];
+        let two = host.new_list().unwrap();
+        two.defer_fill(out.as_mut_ptr(), (start + 0x100) as *const u8, 64);
+        two.close();
+        assert_eq!(
+            crate::host::flights::blocked(&[&two]),
+            Some(crate::host::flights::READ),
+            "a read of what a flight writes"
+        );
+        let released = hold.released().after(200);
+        host.send_for_test(&two);
+        released.join().unwrap();
+        assert_eq!(out, written, "the fill took what the card wrote");
+        assert!(same(start + 0x100, &written));
+        flights.land_all();
+        one.reset();
+        two.reset();
+        drop((one, two, hold));
+        unregister(0xc0de_5201, start);
+        drop(home);
+        region.release();
+    }
+
+    /// An exact copy over a home's bytes; a flight's shaders write the home
+    /// there, and a fence of the title's is signalled behind the flight. By
+    /// the time the fence is set the copy has been told (its next refresh
+    /// takes the card's bytes): the landing tells copies before it tells the
+    /// title.
+    #[test]
+    fn warp_r5_copy_over_a_home_is_told_at_landing() {
+        let Some(host) = warp13() else { return };
+        let (_core, flights) = r5_on();
+        let region = TestRegion::new(8 * K64 as usize);
+        let (start, len) = (region.base + K64, 4 * K64);
+        register(0xc0de_5301, start, len);
+        let home = find(start, len).expect("a home");
+        assert!(home.is_home());
+        let (view, bytes) = (start + 0x2000, 0x1000u64);
+        let copy = crate::shadow::exact(view, bytes).expect("an exact copy");
+        assert!(!copy.is_home());
+        fill(start, len, 5);
+        copy.update(view as usize, bytes as usize);
+        assert!(same(view, crate::shadow::copy_bytes(&copy)));
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence
+            ),
+            crate::object::S_OK
+        );
+        let new = [0x5au8; 0x1000];
+        let from = source(host, &new);
+        let hold = QueueHold::new(host);
+        let one = writer(host, &home, view, &from, bytes);
+        host.send_for_test(&one);
+        assert!(
+            crate::host::flights::signal_behind(crate::fence::FenceRef::new(fence), 1),
+            "the signal waits behind the flight"
+        );
+        assert_eq!(crate::fence::completed(fence), 0);
+        hold.release();
+        let waited = std::time::Instant::now();
+        while crate::fence::completed(fence) < 1 {
+            assert!(waited.elapsed().as_secs() < 10, "the flight lands");
+            std::thread::yield_now();
+        }
+        assert!(same(view, &new), "the card's bytes are in title memory");
+        // On the software adapter the card is this process, and write
+        // watching saw it: forgotten, as a card's write is never seen.
+        // SAFETY: the test's own allocation.
+        unsafe { mem::ResetWriteWatch(region.base as *const c_void, 8 * K64 as usize) };
+        copy.update(view as usize, bytes as usize);
+        assert!(
+            same(view, crate::shadow::copy_bytes(&copy)),
+            "told before the fence was set: the refresh takes the card's bytes"
+        );
+        flights.land_all();
+        one.reset();
+        drop((one, hold));
+        // SAFETY: the fence's own release, our last reference.
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(fence, 0x10)(
+                fence
+            ),
+            0
+        );
+        unregister(0xc0de_5301, start);
+        drop((home, copy));
+        // Not released: the exact copy stays in its table, over this memory.
+        let _ = region;
+    }
+
+    /// An exact copy over a home's bytes is refreshed by a submission while
+    /// a flight's shaders write the home there: it waits for that flight, so
+    /// the refresh takes the card's bytes (nothing else would tell the copy
+    /// before its next refresh), and it is counted.
+    #[test]
+    fn warp_r5_x_refresh_over_flight_written_home_waits() {
+        let Some(host) = warp13() else { return };
+        let (_core, flights) = r5_on();
+        let region = TestRegion::new(8 * K64 as usize);
+        let (start, len) = (region.base + K64, 4 * K64);
+        register(0xc0de_5401, start, len);
+        let home = find(start, len).expect("a home");
+        let (view, bytes) = (start + 0x3000, 0x800u64);
+        let copy = crate::shadow::exact(view, bytes).expect("an exact copy");
+        assert!(!copy.is_home());
+        fill(start, len, 9);
+        copy.update(view as usize, bytes as usize);
+        let new = [0xc3u8; 0x800];
+        let from = source(host, &new);
+        let hold = QueueHold::new(host);
+        let one = writer(host, &home, view, &from, bytes);
+        host.send_for_test(&one);
+        let two = host.new_list().unwrap();
+        copy.refresh(&two, view, bytes);
+        two.close();
+        assert_eq!(
+            crate::host::flights::blocked(&[&two]),
+            None,
+            "no read of the CPU's"
+        );
+        assert!(crate::host::flights::refresh_waits(&[&two]));
+        let counted = crate::host::flights::r5_stats()[0];
+        let released = hold.released().after(200);
+        host.send_for_test(&two);
+        released.join().unwrap();
+        assert_eq!(crate::host::flights::r5_stats()[0], counted + 1, "counted");
+        assert!(
+            same(view, crate::shadow::copy_bytes(&copy)),
+            "the refresh came after the flight: the card's bytes"
+        );
+        assert!(same(view, &new));
+        // A refresh of the home itself does not wait.
+        let three = host.new_list().unwrap();
+        home.refresh(&three, view, bytes);
+        three.close();
+        let hold = QueueHold::new(host);
+        let four = writer(host, &home, view, &from, bytes);
+        host.send_for_test(&four);
+        assert!(!crate::host::flights::refresh_waits(&[&three]));
+        hold.release();
+        flights.land_all();
+        for list in [&one, &two, &three, &four] {
+            list.reset();
+        }
+        drop((one, two, three, four, hold));
+        unregister(0xc0de_5401, start);
+        drop((home, copy));
+        let _ = region;
+    }
+
+    /// The title frees a home's pages while a flight's list holds the home:
+    /// told TRUE, the pages wait, and they are decommitted once the flight
+    /// landed and its list was let go, without a sweep. The title protects
+    /// another home's pages while a flight holds that one: it waits for the
+    /// flights in the air, succeeds, and the region is not blacklisted.
+    #[test]
+    fn warp_r5_free_and_protect_with_a_flight_holding_the_home() {
+        let Some(host) = warp13() else { return };
+        let (_core, flights) = r5_on();
+        let region = TestRegion::new(8 * K64 as usize);
+        let (start, len) = (region.base + K64, K64);
+        register(0xc0de_5601, start, len);
+        let home = find(start, len).expect("a home");
+        assert!(home.is_home());
+        let hold = QueueHold::new(host);
+        let list = host.new_list().unwrap();
+        home.refresh(&list, start, len);
+        list.close();
+        host.send_owned_for_test(list);
+        drop(home);
+        let waiting = TOLD[2].load(Ordering::Relaxed);
+        assert_eq!(
+            title_virtual_free(start as usize, len as usize, mem::MEM_DECOMMIT),
+            1,
+            "told it was done"
+        );
+        assert_eq!(TOLD[2].load(Ordering::Relaxed), waiting + 1, "done later");
+        assert_eq!(state(start), mem::MEM_COMMIT, "held by the flight's list");
+        hold.release();
+        flights.land_all();
+        assert_eq!(
+            state(start),
+            mem::MEM_RESERVE,
+            "decommitted after the landing, with no sweep"
+        );
+        assert_eq!(PENDING.load(Ordering::Relaxed), 0);
+        unregister(0xc0de_5601, start);
+        // A protection, with a flight holding the home.
+        let (start, len) = (region.base + 4 * K64, K64);
+        register(0xc0de_5602, start, len);
+        let home = find(start, len).expect("a home");
+        assert!(home.is_home());
+        let hold = QueueHold::new(host);
+        let list = host.new_list().unwrap();
+        home.refresh(&list, start, len);
+        list.close();
+        host.send_owned_for_test(list);
+        drop(home);
+        let (waited, refused) = (
+            TOLD[11].load(Ordering::Relaxed),
+            TOLD[7].load(Ordering::Relaxed),
+        );
+        let released = hold.released().after(200);
+        let mut old = 0;
+        assert_eq!(
+            title_virtual_protect(start as usize, 4096, mem::PAGE_READONLY, &mut old),
+            1,
+            "done once the flight landed"
+        );
+        released.join().unwrap();
+        assert_eq!(TOLD[11].load(Ordering::Relaxed), waited + 1, "it waited");
+        assert_eq!(TOLD[7].load(Ordering::Relaxed), refused, "not refused");
+        assert_eq!(
+            title_virtual_protect(start as usize, 4096, mem::PAGE_READWRITE, &mut old),
+            1
+        );
+        assert_eq!(old, mem::PAGE_READONLY);
+        let again = find(start, len).expect("a home again");
+        assert!(again.is_home(), "the region is not blacklisted");
+        drop(again);
+        unregister(0xc0de_5602, start);
+        drop(hold);
+        region.release();
+    }
+
+    /// One scripted sequence of submissions, waited for one by one and then
+    /// sent as flights: shaders' writes into a home, fills from what earlier
+    /// ones wrote, bottom-of-pipe writes and a fence signal behind each: the
+    /// same title memory, fills and fence value either way.
+    #[test]
+    fn warp_r5_matches_waited_submissions() {
+        let Some(host) = warp13() else { return };
+        const N: usize = 50;
+        let run = |flights: bool| -> (u64, Vec<Vec<u8>>, u64) {
+            let _core = Switched::on(false);
+            let flying = flights.then(|| TestFlights::on(true, true));
+            let region = TestRegion::new(8 * K64 as usize);
+            let (start, len) = (region.base + K64, 4 * K64);
+            register(0xc0de_5701, start, len);
+            let home = find(start, len).expect("a home");
+            assert!(home.is_home());
+            fill(start, 6 * K64, 0x21);
+            let mut fence = std::ptr::null();
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence,
+            );
+            let mut fills = vec![vec![0u8; 64]; N];
+            let mut lists = Vec::new();
+            let sources: Vec<_> = (0..N)
+                .map(|i| source(host, &[i as u8 ^ 0x5c; 256]))
+                .collect();
+            for i in 0..N {
+                let at = start + ((i as u64 * 9973) % (len - 256)) / 4 * 4;
+                let list = host.new_list().unwrap();
+                list.defer_refresh(&home, at as usize, 256);
+                // SAFETY: an open list of the host's; live buffers.
+                unsafe {
+                    list.list
+                        .CopyBufferRegion(&home.buffer, home.offset(at), &sources[i], 0, 256)
+                };
+                list.defer_gpu_write(&home, at as usize, 256);
+                if i > 0 {
+                    // A fill of what the submission before wrote.
+                    let before = start + (((i as u64 - 1) * 9973) % (len - 256)) / 4 * 4;
+                    list.defer_fill(fills[i].as_mut_ptr(), before as *const u8, 64);
+                }
+                // A bottom-of-pipe value past the home, in the region.
+                list.defer_write(
+                    (start + len + 8 * i as u64) as *mut u8,
+                    crate::queue::Written::Value(i as u64 * 3 + 1),
+                    8,
+                );
+                list.close();
+                if flights {
+                    host.send_for_test(&list);
+                    if !crate::host::flights::signal_behind(
+                        crate::fence::FenceRef::new(fence),
+                        i as u64 + 1,
+                    ) {
+                        crate::fence::set(fence, i as u64 + 1);
+                    }
+                } else {
+                    host.execute(&[&list]);
+                    crate::fence::set(fence, i as u64 + 1);
+                }
+                lists.push(list);
+            }
+            if let Some(flying) = &flying {
+                flying.land_all();
+            }
+            let bytes = 6 * K64 as usize;
+            // SAFETY: the test's own memory.
+            let memory = unsafe { std::slice::from_raw_parts(start as *const u8, bytes) };
+            let hash = memory.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+            });
+            let value = crate::fence::completed(fence);
+            for list in &lists {
+                list.reset();
+            }
+            drop(lists);
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(fence, 0x10)(
+                fence,
+            );
+            unregister(0xc0de_5701, start);
+            drop(home);
+            drop(flying);
+            region.release();
+            (hash, fills, value)
+        };
+        let waited = run(false);
+        let flown = run(true);
+        assert_eq!(waited.2, N as u64);
+        assert_eq!(flown.2, waited.2, "the same fence value");
+        assert_eq!(flown.1, waited.1, "the same fills");
+        assert_eq!(flown.0, waited.0, "the same title memory");
+    }
+
+    /// With the directory switch on: two flights, each behind a change of a
+    /// home's directory entry, both on the queue before either runs. Each
+    /// one's list reads the entry as it was when that flight was sent: the
+    /// second's change did not reach the first's staging.
+    #[test]
+    fn warp_r5_directory_follows_queue_order() {
+        let Some(host) = warp13() else { return };
+        let core = Switched::on(false);
+        crate::memory::set_test(true);
+        let flights = TestFlights::on(true, true);
+        let region = TestRegion::low(12 << 20);
+        let cell = region.base.next_multiple_of(4 << 20);
+        let (start, len) = (cell + K64 + 0x100, 3 * K64);
+        register(0xc0de_5501, start, len);
+        let home = find(start, len).expect("a home");
+        assert!(home.is_home());
+        let heap = crate::descriptor::host::HostHeap::new(false, 8).expect("a view heap");
+        let page = cell + 2 * K64;
+        let hold = QueueHold::new(host);
+        let one = host.new_list().unwrap();
+        crate::memory::ready(&one, &heap, &[page + 0x10], &[], false).expect("ready");
+        let table = crate::memory::directory_buffer().unwrap();
+        let (out, data) = host.shared_buffer(16).unwrap();
+        // SAFETY: the mapping holds 16 bytes; the card does not use it yet.
+        unsafe { std::ptr::write_bytes(data, 0xff, 16) };
+        let seen = |list: &crate::host::HostList, at: u64| {
+            // SAFETY: an open list of the host's; live buffers, the ranges
+            // inside both.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&out, at, &table, page / K64 * 8, 8)
+            };
+        };
+        let (shaders, entry) = crate::memory::entries_of(page).unwrap();
+        assert_ne!(entry.0, 0, "numbered for the next submission");
+        assert_ne!(shaders, entry, "not yet in the card's table");
+        seen(&one, 0);
+        one.close();
+        host.send_for_test(&one);
+        // Changed for the next flight: the home is let go of.
+        assert!(crate::memory::forget(&home));
+        let two = host.new_list().unwrap();
+        seen(&two, 8);
+        two.close();
+        host.send_for_test(&two);
+        assert_eq!(crate::host::flights::in_air(), 2, "both held");
+        hold.release();
+        flights.land_all();
+        let read = |at: usize| {
+            // SAFETY: the mapping holds 16 bytes; the card is done with it.
+            unsafe { std::slice::from_raw_parts(data.add(at).cast::<u32>(), 2).to_vec() }
+        };
+        assert_eq!(
+            read(0),
+            [entry.0, entry.1],
+            "the first flight saw its own table"
+        );
+        assert_eq!(read(8), [0, 0], "the second saw the change");
+        assert_eq!(crate::memory::entries_of(page).unwrap(), ((0, 0), (0, 0)));
+        one.reset();
+        two.reset();
+        drop((one, two, hold, flights));
+        crate::memory::forget_heap(&heap);
+        crate::memory::forget_for_test(region.base, region.base + (12 << 20));
+        unregister(0xc0de_5501, start);
+        drop((heap, home, out));
+        drop(core);
+        region.release();
+        run_pending();
+    }
+
+    /// Six threads (three queues of two threads, as the title has) send
+    /// flights over one home, each its own stretch of it with a value
+    /// written at the bottom of the pipe, each fill reading what another
+    /// thread's flight wrote last. No removal, and title memory ends as the
+    /// last flight of each thread left it. `VICTORY_R5_STRESS` submissions
+    /// in all (10,000; run with `VICTORY_D3D12_DEBUG=1 VICTORY_D3D12_GBV=1`
+    /// for the debug layer and GPU-based validation of the host's device).
+    #[test]
+    fn warp_r5_stress() {
+        let Some(host) = warp13() else { return };
+        const THREADS: u64 = 6;
+        const STRETCH: u64 = 0x400;
+        let total: u64 = std::env::var("VICTORY_R5_STRESS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000);
+        let each = total.div_ceil(THREADS);
+        let (_core, flights) = r5_on();
+        let region = TestRegion::new(4 * K64 as usize);
+        let (start, len) = (region.base + K64, 2 * K64);
+        register(0xc0de_5801, start, len);
+        let home = find(start, len).expect("a home");
+        assert!(home.is_home());
+        fill(start, len, 0);
+        let threads: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let home = home.clone();
+                std::thread::spawn(move || {
+                    // This thread's submissions fly too.
+                    TestFlights::here();
+                    TEST_ON.with(|on| on.set(true));
+                    let host = crate::host::host().unwrap();
+                    let at = start + t * STRETCH;
+                    let other = start + ((t + 1) % THREADS) * STRETCH;
+                    let sources: Vec<_> = (0..4u8)
+                        .map(|k| source(host, &[t as u8 * 16 + k; STRETCH as usize]))
+                        .collect();
+                    let mut out = vec![0u8; 16];
+                    let mut kept = Vec::new();
+                    let mut last = 0;
+                    for i in 0..each {
+                        let list = host.new_list().unwrap();
+                        list.defer_refresh(&home, at as usize, STRETCH as usize);
+                        // SAFETY: an open list of the host's; live buffers.
+                        unsafe {
+                            list.list.CopyBufferRegion(
+                                &home.buffer,
+                                home.offset(at),
+                                &sources[(i % 4) as usize],
+                                0,
+                                STRETCH,
+                            )
+                        };
+                        list.defer_gpu_write(&home, at as usize, STRETCH as usize);
+                        if i % 7 == 0 {
+                            list.defer_fill(out.as_mut_ptr(), other as *const u8, 16);
+                        }
+                        list.defer_write(
+                            (start + len + 8 * t) as *mut u8,
+                            crate::queue::Written::Value(i + 1),
+                            8,
+                        );
+                        list.close();
+                        last = host.send_for_test(&list);
+                        // Kept (not reset) until its flight has landed.
+                        kept.push(list);
+                        if kept.len() > 64 {
+                            crate::host::flights::land_through(last);
+                            for list in kept.drain(..) {
+                                list.reset();
+                            }
+                        }
+                    }
+                    crate::host::flights::land_through(last);
+                    for list in kept {
+                        list.reset();
+                    }
+                    // The last fill read the other thread's stretch whole, as
+                    // one of its flights left it (or as it was filled, if
+                    // none had landed yet).
+                    let next = (t + 1) % THREADS;
+                    let initial: Vec<u8> = (0..16u8).map(|j| j.wrapping_mul(13)).collect();
+                    assert!(
+                        out == initial
+                            || (out.iter().all(|&b| b == out[0])
+                                && u64::from(out[0] / 16) == next
+                                && out[0] % 16 < 4),
+                        "a fill of thread {t} read {out:?}"
+                    );
+                    TEST_ON.with(|on| on.set(false));
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("a stress thread");
+        }
+        flights.land_all();
+        // SAFETY: a plain query.
+        assert!(
+            unsafe { host.device.GetDeviceRemovedReason() }.is_ok(),
+            "no removal"
+        );
+        for t in 0..THREADS {
+            let last = (each - 1) % 4;
+            assert!(
+                same(
+                    start + t * STRETCH,
+                    &[t as u8 * 16 + last as u8; STRETCH as usize]
+                ),
+                "thread {t}'s stretch as its last flight wrote it"
+            );
+            // SAFETY: the test's own memory.
+            let value = unsafe { ((start + len + 8 * t) as *const u64).read_unaligned() };
+            assert_eq!(value, each, "thread {t}'s last bottom-of-pipe value");
+        }
+        unregister(0xc0de_5801, start);
+        drop(home);
+        drop(flights);
         region.release();
     }
 

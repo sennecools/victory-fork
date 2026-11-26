@@ -797,6 +797,11 @@ mod card_tests {
 ///   ([`card_dirty`]), so that a merge can tell the title's bytes the card
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
+    // A test's flights (`crate::host::TestFlights`).
+    #[cfg(test)]
+    if crate::host::test_flights() {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Off by default: with stage 2 on by default, an RX 9070 XT lost the
     // device about 105 s into a run, at a page fault while a submission was
@@ -3524,7 +3529,20 @@ impl Shadow {
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
-                if self.card.is_some() {
+                if self.card_home().is_some() {
+                    // A CPU side that is a home (with R5) is title memory
+                    // itself, nothing to compare it with: the page goes up
+                    // from the home before the next submission, on the
+                    // queue behind the flights writing it, whose merges
+                    // into the home are there by then.
+                    if *runs_left == 0 {
+                        return true;
+                    }
+                    *runs_left -= 1;
+                    self.card_changed(at, at + n);
+                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                    MERGED[2].fetch_add(n as u64, Ordering::Relaxed);
+                } else if self.card.is_some() {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -3818,6 +3836,25 @@ impl Shadow {
     pub(crate) fn card_homed(&self) -> Option<(&Arc<Shadow>, u64, u64)> {
         let card = self.card.as_ref()?;
         Some((card.home.as_ref()?, card.staging_at, card.size))
+    }
+
+    /// With R5 (`crate::host::r5`), for a copy in the card's memory whose
+    /// CPU side is a home: flights in the air may write title memory
+    /// `[from, to)` in the home, which write watching does not see. It goes
+    /// up from the home again at this submission's refresh of the copy
+    /// (`card_changed`, then `card_upload`), which runs on the queue behind
+    /// them. Only for such a copy (`crate::host`'s `retake_flight_homes`
+    /// passes no other).
+    pub(crate) fn card_home_written(&self, from: usize, to: usize) {
+        debug_assert!(
+            self.card_home().is_some(),
+            "a copy whose CPU side is a home"
+        );
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from < to {
+            self.card_changed(from - start, to - start);
+        }
     }
 
     /// For a copy in the card's memory whose CPU side is a home: offsets

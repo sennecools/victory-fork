@@ -212,6 +212,17 @@ impl Detached {
     }
 }
 
+/// A host list of a test's, taken as a queue takes a submitted list's host
+/// side (`crate::host::flights`).
+#[cfg(all(windows, test))]
+pub(crate) fn detached_for_test(host: crate::host::HostList) -> Detached {
+    Detached {
+        host,
+        _uploads: Vec::new(),
+        _state: Default::default(),
+    }
+}
+
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]

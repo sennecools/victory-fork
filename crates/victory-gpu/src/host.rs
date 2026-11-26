@@ -18,6 +18,17 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, w};
 
+/// R5 (`VICTORY_R5=1`): what only the core's homes under the relay use.
+mod late_homes;
+
+#[cfg(test)]
+pub(crate) use late_homes::{flights, test_flights, test_relay_sees};
+use late_homes::{
+    R5_STATS, Writer, home_ranges, join_writers, refresh_over_flight_homes, relay_card_homed,
+    retake_flight_homes, value_unsure,
+};
+pub(crate) use late_homes::{Ring, finished, r5, settle_for_fence_at, wait_for_flights_now};
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -3513,6 +3524,11 @@ pub(crate) fn late() -> bool {
 
 /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
 fn late_stage() -> u8 {
+    // A test's flights: the relay alone, on top of stage 3.
+    #[cfg(test)]
+    if test_flights() {
+        return 3;
+    }
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
         if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
@@ -3604,6 +3620,10 @@ pub(crate) fn late_free_present() -> bool {
 /// goes to the queue under [`QUEUE_ORDER`], which says which sends of
 /// title bytes the card had received when it ran.
 pub(crate) fn relay() -> bool {
+    #[cfg(test)]
+    if test_flights() {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
 }
@@ -3615,6 +3635,10 @@ pub(crate) fn relay() -> bool {
 /// [`late_most`] lists in the air it waits until there are fewer. At `1`
 /// both wait for everything.
 fn relay_exact() -> bool {
+    #[cfg(test)]
+    if test_flights() {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     // The walls of the first room were found drawn in every run with this
     // set and in fewer than half with the first stage; it is not on by
@@ -3708,7 +3732,12 @@ fn inflight_tickets_landed(plans: &[&CardPlan]) {
     // SAFETY: the mapping of the tickets; these plans' fetches have run.
     let table = unsafe { std::slice::from_raw_parts((inflight.table.1 as *const u32).add(1), dwords) };
     for plan in plans.iter().filter(|p| p.inflight) {
-        for r in plan.ranges.iter().filter(|r| r.compared) {
+        // (Ranges of copies whose CPU side is a home took no tickets.)
+        for r in plan
+            .ranges
+            .iter()
+            .filter(|r| r.compared && r.reference.is_none())
+        {
             for p in 0..r.span.pieces {
                 if let Some(&k) = table.get((r.at + p) as usize)
                     && k != INFLIGHT_NONE
@@ -4077,6 +4106,14 @@ struct Line {
     /// The title memory the flights' shaders may write (address, end), in
     /// order and joined.
     written: Vec<(usize, usize)>,
+    /// With [`r5`]: the part of `written` that lies in homes of the memory
+    /// core (and in card copies whose CPU side is one): the title's own
+    /// memory, which the card writes while it runs
+    /// ([`refresh_over_flight_homes`]). In order and joined.
+    homes_written: Vec<(usize, usize)>,
+    /// With [`r5`]: `homes_written` by who declared it, for card copies
+    /// whose CPU side is a home ([`retake_flight_homes`]).
+    home_writers: Vec<Writer>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -4103,6 +4140,8 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    homes_written: Vec::new(),
+    home_writers: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -4869,6 +4908,15 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
             return false;
         }
     }
+    if r5() {
+        // Only until the flights that may write the value have landed:
+        // nothing in the air declares the address, and no write of a value
+        // there waits in the line or is being done.
+        if relay_wait(WHY_VALUE, |line| !value_unsure(line, address, bytes)) {
+            R5_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        return wait.met();
+    }
     settle_now(WHY_VALUE);
     wait.met()
 }
@@ -5081,12 +5129,49 @@ pub(crate) fn settle_for_fence() {
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`).
+/// a queue does for the lists it ran (`crate::list::recycle`). With [`r5`],
+/// a free of the title's that waited for a heap such a list held is tried
+/// again then (`crate::home::after_landing`).
 fn land() {
+    // Noted from before the taking: a thread that waits for the landed
+    // lists to be let go ([`recycled`]) sees this one at work.
+    let ticket = {
+        let mut recycling = RECYCLING.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = recycling.0;
+        recycling.0 += 1;
+        recycling.1.insert(ticket);
+        ticket
+    };
     let landed = std::mem::take(&mut line().landed);
+    let any = !landed.is_empty();
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
     }
+    if any && r5() {
+        crate::home::after_landing();
+    }
+    RECYCLING.lock().unwrap_or_else(|e| e.into_inner()).1.remove(&ticket);
+    RECYCLED.notify_all();
+}
+
+/// The [`land`] calls so far, and those still at work (by their number).
+static RECYCLING: Mutex<(u64, std::collections::BTreeSet<u64>)> =
+    Mutex::new((0, std::collections::BTreeSet::new()));
+
+/// Told when a [`land`] ends.
+static RECYCLED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// After a [`land`] of the caller's own: waits (a second at most) until the
+/// other threads' [`land`] calls that began before it are done: they may have
+/// taken landed lists first. Those that begin later are not waited for.
+fn recycled() {
+    let recycling = RECYCLING.lock().unwrap_or_else(|e| e.into_inner());
+    let before = recycling.0;
+    let _ = RECYCLED
+        .wait_timeout_while(recycling, std::time::Duration::from_secs(1), |r| {
+            r.1.first().is_some_and(|&first| first < before)
+        })
+        .unwrap_or_else(|e| e.into_inner());
 }
 
 /// The thread that settles the flights once the card has run them all
@@ -5182,11 +5267,11 @@ fn late_threads() {
 /// With [`relay`]: waits until `done` says so of the line, looked at each
 /// time flights have landed. Counted as a settle for `why`, and its time
 /// as waiting for the card. The caller may hold the submission lock: the
-/// thread that lands flights never takes it.
-fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+/// thread that lands flights never takes it. Whether it waited.
+fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> bool {
     let mut line = line();
     if done(&line) {
-        return;
+        return false;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
@@ -5205,6 +5290,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    true
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -5299,7 +5385,9 @@ fn relay_worker() {
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        // (A home of the memory core, with R5: the shaders wrote title
+        // memory itself, there is nothing to compare.)
+        if shadow.carded() || shadow.home_kind().is_some() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -5409,6 +5497,21 @@ fn late_line(frames: f64) {
                 i[2],
             );
         }
+    }
+    if r5() {
+        let r: Vec<f64> = R5_STATS
+            .iter()
+            .map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames)
+            .collect();
+        tracing::info!(
+            "R5 per frame (VICTORY_R5=1): {:.2} submissions waited for flights before a copy's refresh over a home they write \
+             (in \"title memory read\" above); {:.2} waits for a memory value and {:.2} blocking fence waits waited for the flights \
+             concerned only; {:.2} protections of the title's waited for the flights in the air",
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+        );
     }
     if lift_mode() != LiftMode::Off {
         let l: Vec<f64> = LIFT_STATS.iter().map(|l| l.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -6183,8 +6286,8 @@ impl Host {
     ///
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
-    /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    /// `relay`). `number`: the submission's number among those started.
+    fn card_before(&self, runs: &[&HostList], flown: bool, number: u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -6405,7 +6508,8 @@ impl Host {
                 .map(|&i| &plan.ranges[i])
                 .map(|r| (&r.shadow, r.span.from, r.span.to))
                 .collect();
-            let Some((list, places)) = crate::card_home::before(self, &spans, &dirty) else {
+            let Some((list, places)) = crate::card_home::before(self, &spans, &dirty, number)
+            else {
                 fail(format_args!(
                     "no memory for, or no list to record, what card copies held before a submission"
                 ));
@@ -6493,7 +6597,9 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(3, inflight.table.0.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(4, inflight.fetched.0.GetGPUVirtualAddress());
                         let mut every = true;
-                        for r in plan.ranges.iter().filter(|r| r.compared) {
+                        // (A copy whose CPU side is a home is merged into it
+                        // on the card, below: nothing of it comes down.)
+                        for r in plan.ranges.iter().filter(|r| r.compared && r.reference.is_none()) {
                             let Some((_, Some(_), size)) = r.shadow.card_sides() else {
                                 every = false;
                                 continue;
@@ -6591,6 +6697,9 @@ impl Host {
     /// flights' own compare lists put them ([`Host::relay_card_inflight`]);
     /// only a landing that cannot take them from there fetches, as here.
     fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+        // Copies whose CPU side is a home (with R5): merged on the card in
+        // their flights, nothing to fetch. The rest below leaves them out.
+        relay_card_homed(plans);
         if inflight_fetch() {
             let landed = self.relay_card_inflight(plans);
             inflight_tickets_landed(plans);
@@ -6614,6 +6723,7 @@ impl Host {
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
+                    .filter(|r| r.reference.is_none())
                     .flat_map(|r| {
                         (0..r.span.pieces).map(move |p| {
                             let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
@@ -6622,7 +6732,7 @@ impl Host {
                     })
                     .collect();
                 let fetched = flagged_pieces(&flags);
-                for r in &plan.ranges {
+                for r in plan.ranges.iter().filter(|r| r.reference.is_none()) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
                         if !fetched.contains(&(copy, r.span.first + p)) {
@@ -6808,16 +6918,23 @@ impl Host {
             };
             let slots = inflight.fetched.2;
             for plan in plans {
-                if plan.ranges.is_empty() {
+                // (Copies whose CPU side is a home land by
+                // `relay_card_homed`.)
+                let ranges: Vec<&CardRange> = plan
+                    .ranges
+                    .iter()
+                    .filter(|r| r.reference.is_none())
+                    .collect();
+                if ranges.is_empty() {
                     continue;
                 }
-                if !plan.inflight || plan.ranges.iter().any(|r| !r.compared) {
+                if !plan.inflight || ranges.iter().any(|r| !r.compared) {
                     return false;
                 }
                 // Pieces (copy, number) the compare flagged, with their ticket.
                 let mut tickets: std::collections::HashMap<(usize, u32), u32> = std::collections::HashMap::new();
                 let mut flags: Vec<(usize, u32, bool)> = Vec::new();
-                for r in &plan.ranges {
+                for r in &ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
                         let at = (r.at + p) as usize;
@@ -6839,7 +6956,7 @@ impl Host {
                 }
                 let fetched = flagged_pieces(&flags);
                 let mut seen = std::collections::HashSet::new();
-                for r in &plan.ranges {
+                for r in &ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
                         let piece = r.span.first + p;
@@ -6884,7 +7001,7 @@ impl Host {
             bytes += (hi - lo) as u64;
         }
         for plan in plans {
-            for r in &plan.ranges {
+            for r in plan.ranges.iter().filter(|r| r.reference.is_none()) {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
             }
         }
@@ -6969,6 +7086,21 @@ impl Host {
                     }
                 }
                 drop(hand_back);
+                if r5() {
+                    // What the waited submission did after its wait, before
+                    // the title is told anything below: copies over the
+                    // bytes the shaders wrote in homes take them again, and
+                    // those over pool pages raw-address shaders reach in
+                    // place. (The line's lock is not held; the core's is
+                    // taken last, by these.)
+                    let _told = crate::profile::span("relay: homes told");
+                    crate::home::after_wait(&back);
+                    let runs: Vec<&HostList> = flights
+                        .iter()
+                        .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
+                        .collect();
+                    crate::memory::after_wait(&runs);
+                }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -7009,6 +7141,8 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                homes_written,
+                home_writers,
                 lists,
                 settling,
                 poke,
@@ -7020,16 +7154,23 @@ impl Host {
             in_hand.clear();
             // What is still in the air, from the flights that are.
             written.clear();
+            homes_written.clear();
+            home_writers.clear();
             *lists = 0;
-            let mut ranges = Vec::new();
+            let (mut ranges, mut homes) = (Vec::new(), Vec::new());
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                     ranges.extend(flight.read_backs.iter().copied());
+                    if r5() {
+                        homes.extend(home_ranges(&flight.back));
+                        join_writers(home_writers, &flight.back);
+                    }
                 }
             }
             join_ranges(written, ranges);
+            join_ranges(homes_written, homes);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -7238,7 +7379,15 @@ impl Host {
             // The line's lock and the join of what the flights write.
             let _join = crate::profile::span("flight join");
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line {
+                line: items,
+                written,
+                homes_written,
+                home_writers,
+                lists: flying,
+                target,
+                ..
+            } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -7246,6 +7395,10 @@ impl Host {
                     .flat_map(|(_, ranges)| ranges.iter().copied())
                     .chain(sent.read_backs.iter().copied()),
             );
+            if r5() {
+                join_ranges(homes_written, home_ranges(&sent.back));
+                join_writers(home_writers, &sent.back);
+            }
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -7291,7 +7444,15 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line {
+                line: items,
+                written,
+                homes_written,
+                home_writers,
+                lists: flying,
+                target,
+                ..
+            } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -7299,6 +7460,10 @@ impl Host {
                     .flat_map(|(_, ranges)| ranges.iter().copied())
                     .chain(sent.read_backs.iter().copied()),
             );
+            if r5() {
+                join_ranges(homes_written, home_ranges(&sent.back));
+                join_writers(home_writers, &sent.back);
+            }
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -7359,6 +7524,8 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.homes_written.clear();
+                line.home_writers.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -7572,6 +7739,26 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        // With R5: a copy's refresh over a home a flight writes waits like
+        // a read, for those flights only (and after the waits above, which
+        // may have landed them).
+        if late && r5() {
+            let homes = line().homes_written.clone();
+            if refresh_over_flight_homes(&homes, runs) {
+                let stamp = crate::profile::stamp();
+                if relay_wait(WHY_READ, |line| {
+                    !refresh_over_flight_homes(&line.homes_written, runs)
+                }) {
+                    R5_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    if waiting == 0 {
+                        waiting = stamp;
+                    }
+                }
+            }
+            // A card copy with a home takes those bytes from the home again.
+            let writers = line().home_writers.clone();
+            retake_flight_homes(&writers, runs);
+        }
         if let Some(submit) = submit.as_mut() {
             gate_args(submit, runs, [entered, walked, locked, waiting]);
         }
@@ -7755,13 +7942,18 @@ impl Host {
         // The directory of title memory by address (`crate::memory`, with
         // `VICTORY_MEMORY_DIRECTORY=1`): its entries changed since the last
         // submission go into the shaders' table ahead of this one's lists,
-        // so that each submission sees it whole, as it was when sent.
-        if !late && let Some(list) = crate::memory::before_submission(self) {
+        // so that each submission sees it whole, as it was when sent. With
+        // R5 a flight's too: on the one host queue, under the submission
+        // lock, the copy runs behind every flight sent before and ahead of
+        // this one's lists (its staging is its own until it lands).
+        if (!late || r5())
+            && let Some(list) = crate::memory::before_submission(self, this_submission)
+        {
             // SAFETY: a closed list of ours; it goes ahead of the lists.
             unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
         }
         let card_before = crate::profile::span("card_before");
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(runs, flown, this_submission);
         drop(card_before);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));

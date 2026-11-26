@@ -48,7 +48,13 @@
 //! (`VICTORY_CARD_WINDOWS_MB`).
 //!
 //! What it assumes is what the core assumes: every submission is waited for
-//! (the core gives no home with late waits or the relay).
+//! (the core gives no home with late waits or the relay), or R5
+//! (`crate::host::r5`): then each flight sets its reference aside with a list
+//! of its own ([`before`], a `crate::host::Ring`), holds the room it reads
+//! ([`Place`]) until it has landed, and lands with no fetch
+//! (`crate::host`'s `relay_card_homed`). On the one host queue a flight's
+//! upload, reference and merge run behind every flight sent before it, so a
+//! kept reference follows its card side in queue order as before.
 //!
 //! shortcut: a kept reference follows the card side through what went up
 //! and what was merged; a shader's write to a copy that no list declared
@@ -64,7 +70,7 @@
 //! can see it; nothing sees it here.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -332,18 +338,23 @@ struct Kept {
 }
 
 /// Where the card side's bytes of a declared range from before the lists
-/// lie, for its merge ([`record_merge`]).
+/// lie, for its merge ([`record_merge`]). Its submission's plan holds it, and
+/// with it the buffer, until the submission has run and landed.
 #[derive(Clone)]
 pub(crate) struct Place {
     /// The copy's kept reference, or `None`: the submission's room.
     kept: Option<ID3D12Resource>,
+    /// The room, for a range whose reference is there: a bigger room made
+    /// for a later submission does not free it while this one may still
+    /// read it.
+    room: Option<ID3D12Resource>,
     /// Where the range's first step lies in it.
     at: u32,
 }
 
-/// The reference, the kept ones, and the list of ours that copies into
-/// them, reused by every submission (each is waited for before the next is
-/// prepared).
+/// The reference, the kept ones, and the lists of ours that copy into
+/// them: one list per submission until that submission has finished (with
+/// every submission waited for, always the same one).
 struct Before {
     room: Option<Room>,
     /// Submissions in a row since the room went to the PC's memory whose
@@ -358,8 +369,16 @@ struct Before {
     /// Submissions prepared so far that had card copies' references to set
     /// aside or kept references to age ([`before`], [`idle`]).
     submissions: u64,
-    list: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+    lists: crate::host::Ring<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+    /// With R5, the kept references each flight's list copies into, by its
+    /// submission's number, until it has finished: one let go meanwhile
+    /// ([`let_go_kept`]) is not freed while the card may still write it (a
+    /// declared range's is held by its [`Place`] too, an upload's only here).
+    filling: Vec<(u64, Vec<ID3D12Resource>)>,
 }
+
+/// Whether [`Before::filling`] holds any, for [`idle`].
+static FILLING: AtomicBool = AtomicBool::new(false);
 
 // SAFETY: D3D12 objects (free-threaded), used under the submission lock.
 unsafe impl Send for Before {}
@@ -371,7 +390,8 @@ static BEFORE: Mutex<Before> = Mutex::new(Before {
     kept_bytes: 0,
     retry: (0, 0),
     submissions: 0,
-    list: None,
+    lists: crate::host::Ring::new(),
+    filling: Vec::new(),
 });
 
 /// What [`room`] does with the reference there is for a submission that
@@ -434,8 +454,8 @@ fn room<'a>(host: &crate::host::Host, before: &'a mut Before, need: u64) -> Opti
             if card_has_room(host, bytes)
                 && let Some(buffer) = host.uav_buffer(bytes)
             {
-                // The old one is no longer read: its last submission was
-                // waited for.
+                // The old one goes when no submission reads it any more
+                // (one that does holds it, [`Place`]).
                 ROOM_MOVES.fetch_add(1, Ordering::Relaxed);
                 set_room(
                     before,
@@ -448,7 +468,8 @@ fn room<'a>(host: &crate::host::Host, before: &'a mut Before, need: u64) -> Opti
             }
         }
         RoomMove::Grow => {
-            // The old one is no longer read: its last submission was waited for.
+            // The old one goes when no submission reads it any more (one
+            // that does holds it, [`Place`]).
             before.room = None;
             let bytes = need.next_multiple_of(16 << 20);
             let on_card = (bytes <= REFERENCE_CARD_MOST && card_has_room(host, bytes))
@@ -545,8 +566,13 @@ fn backed_off((until, refused): (u64, u64), now: u64, bytes: u64) -> bool {
 
 /// Lets go the kept references of copies that are gone or that nothing
 /// declared for [`KEPT_IDLE`] submissions. (A submission that still reads
-/// one holds its buffer, [`Place`].)
+/// one holds its buffer, [`Place`]; one that still copies into one,
+/// [`Before::filling`].)
 fn let_go_kept(before: &mut Before) {
+    if !before.filling.is_empty() {
+        let_go_filled(&mut before.filling, crate::host::finished());
+        FILLING.store(!before.filling.is_empty(), Ordering::Relaxed);
+    }
     let now = before.submissions;
     let mut freed = 0;
     before.kept.retain(|_, k| {
@@ -563,15 +589,25 @@ fn let_go_kept(before: &mut Before) {
     KEPT_BYTES.store(before.kept_bytes, Ordering::Relaxed);
 }
 
+/// Of [`Before::filling`], the lists' kept references of submissions that
+/// have finished by `finished` are let go; the others are kept.
+fn let_go_filled(filling: &mut Vec<(u64, Vec<ID3D12Resource>)>, finished: u64) {
+    filling.retain(|&(number, _)| number > finished);
+}
+
 /// A submission that needs no [`before`] (`Host::card_before`): while there
 /// are kept references, it counts towards letting go those nothing
-/// declares, and those of copies that are gone are let go now.
+/// declares, and those of copies that are gone are let go now (and, with
+/// R5, those the lists of finished flights copied into).
 pub(crate) fn idle() {
-    if KEPT_BYTES.load(Ordering::Relaxed) == 0 {
+    let kept = KEPT_BYTES.load(Ordering::Relaxed) != 0;
+    if !kept && !FILLING.load(Ordering::Relaxed) {
         return;
     }
     let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
-    before.submissions += 1;
+    if kept {
+        before.submissions += 1;
+    }
     let_go_kept(&mut before);
 }
 
@@ -587,10 +623,13 @@ pub(crate) fn idle() {
 ///
 /// Returns the closed list, to run ahead of the lists (`None`: nothing to
 /// copy), and where each range lies; `None` if there is no memory for it.
+/// `number`: the submission's number among those started; the list is its
+/// own until it has finished.
 pub(crate) fn before(
     host: &crate::host::Host,
     spans: &[(&Arc<Shadow>, u32, u32)],
     uploads: &[(Arc<Shadow>, Vec<(usize, usize)>)],
+    number: u64,
 ) -> Option<(Option<ID3D12CommandList>, Vec<Place>)> {
     let mut before = BEFORE.lock().unwrap_or_else(|e| e.into_inner());
     before.submissions += 1;
@@ -636,6 +675,7 @@ pub(crate) fn before(
             Some((buffer, _)) => {
                 places.push(Place {
                     kept: Some(buffer.clone()),
+                    room: None,
                     at: from,
                 });
                 skipped += u64::from(to - from);
@@ -643,9 +683,10 @@ pub(crate) fn before(
             None => {
                 // A submission's ranges lie in copies of at most 1 GiB each,
                 // and each copy's ranges are apart (`Host::card_before` joins
-                // them).
+                // them). (The room, once it is known, below.)
                 places.push(Place {
                     kept: None,
+                    room: None,
                     at: u32::try_from(need).ok()?,
                 });
                 need += u64::from(to - from);
@@ -679,38 +720,45 @@ pub(crate) fn before(
         FLOW[flow::SKIPPED].fetch_add(skipped, Ordering::Relaxed);
         return Some((None, places));
     }
-    if before.list.is_none() {
-        // SAFETY: plain object creation.
-        let made = unsafe {
-            (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
-                let allocator: ID3D12CommandAllocator = host
-                    .device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &allocator,
-                    None,
-                )?;
-                list.Close()?;
-                Ok((allocator, list))
-            })()
-        };
-        before.list = made.ok();
-    }
     let room = match need {
         0 => None,
         _ => Some(room(host, &mut before, need)?.buffer.clone()),
     };
-    let (allocator, list) = before.list.as_ref()?;
-    // SAFETY: the list's last run finished (its submission was waited for
+    for place in places.iter_mut().filter(|p| p.kept.is_none()) {
+        place.room = room.clone();
+    }
+    // A list whose submission has finished, or a new one; this
+    // submission's until it has (with flights, each in the air has its own).
+    let (allocator, list) = match before.lists.take(crate::host::finished()) {
+        Some(made) => made,
+        None => {
+            // SAFETY: plain object creation.
+            let made = unsafe {
+                (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+                    let allocator: ID3D12CommandAllocator = host
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = host.device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                })()
+            };
+            made.ok()?
+        }
+    };
+    // SAFETY: the list's last run finished (its submission has finished
     // before this one was prepared); live buffers, the ranges inside both
     // (the steps lie in the copy's buffer and the room holds `need`; a kept
     // reference has its copy's size, and what went up lies in the copy).
     let recorded = unsafe {
         (|| -> windows::core::Result<ID3D12CommandList> {
             allocator.Reset()?;
-            list.Reset(allocator, None)?;
+            list.Reset(&allocator, None)?;
             for (&(copy, from, to), place) in spans.iter().zip(&places) {
                 let (Some(room), None) = (&room, &place.kept) else {
                     continue;
@@ -731,6 +779,14 @@ pub(crate) fn before(
             list.cast()
         })()
     };
+    // It may go to the card: kept until this submission has finished, and
+    // with R5 (flights) the kept references it copies into too.
+    before.lists.put(number, (allocator, list));
+    if crate::host::r5() && !fills.is_empty() {
+        let targets = fills.iter().map(|f| f.0.clone()).collect();
+        before.filling.push((number, targets));
+        FILLING.store(true, Ordering::Relaxed);
+    }
     FLOW[flow::REFERENCE].fetch_add(need, Ordering::Relaxed);
     FLOW[flow::KEPT].fetch_add(fills.iter().map(|f| f.3).sum(), Ordering::Relaxed);
     FLOW[flow::SKIPPED].fetch_add(skipped, Ordering::Relaxed);
@@ -830,20 +886,9 @@ unsafe fn record_merge(
     let (Some((home, bias, _)), Some(merge)) = (copy.card_homed(), merge()) else {
         return false;
     };
-    let room = match &reference.kept {
-        Some(kept) => kept.clone(),
-        None => {
-            let Some(room) = BEFORE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .room
-                .as_ref()
-                .map(|r| r.buffer.clone())
-            else {
-                return false;
-            };
-            room
-        }
+    // The submission's own room, which it holds ([`Place::room`]).
+    let Some(room) = reference.kept.clone().or_else(|| reference.room.clone()) else {
+        return false;
     };
     let reference = reference.at;
     let (from, to) = steps(span.from, span.to);
@@ -898,7 +943,9 @@ pub(crate) fn stored() -> u64 {
         return 0;
     };
     // SAFETY: the counter's copy's mapping; the merges that add to it have
-    // run (their submission was waited for) and the next is not prepared.
+    // run (their submission was waited for, or has landed). With R5 a later
+    // flight may copy a newer count there meanwhile: each value read is one
+    // the card wrote, and that flight's landing takes the rest.
     let now = unsafe { merge.seen_data.read_volatile() };
     let bytes = now.wrapping_sub(merge.taken.swap(now, Ordering::Relaxed));
     FLOW[flow::STORED].fetch_add(u64::from(bytes), Ordering::Relaxed);
@@ -1246,7 +1293,7 @@ mod tests {
             .unwrap();
         let (from, to) = (span.from as usize, span.to as usize);
         let (list, places) =
-            before(host, &[(&copy, span.from, span.to)], &[]).expect("a reference");
+            before(host, &[(&copy, span.from, span.to)], &[], 0).expect("a reference");
         assert!(places[0].kept.is_none(), "a quarter of the copy: the room");
         rig.run_closed(&list.expect("a copy into the room"))
             .unwrap();
@@ -1548,6 +1595,260 @@ mod tests {
         region.release();
     }
 
+    /// R5 (`crate::host::r5`): two flights over one copy in the card's
+    /// memory whose CPU side is a home, both on the queue before either
+    /// runs. Each merges what its shaders wrote into the home on the card
+    /// and lands with no fetch; the second's compare, over both pieces,
+    /// flags only the one its shaders changed (the first's compare stored
+    /// the hash it made). Title memory holds both writes and nothing else
+    /// changed, and both pieces go up again from the home before the next
+    /// submission.
+    #[test]
+    fn warp_r5_homed_card_copy_merges_and_rehashes_at_landing() {
+        let Some(host) = warp() else { return };
+        let _on = Switched::on();
+        let flights = crate::host::flights::TestFlights::on(true, true);
+        let region = Region::new(4 * BIG as usize);
+        let (start, len) = (region.base + K64, BIG + 2 * K64);
+        fill(start, len, 11);
+        let a = card_copy(0xca4d_0701, start, len);
+        assert!(
+            a.card_homed().is_some(),
+            "its CPU side is a home under flights"
+        );
+        let original = title(start, len);
+        let (source, data) = host.shared_buffer(256).unwrap();
+        // SAFETY: the mapping holds 256 bytes; the card does not use it yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                [0xd1u8, 0xd2, 0xd3, 0xd4, 0xe1, 0xe2, 0xe3, 0xe4].as_ptr(),
+                data,
+                8,
+            )
+        };
+        // Pieces 1 and 3 of the copy (cut at the title's 64 KiB).
+        let (one, three) = (
+            (start + K64).next_multiple_of(K64) - start + 0x40,
+            (start + 3 * K64).next_multiple_of(K64) - start + 0x80,
+        );
+        // A first submission takes the copy up whole and makes its hashes.
+        let list = host.new_list().unwrap();
+        list.defer_refresh(&a, start as usize, len as usize);
+        list.close();
+        host.send_for_test(&list);
+        flights.land_all();
+        list.reset();
+        let hold = crate::host::flights::QueueHold::new(host);
+        let first = host.new_list().unwrap();
+        first.defer_refresh(&a, start as usize, len as usize);
+        // SAFETY: an open list of the host's; live buffers, the range in both.
+        unsafe { first.list.CopyBufferRegion(&a.buffer, one, &source, 0, 4) };
+        first.defer_gpu_write(&a, (start + one) as usize, 4);
+        first.close();
+        host.send_for_test(&first);
+        let second = host.new_list().unwrap();
+        second.defer_refresh(&a, start as usize, len as usize);
+        // SAFETY: as above.
+        unsafe {
+            second
+                .list
+                .CopyBufferRegion(&a.buffer, three, &source, 4, 4)
+        };
+        second.defer_gpu_write(&a, (start + one) as usize, (three + 4 - one) as usize);
+        second.close();
+        host.send_for_test(&second);
+        let was = flow_now();
+        hold.release();
+        flights.land_all();
+        let now = flow_now();
+        assert_eq!(
+            now[flow::PIECES] - was[flow::PIECES],
+            2,
+            "one piece for each flight: the second flagged only what it changed"
+        );
+        let mut expected = original.clone();
+        expected[one as usize..one as usize + 4].copy_from_slice(&[0xd1, 0xd2, 0xd3, 0xd4]);
+        expected[three as usize..three as usize + 4].copy_from_slice(&[0xe1, 0xe2, 0xe3, 0xe4]);
+        assert!(title(start, len) == expected, "both writes, nothing else");
+        let dirty = dirty_of(&a);
+        for at in [one as usize, three as usize] {
+            assert!(
+                dirty.iter().any(|&(lo, hi)| lo <= at && at < hi),
+                "the merged piece at {at:#x} goes up again"
+            );
+        }
+        for list in [&first, &second] {
+            list.reset();
+        }
+        drop((list, first, second, hold, flights));
+        unregister(0xca4d_0701, start);
+        drop((a, source));
+        region.release();
+    }
+
+    /// R5: a flight's shaders write the home in place, where a card copy
+    /// whose CPU side is that home has bytes; the next flight, prepared
+    /// before the first lands, reads them through the card copy. It does not
+    /// wait, and its upload takes them from the home behind the first
+    /// flight: write watching does not see the card's writes, and the first
+    /// flight's landing tells the copy only after the second was prepared.
+    #[test]
+    fn warp_r5_card_copy_over_a_flight_written_home_reads_its_bytes() {
+        let Some(host) = warp() else { return };
+        let _on = Switched::on();
+        let flights = crate::host::flights::TestFlights::on(true, true);
+        let region = Region::new(4 * BIG as usize);
+        let (start, len) = (region.base + K64, BIG + 2 * K64);
+        fill(start, len, 13);
+        let a = card_copy(0xca4d_0801, start, len);
+        let home = a.card_home().expect("its CPU side is a home").clone();
+        let (source, data) = host.shared_buffer(256).unwrap();
+        let (out, seen) = host.shared_buffer(256).unwrap();
+        let written = [0xb1u8, 0xb2, 0xb3, 0xb4];
+        // SAFETY: the mappings hold 256 bytes each; the card does not use
+        // them yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(written.as_ptr(), data, 4);
+            std::ptr::write_bytes(seen, 0, 4);
+        }
+        let at = start + 2 * K64 + 0x40;
+        let original = title(at, 4);
+        assert_ne!(original, written);
+        // A first submission takes the copy up whole.
+        let list = host.new_list().unwrap();
+        list.defer_refresh(&a, start as usize, len as usize);
+        list.close();
+        host.send_for_test(&list);
+        flights.land_all();
+        list.reset();
+        let hold = crate::host::flights::QueueHold::new(host);
+        let first = host.new_list().unwrap();
+        first.defer_refresh(&home, at as usize, 4);
+        // SAFETY: an open list of the host's; live buffers, the range in both.
+        unsafe {
+            first
+                .list
+                .CopyBufferRegion(&home.buffer, home.offset(at), &source, 0, 4)
+        };
+        first.defer_gpu_write(&home, at as usize, 4);
+        first.close();
+        host.send_for_test(&first);
+        let second = host.new_list().unwrap();
+        second.defer_refresh(&a, start as usize, len as usize);
+        // SAFETY: as above.
+        unsafe {
+            second
+                .list
+                .CopyBufferRegion(&out, 0, &a.buffer, a.offset(at), 4)
+        };
+        second.close();
+        assert_eq!(crate::host::flights::blocked(&[&second]), None);
+        assert!(
+            !crate::host::flights::refresh_waits(&[&second]),
+            "a card copy with a home does not wait"
+        );
+        host.send_for_test(&second);
+        hold.release();
+        flights.land_all();
+        // SAFETY: the mapping holds 256 bytes; the card is done with it.
+        let read = unsafe { std::slice::from_raw_parts(seen, 4) }.to_vec();
+        assert_eq!(read, written, "the card copy took the flight's bytes");
+        assert!(title(at, 4) == written);
+        for list in [&first, &second] {
+            list.reset();
+        }
+        drop((list, first, second, hold, flights));
+        unregister(0xca4d_0801, start);
+        drop((a, home, source, out));
+        region.release();
+    }
+
+    /// R5: a flight's shaders write only through a card copy whose CPU side
+    /// is a home, declared written whole (as copies that raw-address shaders
+    /// reach are), and merge into the home on the card; the next flight,
+    /// prepared before the first lands, refreshes that copy. Nothing goes up
+    /// from the home for what the copy itself declared: its card side holds
+    /// those bytes already. Once both landed, title memory and the card side
+    /// hold the shader's bytes.
+    #[test]
+    fn warp_r5_card_copy_does_not_take_its_own_flights_writes_again() {
+        let Some(host) = warp() else { return };
+        let _on = Switched::on();
+        let flights = crate::host::flights::TestFlights::on(true, true);
+        let region = Region::new(4 * BIG as usize);
+        let (start, len) = (region.base + K64, BIG + 2 * K64);
+        fill(start, len, 17);
+        let a = card_copy(0xca4d_0901, start, len);
+        assert!(
+            a.card_homed().is_some(),
+            "its CPU side is a home under flights"
+        );
+        let (source, data) = host.shared_buffer(256).unwrap();
+        let written = [0xc1u8, 0xc2, 0xc3, 0xc4];
+        // SAFETY: the mapping holds 256 bytes; the card does not use it yet.
+        unsafe { std::ptr::copy_nonoverlapping(written.as_ptr(), data, 4) };
+        let at = 2 * K64 + 0x40;
+        assert_ne!(title(start + at, 4), written);
+        // A first submission takes the copy up whole.
+        let list = host.new_list().unwrap();
+        list.defer_refresh(&a, start as usize, len as usize);
+        list.close();
+        host.send_for_test(&list);
+        flights.land_all();
+        list.reset();
+        let hold = crate::host::flights::QueueHold::new(host);
+        let first = host.new_list().unwrap();
+        first.defer_refresh(&a, start as usize, len as usize);
+        // SAFETY: an open list of the host's; live buffers, the range in both.
+        unsafe { first.list.CopyBufferRegion(&a.buffer, at, &source, 0, 4) };
+        first.defer_gpu_write(&a, start as usize, len as usize);
+        first.close();
+        host.send_for_test(&first);
+        let second = host.new_list().unwrap();
+        second.defer_refresh(&a, start as usize, len as usize);
+        second.close();
+        let was = flow_now();
+        host.send_for_test(&second);
+        let now = flow_now();
+        assert!(
+            now[flow::UPLOADED] - was[flow::UPLOADED] < len,
+            "the copy's own declared range does not go up again ({} bytes did)",
+            now[flow::UPLOADED] - was[flow::UPLOADED]
+        );
+        hold.release();
+        flights.land_all();
+        assert!(title(start + at, 4) == written, "merged into title memory");
+        let mut rig = Rig::new(&host.device).unwrap();
+        assert_eq!(
+            rig.fetch(&a.buffer, at, 4).unwrap(),
+            written,
+            "the card side kept the shader's bytes"
+        );
+        for list in [&first, &second] {
+            list.reset();
+        }
+        drop((list, first, second, hold, flights));
+        unregister(0xca4d_0901, start);
+        drop((a, rig, source));
+        region.release();
+    }
+
+    /// With R5, the kept references a flight's list copies into stay in
+    /// [`Before::filling`] while its submission has not finished, and are
+    /// let go once it has.
+    #[test]
+    fn a_flights_filled_references_go_once_it_finished() {
+        let mut filling: Vec<(u64, Vec<ID3D12Resource>)> = vec![(5, Vec::new()), (7, Vec::new())];
+        let numbers =
+            |f: &Vec<(u64, Vec<ID3D12Resource>)>| f.iter().map(|e| e.0).collect::<Vec<_>>();
+        let_go_filled(&mut filling, 4);
+        assert_eq!(numbers(&filling), [5, 7], "neither finished");
+        let_go_filled(&mut filling, 5);
+        assert_eq!(numbers(&filling), [7], "5 finished");
+        let_go_filled(&mut filling, 9);
+        assert!(filling.is_empty());
+    }
+
     /// The room goes back to the card's memory once the need fit it for
     /// [`ROOM_BACK_AFTER`] submissions in a row, and grows when it is short.
     #[test]
@@ -1698,7 +1999,7 @@ mod tests {
         // need no `before` (`idle`) counted too.
         let bytes_kept = KEPT_BYTES.load(Ordering::Relaxed);
         assert!(bytes_kept >= size);
-        let (list, places) = before(host, &[], &[]).expect("nothing to do");
+        let (list, places) = before(host, &[], &[], 0).expect("nothing to do");
         assert!(list.is_none() && places.is_empty());
         for _ in 1..KEPT_IDLE {
             idle();
