@@ -4884,8 +4884,14 @@ unsafe fn record_lifts(list: &ID3D12GraphicsCommandList, lifts: &[LiftCopy]) {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+///
+/// The spans found so (copy, from, to): the first only, or with
+/// [`lift_stale`] all of them.
+fn stale_under_flights(
+    runs: &[&HostList],
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
+    let all = lift_stale();
     // On the profile: host copies looked at, runs merged (`late_exact`),
     // and whether a settle is due.
     let mut span = crate::profile::span("stale under flights");
@@ -4910,27 +4916,69 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there.
-        const RUNS: usize = 512;
-        let mut runs_left = RUNS;
-        let stale = spans.iter().any(|(shadow, from, to)| {
-            shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
-        });
+        // copy of its own there (with `VICTORY_LIFT_STALE=1` more, and every
+        // span is merged).
+        let budget = if all { 4096 } else { 512 };
+        let mut runs_left = budget;
+        let copies = spans.len() as u64;
+        let stale: Vec<_> = if all {
+            spans.retain(|(shadow, from, to)| {
+                shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
+            });
+            spans
+        } else {
+            spans
+                .into_iter()
+                .find(|(shadow, from, to)| {
+                    shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
+                })
+                .into_iter()
+                .collect()
+        };
         if let Some(span) = span.as_mut() {
-            span.arg("copies", spans.len() as u64);
-            span.arg("merged", RUNS.saturating_sub(runs_left) as u64);
-            span.arg("stale", u64::from(stale));
+            span.arg("copies", copies);
+            span.arg("merged", budget.saturating_sub(runs_left) as u64);
+            span.arg("stale", stale.len() as u64);
         }
         return stale;
     }
-    let stale = spans
-        .iter()
-        .any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
+    let copies = spans.len() as u64;
+    let stale: Vec<_> = if all {
+        spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
+        spans
+    } else {
+        spans
+            .into_iter()
+            .find(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+            .into_iter()
+            .collect()
+    };
     if let Some(span) = span.as_mut() {
-        span.arg("copies", spans.len() as u64);
-        span.arg("stale", u64::from(stale));
+        span.arg("copies", copies);
+        span.arg("stale", stale.len() as u64);
     }
     stale
+}
+
+/// Whether a submission that refreshes title memory the title wrote under
+/// flights' shader writes ([`stale_under_flights`]) waits only for the
+/// flights that may write those ranges, instead of settling every flight
+/// (`VICTORY_LIFT_STALE=1`; off by default, and only with [`relay_exact`]).
+///
+/// With it: every stale span is looked at, not only the first, with 4,096
+/// changed runs a submission put in under the writes instead of 512; the
+/// submission waits until no flight's shaders may still write any stale
+/// span (`Shadow::writes_pending_over`), asks the write watch again (the
+/// landings wrote title memory) and looks again, up to three times; what
+/// is still stale then settles as before ([`Host::settle_stale`]).
+///
+/// Why: lifted fills bring the pages of constants the title rewrites each
+/// frame here, which waited before at the reads themselves: cool_fox
+/// measured hundreds of short changed runs a page, more than 512 a
+/// submission, at about 1.5 us a run, and settled every flight for them.
+fn lift_stale() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIFT_STALE").is_some_and(|v| v == "1"))
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -7624,6 +7672,49 @@ impl Host {
     /// signals behind them. `submitted` is the submission lock's value;
     /// `why` one of the `WHY_` places. Nothing happens if nothing flies.
     ///
+    /// For a submission of `runs` that refreshes the spans `stale` of host
+    /// copies, which flights may be writing and the title wrote too
+    /// ([`stale_under_flights`]): the flights land first, and the write
+    /// watch is asked again for `ranges`, the submission's one asking (what
+    /// they landed is title memory written).
+    ///
+    /// With [`lift_stale`] (and the relay's second stage) only the flights
+    /// that may write the spans are waited for, and the spans looked at
+    /// again, up to three times; what is left then, or without the switch
+    /// everything, settles every flight as before.
+    fn settle_stale(
+        &self,
+        submitted: &mut u64,
+        runs: &[&HostList],
+        mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        ranges: &[(usize, usize)],
+    ) {
+        let ask_again = || {
+            let _again = crate::profile::span_args(
+                "ask once",
+                &[("ranges", ranges.len() as u64), ("again", 1)],
+            );
+            let _refresh = crate::profile::refresh_scope();
+            crate::watch::ask_once(ranges);
+        };
+        if lift_stale() && relay_exact() {
+            for _ in 0..3 {
+                relay_wait(WHY_STALE, |_| {
+                    stale
+                        .iter()
+                        .all(|(shadow, from, to)| !shadow.writes_pending_over(*from, *to - *from))
+                });
+                ask_again();
+                stale = stale_under_flights(runs);
+                if stale.is_empty() {
+                    return;
+                }
+            }
+        }
+        self.settle(submitted, WHY_STALE);
+        ask_again();
+    }
+
     /// Everything in the air is settled, never the first flights alone:
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
@@ -7983,18 +8074,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
+                self.settle_stale(&mut submitted, runs, stale, &ranges);
                 settled += settling.elapsed();
-                let _again = crate::profile::span_args(
-                    "ask once",
-                    &[("ranges", ranges.len() as u64), ("again", 1)],
-                );
-                let _refresh = crate::profile::refresh_scope();
-                crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && !stale_under_flights(runs).is_empty() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
