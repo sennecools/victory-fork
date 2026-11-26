@@ -361,7 +361,7 @@ fn a_request_and_its_wait_leave_a_copied_record_made() {
     descriptor::create_sampler(std::ptr::null(), &sampler, source);
     copy_record(source, placed.at(5), 16);
     assert!(!host.made(5));
-    let seq = ahead.request().expect("a request");
+    let seq = ahead.request(&[placed.registered()]).expect("a request");
     assert!(ahead.wait(seq));
     assert!(host.made(5));
     assert_eq!(ahead.behind(seq), 0);
@@ -380,21 +380,21 @@ fn a_pass_begun_before_a_request_does_not_answer_it() {
     let gone = std::sync::Mutex::new(gone);
     let ahead = Ahead::start({
         let written = written.clone();
-        move || {
+        move |_: &[usize]| {
             // What the pass sees as it begins.
             let _ = came.send(written.load(Acquire));
             let _ = gone.lock().unwrap().recv();
         }
     })
     .expect("a helper thread");
-    let first = ahead.request().expect("a request");
+    let first = ahead.request(&[]).expect("a request");
     let seen = come
         .recv_timeout(Duration::from_secs(30))
         .expect("the first pass");
     assert_eq!(seen, 0);
     // The title writes, and the next submission asks, while the pass runs.
     written.store(1, std::sync::atomic::Ordering::Release);
-    let second = ahead.request().expect("a request");
+    let second = ahead.request(&[]).expect("a request");
     assert_eq!(ahead.behind(second), 2);
     go.send(()).unwrap();
     assert!(ahead.wait(first));
@@ -431,7 +431,7 @@ fn a_heap_dropped_while_the_pass_walks_it_waits_for_it() {
     let (go, gone) = std::sync::mpsc::channel();
     *descriptor::tests_hook::AT.lock().unwrap() = Some((placed.registered(), came, gone));
     let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
-    let seq = ahead.request().expect("a request");
+    let seq = ahead.request(&[placed.registered()]).expect("a request");
     come.recv_timeout(Duration::from_secs(30))
         .expect("the pass comes to the heap");
     // The title's last release, on a thread of its own.
@@ -486,10 +486,11 @@ fn a_wait_under_the_submission_lock_ends() {
     let (done, finished) = std::sync::mpsc::channel();
     {
         let ahead = ahead.clone();
+        let heaps = [placed.registered()];
         std::thread::spawn(move || {
-            let seq = ahead.request().expect("a request");
+            let seq = ahead.request(&heaps).expect("a request");
             let held = crate::host::flights::submission_lock(gpu);
-            crate::descriptor::ahead::wait_and_make(Some(&ahead), seq);
+            crate::descriptor::ahead::wait_and_make(Some(&ahead), seq, &heaps);
             drop(held);
             let _ = done.send(());
         });
@@ -533,16 +534,16 @@ fn slots_left_waiting_are_made_by_the_next_wait() {
         copy_record(source, placed.at(s), 32);
     }
     let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
-    let seq = ahead.request().expect("a request");
-    crate::descriptor::ahead::wait_and_make(Some(&ahead), seq);
+    let seq = ahead.request(&[placed.registered()]).expect("a request");
+    crate::descriptor::ahead::wait_and_make(Some(&ahead), seq, &[placed.registered()]);
     assert!(crate::resource::host_waits(title));
     for s in 0..4 {
         assert!(!host.made(s), "slot {s} waits for its texture");
     }
     // Made by a draw before the next submission.
     assert!(crate::resource::host_copy(title).is_some());
-    let seq = ahead.request().expect("a request");
-    crate::descriptor::ahead::wait_and_make(Some(&ahead), seq);
+    let seq = ahead.request(&[placed.registered()]).expect("a request");
+    crate::descriptor::ahead::wait_and_make(Some(&ahead), seq, &[placed.registered()]);
     for s in 0..4 {
         assert!(host.made(s), "slot {s} made with its texture");
         assert_eq!(host.word(s), Some(slot_word(Some(&view))), "slot {s}");
@@ -567,6 +568,7 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
     let _fast = Fast::on();
     let views = views(memory());
     let heap_at: Vec<u64> = (0..SLOTS).map(|s| placed.at(s)).collect();
+    let heaps = [placed.registered()];
     let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
     let stop = std::sync::atomic::AtomicBool::new(false);
     let skipped = SKIPPED_MADE.load(Relaxed);
@@ -619,7 +621,7 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
             let gpu = crate::host::host().expect("the host GPU of the heap");
             let mut passes = 0u64;
             while !stop.load(Relaxed) {
-                let seq = ahead.request().expect("a request");
+                let seq = ahead.request(&heaps).expect("a request");
                 // As a submission waits: under the submission lock.
                 let _held = crate::host::flights::submission_lock(gpu);
                 assert!(ahead.wait(seq));
@@ -661,7 +663,7 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
     });
     assert!(passes > 0);
     // A last pass over what was copied last.
-    let seq = ahead.request().expect("a request");
+    let seq = ahead.request(&heaps).expect("a request");
     assert!(ahead.wait(seq));
     assert!(looks > 0);
     assert!(
@@ -869,7 +871,7 @@ fn passes_of_its_own_run_between_requests_and_answer_none() {
     let ahead = Ahead::start_with(
         {
             let passes = passes.clone();
-            move || {
+            move |_: &[usize]| {
                 // The second pass, of its own, is held until the test lets
                 // it go on.
                 let n = passes.fetch_add(1, Relaxed) + 1;
@@ -884,7 +886,7 @@ fn passes_of_its_own_run_between_requests_and_answer_none() {
     .expect("a helper thread");
     std::thread::sleep(Duration::from_millis(40));
     assert_eq!(passes.load(Relaxed), 0, "no pass before a request");
-    let first = ahead.request().expect("a request");
+    let first = ahead.request(&[]).expect("a request");
     assert!(ahead.wait(first));
     // A pass of its own begins, and is held.
     assert_eq!(
@@ -893,7 +895,7 @@ fn passes_of_its_own_run_between_requests_and_answer_none() {
         2
     );
     assert_eq!(ahead.behind(first), 0);
-    let second = ahead.request().expect("a request");
+    let second = ahead.request(&[]).expect("a request");
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(
         ahead.behind(second),
@@ -925,16 +927,97 @@ fn passes_of_its_own_run_between_requests_and_answer_none() {
     let passes = std::sync::Arc::new(AtomicU64::new(0));
     let ahead = Ahead::start({
         let passes = passes.clone();
-        move || {
+        move |_: &[usize]| {
             passes.fetch_add(1, Relaxed);
         }
     })
     .expect("a helper thread");
-    let first = ahead.request().expect("a request");
+    let first = ahead.request(&[]).expect("a request");
     assert!(ahead.wait(first));
     let after = passes.load(Relaxed);
     std::thread::sleep(Duration::from_millis(60));
     assert_eq!(passes.load(Relaxed), after);
+}
+
+/// A heap no submission binds is not looked at; when one binds it, its
+/// pass makes every record copied into it meanwhile. Both heaps were taken
+/// whole first (their low-water marks raised), and in between passes over
+/// the other heap and another copy's askings about this one's memory (which
+/// take the kernel's written pages) handed out numbers above its mark: its
+/// stamps only rise, and its take asks for those above its mark.
+#[test]
+fn an_unbound_heap_catches_up_when_bound() {
+    let (bound, unbound) = (
+        Placed::new(descriptor::SAMPLERS),
+        Placed::new(descriptor::SAMPLERS),
+    );
+    let (Some(host), Some(other)) = (bound.host(), unbound.host()) else {
+        return; // no host GPU
+    };
+    let mut elsewhere = [0u64; 2];
+    let source = elsewhere.as_mut_ptr() as u64;
+    let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+    descriptor::create_sampler(std::ptr::null(), &sampler, source);
+    // Both bound once: each taken whole.
+    copy_record(source, bound.at(SLOTS - 1), 16);
+    copy_record(source, unbound.at(SLOTS - 1), 16);
+    descriptor::sync_heaps(&[bound.registered(), unbound.registered()]);
+    assert!(host.made(SLOTS - 1) && other.made(SLOTS - 1));
+    let (from, to) = (unbound.at(0) as usize, unbound.at(SLOTS - 1) as usize + 16);
+    for round in 0..8 {
+        copy_record(source, bound.at(round), 16);
+        copy_record(source, unbound.at(round), 16);
+        // Another copy over the unbound heap's memory asks meanwhile.
+        crate::watch::writes(from, to, true, 0).expect("write-watched");
+        descriptor::sync_heaps(&[bound.registered()]);
+        assert!(host.made(round), "round {round}: the bound heap's record");
+        assert!(
+            !other.made(round),
+            "round {round}: the unbound heap is left"
+        );
+    }
+    descriptor::sync_heaps(&[unbound.registered()]);
+    for round in 0..8 {
+        assert!(other.made(round), "slot {round}: caught up");
+    }
+}
+
+/// A pass looks at the heaps of the requests it covers, each once, and a
+/// pass of its own at those of the last pass that covered requests.
+#[test]
+fn a_pass_looks_at_the_heaps_of_the_requests_it_covers() {
+    use std::sync::mpsc::channel;
+    let (came, come) = channel::<Vec<usize>>();
+    let (go, gone) = channel::<()>();
+    let gone = std::sync::Mutex::new(gone);
+    let ahead = Ahead::start_with(
+        move |heaps: &[usize]| {
+            let _ = came.send(heaps.to_vec());
+            let _ = gone.lock().unwrap().recv();
+        },
+        Some(Duration::from_millis(2)),
+    )
+    .expect("a helper thread");
+    let first = ahead.request(&[1]).expect("a request");
+    let seen = come.recv_timeout(Duration::from_secs(30)).expect("a pass");
+    assert_eq!(seen, [1]);
+    // Asked for while the first pass is held: the next pass's.
+    ahead.request(&[2]).expect("a request");
+    let third = ahead.request(&[3, 2]).expect("a request");
+    go.send(()).unwrap();
+    assert!(ahead.wait(first));
+    let seen = come.recv_timeout(Duration::from_secs(30)).expect("a pass");
+    assert_eq!(seen, [2, 3]);
+    go.send(()).unwrap();
+    assert!(ahead.wait(third));
+    // A pass of its own, while requests are recent.
+    let seen = come
+        .recv_timeout(Duration::from_secs(30))
+        .expect("a pass of its own");
+    assert_eq!(seen, [2, 3]);
+    assert_eq!(ahead.behind(third), 0);
+    // (The helper ends once its passes stop being held.)
+    drop(go);
 }
 
 /// With `VICTORY_SAME_RECORDS`, records copied onto the same bytes leave

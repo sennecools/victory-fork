@@ -1192,6 +1192,11 @@ impl State {
                 }
             }
             heaps.iter().flatten().for_each(|h| list.keep(h));
+            // Its submission's heap sync looks at these heaps.
+            self.heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .for_each(|&h| list.binds_heap(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = want;

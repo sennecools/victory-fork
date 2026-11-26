@@ -3202,6 +3202,10 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The title's shader-visible heaps whose host heaps the list binds
+    /// (`crate::descriptor::Heap` addresses): the heaps its submission's
+    /// heap sync looks at (`crate::descriptor::sync_heaps`).
+    heaps: Vec<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -7616,9 +7620,11 @@ impl Host {
         // For the critical path on the profile: when each wait before
         // preparing ended (`gate_args`).
         let entered = crate::profile::stamp();
+        // The title heaps the lists bind: those the heap sync looks at.
+        let bound = HostList::bound_heaps(runs);
         // With `VICTORY_HEAP_SYNC_AHEAD=1`: the heap sync below runs on its
         // own thread from here, while this one waits and prepares.
-        let heap_sync = crate::descriptor::sync_ahead();
+        let heap_sync = crate::descriptor::sync_ahead(&bound);
         // Lists whose binds lost the heap buffer pass's claim: not before
         // its walk has ended, and before the submission lock.
         wait_for_walks(runs);
@@ -7706,7 +7712,7 @@ impl Host {
         // `sync heaps`, is its own.) Ahead of the submission, waited for
         // before its lists go to the card (`heap_sync`).
         if heap_sync.is_none() {
-            crate::descriptor::sync_heaps();
+            crate::descriptor::sync_heaps(&bound);
         }
         // Idle host objects are let go by a thread of their own, outside
         // this lock and behind flights too (`sweeper`).
@@ -7881,7 +7887,7 @@ impl Host {
         // thread takes nothing this one holds. Slots it left waiting for a
         // texture made meanwhile are made then too.
         if let Some(seq) = heap_sync {
-            crate::descriptor::sync_ahead_wait(seq);
+            crate::descriptor::sync_ahead_wait(seq, &bound);
         }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
@@ -9574,6 +9580,27 @@ impl HostList {
             return Some(card);
         }
         self.budget.get()?.as_ref().map(|(mapped, _)| mapped)
+    }
+
+    /// The list binds the host heap of the title's heap at `heap` (a
+    /// `crate::descriptor::Heap` address), until it is reset.
+    pub(crate) fn binds_heap(&self, heap: usize) {
+        let mut deferred = self.deferred();
+        if !deferred.heaps.contains(&heap) {
+            deferred.heaps.push(heap);
+        }
+    }
+
+    /// The title heaps the lists `runs` bind (`HostList::binds_heap`),
+    /// each once.
+    pub(crate) fn bound_heaps(runs: &[&HostList]) -> Vec<usize> {
+        let mut heaps: Vec<usize> = runs
+            .iter()
+            .flat_map(|list| list.deferred().heaps.clone())
+            .collect();
+        heaps.sort_unstable();
+        heaps.dedup();
+        heaps
     }
 
     /// Keeps `object` alive until the list is reset.

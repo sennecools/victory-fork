@@ -245,8 +245,16 @@ fn mirror(handle: u64, site: u64) {
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
+///
+/// Only the heaps in `bound` (their [`Heap`] addresses) are looked at:
+/// those a submission's lists bind (`crate::host::HostList::bound_heaps`),
+/// the only ones its lists can read. A heap no submission binds is not
+/// looked at, however many pages the title writes in it; when one binds it
+/// again its pass takes every page written meanwhile, since the journal's
+/// stamps only rise and its take asks for those above its last
+/// (`crate::watch::Tracked::take`).
 #[cfg(windows)]
-pub(crate) fn sync_heaps() {
+pub(crate) fn sync_heaps(bound: &[usize]) {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
@@ -274,7 +282,7 @@ pub(crate) fn sync_heaps() {
     let parted = host::sync_parted();
     let mut nothing = 0u64;
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    for &(start, end, at) in heaps.iter() {
+    for &(start, end, at) in heaps.iter().filter(|h| bound.contains(&h.2)) {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
         #[cfg(test)]
@@ -1694,7 +1702,7 @@ mod tests {
                 )
             };
             assert!(!host.made(5));
-            sync_heaps();
+            sync_heaps(&[h as usize]);
             assert!(host.made(5));
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
