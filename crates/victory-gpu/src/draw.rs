@@ -4348,7 +4348,7 @@ fn walk_spread(
     let ticks = [const { AtomicU64::new(0) }; 3];
     let removed = std::sync::Mutex::new(None::<(String, usize)>);
     let gone = std::sync::atomic::AtomicBool::new(!alive);
-    each_on(threads, jobs, &|job| {
+    each_on(threads, jobs, "victory-heap-walk", &|job| {
         let at = job * HEAP_WALK_JOB;
         let end = slots.len().min(at + HEAP_WALK_JOB);
         // A span of its own on this thread sums the views it makes.
@@ -4411,8 +4411,9 @@ fn walk_spread(
 /// Calls `f` with every number below `count`, on this thread and on up to
 /// `threads - 1` more made for the call, and returns when every call has.
 /// A panic of one call is the caller's once all have ended. With fewer than
-/// two threads or numbers, on this thread alone.
-fn each_on(threads: usize, count: usize, f: &(dyn Fn(usize) + Sync)) {
+/// two threads or numbers, on this thread alone. The threads are named
+/// `name-1` on. (Also the heap sync's, `VICTORY_HEAP_SYNC_THREADS`.)
+pub(crate) fn each_on(threads: usize, count: usize, name: &str, f: &(dyn Fn(usize) + Sync)) {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let run = || {
         loop {
@@ -4432,7 +4433,7 @@ fn each_on(threads: usize, count: usize, f: &(dyn Fn(usize) + Sync)) {
             // (A thread that cannot be made is only missed: the others
             // take its numbers.)
             let _ = std::thread::Builder::new()
-                .name(format!("victory-heap-walk-{i}"))
+                .name(format!("{name}-{i}"))
                 .spawn_scoped(s, run);
         }
         run();
@@ -4854,7 +4855,7 @@ void main() {
         for threads in [0, 1, 2, 4, 16] {
             for count in [0, 1, 2, 7, 1000] {
                 let calls: Vec<AtomicU64> = (0..count).map(|_| AtomicU64::new(0)).collect();
-                each_on(threads, count, &|n| {
+                each_on(threads, count, "victory-heap-walk", &|n| {
                     calls[n].fetch_add(1, Ordering::Relaxed);
                 });
                 assert!(

@@ -684,3 +684,185 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
     words_agree(host);
     assert!(alive());
 }
+
+/// Records over a page, some slots a table's lately, some made by a draw,
+/// some written with bytes that are no view, mirrored one by one
+/// (`mirror_copied`) on one heap, and on another sorted in parts of the
+/// page on four threads (`sort_copied_page`) and the slots found mirrored
+/// on four threads (`mirror_synced`): after every round the same slots
+/// made from the same records, with the same words and buffer sets, and
+/// the same records last seen. With prints or bytes (`bytes`), and with or
+/// without `shows_none`.
+fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
+    let (Some(one), Some(sorted)) = (
+        HostHeap::with_made(false, SLOTS, false),
+        HostHeap::with_made(false, SLOTS, false),
+    ) else {
+        return; // no host GPU
+    };
+    let views = views(memory());
+    let none_before = SHOWED_NONE.load(Relaxed);
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let step = 32u64;
+    let mut rng = 0x0dd5_eed5_1f1a_4330u64 ^ u64::from(bytes) ^ u64::from(shows_none) << 1;
+    let mut mirrored = 0u64;
+    for round in 0..200 {
+        for _ in 0..8 {
+            let r = next(&mut rng);
+            let s = (r % u64::from(SLOTS)) as u32;
+            let handle = base + u64::from(s) * step;
+            if r >> 50 & 7 == 0 {
+                // Bytes that are no view of ours.
+                // SAFETY: a record of `records`.
+                unsafe { (handle as *mut [u32; 8]).write_unaligned([(r >> 8) as u32 | 1; 8]) };
+            } else {
+                write(handle, &views[(r >> 16) as usize % views.len()]);
+            }
+            if r >> 40 & 7 == 0 {
+                one.texture_slot_tabled(s, false);
+                sorted.texture_slot_tabled(s, false);
+            }
+            if r >> 44 & 3 == 0 {
+                one.mirror(s, handle, true);
+                sorted.mirror(s, handle, true);
+            }
+        }
+        // SAFETY: `records` is `SLOTS` records of `step` bytes.
+        let page = unsafe {
+            std::slice::from_raw_parts(base as *const u8, (u64::from(SLOTS) * step) as usize)
+        }
+        .to_vec();
+        let mut one_by_one = 0;
+        for index in 0..u64::from(SLOTS) {
+            let at = (index * step) as usize;
+            if one.mirror_copied(
+                index as u32,
+                base + index * step,
+                &page[at..at + step as usize],
+            ) {
+                one_by_one += 1;
+            }
+        }
+        // The page in eight parts of 256 bytes, as ranges the watch gives.
+        let parts: Vec<(usize, usize)> = (0..8)
+            .map(|p| (base as usize + p * 256, base as usize + (p + 1) * 256))
+            .collect();
+        let found: Vec<std::sync::Mutex<SyncPart>> =
+            parts.iter().map(|_| Default::default()).collect();
+        {
+            let copied = sorted.copied_begin(step as usize, bytes);
+            crate::draw::each_on(4, parts.len(), "test-sync", &|n| {
+                let (from, to) = parts[n];
+                let mut part = SyncPart::default();
+                let at = from - base as usize;
+                let slots = (at as u64 / step)..((to - base as usize) as u64).div_ceil(step);
+                // SAFETY: the parts are apart from one another.
+                unsafe {
+                    sorted.sort_copied_page(
+                        &copied,
+                        slots,
+                        (base, step),
+                        from,
+                        &page[at..to - base as usize],
+                        shows_none,
+                        &mut part,
+                    )
+                };
+                *found[n].lock().unwrap() = part;
+            });
+        }
+        let mut make = Vec::new();
+        let mut nothing = 0;
+        for part in found {
+            let mut part = part.into_inner().unwrap();
+            assert_eq!(part.looked, 8, "round {round}");
+            nothing += part.nothing;
+            make.append(&mut part.make);
+        }
+        assert!(make.is_sorted(), "round {round}");
+        crate::draw::each_on(4, make.len().div_ceil(4), "test-sync", &|n| {
+            for &index in make.chunks(4).nth(n).unwrap_or_default() {
+                sorted.mirror_synced(index, base + u64::from(index) * step);
+            }
+        });
+        if shows_none {
+            assert_eq!(make.len() as u64 + nothing, one_by_one, "round {round}");
+        } else {
+            assert_eq!(nothing, 0, "round {round}");
+            assert_eq!(make.len() as u64, one_by_one, "round {round}");
+        }
+        mirrored += one_by_one;
+        for s in 0..SLOTS {
+            assert_eq!(key(&one, s), key(&sorted, s), "round {round}, slot {s}");
+            assert_eq!(one.word(s), sorted.word(s), "round {round}, slot {s}");
+            let print = one.copied_print(s);
+            if bytes {
+                let seen = sorted.copied_record(s, step as usize).expect("bytes kept");
+                if print == 0 {
+                    assert!(seen.iter().all(|&b| b == 0), "round {round}, slot {s}");
+                } else {
+                    assert_eq!(record_print(&seen) | 1, print, "round {round}, slot {s}");
+                }
+            } else {
+                assert_eq!(print, sorted.copied_print(s), "round {round}, slot {s}");
+            }
+        }
+        assert_eq!(one.buffer_slots(), sorted.buffer_slots(), "round {round}");
+        words_agree(&sorted);
+    }
+    assert!(mirrored > 0);
+    if shows_none {
+        assert!(SHOWED_NONE.load(Relaxed) > none_before, "records left");
+    }
+    assert!(alive());
+}
+
+/// [`sorted_against_one_by_one`] with prints.
+#[test]
+fn pages_sorted_on_threads_make_what_one_by_one_makes() {
+    sorted_against_one_by_one(false, false);
+}
+
+/// [`sorted_against_one_by_one`] with the records' bytes as last seen.
+#[test]
+fn pages_sorted_with_bytes_make_what_one_by_one_makes() {
+    sorted_against_one_by_one(true, false);
+}
+
+/// [`sorted_against_one_by_one`] with bytes, records of no view into slots
+/// made from none left before their mirror.
+#[test]
+fn records_of_no_view_left_before_their_mirror_make_what_one_by_one_makes() {
+    sorted_against_one_by_one(true, true);
+}
+
+/// The records [`changed_records`] gives are those that differ one by one,
+/// in order, and it changes nothing (from cool_fox 53c5256's test).
+#[test]
+fn changed_records_are_those_that_differ_one_by_one() {
+    for (step, count) in [(32usize, 128usize), (32, 2048), (16, 77), (32, 5), (32, 17)] {
+        let mut seed = 7u64;
+        let mut random = move || {
+            seed = seed
+                .wrapping_mul(0x5851_F42D_4C95_7F2D)
+                .wrapping_add(0x1405_7B7E_F767_814F);
+            (seed >> 33) as usize
+        };
+        let last: Vec<u8> = (0..step * count).map(|_| random() as u8).collect();
+        let mut now = last.clone();
+        let mut differ = Vec::new();
+        for slot in 0..count {
+            if random() % 9 == 0 {
+                now[slot * step + random() % step] ^= 1 + (random() % 255) as u8;
+                differ.push(1000 + slot as u32);
+            }
+        }
+        let mut out = Vec::new();
+        changed_records(&last, &now, step, 1000, &mut out);
+        assert_eq!(out, differ);
+        out.clear();
+        changed_records(&now, &now, step, 1000, &mut out);
+        assert!(out.is_empty());
+    }
+}

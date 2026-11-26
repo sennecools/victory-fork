@@ -49,6 +49,10 @@ pub(crate) struct HostHeap {
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
     copied: Mutex<Vec<u64>>,
+    /// With [`sync_bytes`]: the records themselves, `step` bytes a slot, as
+    /// that pass last saw them, in place of `copied`'s prints
+    /// ([`HostHeap::copied_begin`]). Made on first use.
+    copied_bytes: Mutex<Vec<u8>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -1447,6 +1451,7 @@ impl HostHeap {
             holder: std::sync::atomic::AtomicU64::new(0),
             log: NoteLog::default(),
             copied: Mutex::new(Vec::new()),
+            copied_bytes: Mutex::new(Vec::new()),
             kept: (0..(count + extra).div_ceil(KEPT_SHARD))
                 .map(|shard| {
                     let slots = (count + extra - shard * KEPT_SHARD).min(KEPT_SHARD);
@@ -3138,6 +3143,154 @@ impl HostHeap {
         copied.get(index as usize).copied().unwrap_or(0)
     }
 
+    /// What the pass over records copied in as bytes last saw of this heap,
+    /// held for one pass over it (`super::sync_heaps` with [`sync_parted`]):
+    /// the prints of `copied`, or with `bytes` ([`sync_bytes`]) the records
+    /// themselves, `step` bytes each. Threads that sort parts of the heap's
+    /// changed pages beside one another share it
+    /// ([`HostHeap::sort_copied_page`]); held, it keeps the one-by-one and
+    /// page-at-once mirrors of copied records waiting.
+    pub(crate) fn copied_begin(&self, step: usize, bytes: bool) -> Copied<'_> {
+        let slots = self.count as usize;
+        if bytes {
+            let mut held = self.copied_bytes.lock().unwrap_or_else(|e| e.into_inner());
+            // Nothing there: a slot never looked at that holds nothing is as
+            // it was, as with prints.
+            if held.len() != slots * step {
+                held.clear();
+                held.resize(slots * step, 0);
+            }
+            Copied {
+                at: held.as_mut_ptr(),
+                slots,
+                step,
+                bytes: true,
+                _prints: None,
+                _bytes: Some(held),
+            }
+        } else {
+            let mut held = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if held.len() != slots {
+                held.resize(slots, 0);
+            }
+            Copied {
+                at: held.as_mut_ptr().cast(),
+                slots,
+                step,
+                bytes: false,
+                _prints: Some(held),
+                _bytes: None,
+            }
+        }
+    }
+
+    /// For one changed page of the title's heap (`super::sync_heaps` with
+    /// [`sync_parted`]): title slots `slots`, the record of slot `i` at
+    /// title address `start + i * step`, and `page` the bytes read from
+    /// title address `from` on, compared with what `copied` last saw. The
+    /// records are sorted as [`HostHeap::mirror_copied_page`] sorts them (a
+    /// record that straddles the page's start is the range's before it; one
+    /// as last seen is left; a changed one of a slot a table's lately is
+    /// left to its draws and looked at again next time; the others are
+    /// last seen from here on), but nothing is mirrored here: the slots to
+    /// mirror go into `part.make`, in slot order, for the caller to mirror
+    /// ([`HostHeap::mirror_synced`]) once every part of the heap is sorted.
+    ///
+    /// With `shows_none` ([`shows_none`]), a changed record that is no view
+    /// of ours, into a slot made from no record, is not handed on
+    /// (`part.nothing`): the mirror would find the slot showing nothing
+    /// and leave it so, after the slots that C-pool let-goes made anew and
+    /// the heap-wide lock (cool_fox measured 32,000 such records of 41,000
+    /// a frame in one place of the title). A slot being claimed is not made from
+    /// no record, and is handed on.
+    ///
+    /// # Safety
+    /// No other call with `copied` at the same time has any of these
+    /// slots: the parts of a pass are ranges of the heap apart from one
+    /// another, and a record is the part's that holds its first byte.
+    #[allow(clippy::too_many_arguments)] // a page, where it lies, and where its findings go
+    pub(crate) unsafe fn sort_copied_page(
+        &self,
+        copied: &Copied<'_>,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+        shows_none: bool,
+        part: &mut SyncPart,
+    ) {
+        let first = ((from as u64).saturating_sub(start))
+            .div_ceil(step)
+            .max(slots.start);
+        let Some(records) = ((start + first * step) as usize)
+            .checked_sub(from)
+            .and_then(|at| page.get(at..))
+        else {
+            return;
+        };
+        let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
+        part.looked += count;
+        let records = &records[..(count * step) as usize];
+        let mut changed = std::mem::take(&mut part.changed);
+        changed.clear();
+        // SAFETY: by the caller, these slots are this call's alone.
+        unsafe { copied.differ(first as u32, records, &mut changed) };
+        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let step = step as usize;
+        for &index in &changed {
+            let at = (index as usize - first as usize) * step;
+            let record = &records[at..at + step];
+            // A table's slot lately: left to its draws, and looked at again
+            // next time.
+            if !tables && self.tabled_lately(index, frame) {
+                COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                part.tabled += 1;
+                continue;
+            }
+            // SAFETY: as above.
+            unsafe { copied.take(index, record) };
+            if shows_none && self.shows_none(index, record) {
+                SHOWED_NONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                part.nothing += 1;
+                continue;
+            }
+            part.make.push(index);
+        }
+        part.changed = changed;
+    }
+
+    /// Whether `record`, copied into title slot `index`, is no view of ours
+    /// and the slot was made from no record: a mirror of it (not a draw's)
+    /// would leave the slot as it is ([`HostHeap::sort_copied_page`]).
+    fn shows_none(&self, index: u32, record: &[u8]) -> bool {
+        let tag = record
+            .get(..4)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u32::from_le_bytes);
+        tag != VIEW_TAG
+            && self
+                .made
+                .get(index as usize)
+                .is_some_and(|made| made.load(std::sync::atomic::Ordering::Acquire) == 0)
+    }
+
+    /// [`HostHeap::mirror`] of a slot `super::sync_heaps` found a new
+    /// record in, as [`HostHeap::mirror_copied`] mirrors it (with
+    /// [`sync_fast`], a slot made from it already is done with before the
+    /// lock). Any thread may call it.
+    pub(crate) fn mirror_synced(&self, index: u32, handle: u64) {
+        self.mirror_marking(index, handle, false, true, hold::SYNC);
+    }
+
+    /// The record [`HostHeap::copied_begin`] with bytes last saw in slot
+    /// `index` (tests; `None` before the first pass).
+    #[cfg(test)]
+    pub(crate) fn copied_record(&self, index: u32, step: usize) -> Option<Vec<u8>> {
+        let bytes = self.copied_bytes.lock().unwrap_or_else(|e| e.into_inner());
+        let at = index as usize * step;
+        bytes.get(at..at + step).map(<[u8]>::to_vec)
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -3784,6 +3937,190 @@ pub(crate) fn sync_fast() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FAST").is_some_and(|v| v == "1"))
+}
+
+/// Whether the pass over records copied in as bytes keeps the records
+/// themselves as last seen, and compares a changed page's records sixteen
+/// at a time with what it saw (`VICTORY_HEAP_SYNC_BYTES=1`, off by default:
+/// a print of each record, compared one by one, as before). Most of a
+/// changed page is as it was: sixteen records of 32 bytes are one compare
+/// of 512, with no print made of any. The copy is 32 bytes a slot of the
+/// title's view heap where a print is 8 (on first use).
+///
+/// Ported from the byte copy of cool_fox 1f1a433 and the sixteen at a time
+/// of its 53c5256, both by local.
+pub(crate) fn sync_bytes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BYTES").is_some_and(|v| v == "1"))
+}
+
+/// Threads the heap sync reads, compares and sorts changed pages on, and
+/// mirrors the slots it found new records in, the calling one among them
+/// (`VICTORY_HEAP_SYNC_THREADS=N`, 2 to 16): the pages go [`SYNC_PAGES`] a
+/// job, the slots to mirror [`SYNC_SLOTS`] a job, on threads made for the
+/// pass (`crate::draw::each_on`). Unset, 0 or 1, the default: on the
+/// calling thread alone, as before.
+///
+/// Ported from cool_fox 44629de, by local (cool_fox measured 14 ms a frame
+/// of one thread for 160 changed pages).
+pub(crate) fn sync_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SYNC_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(1, |n| n.clamp(1, 16))
+    })
+}
+
+/// Whether the heap sync leaves a changed record that is no view of ours,
+/// into a slot made from no record, before its mirror
+/// (`VICTORY_SHOWS_NONE=1`, off by default: such a record is mirrored, which
+/// finds nothing to do). See [`HostHeap::sort_copied_page`].
+///
+/// Ported from `shows_none` of cool_fox 44629de, by local.
+pub(crate) fn shows_none() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOWS_NONE").is_some_and(|v| v == "1"))
+}
+
+/// Whether the heap sync sorts a heap's changed pages first and mirrors the
+/// slots it found after ([`HostHeap::copied_begin`],
+/// [`HostHeap::sort_copied_page`]): with any of [`sync_bytes`],
+/// [`sync_threads`] or [`shows_none`]. With none of them, page by page as
+/// before.
+pub(crate) fn sync_parted() -> bool {
+    sync_bytes() || sync_threads() > 1 || shows_none()
+}
+
+/// Changed pages of a heap [`sync_parted`] gives a job at a time.
+pub(crate) const SYNC_PAGES: usize = 8;
+
+/// Slots to mirror [`sync_parted`] gives a job at a time.
+pub(crate) const SYNC_SLOTS: usize = 256;
+
+/// Records [`HostHeap::sort_copied_page`] left with [`shows_none`]. Only
+/// grows.
+pub(crate) static SHOWED_NONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a job of [`sync_parted`] found on its pages of a heap.
+#[derive(Default)]
+pub(crate) struct SyncPart {
+    /// Pages read.
+    pub(crate) pages: u64,
+    /// Records on them looked at.
+    pub(crate) looked: u64,
+    /// Changed ones left to the draws of tables.
+    pub(crate) tabled: u64,
+    /// Changed ones left with [`shows_none`].
+    pub(crate) nothing: u64,
+    /// Profile ticks reading the pages.
+    pub(crate) read_ticks: u64,
+    /// The slots to mirror, in slot order.
+    pub(crate) make: Vec<u32>,
+    /// Room for the changed slots of a page.
+    changed: Vec<u32>,
+}
+
+/// The records last seen of a heap, held for one pass
+/// ([`HostHeap::copied_begin`]): `slots` prints, or `slots` records of
+/// `step` bytes, at `at`.
+pub(crate) struct Copied<'a> {
+    at: *mut u8,
+    slots: usize,
+    step: usize,
+    bytes: bool,
+    /// The lock held of the prints, or of the bytes.
+    _prints: Option<std::sync::MutexGuard<'a, Vec<u64>>>,
+    _bytes: Option<std::sync::MutexGuard<'a, Vec<u8>>>,
+}
+
+// SAFETY: the copy is reached only through `differ` and `take`, whose
+// callers take slots apart from one another; the guard stays with the
+// thread that took it.
+unsafe impl Sync for Copied<'_> {}
+
+impl Copied<'_> {
+    /// The slots of `records` (as the title has them now, `step` bytes each,
+    /// from slot `first` on) that are not the ones last seen, into `out` in
+    /// slot order. Nothing is changed: [`Copied::take`] does it.
+    ///
+    /// # Safety
+    /// No other call beside this one has any of these slots.
+    unsafe fn differ(&self, first: u32, records: &[u8], out: &mut Vec<u32>) {
+        let first_at = first as usize;
+        let n = (records.len() / self.step).min(self.slots.saturating_sub(first_at));
+        let records = &records[..n * self.step];
+        if n == 0 {
+            return;
+        }
+        if self.bytes {
+            // SAFETY: within the records held; the caller's slots alone.
+            let last = unsafe {
+                std::slice::from_raw_parts(self.at.add(first_at * self.step), n * self.step)
+            };
+            changed_records(last, records, self.step, first, out);
+        } else {
+            // SAFETY: as above, `slots` prints of 8 bytes.
+            let last =
+                unsafe { std::slice::from_raw_parts(self.at.cast::<u64>().add(first_at), n) };
+            for (k, (record, &last)) in records.chunks_exact(self.step).zip(last).enumerate() {
+                // Never 0, which is "never looked at"; a slot never looked
+                // at that holds nothing: as it was.
+                let print = record_print(record) | 1;
+                if last != print && !(last == 0 && record.iter().all(|&b| b == 0)) {
+                    out.push(first + k as u32);
+                }
+            }
+        }
+    }
+
+    /// `record` is the one last seen in slot `index` from here on.
+    ///
+    /// # Safety
+    /// As [`Copied::differ`].
+    unsafe fn take(&self, index: u32, record: &[u8]) {
+        let index = index as usize;
+        if index >= self.slots || record.len() != self.step {
+            return;
+        }
+        if self.bytes {
+            // SAFETY: within the records held; the caller's slot alone.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    record.as_ptr(),
+                    self.at.add(index * self.step),
+                    self.step,
+                )
+            };
+        } else {
+            // SAFETY: as above.
+            unsafe { *self.at.cast::<u64>().add(index) = record_print(record) | 1 };
+        }
+    }
+}
+
+/// The records (`step` bytes each, the first is slot `first`) that differ
+/// between `last` and `records` (of one length), into `out` in slot order.
+/// Most of a changed page is as it was: it is compared sixteen records at a
+/// time, and only a block that differs record by record.
+fn changed_records(last: &[u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    const AT_A_TIME: usize = 16;
+    let block = AT_A_TIME * step;
+    for (b, (old, new)) in last.chunks(block).zip(records.chunks(block)).enumerate() {
+        if old == new {
+            continue;
+        }
+        for (n, (old, new)) in old
+            .chunks_exact(step)
+            .zip(new.chunks_exact(step))
+            .enumerate()
+        {
+            if old != new {
+                out.push(first + (b * AT_A_TIME + n) as u32);
+            }
+        }
+    }
 }
 
 /// Tests: [`sync_fast`] on, whatever the environment says.
