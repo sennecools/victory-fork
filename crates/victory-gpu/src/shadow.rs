@@ -73,6 +73,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// How the copy came to be what it is, for the frame budget only
+    /// ([`Origin`]).
+    origin: Origin,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -147,6 +150,52 @@ impl Hand {
     fn of(id: u32) -> Option<Hand> {
         Hand::ALL.into_iter().find(|&hand| hand as u32 == id)
     }
+}
+
+/// How a copy came to be what it is ([`Shadow::origin`]): what the frame
+/// budget's H2 classes are told apart by. Nothing reads it to decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// Made as copies are made: a home, a window, a buffer's copy with no
+    /// reason of the memory core's noted.
+    Made,
+    /// A buffer view's copy of its own bytes ([`exact`]), and what the copy
+    /// of the view's buffer (its base) was when it was made: a home of the
+    /// memory core, or a copy in the card's memory whose CPU side is one.
+    Exact {
+        base_is_home: bool,
+        base_is_card: bool,
+    },
+    /// A title buffer's copy (or a card copy's staging) made because the
+    /// memory core gave its bytes no home: why.
+    Kept(Kept),
+}
+
+/// Why a copy got no home ([`Origin::Kept`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The memory core's reason (`crate::home::classify`).
+    Why(crate::home::Why),
+    /// A copy in the card's memory that would start off a 16-byte step of
+    /// its home ([`card_side`]): it keeps its staging buffer.
+    Misaligned,
+}
+
+/// The words for a [`Shadow::budget_key`] on the frame budget's line.
+pub(crate) fn budget_name(key: u16) -> String {
+    let kind = match key >> 8 & 3 {
+        1 => "title memory in place",
+        2 => "window",
+        3 => "view copy",
+        _ => "buffer copy",
+    };
+    let card = if key >> 8 & 4 != 0 {
+        " on the card"
+    } else {
+        ""
+    };
+    let hand = Hand::of(u32::from(key & 0xff)).map_or("no way noted", Hand::name);
+    format!("{kind}{card}, last handed as {hand}")
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -3015,6 +3064,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            origin: Origin::Made,
             place: None,
             core: None,
             hands: AtomicU32::new(0),
@@ -3040,6 +3090,28 @@ impl Shadow {
             self.root_at
                 .store(address.wrapping_sub(self.start), Ordering::Relaxed);
         }
+    }
+
+    /// For the frame budget's H2 table (`crate::frame_budget`): what kind of
+    /// copy this is, and the way it was last handed to the card, as one
+    /// number ([`budget_name`]).
+    pub(crate) fn budget_key(&self) -> u16 {
+        let kind = if self.place.is_some() {
+            1
+        } else if self.window {
+            2
+        } else if matches!(self.origin, Origin::Exact { .. }) {
+            3
+        } else {
+            0
+        };
+        let card = if self.card.is_some() { 4 } else { 0 };
+        (kind | card) << 8 | (self.last_hands.load(Ordering::Relaxed) & 0xff) as u16
+    }
+
+    /// How the copy came to be (the frame budget's H2 classes).
+    pub(crate) fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// What kind of copy it is, by its own marks (`from`: what the table
@@ -4684,10 +4756,11 @@ pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 /// title memory `[start, start + len)` (`crate::card_home`): the home that
 /// holds the bytes, or a new one, if the memory core gives them one
 /// (classified as a buffer not offered the card, so a later slice's homes
-/// come here the same way). `None`: the copy keeps a staging buffer.
-fn card_side(start: u64, len: u64) -> Option<Arc<Shadow>> {
+/// come here the same way). `Err`: the copy keeps a staging buffer, and why
+/// (`None`: the switch is off).
+fn card_side(start: u64, len: u64) -> Result<Arc<Shadow>, Option<Kept>> {
     if !crate::card_home::on() {
-        return None;
+        return Err(None);
     }
     // The merge on the card stores whole words of 16-byte steps of the copy
     // into the home: they must be steps of the home too. A private home's
@@ -4695,22 +4768,23 @@ fn card_side(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // a 64 KiB page's offset in its chunk's buffer, so asked before any opening.
     if !start.is_multiple_of(16) {
         crate::card_home::misaligned();
-        return None;
+        return Err(Some(Kept::Misaligned));
     }
     let home = match crate::home::resolve(start, len, false, false, &mut || false) {
         crate::home::Found::Home(home) => home,
         // Of either kind: a home in private memory or in a chunk of the pool.
         crate::home::Found::New(new) => new.home(start, len, false),
-        crate::home::Found::Card | crate::home::Found::Copy => return None,
+        crate::home::Found::Card => return Err(Some(Kept::Why(crate::home::Why::Off))),
+        crate::home::Found::Copy(why) => return Err(Some(Kept::Why(why))),
     };
     // (A home that holds it from further out, of a kind that does not. As
     // homes are made today the offset keeps `start`'s step, so this never
     // turns one down: a defence.)
     if !home.offset(start).is_multiple_of(16) {
         crate::card_home::misaligned();
-        return None;
+        return Err(Some(Kept::Misaligned));
     }
-    Some(home)
+    Ok(home)
 }
 
 /// A copy in the card's memory (`on_card`, `size` bytes) of title buffer
@@ -4863,6 +4937,9 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
     // copy made below. A home is found or made, and tabled, under one hold
     // of [`HOMING`].
     let mut card_asked: Option<Option<ID3D12Resource>> = None;
+    // Why the bytes got no home, if the core said (the copy made below
+    // notes it, [`Origin::Kept`]).
+    let mut kept = None;
     if crate::home::on() {
         let _homing = homing(true);
         let mut card = || {
@@ -4876,7 +4953,8 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
             crate::home::Found::New(new) => {
                 return publish(key, len, new.home(key.0, len, false), false).map(Some);
             }
-            crate::home::Found::Card | crate::home::Found::Copy => {}
+            crate::home::Found::Card => {}
+            crate::home::Found::Copy(why) => kept = Some(Kept::Why(why)),
         }
     }
     // Folded (`VICTORY_FOLD_BUFFERS=1`, off by default): a small buffer
@@ -4918,11 +4996,16 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
     // with that home ([`let_go_homes`]), so tabled under [`HOMING`] too.
     if let Some(Some(on_card)) = &card_asked {
         let _homing = homing(true);
-        if let Some(home) = card_side(key.0, len) {
-            let shadow = carded_home(on_card.clone(), home, key.0, len, size);
-            return publish(key, len, shadow, true).map(Some);
+        match card_side(key.0, len) {
+            Ok(home) => {
+                let shadow = carded_home(on_card.clone(), home, key.0, len, size);
+                return publish(key, len, shadow, true).map(Some);
+            }
+            Err(why) => {
+                crate::card_home::kept(why, len);
+                kept = why;
+            }
         }
-        crate::card_home::kept();
     }
     making();
     let Some((buffer, data)) = host().and_then(|host| host.shared_buffer(size)) else {
@@ -4976,6 +5059,9 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
     }
     let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
     shadow.card = card;
+    if let Some(kept) = kept {
+        shadow.origin = Origin::Kept(kept);
+    }
     publish(key, len, Arc::new(shadow), true).map(Some)
 }
 
@@ -5199,7 +5285,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let home = match crate::home::resolve(start, len, true, false, &mut || false) {
             crate::home::Found::Home(home) => Some(home),
             crate::home::Found::New(new) => Some(new.home(start, len, true)),
-            crate::home::Found::Card | crate::home::Found::Copy => None,
+            crate::home::Found::Card | crate::home::Found::Copy(_) => None,
         };
         if let Some(home) = home {
             let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
@@ -5355,7 +5441,29 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
+///
+/// `base`: the copy of the view's buffer (which the copy made here notes,
+/// [`Origin::Exact`]; a copy found is as it was made).
+pub(crate) fn exact_of(address: u64, len: u64, base: &Shadow) -> Option<Arc<Shadow>> {
+    exact_with(address, len, Origin::Exact {
+        base_is_home: base.home_kind().is_some(),
+        base_is_card: base.card_home().is_some(),
+    })
+}
+
+/// [`exact_of`] for tests, whose views name no buffer: the base is the home
+/// that holds the view's first byte, if one does.
+#[cfg(test)]
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let base = home_of(address, 1);
+    exact_with(address, len, Origin::Exact {
+        base_is_home: base.as_ref().is_some_and(|b| b.home_kind().is_some()),
+        base_is_card: false,
+    })
+}
+
+/// [`exact_of`], the copy made noting `origin`.
+fn exact_with(address: u64, len: u64, origin: Origin) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
     const MANY: usize = 256;
@@ -5393,7 +5501,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.origin = origin;
+    let shadow = Arc::new(shadow);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let map = &mut guard.1;
     // Another thread's copy of the same bytes, made meanwhile: that one

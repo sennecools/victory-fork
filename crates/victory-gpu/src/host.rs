@@ -20,6 +20,8 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 /// The card's clocks kept up between submissions (`VICTORY_CARD_AWAKE=1`).
 mod awake;
+/// Which copies make H2 waits, for the frame budget's line.
+mod budget;
 /// The copy queue and its uploader thread; the wait the direct queue is
 /// given for them ([`Host::run_lists`]).
 pub(crate) mod copyq;
@@ -5092,6 +5094,7 @@ fn relay_wait_with(
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    crate::frame_budget::waited_here(0);
     // Only when it waits: a line that is done already says nothing.
     let mut span = crate::profile::span_args("relay wait", &[("why", why as u64)]);
     if let Some(span) = span.as_mut() {
@@ -5181,6 +5184,7 @@ fn relay_worker() {
         match next {
             Ok(items) => host.relay_land(items, &mut fetch),
             Err(target) => {
+                let _phase = crate::frame_budget::phase(crate::frame_budget::Phase::Card);
                 let waiting = std::time::Instant::now();
                 let span = crate::profile::span("relay: card wait");
                 // SAFETY: the host's fence and this thread's event.
@@ -6704,6 +6708,7 @@ impl Host {
             "relay fetch wait",
             &[("bytes", total), ("pieces", pieces.len() as u64)],
         );
+        let fetch_phase = crate::frame_budget::phase(crate::frame_budget::Phase::Card);
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -6731,6 +6736,7 @@ impl Host {
             })()
         };
         drop(fetch_wait);
+        drop(fetch_phase);
         let after = match ran {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
@@ -6939,6 +6945,7 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        let _phase = crate::frame_budget::phase(crate::frame_budget::Phase::Land);
         let landing = std::time::Instant::now();
         let mut span = crate::profile::span("relay: land");
         if let Some(span) = span.as_mut() {
@@ -7424,10 +7431,12 @@ impl Host {
         };
         if lift_stale() && relay_exact() {
             for _ in 0..3 {
-                relay_wait(WHY_STALE, |_| {
-                    stale
-                        .iter()
-                        .all(|(shadow, from, to)| !shadow.writes_pending_over(*from, *to - *from))
+                budget::measured(budget::Wait::Stale, || {
+                    relay_wait(WHY_STALE, |_| {
+                        stale.iter().all(|(shadow, from, to)| {
+                            !shadow.writes_pending_over(*from, *to - *from)
+                        })
+                    })
                 });
                 ask_again();
                 stale = stale_under_flights(runs);
@@ -7436,7 +7445,7 @@ impl Host {
                 }
             }
         }
-        self.settle(submitted, WHY_STALE);
+        budget::measured(budget::Wait::Stale, || self.settle(submitted, WHY_STALE));
         ask_again();
     }
 
@@ -7504,6 +7513,7 @@ impl Host {
                     }
                 }
                 let gpu = waiting.elapsed();
+                crate::frame_budget::waited_here(gpu.as_micros() as u64);
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -7678,9 +7688,10 @@ impl Host {
         // what they write. (`waiting`: when the wait for them began, for
         // `gate_args`; 0: no wait.)
         let mut waiting = 0;
+        use budget::{Wait, measured};
         if !late {
             waiting = crate::profile::stamp();
-            self.settle(&mut submitted, WHY_SYNC);
+            measured(Wait::Sync, || self.settle(&mut submitted, WHY_SYNC));
         } else if let Some(why) = late_blocked(runs) {
             if relay_exact() && why == WHY_READ {
                 // The reads done on the card behind the flights, if they
@@ -7690,8 +7701,10 @@ impl Host {
                 if !lift_reads(runs) {
                     waiting = crate::profile::stamp();
                     let args = late_lift::wait_args(runs, false);
-                    let waited = relay_wait_with(why, &args, |line| {
-                        blocked_by(&line.written, runs, false).is_none()
+                    let waited = measured(Wait::H8, || {
+                        relay_wait_with(why, &args, |line| {
+                            blocked_by(&line.written, runs, false).is_none()
+                        })
                     });
                     if let Some(us) = waited.filter(|_| r5()) {
                         R5_STATS[late_lift::R5_H8].fetch_add(1, Ordering::Relaxed);
@@ -7700,7 +7713,7 @@ impl Host {
                 }
             } else {
                 waiting = crate::profile::stamp();
-                self.settle(&mut submitted, why);
+                measured(Wait::Settle, || self.settle(&mut submitted, why));
             }
         }
         // With R5: a copy's refresh over a home a flight writes waits like
@@ -7712,9 +7725,7 @@ impl Host {
             if refresh_over_flight_homes(&homes, runs) && !late_lift::lift_refreshes(&homes, runs) {
                 let stamp = crate::profile::stamp();
                 let args = late_lift::wait_args(runs, true);
-                if let Some(us) = relay_wait_with(WHY_READ, &args, |line| {
-                    !refresh_over_flight_homes(&line.homes_written, runs)
-                }) {
+                if let Some(us) = budget::h2_wait(&args, &homes, runs) {
                     R5_STATS[0].fetch_add(1, Ordering::Relaxed);
                     R5_STATS[late_lift::R5_H2_US].fetch_add(us, Ordering::Relaxed);
                     if waiting == 0 {
@@ -7724,7 +7735,7 @@ impl Host {
             }
             // A card copy with a home takes those bytes from the home again.
             let writers = line().home_writers.clone();
-            retake_flight_homes(&writers, runs);
+            budget::retake(&writers, runs);
         }
         if let Some(submit) = submit.as_mut() {
             gate_args(submit, runs, [entered, walked, locked, waiting]);
@@ -7752,7 +7763,7 @@ impl Host {
             // frees (`crate::home::tick`: `run_own_frees` and
             // `run_pending` need nothing in flight), until change 3 keys
             // them to a fence; without the core there is no settle.
-            self.settle(&mut submitted, WHY_SYNC);
+            measured(Wait::Quiet, || self.settle(&mut submitted, WHY_SYNC));
             crate::inplace::tick();
             QUIET.store(now_ms(), Ordering::Relaxed);
         }
@@ -7823,7 +7834,7 @@ impl Host {
             }
         } else if behind && !stale_under_flights(runs).is_empty() {
             let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
+            measured(Wait::Stale, || self.settle(&mut submitted, WHY_STALE));
             settled += settling.elapsed();
         }
         // Each run's prelude and list, in order.
@@ -7910,7 +7921,7 @@ impl Host {
         let flown = late && relay();
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_MOST);
+            measured(Wait::Most, || self.settle(&mut submitted, WHY_MOST));
             settled += settling.elapsed();
         }
         // The directory of title memory by address (`crate::memory`, with
@@ -10576,6 +10587,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        budget::line(frames);
         r5_flush::line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);

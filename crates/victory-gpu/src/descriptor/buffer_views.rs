@@ -198,7 +198,7 @@ pub(super) fn place(base: u64, width: u64, fields: Option<Fields>) -> Option<Buf
         && let Some((start, bytes)) = own_bytes(
             offset, base, f.first, f.count, f.element, f.stride, f.unknown,
         )
-        && let Some(own) = crate::shadow::exact(start, bytes)
+        && let Some(own) = crate::shadow::exact_of(start, bytes, &whole)
     {
         return Some(BufferPlace::Own(own, start, bytes));
     }

@@ -364,6 +364,42 @@ static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// maker, which then writes a view of the levels from before.
 static LEVELS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The changes of a texture's levels so far ([`LEVELS_SEEN`]), for the
+/// frame budget's line.
+pub(crate) fn levels_seen() -> u64 {
+    LEVELS_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What the frame budget counts a mirror that changes a slot as: from
+/// `view` (`None`: the slot is made null), `later`: left for later.
+/// `entry`: the record names a table entry, not a view held whole. Only
+/// plain matches: nothing looked up, no lock.
+fn mirror_kind(
+    view: Option<&View>,
+    sampler: bool,
+    later: bool,
+    entry: bool,
+) -> (crate::frame_budget::Mirror, bool) {
+    use crate::frame_budget::Mirror;
+    const BUFFER: u32 = 1;
+    let kind = match view {
+        None => Mirror::Null,
+        Some(_) if sampler => Mirror::Sampler,
+        Some(View::Sampler(_) | View::ConsoleSampler(_)) => Mirror::Sampler,
+        // (Left for a draw or not: the title's placed textures are.)
+        Some(View::Placed(_, resource, _)) if resource[0] != BUFFER => Mirror::PlacedTexture,
+        Some(view) if later && view.is_buffer() => Mirror::BufferDeferred,
+        Some(view @ (View::Shader(..) | View::Unordered(..))) if !view.is_buffer() => {
+            Mirror::ObjectTexture
+        }
+        Some(_) => Mirror::Other,
+    };
+    // A pre-made descriptor per table entry serves a view that is an entry
+    // and needs no host copy of title memory.
+    let eligible = entry && matches!(kind, Mirror::Sampler | Mirror::ObjectTexture);
+    (kind, eligible)
+}
+
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
@@ -3149,6 +3185,14 @@ impl HostHeap {
         changed.clear();
         // SAFETY: by the caller, these slots are this call's alone.
         unsafe { copied.differ(first as u32, records, &mut changed) };
+        // The 4 KiB pieces the changed records are in (in slot order: each
+        // once).
+        for &index in &changed {
+            let piece = (start + u64::from(index) * step) >> 12;
+            if part.pieces.last() != Some(&piece) {
+                part.pieces.push(piece);
+            }
+        }
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let step = step as usize;
         for &index in &changed {
@@ -3395,6 +3439,8 @@ impl HostHeap {
                 return None;
             };
             if claim.old != 0 {
+                let (kind, _) = mirror_kind(None, self.sampler, false, false);
+                crate::frame_budget::mirrored(kind, false);
                 claim.value = 0;
                 self.write_word(index, 0);
                 self.make_null(index);
@@ -3480,6 +3526,11 @@ impl HostHeap {
         // On the profile: slots changed against the distinct records they
         // changed to, by who mirrored them.
         crate::profile::record_changed(site, key);
+        {
+            let entry = generation >> super::KIND_SHIFT == 0;
+            let (kind, eligible) = mirror_kind(Some(&view), self.sampler, later, entry);
+            crate::frame_budget::mirrored(kind, eligible);
+        }
         // Nothing to shaders while the slot changes (`write_word`).
         self.write_word(index, 0);
         // Views of other textures in the memory this one describes are
@@ -3867,6 +3918,11 @@ pub(crate) struct SyncPart {
     pub(crate) make: Vec<u32>,
     /// Room for the changed slots of a page.
     changed: Vec<u32>,
+    /// Records looked at on pages our own writes had changed, and the
+    /// 4 KiB pieces of title memory with changed records (their numbers,
+    /// each once per page): for the frame budget.
+    pub(crate) own_looked: u64,
+    pub(crate) pieces: Vec<u64>,
 }
 
 /// The records last seen of a heap, held for one pass
@@ -6365,6 +6421,56 @@ mod made_tests {
     /// The slots in the queue of textures picked by index, in its order.
     fn queued(heap: &HostHeap) -> Vec<(u32, u64)> {
         heap.texture_slots_due(u64::MAX, SLOTS as usize).0
+    }
+
+    /// The frame budget's mirrors by kind, as this thread counted them
+    /// (`crate::frame_budget::take_seen`): a sampler, the same slot made
+    /// null, a placed texture and a buffer view left for a draw, one each;
+    /// only the sampler (a table entry needing no host copy) is eligible
+    /// for a pre-made descriptor. A mirror of what a slot shows already
+    /// counts nothing.
+    #[test]
+    fn sync_counts_kinds() {
+        use crate::frame_budget::{Mirror, Seen, take_seen};
+        let (Some(heap), Some(samplers)) =
+            (HostHeap::new(false, SLOTS), HostHeap::new(true, SLOTS))
+        else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        let mut records = vec![[0u32; 8]; 4];
+        let base = records.as_mut_ptr() as u64;
+        let at = |slot: u64| base + slot * 32;
+        // A valid point sampler (D3D12_SAMPLER_DESC's words): wrap on every
+        // axis, one sample, compared never, every level.
+        let sampler = [0, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, f32::MAX.to_bits()];
+        let _ = take_seen();
+        write(at(0), &Some(View::Sampler(sampler)));
+        samplers.mirror(0, at(0), false);
+        samplers.mirror(0, at(0), false);
+        write(at(0), &None);
+        samplers.mirror(0, at(0), false);
+        write(at(1), &views[3]);
+        heap.mirror(1, at(1), false);
+        write(at(2), &views[2]);
+        heap.mirror(2, at(2), false);
+        let seen: Vec<(Mirror, bool)> = take_seen()
+            .into_iter()
+            .filter_map(|s| match s {
+                Seen::Mirror { kind, eligible } => Some((kind, eligible)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Mirror::Sampler, true),
+                (Mirror::Null, false),
+                (Mirror::PlacedTexture, false),
+                (Mirror::BufferDeferred, false),
+            ]
+        );
+        drop(records);
     }
 
     /// One thread's writes, mirrors (of new records and of records already

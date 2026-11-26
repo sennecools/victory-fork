@@ -139,6 +139,7 @@ fn submit_cut(this: This, lists: &[This]) {
     } else {
         0
     };
+    crate::frame_budget::count(crate::frame_budget::Part::AtOnce, first as u64);
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -175,6 +176,14 @@ fn submit_cut(this: This, lists: &[This]) {
     }
     if first < lists.len() {
         let parts = crate::list::detach_parts(&lists[first..]);
+        {
+            use crate::frame_budget::{Part, count};
+            count(Part::Held, parts.len() as u64);
+            count(
+                Part::ValueWaits,
+                parts.iter().map(|p| p.0.len() as u64).sum(),
+            );
+        }
         static SEEN: AtomicU64 = AtomicU64::new(0);
         if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
             tracing::info!(
@@ -324,6 +333,9 @@ pub(crate) fn release_held(all: bool) {
             // SAFETY: a live queue: one released is taken off the list.
             let held = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(held);
+            // Whether a wait before the next held run was passed unmet (at a
+            // present): that run is forced.
+            let mut unmet = false;
             loop {
                 match held.first() {
                     None => break,
@@ -336,11 +348,14 @@ pub(crate) fn release_held(all: bool) {
                     Some(_) => {}
                 }
                 match held.remove(0) {
-                    Held::Wait(..) => {}
+                    Held::Wait(fence, value) => {
+                        unmet |= all && crate::fence::completed(fence.as_this()) < value;
+                    }
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
                         if all && !value_met(&wait) {
+                            unmet = true;
                             static SEEN: AtomicU64 = AtomicU64::new(0);
                             if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
                                 tracing::warn!(
@@ -352,6 +367,10 @@ pub(crate) fn release_held(all: bool) {
                         }
                     }
                     Held::Run(lists, order) => {
+                        crate::frame_budget::count(crate::frame_budget::Part::HeldRun, 1);
+                        if std::mem::take(&mut unmet) {
+                            crate::frame_budget::count(crate::frame_budget::Part::Forced, 1);
+                        }
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -526,6 +545,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        crate::frame_budget::count(crate::frame_budget::Part::TitleSubmits, 1);
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -666,6 +686,13 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
             behind
         };
+        {
+            use crate::frame_budget::{Part, count};
+            count(Part::QueueWaits, 1);
+            if behind {
+                count(Part::QueueWaitsBehind, 1);
+            }
+        }
         if behind {
             static SEEN: AtomicU64 = AtomicU64::new(0);
             if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {

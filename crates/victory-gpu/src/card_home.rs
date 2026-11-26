@@ -1007,10 +1007,17 @@ pub(crate) fn gone(size: u64) {
     CARDS[2].fetch_sub(size, Ordering::Relaxed);
 }
 
-/// A card copy keeps its staging buffer: its bytes got no home.
-pub(crate) fn kept() {
+/// A card copy of `bytes` title bytes keeps its staging buffer: its bytes
+/// got no home, for `why` (`None`: the switch is off, and nothing is
+/// counted). The frame budget counts it by reason
+/// (`crate::frame_budget::Staging`): a misaligned one once, here, beside
+/// [`misaligned`]'s own count.
+pub(crate) fn kept(why: Option<crate::shadow::Kept>, bytes: u64) {
     if on() {
         CARDS[3].fetch_add(1, Ordering::Relaxed);
+        if let Some(why) = why {
+            crate::frame_budget::staging_kept(crate::frame_budget::Staging::of(why), bytes);
+        }
     }
 }
 
@@ -1441,6 +1448,52 @@ mod tests {
         unregister(0xca4d_0303, start);
         drop(copy);
         region.release();
+        // SAFETY: the test's own allocation.
+        unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) };
+    }
+
+    /// A card copy off a 16-byte step of its home keeps its staging buffer:
+    /// counted once by the frame budget, as misaligned with its bytes
+    /// (`misaligned`'s own count aside), and the copy notes why. One of
+    /// memory that is no region is counted as that.
+    #[test]
+    fn kept_reason_misaligned() {
+        use crate::frame_budget::{Seen, Staging, take_seen};
+        use crate::shadow::{Kept, Origin};
+        let Some(_host) = warp() else { return };
+        let _on = Switched::on();
+        let kept = |seen: Vec<Seen>| -> Vec<(Staging, u64)> {
+            seen.into_iter()
+                .filter_map(|s| match s {
+                    Seen::Kept { reason, bytes } => Some((reason, bytes)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let region = Region::new(4 * BIG as usize);
+        let start = region.base + K64 + 8;
+        let _ = take_seen();
+        let copy = card_copy(0xca4d_0311, start, BIG);
+        assert!(copy.card_homed().is_none());
+        assert_eq!(kept(take_seen()), vec![(Staging::Misaligned, BIG)]);
+        assert_eq!(copy.origin(), Origin::Kept(Kept::Misaligned));
+        unregister(0xca4d_0311, start);
+        drop(copy);
+        region.release();
+        // SAFETY: an allocation of the test's own.
+        let base = unsafe {
+            mem::VirtualAlloc(
+                std::ptr::null(),
+                4 * BIG as usize,
+                mem::MEM_RESERVE | mem::MEM_COMMIT,
+                mem::PAGE_READWRITE,
+            )
+        } as u64;
+        assert_ne!(base, 0);
+        let copy = card_copy(0xca4d_0312, base + K64, BIG);
+        assert_eq!(kept(take_seen()), vec![(Staging::NotRegion, BIG)]);
+        unregister(0xca4d_0312, base + K64);
+        drop(copy);
         // SAFETY: the test's own allocation.
         unsafe { mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE) };
     }
