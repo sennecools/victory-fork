@@ -25,6 +25,7 @@ use crate::host::{HostList, OpKind};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 use crate::shadow::Hand;
+use crate::spans::Span;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -3664,6 +3665,8 @@ impl State {
         let batched = if grouped {
             args.refresh(list, arguments, len);
             list.buffer_read(&args.buffer);
+            // It marks what it records (a batch's end and clamp).
+            let _span = list.span_held();
             crate::indirect::grouped_mesh(list, args.id(), &args.buffer, offset as u32)
         } else {
             None
@@ -3754,12 +3757,24 @@ impl State {
                 }
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if parts.is_some() {
-                    crate::indirect::bound_split(list, (&args.buffer, offset))
-                } else if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
-                } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                let bounded = {
+                    let _span = list.spanned(Span::Clamp);
+                    if parts.is_some() {
+                        crate::indirect::bound_split(list, (&args.buffer, offset))
+                    } else if windowed && records > 1 {
+                        crate::indirect::bound_ahead(
+                            list,
+                            (&args.buffer, offset),
+                            (kind, step, records),
+                        )
+                    } else {
+                        crate::indirect::bound(
+                            list,
+                            (&args.buffer, offset),
+                            count_arg,
+                            (kind, step, records),
+                        )
+                    }
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;

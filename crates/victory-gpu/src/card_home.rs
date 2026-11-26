@@ -729,8 +729,13 @@ pub(crate) fn before(
     }
     // A list whose submission has finished, or a new one; this
     // submission's until it has (with flights, each in the air has its own).
-    let (allocator, list) = match before.lists.take(crate::host::finished()) {
-        Some(made) => made,
+    let (allocator, list) = match before.lists.take_with(crate::host::finished(), |(_, list)| crate::spans::forget(&list)) {
+        Some(made) => {
+            // (Diagnostics: its last run is over; its time goes to the sums
+            // before it records again, `crate::spans`.)
+            crate::spans::ran(&made.1);
+            made
+        }
         None => {
             // SAFETY: plain object creation.
             let made = unsafe {
@@ -759,6 +764,8 @@ pub(crate) fn before(
         (|| -> windows::core::Result<ID3D12CommandList> {
             allocator.Reset()?;
             list.Reset(&allocator, None)?;
+            // The references the compares are made against.
+            crate::spans::mark(&list, crate::spans::Span::CardHash);
             for (&(copy, from, to), place) in spans.iter().zip(&places) {
                 let (Some(room), None) = (&room, &place.kept) else {
                     continue;
@@ -775,6 +782,7 @@ pub(crate) fn before(
             for (kept, card, at, bytes) in &fills {
                 list.CopyBufferRegion(kept, *at, *card, *at, *bytes);
             }
+            crate::spans::end(&list);
             list.Close()?;
             list.cast()
         })()
@@ -831,6 +839,7 @@ pub(crate) unsafe fn record_merges<'a>(
     if ranges.peek().is_none() {
         return;
     }
+    crate::spans::mark(list, crate::spans::Span::CardHash);
     crate::profile::count(crate::profile::Count::UavCard, 1);
     // SAFETY: the caller's: an open list; what the compares wrote first.
     unsafe { list.ResourceBarrier(&[uav_barrier()]) };

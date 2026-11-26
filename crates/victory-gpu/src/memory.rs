@@ -1133,8 +1133,14 @@ fn record(
     bytes: u64,
     number: u64,
 ) -> Option<ID3D12CommandList> {
-    let mut copier = match next.copiers.take(crate::host::finished()) {
-        Some(copier) => copier,
+    let mut copier = match next.copiers.take_with(crate::host::finished(), |copier| {
+        crate::spans::forget(&copier.list.1)
+    }) {
+        Some(copier) => {
+            // (Diagnostics: its last run is over, `crate::spans`.)
+            crate::spans::ran(&copier.list.1);
+            copier
+        }
         None => Copier {
             staging: None,
             list: new_copier(host)?,
@@ -1209,12 +1215,14 @@ fn record_with(
         (|| -> windows::core::Result<ID3D12CommandList> {
             allocator.Reset()?;
             list.Reset(allocator, None)?;
+            crate::spans::mark(list, crate::spans::Span::Other);
             let mut at = 0u64;
             for &(first, count) in runs {
                 let len = u64::from(count) * 8;
                 list.CopyBufferRegion(&directory.0, u64::from(first) * 8, staging, at, len);
                 at += len;
             }
+            crate::spans::end(list);
             list.Close()?;
             list.cast()
         })()

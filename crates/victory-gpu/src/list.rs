@@ -140,15 +140,28 @@ const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
-/// is a host GPU.
+/// is a host GPU. What a draw or dispatch records around the host call
+/// that runs it (marked the title's by `HostList::op`) is ours
+/// (`crate::spans`).
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    if let Some(list) = host_list(this) {
+        list.span(crate::spans::Span::Other);
+    }
+    state_of(this, f);
+}
+
+/// [`with_state`] with no mark before `f`: for the title's reset, which
+/// finds the host list closed.
+#[cfg(windows)]
+fn state_of(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    list.span(crate::spans::Span::Other);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
 }
@@ -281,6 +294,16 @@ fn fresh_list() -> Option<crate::host::HostList> {
 /// kept for [`fresh_list`].
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
+    // The time of what ran, by kind, once per run (`crate::spans`).
+    #[cfg(feature = "diagnostics")]
+    if crate::spans::on() {
+        for (i, list) in lists.iter().enumerate() {
+            let runs = ran.iter().filter(|&&r| r == i).count() as u64;
+            if runs > 0 {
+                list.host.spans_ran(runs);
+            }
+        }
+    }
     if !pools() {
         return;
     }
@@ -674,7 +697,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
+    state_of(this, |host, state| {
         host.recording_opens();
         host.reset();
         state.reset(pipeline);
@@ -807,6 +830,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = recording_list(this)
         && !barriers.is_null()
     {
+        let _span = list.spanned(crate::spans::Span::TitleBarrier);
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = Vec::with_capacity(barriers.len());
@@ -900,6 +924,7 @@ pub(crate) fn upscale(
     if !crate::host::upscale_fits(from, to) {
         return false;
     }
+    let _span = list.spanned(crate::spans::Span::Upscale);
     ensure_state(list, output, RENDER_TARGET);
     ensure_state(list, colour, PIXEL_READ);
     #[cfg(feature = "diagnostics")]
@@ -1012,6 +1037,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            let _span = list.spanned(crate::spans::Span::TitleCopy);
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -1174,6 +1200,7 @@ extern "system" fn copy_texture_region(
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        let _span = list.spanned(crate::spans::Span::TitleCopy);
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
@@ -1245,13 +1272,22 @@ fn read_back(
             src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
         )
     });
-    // SAFETY: an open list; both locations in the host's layout (asserted
-    // in `copy_texture_region`), naming a live texture and our buffer, which
-    // the list keeps until it is reset; the box is the title's.
-    unsafe {
-        list.list
-            .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
-    };
+    {
+        let _span = list.spanned(crate::spans::Span::TitleCopy);
+        // SAFETY: an open list; both locations in the host's layout (asserted
+        // in `copy_texture_region`), naming a live texture and our buffer,
+        // which the list keeps until it is reset; the box is the title's.
+        unsafe {
+            list.list.CopyTextureRegion(
+                (&raw const to).cast(),
+                0,
+                0,
+                0,
+                (&raw const from).cast(),
+                host_box,
+            )
+        };
+    }
     list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
     Ok(())
 }
@@ -1306,6 +1342,7 @@ extern "system" fn resolve(
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        let _span = list.spanned(crate::spans::Span::TitleCopy);
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
@@ -1387,6 +1424,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            let _span = list.spanned(crate::spans::Span::TitleCopy);
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -1432,6 +1470,7 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        let _span = list.spanned(crate::spans::Span::TitleCopy);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
@@ -2128,6 +2167,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = recording_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        let _span = list.spanned(crate::spans::Span::TitleBarrier);
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         crate::profile::count(crate::profile::Count::UavTitleGroup, 1);
