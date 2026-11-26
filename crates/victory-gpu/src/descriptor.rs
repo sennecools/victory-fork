@@ -272,13 +272,12 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
     // the time it took on the calling thread, that thread's share of the
     // reading and its waits for the other threads with it, so it overlaps
     // `read_us`); `skipped_made`: records whose slot was made from them
-    // already, done with before its slot's claim (`VICTORY_HEAP_SYNC_FAST=1`);
+    // already, done with before its slot's claim (`host::SKIPPED_MADE`);
     // `shows_none`: records left with `VICTORY_SHOWS_NONE=1`.
     let mut span = crate::profile::span("sync heaps");
     let (mut read_ticks, mut mirror_ticks) = (0u64, 0u64);
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut nothing) = (0u64, 0u64, 0u64, 0u64);
-    let fast = host::sync_fast();
     let skipped_before = host::SKIPPED_MADE.load(Relaxed);
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter().filter(|h| bound.contains(&h.2)) {
@@ -313,12 +312,10 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
         span.arg("mirrored", mirrored);
         span.arg("read_us", crate::profile::micros(read_ticks));
         span.arg("mirror_us", crate::profile::micros(mirror_ticks));
-        if fast {
-            span.arg(
-                "skipped_made",
-                host::SKIPPED_MADE.load(Relaxed) - skipped_before,
-            );
-        }
+        span.arg(
+            "skipped_made",
+            host::SKIPPED_MADE.load(Relaxed) - skipped_before,
+        );
         span.arg("shows_none", nothing);
     }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
@@ -518,18 +515,18 @@ pub(crate) fn sync_line(frames: f64) {
     if pages == 0 {
         return;
     }
-    // With `VICTORY_HEAP_SYNC_FAST=1` a record's print is compared before
-    // the question whether its slot was a table's, so "left to the draws"
-    // counts only records that changed there.
-    if host::sync_fast() {
+    // A record is compared with the one last seen before the question
+    // whether its slot was a table's, so "left to the draws" counts only
+    // records that changed there.
+    {
         // (`SKIPPED_MADE` only grows: the line's part since the last line.)
         static LINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let skipped = host::SKIPPED_MADE.load(std::sync::atomic::Ordering::Relaxed);
         let since = skipped.wrapping_sub(LINED.swap(skipped, std::sync::atomic::Ordering::Relaxed));
         tracing::info!(
-            "heap sync with VICTORY_HEAP_SYNC_FAST=1: per frame {:.0} records whose slot was \
-             made from them already, done with before their slot's claim; the count left to the \
-             draws below is of changed records only",
+            "heap sync: per frame {:.0} records whose slot was made from them already, done \
+             with before their slot's claim; the count left to the draws below is of changed \
+             records only",
             since as f64 / frames
         );
     }

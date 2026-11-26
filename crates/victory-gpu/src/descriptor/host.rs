@@ -3178,8 +3178,8 @@ impl HostHeap {
     }
 
     /// [`HostHeap::mirror`] of a slot `super::sync_heaps` found a new
-    /// record in (with [`sync_fast`], a slot made from it already is done
-    /// with before the lock). Any thread may call it.
+    /// record in (a slot made from it already is done with before the lock,
+    /// [`SKIPPED_MADE`]). Any thread may call it.
     pub(crate) fn mirror_synced(&self, index: u32, handle: u64) {
         self.mirror_marking(index, handle, false, true, hold::SYNC);
     }
@@ -3342,7 +3342,7 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        // With `VICTORY_HEAP_SYNC_FAST=1`, for `sync_heaps`, and with
+        // For `sync_heaps` ([`SKIPPED_MADE`]), and with
         // `VICTORY_QUICK_MIRROR=1` ([`HostHeap::quick`]) for every mirror
         // (table binds, the walk of the heap buffer pass, the texture pass,
         // the title's writes): a slot made from this record already, of a
@@ -3360,7 +3360,7 @@ impl HostHeap {
         // record beside its `made`, and had to forget it where a slot
         // flips to its late view, e4d0837; ours has no such record to
         // forget.)
-        let sync = site == hold::SYNC && sync_fast();
+        let sync = site == hold::SYNC;
         if (sync || self.quick)
             && tag == VIEW_TAG
             && self
@@ -3937,19 +3937,6 @@ fn sync_tables() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
 }
 
-/// The faster heap sync (on by default, as the play set runs it;
-/// `VICTORY_HEAP_SYNC_FAST=0`: off): a
-/// record whose slot is made from it already done with before its claim
-/// ([`SKIPPED_MADE`]). The same slots are made either way.
-pub(crate) fn sync_fast() -> bool {
-    #[cfg(test)]
-    if SYNC_FAST_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FAST").is_none_or(|v| v != "0"))
-}
-
 /// Whether the heap sync leaves a changed record that is no view of ours,
 /// into a slot made from no record, before its mirror
 /// (`VICTORY_SHOWS_NONE=1`, off by default: such a record is mirrored, which
@@ -4068,18 +4055,15 @@ fn changed_records(last: &[u8], records: &[u8], step: usize, first: u32, out: &m
     }
 }
 
-/// Tests: [`sync_fast`] on, whatever the environment says.
-#[cfg(test)]
-pub(crate) static SYNC_FAST_FOR_TESTS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Records `sync_heaps` found its slot made from already, with
-/// [`sync_fast`], and left before the claim. Only grows.
+/// Records `sync_heaps` found its slot made from already, of a view still
+/// there, and left before the slot's claim (a plain look; a record of a
+/// released resource still goes on and makes its slot null). The same slots
+/// are made as with the claim. Only grows.
 pub(crate) static SKIPPED_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether every mirror of a slot made from its record already is done
 /// with before the slot's claim (`VICTORY_QUICK_MIRROR=1`, off by default:
-/// only `sync_heaps` with [`sync_fast`] does so). The same slots are made
+/// only `sync_heaps` does so, [`SKIPPED_MADE`]). The same slots are made
 /// either way: what is skipped is a claim that would have found the slot
 /// made from the record and let it be.
 ///

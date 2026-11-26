@@ -1,6 +1,6 @@
 //! The heap sync (`super::super::sync_heaps`): changed pages sorted on
-//! threads, the early skip (`VICTORY_HEAP_SYNC_FAST=1`), and the pass run
-//! ahead on its own thread (`super::super::ahead`).
+//! threads, the early skip (`SKIPPED_MADE`), and the pass run ahead on its
+//! own thread (`super::super::ahead`).
 
 use super::made_tests::{alive, key, memory, next, record_key, texture, views, write};
 use super::*;
@@ -12,22 +12,6 @@ use std::time::Duration;
 
 /// Slots of the heaps these tests make.
 const SLOTS: u32 = 64;
-
-/// [`sync_fast`] on until dropped.
-struct Fast;
-
-impl Fast {
-    fn on() -> Self {
-        SYNC_FAST_FOR_TESTS.store(true, Relaxed);
-        Self
-    }
-}
-
-impl Drop for Fast {
-    fn drop(&mut self) {
-        SYNC_FAST_FOR_TESTS.store(false, Relaxed);
-    }
-}
 
 /// A title heap placed in write-watched memory of its own: the heap, the
 /// memory, and the host heap behind it (`None`: no host GPU).
@@ -208,7 +192,6 @@ fn the_early_skip_takes_no_claim_and_still_nulls_a_released_view() {
     let Some(heap) = HostHeap::new(false, SLOTS) else {
         return; // no host GPU
     };
-    let _fast = Fast::on();
     let heap = std::sync::Arc::new(heap);
     let mut records = vec![[0u32; 8]; 2];
     let (live, gone) = (
@@ -464,8 +447,8 @@ fn slots_left_waiting_are_made_by_the_next_wait() {
 /// Four threads write views into a placed heap (`Create*View`), copy
 /// records into it as bytes and by calls (`CopyDescriptorsSimple`) and
 /// make slots for draws that read them through tables, while submissions
-/// ask the helper for passes and wait for them under the submission lock,
-/// with the early skip on: all finish, and every slot's word is of the kind
+/// ask the helper for passes and wait for them under the submission lock:
+/// all finish, and every slot's word is of the kind
 /// of the descriptor under it, during and after.
 #[test]
 fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
@@ -474,7 +457,6 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
     let Some(host) = placed.host() else {
         return; // no host GPU
     };
-    let _fast = Fast::on();
     let views = views(memory());
     let heap_at: Vec<u64> = (0..SLOTS).map(|s| placed.at(s)).collect();
     let heaps = [placed.registered()];
