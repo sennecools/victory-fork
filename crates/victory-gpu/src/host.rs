@@ -4915,7 +4915,9 @@ fn stale_under_flights(
     runs: &[&HostList],
 ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
-    let all = lift_stale();
+    // (Only with the relay's second stage, as the switch says: with
+    // `VICTORY_LATE_WAIT=2` alone the first span and 512 runs, as before.)
+    let all = lift_stale() && relay_exact();
     // On the profile: host copies looked at, runs merged (`late_exact`),
     // and whether a settle is due.
     let mut span = crate::profile::span("stale under flights");
