@@ -2177,8 +2177,19 @@ impl HostHeap {
         let mut textures = self.texture_queue();
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
-        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        // (Counted for the black census: a slot out of the queue is one
+        // the pass was done with; without `due` its write goes unnoticed.)
+        let mut out_of_queue = 0u64;
+        slots.retain(|slot| match textures.slots.get(slot) {
+            None => {
+                out_of_queue += 1;
+                true
+            }
+            Some(w) => w.mapped > 0 || w.checked.2 != 0,
+        });
+        crate::census::PAGE_WRITES_LOST[0].fetch_add(out_of_queue, std::sync::atomic::Ordering::Relaxed);
         let Some(after) = due else {
+            crate::census::PAGE_WRITES_LOST[1].fetch_add(out_of_queue, std::sync::atomic::Ordering::Relaxed);
             return [held, slots.len(), 0];
         };
         for &slot in &slots {
@@ -3326,6 +3337,8 @@ impl HostHeap {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            crate::census::PAST_HEAP[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::census::PAST_HEAP[1].fetch_max(u64::from(index), std::sync::atomic::Ordering::Relaxed);
             if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
                 tracing::warn!(
                     index,
@@ -3681,6 +3694,7 @@ impl HostHeap {
         const RETRY_FRAMES: u64 = 16;
         let texture = placed.as_ref().unwrap_or(view).waiting_texture()?;
         *made = 0;
+        crate::census::VIEW_NULL_WAITING[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // (`make_waiting` makes only slots that view the texture object.)
         let wait = placed.is_none().then_some(texture);
         let frame = crate::frame::current();
@@ -4792,6 +4806,27 @@ fn resolve(view: &View) -> Option<Resolved> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                // For the black census: a view of a 2D texture whose last
+                // partial upload found its first levels without pages, and
+                // the ones that start in them (nothing clamps those yet).
+                // One load and two adds, no lock.
+                let held = crate::resource::held_from(resource);
+                if held > 0 {
+                    let first = match &desc {
+                        None => Some(0),
+                        // SAFETY: the Texture2D member of a Texture2D view.
+                        Some(d) if d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D => {
+                            Some(unsafe { d.Anonymous.Texture2D.MostDetailedMip })
+                        }
+                        Some(_) => None,
+                    };
+                    if let Some(first) = first {
+                        crate::census::VIEWS_BELOW_HELD[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if first < held {
+                            crate::census::VIEWS_BELOW_HELD[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
                 // Levels on demand (`crate::tiles`): a texture made level by
                 // level is shown from the first level that is the title's

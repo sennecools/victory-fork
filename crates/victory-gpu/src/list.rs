@@ -1767,6 +1767,7 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));

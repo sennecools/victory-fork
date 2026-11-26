@@ -132,10 +132,29 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     })
 }
 
+/// Why no console layout comes out of a texture description
+/// ([`layout_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayoutRefusal {
+    /// Not a 1D, 2D or 3D texture, or a width past 32 bits.
+    Dimension,
+    /// The layout field is no swizzle word the layout library knows.
+    Swizzle,
+    /// No format of the library's, or an extent, mip count or mode it
+    /// refuses for that format.
+    Format,
+}
+
 /// A texture's layout in console memory, as the console's layout library
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
 /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
+    layout_of(desc).ok()
+}
+
+/// [`texture_layout`] with the reason it gives none (`LayoutRefusal`), for
+/// the census of textures never uploaded.
+pub(crate) fn layout_of(desc: &ResourceDesc) -> Result<texture::Texture, LayoutRefusal> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
     const TEXTURE_2D: u32 = 3;
@@ -145,7 +164,7 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         TEXTURE_1D => Dimension::Tex1d,
         TEXTURE_2D => Dimension::Tex2d,
         TEXTURE_3D => Dimension::Tex3d,
-        _ => return None,
+        _ => return Err(LayoutRefusal::Dimension),
     };
     let swizzle = match desc.layout {
         0 if dimension == Dimension::Tex1d => Swizzle::LINEAR,
@@ -154,11 +173,11 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         0 => Swizzle::SW_4KB_S,
         1 => Swizzle::LINEAR,
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
-        _ => return None,
+        _ => return Err(LayoutRefusal::Swizzle),
     };
     texture::Texture::new(&TextureDesc {
         dimension,
-        width: u32::try_from(desc.width).ok()?,
+        width: u32::try_from(desc.width).map_err(|_| LayoutRefusal::Dimension)?,
         height: desc.height,
         depth_or_array: u32::from(desc.depth_or_array_size),
         mips: u32::from(desc.mip_levels),
@@ -166,7 +185,22 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         samples: desc.sample_count.max(1),
         swizzle,
     })
-    .ok()
+    .map_err(|_| {
+        // A word the library has no mode for is told apart from a format
+        // it lacks; what is left (an extent, a mip count or a mode this
+        // dimension cannot use) counts with the formats.
+        if texture::format(desc.format).is_some() && swizzle.block_log2().is_none() {
+            LayoutRefusal::Swizzle
+        } else {
+            LayoutRefusal::Format
+        }
+    })
+}
+
+/// The bytes `desc` takes in the title's memory (0 for a description with
+/// no size), for the census of textures never uploaded.
+pub(crate) fn footprint_bytes(desc: &ResourceDesc) -> u64 {
+    footprint(desc).map_or(0, |info| info.size)
 }
 
 /// Bytes and alignment a resource takes: buffers their width (64 KiB
@@ -1197,6 +1231,17 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// For the black census: the first level the last partial upload found
+    /// held to the end of the chain (0: all of them, or no look yet). Shared
+    /// with the texture's staging state, which writes it
+    /// (`crate::texture::Staging`); read without a lock at a view's resolve.
+    held_from: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// For the black census: this resource's refused upload, and its planes
+    /// that are not uploaded, were counted ([`first_refusal`],
+    /// [`first_planes`]). Made false with the resource, so an address a
+    /// later resource reuses counts again.
+    refusal_noted: std::sync::atomic::AtomicBool,
+    planes_noted: std::sync::atomic::AtomicBool,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -2424,6 +2469,48 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
     host_tiled(this)?.tiled()?.first_shown()
 }
 
+/// For the black census: the cell where the staging state of title texture
+/// `this` notes the first level its last partial upload found held
+/// ([`Hosted::held_from`]).
+#[cfg(windows)]
+pub(crate) fn held_from_cell(this: This) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+    resource(this).host.held_from.clone()
+}
+
+/// True once for each title texture `this`: its refused upload is to be
+/// counted now (one atomic swap, no lock).
+#[cfg(windows)]
+pub(crate) fn first_refusal(this: This) -> bool {
+    !resource(this)
+        .host
+        .refusal_noted
+        .swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// True once for each title texture `this`: its planes that are not
+/// uploaded are to be counted now.
+#[cfg(windows)]
+pub(crate) fn first_planes(this: This) -> bool {
+    !resource(this)
+        .host
+        .planes_noted
+        .swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The first level of title texture `this` that its last partial upload
+/// found held, to the end of the chain: 0 if all of them were, or the
+/// texture was not looked at. One relaxed load, no lock.
+#[cfg(windows)]
+pub(crate) fn held_from(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    resource(this)
+        .host
+        .held_from
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
@@ -2544,6 +2631,9 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            held_from: std::sync::Arc::default(),
+            refusal_noted: std::sync::atomic::AtomicBool::new(false),
+            planes_noted: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -3123,6 +3213,81 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Why `texture_layout` gives nothing for `desc` (`None`: it gives one).
+    fn layout_of_err(desc: &ResourceDesc) -> Option<LayoutRefusal> {
+        layout_of(desc).err()
+    }
+
+    /// A 2D texture of 64 by 64 texels with 3 levels in format 28, the
+    /// console's pick of layout: one that has a layout.
+    fn plain_desc() -> ResourceDesc {
+        ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 3,
+            format: 28,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        }
+    }
+
+    /// `layout_of` says why `texture_layout` gives nothing, one reason
+    /// for each way, and nothing for a description that has a layout.
+    #[test]
+    fn layout_of_gives_each_reason() {
+        use LayoutRefusal::{Dimension, Format, Swizzle};
+        let plain = plain_desc();
+        assert!(texture_layout(&plain).is_some());
+        assert_eq!(layout_of_err(&plain), None);
+        // Not a 1D, 2D or 3D texture: a buffer, nothing, and one past those.
+        for dimension in [0, BUFFER, 5] {
+            let desc = ResourceDesc { dimension, ..plain };
+            assert!(texture_layout(&desc).is_none());
+            assert_eq!(
+                layout_of_err(&desc),
+                Some(Dimension),
+                "dimension {dimension}"
+            );
+        }
+        // A width that does not fit 32 bits.
+        let desc = ResourceDesc {
+            width: 1 << 32,
+            ..plain
+        };
+        assert_eq!(layout_of_err(&desc), Some(Dimension));
+        // A layout word that is neither 0, 1 nor 0x100 | mode.
+        for layout in [2, 0x2000, 0x1_0100] {
+            let desc = ResourceDesc { layout, ..plain };
+            assert!(texture_layout(&desc).is_none());
+            assert_eq!(layout_of_err(&desc), Some(Swizzle), "layout {layout:#x}");
+        }
+        // A mode of that form the library has none of (3 is not one).
+        let desc = ResourceDesc {
+            layout: 0x103,
+            ..plain
+        };
+        assert!(texture_layout(&desc).is_none());
+        assert_eq!(layout_of_err(&desc), Some(Swizzle));
+        // No format: 0, the 96-bit ones, and past the console's.
+        for format in [0, 5, 200] {
+            let desc = ResourceDesc { format, ..plain };
+            assert!(texture_layout(&desc).is_none());
+            assert_eq!(layout_of_err(&desc), Some(Format), "format {format}");
+        }
+        // An XOR mode has a layout: it is refused later, by the upload.
+        let desc = ResourceDesc {
+            layout: 0x100 | 27,
+            ..plain
+        };
+        assert!(texture_layout(&desc).is_some_and(|t| t.planes[0].layout.desc.swizzle.xor()));
+        assert_eq!(layout_of_err(&desc), None);
+    }
 
     /// The profile's memory sample counts a registered pool's bytes, and
     /// as resident only its 64 KiB pages that were touched.

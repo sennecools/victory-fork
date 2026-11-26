@@ -1078,6 +1078,14 @@ impl View {
 static WAITING: std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// How many textures and slots wait for a host copy now (a gauge for the
+/// black census, read under the table's lock).
+#[cfg(windows)]
+pub(crate) fn waiting_gauge() -> [u64; 2] {
+    let waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    [waiting.len() as u64, waiting.values().map(|slots| slots.len() as u64).sum()]
+}
+
 /// Textures given their host copy since [`make_waiting`] last ran.
 #[cfg(windows)]
 static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -1096,6 +1104,7 @@ pub(crate) fn texture_made(resource: usize) {
 /// which has no host copy: it waits for one.
 #[cfg(windows)]
 fn wait_for(resource: usize, handle: u64) {
+    crate::census::VIEW_NULL_WAITING[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     /// A texture with more slots waiting than this is in use for all we
     /// know (its views are being copied about): its host copy is made.
     const MOST: usize = 64;
@@ -1142,6 +1151,7 @@ pub(crate) fn make_waiting() {
                 _ => false,
             };
             if same && let Some(Some(host)) = heap.host.get() {
+                crate::census::VIEW_NULL_WAITING[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 host.mirror_at(index, handle, true, crate::descriptor::host::hold::WAITING);
             }
         }

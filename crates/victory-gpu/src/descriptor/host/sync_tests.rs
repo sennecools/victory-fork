@@ -189,6 +189,7 @@ fn title_texture() -> This {
 /// null, as without the skip.
 #[test]
 fn the_early_skip_takes_no_claim_and_still_nulls_a_released_view() {
+    let _census = crate::census::lock_tests();
     let Some(heap) = HostHeap::new(false, SLOTS) else {
         return; // no host GPU
     };
@@ -242,6 +243,7 @@ fn the_early_skip_takes_no_claim_and_still_nulls_a_released_view() {
 /// it).
 #[test]
 fn a_request_and_its_wait_leave_a_copied_record_made() {
+    let _census = crate::census::lock_tests();
     let placed = Placed::new(descriptor::SAMPLERS);
     let Some(host) = placed.host() else {
         return; // no host GPU
@@ -264,6 +266,7 @@ fn a_request_and_its_wait_leave_a_copied_record_made() {
 /// pass, which sees it.
 #[test]
 fn a_pass_begun_before_a_request_does_not_answer_it() {
+    let _census = crate::census::lock_tests();
     use std::sync::atomic::AtomicU64;
     use std::sync::mpsc::channel;
     let written = std::sync::Arc::new(AtomicU64::new(0));
@@ -310,6 +313,7 @@ fn a_pass_begun_before_a_request_does_not_answer_it() {
 /// nothing reads freed memory.
 #[test]
 fn a_heap_dropped_while_the_pass_walks_it_waits_for_it() {
+    let _census = crate::census::lock_tests();
     let mut placed = Placed::new(descriptor::SAMPLERS);
     if placed.host().is_none() {
         return; // no host GPU
@@ -354,6 +358,7 @@ fn a_heap_dropped_while_the_pass_walks_it_waits_for_it() {
 /// on the pass's way takes the submission lock.
 #[test]
 fn a_wait_under_the_submission_lock_ends() {
+    let _census = crate::census::lock_tests();
     /// Slots that view the title texture: more than the 64 that may wait.
     const VIEWING: u32 = 72;
     let placed = Placed::with_slots(descriptor::VIEWS_KIND, VIEWING + 8);
@@ -413,6 +418,7 @@ fn a_wait_under_the_submission_lock_ends() {
 /// as the ones it saw last.
 #[test]
 fn slots_left_waiting_are_made_by_the_next_wait() {
+    let _census = crate::census::lock_tests();
     let placed = Placed::new(descriptor::VIEWS_KIND);
     let Some(host) = placed.host() else {
         return; // no host GPU
@@ -444,6 +450,100 @@ fn slots_left_waiting_are_made_by_the_next_wait() {
     assert!(alive());
 }
 
+/// The black census counts the slots left unmade for a texture that waits
+/// for its host copy (`wait_for`), the slots made late once it is there
+/// (`make_waiting`), and shows both waiting gauges. A slot made null for a
+/// texture the host refused (`refused_for_now`) is counted on its own.
+#[test]
+fn the_census_counts_slots_nulled_for_a_waiting_texture_and_made_late() {
+    let _census = crate::census::lock_tests();
+    use crate::census::VIEW_NULL_WAITING;
+    let placed = Placed::new(descriptor::VIEWS_KIND);
+    let Some(host) = placed.host() else {
+        return; // no host GPU
+    };
+    let title = title_texture();
+    let view = View::Shader(title as usize, None);
+    let mut elsewhere = [0u64; 4];
+    let source = elsewhere.as_mut_ptr() as u64;
+    write(source, &Some(view.clone()));
+    for s in 0..4 {
+        copy_record(source, placed.at(s), 32);
+    }
+    // (Other tests that make slots reach these counters too, so they are
+    // asked for "at least"; what must hold for this test's own slots is
+    // asked of the slots.)
+    let [late, waited] = [1, 2].map(|i| VIEW_NULL_WAITING[i].load(Relaxed));
+    let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
+    let seq = ahead.request(&[placed.registered()]).expect("a request");
+    crate::descriptor::ahead::wait_and_make(Some(&ahead), Some(seq), &[placed.registered()]);
+    assert!(crate::resource::host_waits(title));
+    assert!(
+        VIEW_NULL_WAITING[2].load(Relaxed) >= waited + 4,
+        "four slots left unmade for the waiting texture"
+    );
+    for s in 0..4 {
+        assert!(!host.made(s), "slot {s} left for its texture, not made");
+    }
+    let waiting = crate::descriptor::waiting_gauge();
+    assert!(
+        waiting[0] >= 1 && waiting[1] >= 4,
+        "the gauge sees the waiting slots"
+    );
+    // Made by a draw, then the slots by the next wait.
+    assert!(crate::resource::host_copy(title).is_some());
+    let seq = ahead.request(&[placed.registered()]).expect("a request");
+    crate::descriptor::ahead::wait_and_make(Some(&ahead), Some(seq), &[placed.registered()]);
+    assert!(
+        VIEW_NULL_WAITING[1].load(Relaxed) >= late + 4,
+        "four slots made late with their texture"
+    );
+    for s in 0..4 {
+        assert!(host.made(s), "slot {s} made with its texture");
+    }
+    assert!(alive());
+}
+
+/// A slot made null for a texture without its host copy is counted, and
+/// returns the texture the slot waits for (`refused_for_now`).
+#[test]
+fn the_census_counts_a_slot_made_null_for_a_waiting_texture() {
+    let _census = crate::census::lock_tests();
+    use crate::census::VIEW_NULL_WAITING;
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let title = title_texture();
+    let view = View::Shader(title as usize, None);
+    let nulled = VIEW_NULL_WAITING[0].load(Relaxed);
+    let mut made = 7;
+    assert_eq!(
+        heap.refused_for_now(&mut made, 3, &view, None),
+        Some(title as usize)
+    );
+    assert_eq!(made, 0, "counted as not made");
+    assert!(VIEW_NULL_WAITING[0].load(Relaxed) > nulled);
+    // A view of nothing that waits is no such slot: it says so itself.
+    let buffer = View::Constant(0x7d_5000_0000, 256);
+    let mut made = 7;
+    assert_eq!(heap.refused_for_now(&mut made, 3, &buffer, None), None);
+    assert_eq!(made, 7, "left as it was");
+}
+
+/// A look at a slot past the host heap is counted, with the highest seen.
+#[test]
+fn the_census_counts_a_slot_past_the_host_heap() {
+    let _census = crate::census::lock_tests();
+    use crate::census::PAST_HEAP;
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let seen = PAST_HEAP[0].load(Relaxed);
+    assert_eq!(heap.mirror(SLOTS + 3, 0, true), None);
+    assert!(PAST_HEAP[0].load(Relaxed) > seen);
+    assert!(PAST_HEAP[1].load(Relaxed) >= u64::from(SLOTS + 3));
+}
+
 /// Four threads write views into a placed heap (`Create*View`), copy
 /// records into it as bytes and by calls (`CopyDescriptorsSimple`) and
 /// make slots for draws that read them through tables, while submissions
@@ -452,6 +552,7 @@ fn slots_left_waiting_are_made_by_the_next_wait() {
 /// of the descriptor under it, during and after.
 #[test]
 fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
+    let _census = crate::census::lock_tests();
     const THREADS: u64 = 4;
     let placed = Placed::new(descriptor::VIEWS_KIND);
     let Some(host) = placed.host() else {
@@ -753,6 +854,7 @@ fn changed_records_are_those_that_differ_one_by_one() {
 /// requests have stopped.
 #[test]
 fn passes_of_its_own_run_between_requests_and_answer_none() {
+    let _census = crate::census::lock_tests();
     use std::sync::atomic::AtomicU64;
     use std::sync::mpsc::channel;
     let passes = std::sync::Arc::new(AtomicU64::new(0));
@@ -861,6 +963,7 @@ fn an_unbound_heap_catches_up_when_bound() {
 /// pass of its own at those of the last pass that covered requests.
 #[test]
 fn a_pass_looks_at_the_heaps_of_the_requests_it_covers() {
+    let _census = crate::census::lock_tests();
     use std::sync::mpsc::channel;
     let (came, come) = channel::<Vec<usize>>();
     let (go, gone) = channel::<()>();

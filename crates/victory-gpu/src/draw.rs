@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
+use crate::census::Dropped;
 use crate::host::{HostList, OpKind};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
@@ -261,6 +262,14 @@ impl Drop for State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
     }
+}
+
+/// Why a draw is dropped for the tables [`State::tables`] made: one of them
+/// found no free dynamic slots (`u32::MAX` for its offset).
+fn table_refused(made: &[(u8, u32)]) -> Option<Dropped> {
+    made.iter()
+        .any(|m| m.1 == u32::MAX)
+        .then_some(Dropped::TableFull)
 }
 
 impl State {
@@ -1054,23 +1063,37 @@ impl State {
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
-        self.prepare_for(list, indexed, false)
+        self.prepare_for(list, indexed, false, true)
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
-    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+    /// With `note` a drop is counted by its reason ([`Dropped`]); the
+    /// indirect path, whose drops are not those of `DROPPED`, passes false.
+    fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool, note: bool) -> bool {
+        let drop = |why: Dropped| {
+            if note {
+                why.note();
+            }
+        };
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            drop(Dropped::Skipped);
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            drop(Dropped::NoPipeline);
             return false;
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            drop(Dropped::Other);
             return false;
         }
-        if !self.bind(list, p, false) {
-            return false;
+        match self.bind(list, p, false) {
+            Ok(()) => {}
+            Err(why) => {
+                drop(why);
+                return false;
+            }
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -1105,6 +1128,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                drop(Dropped::Other);
                 return false;
             };
             shadow.handed(Hand::Index, v.address);
@@ -1165,9 +1189,16 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a root SRV it reads
-    /// could not be given a view.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    /// `Ok` when the draw or dispatch may run. `Err(why)` says why it
+    /// must be dropped ([`Dropped`]): a root view or table that could not
+    /// be given a slot, no view heap, or no free table slots. Counting
+    /// the drop by that reason is the caller's ([`State::bound`]).
+    pub(crate) fn bind(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+    ) -> Result<(), Dropped> {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1244,9 +1275,9 @@ impl State {
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
-            if made.iter().any(|m| m.1 == u32::MAX) {
+            if let Some(why) = table_refused(&made) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return Err(why);
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -1256,7 +1287,7 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    return Err(Dropped::MemoryWithoutHeap);
                 };
                 Some(ready)
             } else {
@@ -1328,16 +1359,16 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
-                            return false;
+                            return Err(Dropped::RootSrv);
                         }
                         if constant_table && !self.root_cbv_table(list, None, param, compute) {
-                            return false;
+                            return Err(Dropped::RootCbv);
                         }
                         continue;
                     };
                     if constant_table {
                         if !self.root_cbv_table(list, Some(address), param, compute) {
-                            return false;
+                            return Err(Dropped::RootCbv);
                         }
                         continue;
                     }
@@ -1349,7 +1380,7 @@ impl State {
                         });
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
-                            return false;
+                            return Err(Dropped::RootSrv);
                         }
                         continue;
                     }
@@ -1400,14 +1431,26 @@ impl State {
                     }
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
-                    return false;
+                    return Err(Dropped::RootUav);
                 }
             }
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
-        true
+        Ok(())
+    }
+
+    /// [`State::bind`] for the callers that only ask whether the draw runs:
+    /// a draw it drops is counted by its reason.
+    fn bound(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        match self.bind(list, p, compute) {
+            Ok(()) => true,
+            Err(why) => {
+                why.note();
+                false
+            }
+        }
     }
 
     /// Binds a root UAV: a raw unordered access view of the title buffer's
@@ -2388,7 +2431,9 @@ impl State {
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
+                    crate::census::TEXTURE_PASS_HELD[1].fetch_add(1, Ordering::Relaxed);
                     if full_card_pass() {
+                        crate::census::TEXTURE_PASS_HELD[0].fetch_add(1, Ordering::Relaxed);
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
                         // goes on, within a count that bounds one pass.
@@ -2513,6 +2558,7 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        crate::census::TEXTURE_PASS_STOP[stop as usize].fetch_add(1, Ordering::Relaxed);
         if let Some(uploads) = uploads.as_mut() {
             uploads.arg("looked", looked);
             uploads.arg("uploaded", uploaded);
@@ -2564,6 +2610,7 @@ impl State {
         self.window = None;
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            Dropped::Skipped.note();
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
@@ -2571,6 +2618,7 @@ impl State {
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            Dropped::BuilderOff.note();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
@@ -2584,6 +2632,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            Dropped::NoPipeline.note();
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -2593,9 +2642,11 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            Dropped::GraphicsDispatch.note();
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bound(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2902,9 +2953,15 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = mesh_test() != 1
-            && mesh_kept(self.pipeline)
-            && self.prepare_for(list, false, true)
+        // (`prepare_for` counts its own reasons, so a drop is counted once:
+        // the mesh reason is for a dispatch the test switches keep out and
+        // for a list that has no mesh dispatch.)
+        let gated = mesh_test() != 1 && mesh_kept(self.pipeline);
+        if !gated {
+            Dropped::Mesh.note();
+        }
+        let ran = gated
+            && self.prepare_for(list, false, true, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -2917,7 +2974,10 @@ impl State {
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                Err(_) => false,
+                Err(_) => {
+                    Dropped::Mesh.note();
+                    false
+                }
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3374,6 +3434,7 @@ impl State {
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            Dropped::Other.note();
             return false;
         };
         let rects = u64::from(count / 3);
@@ -3390,13 +3451,16 @@ impl State {
             let v = self.vertex[slot as usize];
             let Some((from, src_bytes, dst_bytes)) = rect_vertex_span(v, first, count, rects) else {
                 once!(slot, "rectangle vertices outside their buffer");
+                Dropped::Other.note();
                 return false;
             };
             if crate::shadow::find(from, src_bytes).is_none() {
                 once!(slot, "rectangle vertices outside their buffer");
+                Dropped::Other.note();
                 return false;
             }
             let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
+                Dropped::Other.note();
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
@@ -3445,6 +3509,7 @@ impl State {
         let rects = self.topology == RECTANGLES && !self.rect_gs();
         if rects {
             once!("indexed rectangles not drawn");
+            Dropped::Other.note();
         }
         let ran = !rects && self.prepare(list, true);
         if ran {
@@ -3716,9 +3781,11 @@ impl State {
             }
         };
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            // (Not counted by reason: the drops of `DROPPED` are the direct
+            // calls'; these are counted as indirect in the frame line.)
+            DRAW | INDEXED => self.prepare_for(list, kind == INDEXED, false, false),
+            MESH => self.prepare_for(list, false, true, false),
+            DISPATCH => self.bind(list, p, true).is_ok(),
             _ => false,
         };
         if !ran {
@@ -4522,6 +4589,50 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table that found no slots drops the draw as "table full"; a draw
+    /// without a host pipeline is counted by that reason, for a draw, a
+    /// mesh dispatch and a dispatch alike (`VICTORY_D3D12_WARP=1`).
+    #[test]
+    fn a_dropped_draw_is_counted_by_its_reason() {
+        let _census = crate::census::lock_tests();
+        use crate::census::DROPPED_BY;
+        assert_eq!(table_refused(&[(0, 64), (1, 0)]), None);
+        assert_eq!(
+            table_refused(&[(0, 64), (1, u32::MAX)]),
+            Some(Dropped::TableFull)
+        );
+        let table = DROPPED_BY[Dropped::TableFull as usize].load(Ordering::Relaxed);
+        table_refused(&[(1, u32::MAX)]).unwrap().note();
+        assert_eq!(
+            DROPPED_BY[Dropped::TableFull as usize].load(Ordering::Relaxed),
+            table + 1
+        );
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let none = || DROPPED_BY[Dropped::NoPipeline as usize].load(Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        let was = none();
+        assert!(
+            !state.prepare_for(&list, false, false, true),
+            "no pipeline set"
+        );
+        let quiet = none();
+        assert!(
+            !state.prepare_for(&list, false, false, false),
+            "no pipeline set"
+        );
+        assert_eq!(none(), quiet, "not counted when told not to");
+        assert_eq!(none(), was + 1, "a draw");
+        state.dispatch_mesh(&list, 1);
+        assert_eq!(none(), was + 2, "a mesh dispatch");
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(none(), was + 3, "a dispatch");
+        list.close();
+        list.reset();
+    }
 
     /// One of our root signatures needs a sampler heap bound before it is
     /// set: ours stands in for a title that binds none, which a compute list
