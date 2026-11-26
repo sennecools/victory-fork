@@ -2926,6 +2926,130 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// How a texture placed where others are described already relates to the
+/// closest of them ([`sibling_of`]): the identity census, which says how
+/// much of the host copies' memory is the same title memory made again.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Sibling {
+    /// The same texture as the description's words go, differing only in
+    /// words the key leaves out or does not read (flags, sample quality).
+    SameKey,
+    /// The same shape in another format of the same typeless family (a
+    /// typed and an sRGB view of one texture): one host copy could serve.
+    FormatInFamily,
+    /// The same shape and array size with another number of levels.
+    MipVariant,
+    /// The same shape and levels with another array size.
+    ArrayVariant,
+    /// The same shape in a format of another family.
+    OtherFamily,
+    /// Another extent, dimension, layout word or sample count, or both the
+    /// levels and the array size differ.
+    OtherShape,
+}
+
+/// What [`Sibling`] has, and one more kind for a texture first at its
+/// address.
+#[cfg(windows)]
+const SIBLINGS: usize = 7;
+
+/// Textures [`texture_at`] made, by [`Sibling`] (the last: none was at the
+/// address before): the count, then the bytes of their title memory, for
+/// each.
+#[cfg(windows)]
+static PLACED_SIBLINGS: [std::sync::atomic::AtomicU64; SIBLINGS * 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; SIBLINGS * 2];
+
+/// How the description `new` of a texture at one address relates to `old`,
+/// another description there (words as [`texture_at`] keys them: 0 the
+/// dimension, 4 and 5 the width, 6 the height, 7 the array size and the
+/// levels, 8 the format, 9 the sample count, 11 the layout).
+#[cfg(windows)]
+fn sibling_of(old: &[u32; 14], new: &[u32; 14]) -> Sibling {
+    let shape = [0, 4, 5, 6, 9, 11].iter().all(|&i| old[i] == new[i]);
+    if !shape {
+        return Sibling::OtherShape;
+    }
+    if family(old[8]) != family(new[8]) {
+        return Sibling::OtherFamily;
+    }
+    let (array, levels) = (
+        old[7] & 0xffff == new[7] & 0xffff,
+        old[7] >> 16 == new[7] >> 16,
+    );
+    match (array, levels) {
+        (true, true) if old[8] == new[8] => Sibling::SameKey,
+        (true, true) => Sibling::FormatInFamily,
+        (true, false) => Sibling::MipVariant,
+        (false, true) => Sibling::ArrayVariant,
+        (false, false) => Sibling::OtherShape,
+    }
+}
+
+/// The closest [`Sibling`] of description `desc` among those already placed
+/// at `address` in `placed` (`None`: there is none).
+#[cfg(windows)]
+fn closest_sibling(
+    placed: &std::collections::BTreeMap<(u64, [u32; 14]), usize>,
+    address: u64,
+    desc: &[u32; 14],
+) -> Option<Sibling> {
+    placed
+        .range((address, [0; 14])..=(address, [u32::MAX; 14]))
+        .map(|(&(_, old), _)| sibling_of(&old, desc))
+        .min()
+}
+
+/// Counts a texture about to be placed at `address` with `desc` against
+/// what is placed there ([`closest_sibling`]), by its bytes of title
+/// memory, and says so in a line at the 1st, 2nd, 4th, ... and every
+/// 1024th texture: release builds, one pass over the few keys at one
+/// address, under the table's lock the insert holds already.
+#[cfg(windows)]
+fn note_placed(
+    placed: &std::collections::BTreeMap<(u64, [u32; 14]), usize>,
+    address: u64,
+    desc: &[u32; 14],
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let kind = closest_sibling(placed, address, desc).map_or(SIBLINGS - 1, |s| s as usize);
+    PLACED_SIBLINGS[kind * 2].fetch_add(1, Relaxed);
+    PLACED_SIBLINGS[kind * 2 + 1].fetch_add(placed_bytes(desc).unwrap_or(0), Relaxed);
+    let total: u64 = (0..SIBLINGS)
+        .map(|k| PLACED_SIBLINGS[k * 2].load(Relaxed))
+        .sum();
+    if total.is_power_of_two() || total.is_multiple_of(1024) {
+        let [same, family, mips, array, other_family, other_shape, alone] =
+            std::array::from_fn(|k| {
+                [
+                    PLACED_SIBLINGS[k * 2].load(Relaxed),
+                    PLACED_SIBLINGS[k * 2 + 1].load(Relaxed) >> 20,
+                ]
+            });
+        tracing::info!(
+            "identity census of placed textures, since the start: {total} made; at an address nothing else was placed \
+             at {} ({} MB); beside another description there: of the same key {} ({} MB), of a format of the same \
+             family {} ({} MB), with other levels {} ({} MB), with another array size {} ({} MB), of another family \
+             {} ({} MB), of another shape {} ({} MB)",
+            alone[0],
+            alone[1],
+            same[0],
+            same[1],
+            family[0],
+            family[1],
+            mips[0],
+            mips[1],
+            array[0],
+            array[1],
+            other_family[0],
+            other_family[1],
+            other_shape[0],
+            other_shape[1],
+        );
+    }
+}
+
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -3028,6 +3152,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    note_placed(&map, address, desc);
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);
     resource(out)
@@ -3287,6 +3412,129 @@ mod tests {
         };
         assert!(texture_layout(&desc).is_some_and(|t| t.planes[0].layout.desc.swizzle.xor()));
         assert_eq!(layout_of_err(&desc), None);
+    }
+
+    /// The words of a placed 2D texture of 64 by 64 texels with `levels`
+    /// levels and `slices` array slices in `format`.
+    #[cfg(windows)]
+    fn placed_words(format: u32, levels: u32, slices: u32) -> [u32; 14] {
+        [
+            3,
+            0,
+            0,
+            0,
+            64,
+            0,
+            64,
+            levels << 16 | slices,
+            format,
+            1,
+            0,
+            0x100,
+            0,
+            0,
+        ]
+    }
+
+    /// The identity census sorts a second description at an address by what
+    /// differs from the first: a BC1 typed and sRGB pair is a format of the
+    /// same family, and the other kinds are told apart.
+    #[cfg(windows)]
+    #[test]
+    fn the_identity_census_sorts_descriptions_at_one_address() {
+        const BC1: u32 = 71;
+        const BC1_SRGB: u32 = 72;
+        let first = placed_words(BC1, 7, 1);
+        assert_eq!(
+            sibling_of(&first, &placed_words(BC1_SRGB, 7, 1)),
+            Sibling::FormatInFamily
+        );
+        assert_eq!(
+            sibling_of(&first, &placed_words(BC1, 7, 1)),
+            Sibling::SameKey
+        );
+        assert_eq!(
+            sibling_of(&first, &placed_words(BC1, 6, 1)),
+            Sibling::MipVariant
+        );
+        assert_eq!(
+            sibling_of(&first, &placed_words(BC1_SRGB, 6, 1)),
+            Sibling::MipVariant
+        );
+        assert_eq!(
+            sibling_of(&first, &placed_words(BC1, 7, 6)),
+            Sibling::ArrayVariant
+        );
+        assert_eq!(
+            sibling_of(&first, &placed_words(BC1, 6, 6)),
+            Sibling::OtherShape
+        );
+        // BC7 is another family; so is R32_UINT beside R9G9B9E5.
+        assert_eq!(
+            sibling_of(&first, &placed_words(98, 7, 1)),
+            Sibling::OtherFamily
+        );
+        assert_eq!(
+            sibling_of(&placed_words(42, 1, 1), &placed_words(67, 1, 1)),
+            Sibling::OtherFamily
+        );
+        // Another extent, layout word or sample count is another shape.
+        let mut wider = first;
+        wider[4] = 128;
+        assert_eq!(sibling_of(&first, &wider), Sibling::OtherShape);
+        let mut tiled = first;
+        tiled[11] = 0x100 | 9;
+        assert_eq!(sibling_of(&first, &tiled), Sibling::OtherShape);
+        // The closest of those at the address decides; none at another one.
+        let mut placed = std::collections::BTreeMap::new();
+        assert_eq!(closest_sibling(&placed, 0x10_0000, &first), None);
+        placed.insert((0x10_0000, placed_words(BC1, 3, 1)), 1);
+        placed.insert((0x10_0000, placed_words(98, 7, 1)), 2);
+        assert_eq!(
+            closest_sibling(&placed, 0x10_0000, &first),
+            Some(Sibling::MipVariant)
+        );
+        placed.insert((0x10_0000, placed_words(BC1_SRGB, 7, 1)), 3);
+        assert_eq!(
+            closest_sibling(&placed, 0x10_0000, &first),
+            Some(Sibling::FormatInFamily)
+        );
+        assert_eq!(closest_sibling(&placed, 0x20_0000, &first), None);
+    }
+
+    /// `texture_at` counts each texture it places: the first at an address
+    /// as alone there, a typed and an sRGB view of one block as a format of
+    /// the same family, with its bytes.
+    #[cfg(windows)]
+    #[test]
+    fn texture_at_counts_a_typed_and_an_srgb_pair() {
+        let _census = crate::census::lock_tests();
+        use std::sync::atomic::Ordering::Relaxed;
+        let counts = || {
+            std::array::from_fn::<u64, { SIBLINGS * 2 }, _>(|i| PLACED_SIBLINGS[i].load(Relaxed))
+        };
+        // An address of its own for this test (nothing is read there).
+        let address = 0x7e57_0000_0000u64;
+        let bytes = placed_bytes(&placed_words(71, 7, 1)).expect("a size");
+        assert!(bytes > 0);
+        let before = counts();
+        let typed = texture_at(address, &placed_words(71, 7, 1)).expect("a texture");
+        let srgb = texture_at(address, &placed_words(72, 7, 1)).expect("a texture");
+        assert_ne!(
+            typed, srgb,
+            "two resources today, which is what the census counts"
+        );
+        // The same words again are no new texture.
+        assert_eq!(texture_at(address, &placed_words(71, 7, 1)), Some(typed));
+        let after = counts();
+        let alone = SIBLINGS - 1;
+        let family_kind = Sibling::FormatInFamily as usize;
+        // (At least: other tests place textures too, into the same
+        // buckets; the address is this test's own.)
+        assert!(after[alone * 2] > before[alone * 2]);
+        assert!(after[alone * 2 + 1] >= before[alone * 2 + 1] + bytes);
+        assert!(after[family_kind * 2] > before[family_kind * 2]);
+        assert!(after[family_kind * 2 + 1] >= before[family_kind * 2 + 1] + bytes);
     }
 
     /// The profile's memory sample counts a registered pool's bytes, and
