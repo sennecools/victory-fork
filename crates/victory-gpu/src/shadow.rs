@@ -3412,7 +3412,22 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// Whether shaders of a submission not yet copied back may be writing
+    /// title memory `[address, address + len)` of the copy.
+    pub(crate) fn writes_pending_over(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < end && address < e)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -4325,6 +4340,26 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// end is looked at; it runs only for submissions whose reads would wait
 /// for flights (a few a frame).
 pub(crate) fn sole(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    sole_with(address, len, false)
+}
+
+/// As [`sole`], but a home of the memory core (`crate::home`) that holds the
+/// whole range is taken too (R5's lifts, `VICTORY_R5_LIFT=1`): a copy on the
+/// card from or into its placed buffer, at [`Shadow::offset`], is what every
+/// list of ours sees of those bytes. Two homes, or a home and a copy over
+/// some of the bytes, are still none.
+pub(crate) fn sole_or_home(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    sole_with(address, len, true)
+}
+
+/// Whether [`sole`] (with `homes`: [`sole_or_home`]) takes the one host copy
+/// that holds a range: `placed`, whether it is title memory in place; `home`,
+/// whether it is a home of the memory core.
+pub(crate) fn sole_takes(placed: bool, home: bool, homes: bool) -> bool {
+    !placed || homes && home
+}
+
+fn sole_with(address: u64, len: u64, homes: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut found: Option<Arc<Shadow>> = None;
     // False at a second copy.
@@ -4355,7 +4390,44 @@ pub(crate) fn sole(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
     }
     let shadow = found?;
-    (shadow.place.is_none() && shadow.start <= address && shadow.left(address) >= len).then_some(shadow)
+    let taken = sole_takes(shadow.place.is_some(), shadow.core.is_some(), homes);
+    (taken && shadow.start <= address && shadow.left(address) >= len).then_some(shadow)
+}
+
+/// The home of the memory core (`crate::home`) that holds the whole of
+/// title memory `[address, address + len)`, if one does (R5's lifted
+/// refreshes, `crate::host`). Other copies over the bytes do not matter.
+///
+/// shortcut: as [`sole`], every title buffer and window that begins below
+/// the range's end is looked at; it runs only for refreshes that would wait
+/// for flights.
+pub(crate) fn home_of(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let holds = |shadow: &Arc<Shadow>| {
+        shadow.core.is_some() && shadow.start <= address && shadow.left(address) >= len
+    };
+    {
+        let map = buffers();
+        let found = map
+            .range(..(end, 0))
+            .rev()
+            .filter(|(_, entry)| entry.end > address)
+            .find_map(|(_, entry)| {
+                entry
+                    .shadow
+                    .as_ref()
+                    .filter(|shadow| holds(shadow))
+                    .cloned()
+            });
+        if found.is_some() {
+            return found;
+        }
+    }
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    loose
+        .range(..(end, 0))
+        .rev()
+        .find_map(|(_, shadow)| holds(shadow).then(|| shadow.clone()))
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

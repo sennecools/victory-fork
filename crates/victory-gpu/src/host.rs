@@ -20,14 +20,17 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 /// R5 (`VICTORY_R5=1`): what only the core's homes under the relay use.
 mod late_homes;
+/// R5's reads of homes on the card (`VICTORY_R5_LIFT=1`), and what its
+/// waits for flights say on the profile.
+mod late_lift;
 
-#[cfg(test)]
-pub(crate) use late_homes::{flights, test_flights, test_relay_sees};
 use late_homes::{
-    R5_STATS, Writer, home_ranges, join_writers, refresh_over_flight_homes, relay_card_homed,
-    retake_flight_homes, value_unsure,
+    R5_STATS, Writer, home_ranges, join_writers, r5_lift, refresh_over_flight_homes,
+    relay_card_homed, retake_flight_homes, value_unsure,
 };
 pub(crate) use late_homes::{Ring, finished, r5, settle_for_fence_at, wait_for_flights_now};
+#[cfg(test)]
+pub(crate) use late_homes::{flights, test_flights, test_relay_sees};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -2648,6 +2651,8 @@ struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
+    /// Whether it is shared memory (a lifted fill may copy into it).
+    shared: bool,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2729,20 +2734,27 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
+    // With lifted fills (`VICTORY_LIFT_READS=2`, or `VICTORY_R5_LIFT=1`) a
+    // copy on the card writes into chunks, which upload memory cannot take:
+    // shared memory instead (it starts in the common state and is read from
+    // there, as host copies are). The mode is fixed for the run, so kept
+    // chunks are of one kind; one of the other (tests switch the mode) is
+    // freed.
+    let shared = lift_mode() == LiftMode::Fills;
     if scratch_pool()
         && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
     {
         ALIVE[3].fetch_sub(1, Ordering::Relaxed);
         ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
-        return Some(chunk);
+        if chunk.shared == shared {
+            ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            return Some(chunk);
+        }
+        ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+        ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+        drop(chunk);
     }
-    // With lifted fills (`VICTORY_LIFT_READS=2`) a copy on the card writes
-    // into chunks, which upload memory cannot take: shared memory instead
-    // (it starts in the common state and is read from there, as host
-    // copies are). The mode is fixed for the run, so kept chunks are of
-    // one kind.
-    let (buffer, data) = if lift_mode() == LiftMode::Fills {
+    let (buffer, data) = if shared {
         host.shared_buffer(size)?
     } else {
         host.upload_buffer(size)?
@@ -2762,6 +2774,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         buffer,
         data: data as usize,
         gpu,
+        shared,
     })
 }
 
@@ -3305,15 +3318,24 @@ enum LiftedTo {
     /// `VICTORY_LIFT_READS=2`), the offset in it, and the fill's destination
     /// (the CPU address of those bytes, for [`Lifted::cpu_step`]).
     Fill(ID3D12Resource, u64, usize),
+    /// With `VICTORY_R5_LIFT=1`: the part of a copy's refresh over a home a
+    /// flight writes (the source), copied into this copy at the same title
+    /// address, behind the flights ([`late_lift::lift_refreshes`]). The
+    /// refresh step itself stays, and is done on the CPU first. Its
+    /// [`LiftCopy`] has no bounce buffer: with the memory core no copy that
+    /// is no home is placed, so the home and the copy are two buffers.
+    Refresh(std::sync::Arc<crate::shadow::Shadow>),
 }
 
 impl Lifted {
     /// The step it was lifted from, done on the CPU at submission: what a
-    /// submission that did not plan it does ([`HostList::unlift`]).
-    fn cpu_step(&self) -> Step {
+    /// submission that did not plan it does ([`HostList::unlift`]). None for
+    /// a lifted refresh: its refresh step is still there.
+    fn cpu_step(&self) -> Option<Step> {
         match &self.to {
-            LiftedTo::Copy(_, at, _) => Step::Copy(*at, self.src_at, self.len),
-            LiftedTo::Fill(_, _, dst) => Step::Fill(*dst, self.src_at, self.len),
+            LiftedTo::Copy(_, at, _) => Some(Step::Copy(*at, self.src_at, self.len)),
+            LiftedTo::Fill(_, _, dst) => Some(Step::Fill(*dst, self.src_at, self.len)),
+            LiftedTo::Refresh(_) => None,
         }
     }
 }
@@ -3329,7 +3351,7 @@ impl Step {
                 Some((&lift.src, lift.src_at, lift.len)),
                 match &lift.to {
                     LiftedTo::Copy(dst, at, _) => Some((dst, *at, lift.len)),
-                    LiftedTo::Fill(..) => None,
+                    LiftedTo::Fill(..) | LiftedTo::Refresh(_) => None,
                 },
             ),
             _ => (None, None),
@@ -3345,7 +3367,7 @@ impl Step {
             Step::GpuWrite(shadow, address, len) => Some((shadow, *address, *len)),
             Step::Lifted(lift) => match &lift.to {
                 LiftedTo::Copy(dst, at, _) => Some((dst, *at, lift.len)),
-                LiftedTo::Fill(..) => None,
+                LiftedTo::Fill(..) | LiftedTo::Refresh(_) => None,
             },
             _ => None,
         }
@@ -4331,6 +4353,10 @@ impl LiftMode {
 }
 
 fn lift_mode() -> LiftMode {
+    // R5's lifts of homes' bytes (`VICTORY_R5_LIFT=1`) lift fills too.
+    if r5_lift() {
+        return LiftMode::Fills;
+    }
     static MODE: OnceLock<LiftMode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_LIFT_READS").as_deref() {
         Ok("count") => LiftMode::Count,
@@ -4403,10 +4429,14 @@ enum LiftAbort {
     /// A planned step was no longer the copy or fill the plan saw when the
     /// steps were rewritten (counted after the rewrite, see [`lift_reads`]).
     Changed,
+    /// With `VICTORY_R5_LIFT=1`: a lifted copy writes a home, and the
+    /// submission refreshes another copy over those bytes, which would take
+    /// them on the CPU before the card's copy ([`late_lift::over_lifted_homes`]).
+    Viewed,
 }
 
 impl LiftAbort {
-    const ALL: [LiftAbort; 10] = [
+    const ALL: [LiftAbort; 11] = [
         LiftAbort::NotSole,
         LiftAbort::SameBuffer,
         LiftAbort::NoBounce,
@@ -4417,6 +4447,7 @@ impl LiftAbort {
         LiftAbort::CpuWrites,
         LiftAbort::Twice,
         LiftAbort::Changed,
+        LiftAbort::Viewed,
     ];
 
     /// Its name on the frame-rate line (no commas: the names are joined
@@ -4433,6 +4464,7 @@ impl LiftAbort {
             LiftAbort::CpuWrites => "a CPU copy writes it",
             LiftAbort::Twice => "a list named twice",
             LiftAbort::Changed => "a step changed",
+            LiftAbort::Viewed => "a copy over a home it writes is refreshed",
         }
     }
 }
@@ -4619,25 +4651,54 @@ fn lift_reads(runs: &[&HostList]) -> bool {
     };
     LIFT_STATS[LIFT_PLANS].fetch_add(1, Ordering::Relaxed);
     let written = line().written.clone();
-    let twice = runs.iter().enumerate().any(|(i, a)| runs[..i].iter().any(|b| std::ptr::eq(*a, *b)));
+    let twice = runs
+        .iter()
+        .enumerate()
+        .any(|(i, a)| runs[..i].iter().any(|b| std::ptr::eq(*a, *b)));
+    // With R5's lifts a home holding the whole range is taken too, named by
+    // its buffer: two homes in one chunk of the pool share it, and a copy
+    // between them goes through a bounce buffer.
+    let homes = r5_lift();
+    // One list's lock at a time.
+    let steps: Vec<(usize, usize, Seen)> = if twice {
+        Vec::new()
+    } else {
+        runs.iter()
+            .enumerate()
+            .flat_map(|(l, list)| {
+                list.deferred()
+                    .copies
+                    .iter()
+                    .enumerate()
+                    .map(|(i, step)| (l, i, step.seen()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
     let plan = if twice {
         Err(LiftAbort::Twice)
     } else {
-        // One list's lock at a time.
-        let steps: Vec<(usize, usize, Seen)> = runs
-            .iter()
-            .enumerate()
-            .flat_map(|(l, list)| {
-                list.deferred().copies.iter().enumerate().map(|(i, step)| (l, i, step.seen())).collect::<Vec<_>>()
-            })
-            .collect();
         plan_lifts(
             &written,
-            steps,
+            steps.iter().copied(),
             mode != LiftMode::Copies,
-            |at, len| crate::shadow::sole(at as u64, len as u64).map(|s| (Arc::as_ptr(&s) as usize, s)),
+            |at, len| {
+                if homes {
+                    crate::shadow::sole_or_home(at as u64, len as u64)
+                        .map(|s| (s.buffer.as_raw() as usize, s))
+                } else {
+                    crate::shadow::sole(at as u64, len as u64)
+                        .map(|s| (Arc::as_ptr(&s) as usize, s))
+                }
+            },
             |l, at, len| runs[l].scratch_chunk(at, len),
         )
+        .and_then(|lifts| {
+            if homes && late_lift::over_lifted_homes(&lifts, &steps, runs) {
+                return Err(LiftAbort::Viewed);
+            }
+            Ok(lifts)
+        })
     };
     let lifts = match plan {
         Ok(lifts) => lifts,
@@ -5273,14 +5334,29 @@ fn late_threads() {
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it. Whether it waited.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> bool {
+    relay_wait_with(why, &[], done).is_some()
+}
+
+/// [`relay_wait`], with more arguments for its span on the profile
+/// ([`late_lift::wait_args`]); the microseconds it waited, if it did.
+fn relay_wait_with(
+    why: usize,
+    args: &[(&'static str, u64)],
+    done: impl Fn(&Line) -> bool,
+) -> Option<u64> {
     let mut line = line();
     if done(&line) {
-        return false;
+        return None;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     // Only when it waits: a line that is done already says nothing.
-    let span = crate::profile::span_args("relay wait", &[("why", why as u64)]);
+    let mut span = crate::profile::span_args("relay wait", &[("why", why as u64)]);
+    if let Some(span) = span.as_mut() {
+        for &(key, value) in args {
+            span.arg(key, value);
+        }
+    }
     let was_working = working(false);
     let waiting = std::time::Instant::now();
     while !done(&line) {
@@ -5294,7 +5370,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> bool {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
-    true
+    Some(us)
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -5510,15 +5586,27 @@ fn late_line(frames: f64) {
         tracing::info!(
             "R5 per frame (VICTORY_R5=1): {:.2} submissions waited for flights before a copy's refresh over a home they write \
              (in \"title memory read\" above); {:.2} waits for a memory value and {:.2} blocking fence waits waited for the flights \
-             concerned only; {:.2} protections of the title's waited for the flights in the air",
+             concerned only; {:.2} protections of the title's waited for the flights in the air; of \"title memory read\": \
+             {:.2} waits by a buffer copy, fill or texture (H8) {:.1} ms, those refreshes (H2) {:.1} ms; with VICTORY_R5_LIFT={}: \
+             {:.2} submissions had such refreshes done on the card, {:.2} waited all the same (the copy is written there too, \
+             or no one home holds the bytes)",
             r[0],
             r[1],
             r[2],
             r[3],
+            r[late_lift::R5_H8],
+            r[late_lift::R5_H8_US] / 1000.0,
+            r[late_lift::R5_H2_US] / 1000.0,
+            u8::from(r5_lift()),
+            r[late_lift::R5_REFRESHES_LIFTED],
+            r[late_lift::R5_REFRESHES_REFUSED],
         );
     }
     if lift_mode() != LiftMode::Off {
-        let l: Vec<f64> = LIFT_STATS.iter().map(|l| l.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let l: Vec<f64> = LIFT_STATS
+            .iter()
+            .map(|l| l.swap(0, Ordering::Relaxed) as f64 / frames)
+            .collect();
         // Only the reasons that aborted a plan.
         let aborted: Vec<String> = LiftAbort::ALL
             .iter()
@@ -7740,7 +7828,14 @@ impl Host {
                 // copy-back's end, not the card's other work.
                 if !lift_reads(runs) {
                     waiting = crate::profile::stamp();
-                    relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                    let args = late_lift::wait_args(runs, false);
+                    let waited = relay_wait_with(why, &args, |line| {
+                        blocked_by(&line.written, runs, false).is_none()
+                    });
+                    if let Some(us) = waited.filter(|_| r5()) {
+                        R5_STATS[late_lift::R5_H8].fetch_add(1, Ordering::Relaxed);
+                        R5_STATS[late_lift::R5_H8_US].fetch_add(us, Ordering::Relaxed);
+                    }
                 }
             } else {
                 waiting = crate::profile::stamp();
@@ -7749,15 +7844,18 @@ impl Host {
         }
         // With R5: a copy's refresh over a home a flight writes waits like
         // a read, for those flights only (and after the waits above, which
-        // may have landed them).
+        // may have landed them); with `VICTORY_R5_LIFT=1` the card takes
+        // those bytes for it at the head of the submission, if it can.
         if late && r5() {
             let homes = line().homes_written.clone();
-            if refresh_over_flight_homes(&homes, runs) {
+            if refresh_over_flight_homes(&homes, runs) && !late_lift::lift_refreshes(&homes, runs) {
                 let stamp = crate::profile::stamp();
-                if relay_wait(WHY_READ, |line| {
+                let args = late_lift::wait_args(runs, true);
+                if let Some(us) = relay_wait_with(WHY_READ, &args, |line| {
                     !refresh_over_flight_homes(&line.homes_written, runs)
                 }) {
                     R5_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    R5_STATS[late_lift::R5_H2_US].fetch_add(us, Ordering::Relaxed);
                     if waiting == 0 {
                         waiting = stamp;
                     }
@@ -8893,14 +8991,27 @@ impl HostList {
         for list in runs {
             let mut deferred = list.deferred();
             let deferred = &mut *deferred;
-            for step in &mut deferred.copies {
-                if let Step::Lifted(lift) = step {
-                    let cpu = lift.cpu_step();
-                    if let Step::Lifted(lift) = std::mem::replace(step, cpu) {
-                        deferred.spent.push(*lift);
-                    }
-                }
+            if !deferred
+                .copies
+                .iter()
+                .any(|step| matches!(step, Step::Lifted(_)))
+            {
+                continue;
             }
+            // (A lifted refresh goes: its refresh step is still there.)
+            let steps = std::mem::take(&mut deferred.copies);
+            let spent = &mut deferred.spent;
+            deferred.copies = steps
+                .into_iter()
+                .filter_map(|step| match step {
+                    Step::Lifted(lift) => {
+                        let cpu = lift.cpu_step();
+                        spent.push(*lift);
+                        cpu
+                    }
+                    step => Some(step),
+                })
+                .collect();
         }
     }
 
@@ -9750,9 +9861,13 @@ impl HostList {
                     // Done on the card at the head of the submission: the
                     // source's host copy brought up to date (ranges flights
                     // write stay as they are), nothing read or written on
-                    // the CPU.
+                    // the CPU. (A lifted refresh's copy is refreshed by its
+                    // own step, which stays: the card's copy goes over that.)
                     batch.add(&lift.src, lift.src_at, lift.len);
                     let (dst, dst_offset, bounce) = match &lift.to {
+                        LiftedTo::Refresh(copy) => {
+                            (copy.buffer.clone(), copy.offset(lift.src_at as u64), None)
+                        }
                         LiftedTo::Copy(dst, at, bounce) => {
                             // As shaders' writes: the destination's copy up
                             // to date first, then its bytes kept, so that
@@ -9793,7 +9908,13 @@ impl HostList {
         scratch
             .chunks
             .iter()
-            .find(|(chunk, size)| chunk.data <= at && at.checked_add(len).is_some_and(|end| end <= chunk.data + *size as usize))
+            .find(|(chunk, size)| {
+                chunk.shared
+                    && chunk.data <= at
+                    && at
+                        .checked_add(len)
+                        .is_some_and(|end| end <= chunk.data + *size as usize)
+            })
             .map(|(chunk, _)| (chunk.buffer.clone(), (at - chunk.data) as u64))
     }
 }

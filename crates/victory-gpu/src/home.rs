@@ -3021,6 +3021,9 @@ pub(crate) mod tests {
         list
     }
 
+    /// R5's reads of homes on the card (`VICTORY_R5_LIFT=1`).
+    mod r5_lift;
+
     /// A flight's shaders write a home's range; the next submission fills
     /// upload memory from that range: it waits for that flight (a read of
     /// what flights write), and once it is prepared its fill holds the
