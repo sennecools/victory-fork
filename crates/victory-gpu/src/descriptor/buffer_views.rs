@@ -7,8 +7,6 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{REFUSED_VIEWS, Resolved, View, srv_desc, uav_desc};
 
-/// A buffer view of title memory at `address` on its host copy: the first
-/// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
 fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     // SAFETY: a buffer view's union member.
@@ -56,8 +54,8 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 
 /// The title memory the host slot of buffer view `view` is made on
 /// (address, bytes): the whole buffer the view is of, which is what
-/// [`make`] finds the host copy by. [`buffer_range`] is the part of it the
-/// view reads.
+/// [`make`](super::make) finds the host copy by. [`buffer_range`] is the
+/// part of it the view reads.
 pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
     match view {
         View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
@@ -83,15 +81,17 @@ fn view_extent() -> bool {
 /// The host copy buffer view `view` reads, and the title range (address,
 /// bytes) it reads there; `None` for other views and empty ranges.
 ///
-/// The copy is the one the view's slot shows: [`make`] finds it by the
-/// whole buffer the view is of ([`buffer_extent`]). Looked up by the range
-/// the view reads, as it was, the copy is another one wherever the two
-/// lookups differ: for memory outside buffer objects, a view of a part of a
+/// The copy is the one the view's slot shows: [`make`](super::make) finds
+/// it by the whole buffer the view is of ([`buffer_extent`]). Looked up by
+/// the range the view reads, as it was, the copy is another one wherever
+/// the two lookups differ: for memory outside buffer objects, a view of a part of a
 /// buffer that crosses a window line (the buffer's window is two cells, the
 /// part's one), and for buffer objects, a part that also lies in a smaller
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
-pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+pub(crate) fn buffer_copy(
+    view: &View,
+) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -103,7 +103,15 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if let Some((base, width)) = buffer_extent(view)
         && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
         && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+        && let Some((start, bytes)) = own_bytes(
+            whole.offset(base),
+            base,
+            first,
+            count,
+            element,
+            stride,
+            unknown,
+        )
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
         return Some((own, start, bytes));
@@ -156,8 +164,25 @@ fn own_copy_on() -> bool {
 /// a view has no host view there; it is made on a copy of its own bytes
 /// (`crate::shadow::exact`), where it starts at element 0. `None`: the
 /// view is made on its buffer's copy, as every other.
-fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
-    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
+fn own_bytes(
+    offset: u64,
+    base: u64,
+    first: u64,
+    count: u32,
+    element: u64,
+    stride: u32,
+    unknown: bool,
+) -> Option<(u64, u64)> {
+    own_bytes_if(
+        own_copy_on(),
+        offset,
+        base,
+        first,
+        count,
+        element,
+        stride,
+        unknown,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -189,7 +214,9 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
         View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
-        View::Placed(unordered, resource, d) if resource[0] == BUFFER => (d[..10].try_into().ok()?, *unordered),
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
+            (d[..10].try_into().ok()?, *unordered)
+        }
         _ => return None,
     };
     if unordered {
@@ -203,12 +230,24 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
         } else {
             crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
-        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+        Some((
+            b.FirstElement,
+            b.NumElements,
+            element,
+            b.StructureByteStride,
+            d.Format == DXGI_FORMAT_UNKNOWN,
+        ))
     } else {
         let d = srv_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { d.Anonymous.Buffer };
-        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+        Some((
+            b.FirstElement,
+            b.NumElements,
+            element_size(&d),
+            b.StructureByteStride,
+            d.Format == DXGI_FORMAT_UNKNOWN,
+        ))
     }
 }
 
@@ -229,7 +268,11 @@ pub(super) fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Op
     let start = first.checked_mul(u64::from(stride))?.checked_add(offset)?;
     let bytes = u64::from(count) * u64::from(stride);
     (start % 16 == 0 && bytes % 4 == 0)
-        .then(|| u32::try_from(bytes / 4).ok().map(|dwords| (start / 4, dwords)))
+        .then(|| {
+            u32::try_from(bytes / 4)
+                .ok()
+                .map(|dwords| (start / 4, dwords))
+        })
         .flatten()
 }
 
@@ -240,7 +283,14 @@ pub(super) fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Op
 /// without the raw flag, with strides the host has no structured buffers
 /// for. Since every buffer view of the heap is made for shaders that pick
 /// them by index, one such view ended the run (2026-11-24, run 10).
-pub(super) fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> bool {
+pub(super) fn buffer_view_ok(
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+) -> bool {
     use crate::resource::family;
     let f = format.0 as u32;
     let element = if raw {
@@ -284,7 +334,7 @@ pub(super) fn elements_inside(first: u64, count: u32, element: u64, width: u64) 
 
 /// What a shader resource view of title buffer memory at `address` (`len`
 /// bytes) is made from on its host copy, made now if it has none
-/// ([`resolve`]).
+/// ([`resolve`](super::resolve)).
 pub(super) fn buffer_srv(
     address: u64,
     len: u64,
