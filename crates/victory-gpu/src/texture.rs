@@ -1905,8 +1905,9 @@ impl Staging {
             return 0;
         }
         if !alone
-            && let Some((now, written)) =
-                waited(1, || crate::watch::writes(start, start + size, false))
+            && let Some((now, written)) = waited(1, || {
+                crate::watch::writes(start, start + size, false, last.asked)
+            })
         {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -1939,8 +1940,9 @@ impl Staging {
         if !alone
             && *GUARD
                 .get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) =
-                waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || {
+                crate::watch::writes(start, start + size, true, last.asked)
+            })
         {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;

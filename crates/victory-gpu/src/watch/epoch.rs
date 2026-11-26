@@ -1036,12 +1036,12 @@ mod tests {
                     let (at, len) = shapes[i];
                     let from = at + rng.next(len);
                     let to = from + 1 + rng.next(at + len - from);
-                    let ja = asked_in(&journal, a.0 + from, a.0 + to);
+                    let ja = asked_in(&journal, a.0 + from, a.0 + to, 0);
                     let eb = e.asked(b.0 + from, b.0 + to);
                     assert_eq!(ja.is_some(), eb.is_some(), "step {step}: asked");
                     from_stand += usize::from(ja.is_some());
                     let (jn, jw) =
-                        writes_in(&journal, a.0 + from, a.0 + to, false).expect("watched");
+                        writes_in(&journal, a.0 + from, a.0 + to, false, 0).expect("watched");
                     let (en, ew) = e.writes(b.0 + from, b.0 + to, false).expect("watched");
                     assert_eq!(
                         pages(&jw, a.0),
@@ -1097,7 +1097,7 @@ mod tests {
                     e.ask_ahead(&rb);
                     for (i, &(at, len)) in shapes.iter().enumerate() {
                         let (jn, jw) =
-                            writes_in(&journal, a.0 + at, a.0 + at + len, false).expect("watched");
+                            writes_in(&journal, a.0 + at, a.0 + at + len, false, 0).expect("watched");
                         let (en, ew) = e.writes(b.0 + at, b.0 + at + len, false).expect("watched");
                         let (ca, cb) = &mut copies[i];
                         let ta = ca.refresh(a.0 + at, a.0 + at + len, jn, &jw);

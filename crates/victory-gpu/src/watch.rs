@@ -23,16 +23,21 @@
 //! [`MANY_VIEWS`] views). A
 //! system call writing into a guarded block fails (none is known to).
 //!
-//! With `VICTORY_EPOCH_JOURNAL=1` the journal is kept in [`epoch`]'s tables
-//! instead: a number per 4 KiB page, no lock shared by every asking.
+//! The journal's numbers are kept in [`stamps`]' tables: one per page and a
+//! summary per 4 MiB, so an answer costs what was written since the asker's
+//! last take, not what was ever written. With `VICTORY_EPOCH_JOURNAL=1` the
+//! journal is kept in [`epoch`]'s tables instead: a number per 4 KiB page,
+//! no lock shared by every asking.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 mod bits;
 mod epoch;
+mod stamps;
 
 use bits::{Bits, BitsOf, Blocks, guard_bits, in_word};
+use stamps::Stamps;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -52,7 +57,9 @@ pub(crate) struct Tracked {
 /// `views` is true. Other process memory is not tracked.
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     let end = start.checked_add(len)?;
-    if len == 0 || writes(start, end, views).is_none() {
+    // Only whether it can be tracked: no page is wanted (none is stamped
+    // after `u64::MAX`).
+    if len == 0 || writes(start, end, views, u64::MAX).is_none() {
         return None;
     }
     Some(Tracked {
@@ -65,14 +72,11 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
-    /// Big ranges the GPU wrote ([`gpu_wrote`]): first page, end page, and
-    /// the asking they count as written by. A page's asking is the highest
-    /// of its entry in `written` and of the ranges over it
-    /// ([`Journal::pages`]); at most [`GPU_RANGES`] of them, the oldest
-    /// folded into `written` beyond that.
-    gpu: Vec<(usize, usize, u64)>,
+    /// For each page, the highest asking that found it written. Marked
+    /// with this lock held only, so that an asking's marks are made before
+    /// its number is handed out and before another asking of the same
+    /// memory begins (the guards rely on that, [`guard_switched`]).
+    stamps: Stamps,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -90,8 +94,7 @@ impl Journal {
     const fn new() -> Self {
         Self {
             asked: 0,
-            written: BTreeMap::new(),
-            gpu: Vec::new(),
+            stamps: Stamps::new(),
             found: Vec::new(),
             ahead: Vec::new(),
             ahead_asked: 0,
@@ -101,62 +104,35 @@ impl Journal {
 }
 
 impl Journal {
-    /// The pages of `[first, last)` written since tracking began, with the
-    /// asking that last found each written, in page order.
-    fn pages(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
-        let written = self.written.range(first..last).map(|(&p, &w)| (p, w));
-        if !self.gpu.iter().any(|&(a, b, _)| a < last && b > first) {
-            return written.collect();
-        }
-        let mut pages: Vec<(usize, u64)> = self
-            .gpu
-            .iter()
-            .flat_map(|&(a, b, w)| (a.max(first)..b.min(last)).map(move |p| (p, w)))
-            .chain(written)
-            .collect();
-        // Per page the highest: sorted by page, then asking, the last one.
-        pages.sort_unstable();
-        pages.dedup_by(|later, kept| {
-            let same = later.0 == kept.0;
-            if same {
-                kept.1 = later.1;
-            }
-            same
-        });
+    /// The pages of `[first, last)` last found written by an asking after
+    /// `since` (0: since tracking began), with that asking, in page order.
+    fn pages(&self, first: usize, last: usize, since: u64) -> Vec<(usize, u64)> {
+        let mut pages = Vec::new();
+        self.stamps.since(first, last, since, &mut pages);
         pages
     }
 
-    /// Notes pages `[first, last)` written by asking `now`, the newest: one
-    /// entry per page, or one for them all if they are [`GPU_RANGE_PAGES`]
-    /// or more.
-    fn mark(&mut self, first: usize, last: usize, now: u64) {
-        if last - first < GPU_RANGE_PAGES {
-            for page in first..last {
-                self.written.insert(page, now);
+    /// Notes `pages` (in order, each as often as it comes) written by asking
+    /// `now`: a mark per run of pages that follow each other.
+    fn mark_pages(&self, pages: impl IntoIterator<Item = usize>, now: u64) {
+        let mut run: Option<(usize, usize)> = None;
+        for page in pages {
+            match &mut run {
+                Some((_, end)) if page == *end => *end += 1,
+                Some((first, end)) if (*first..*end).contains(&page) => {}
+                _ => {
+                    if let Some((first, end)) = run {
+                        self.stamps.mark(first, end, now);
+                    }
+                    run = Some((page, page + 1));
+                }
             }
-            return;
         }
-        // Those inside it count as written by it from now on.
-        self.gpu.retain(|&(a, b, _)| a < first || b > last);
-        self.gpu.push((first, last, now));
-        if self.gpu.len() > GPU_RANGES {
-            let (a, b, w) = self.gpu.remove(0);
-            for page in a..b {
-                let entry = self.written.entry(page).or_insert(w);
-                *entry = (*entry).max(w);
-            }
+        if let Some((first, end)) = run {
+            self.stamps.mark(first, end, now);
         }
     }
 }
-
-/// GPU-written ranges of at least this many pages (1 MiB) are noted as one
-/// range in the journal ([`Journal::mark`]).
-const GPU_RANGE_PAGES: usize = 16;
-
-/// The most ranges noted so ([`Journal::gpu`]). The same ranges come back
-/// submission after submission (a range inside a newer one goes), so these
-/// are the distinct ones of the last while.
-const GPU_RANGES: usize = 256;
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal::new());
 
@@ -451,9 +427,8 @@ fn wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
-    }
+    j.stamps
+        .mark(at / PAGE, at.saturating_add(len).div_ceil(PAGE), now);
 }
 
 /// The GPU wrote title memory `[at, at + len)` through a home of the memory
@@ -480,7 +455,8 @@ fn gpu_wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
     if !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    j.mark(at / PAGE, at.saturating_add(len).div_ceil(PAGE), now);
+    j.stamps
+        .mark(at / PAGE, at.saturating_add(len).div_ceil(PAGE), now);
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -538,23 +514,19 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
+    j.mark_pages(j.found[..count].iter().map(|&at| at / PAGE), j.ahead_asked);
     true
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
 /// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
-/// pages written since tracking began and the asking that last found each
-/// written, with the number of the asking that stands (as [`writes`] gives
-/// it). `None` if the kernel would have to be asked.
-pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+/// pages last found written by an asking after `since` and that asking, with
+/// the number of the asking that stands (as [`writes`] gives it). `None` if
+/// the kernel would have to be asked.
+pub(crate) fn asked(start: usize, end: usize, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
     match epoch::on() {
-        Some(epochs) => epochs.asked(start, end),
-        None => asked_in(&JOURNAL, start, end),
+        Some(epochs) => epochs.asked(start, end).map(|(now, w)| (now, after(w, since))),
+        None => asked_in(&JOURNAL, start, end, since),
     }
 }
 
@@ -563,25 +535,39 @@ fn asked_in(
     journal: &Mutex<Journal>,
     start: usize,
     end: usize,
+    since: u64,
 ) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.pages(first, last)))
+        .then(|| (j.ahead_asked, j.pages(first, last, since)))
 }
 
-/// The pages of `[start, end)` (whole pages) as last written, for pages
-/// written since tracking began: `(page number, asking)` in page order, and
-/// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+/// The pages of `[start, end)` (whole pages) last found written by an
+/// asking after `since` (0: since tracking began; a copy passes the asking
+/// after which it last took the range): `(page number, asking)` in page
+/// order, and this asking's number, which is higher than any in the list
+/// but those the kernel just reported. `None` if the memory is not
+/// write-watched (nor, with `guarded`, view memory, which is then guarded).
+pub(crate) fn writes(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    since: u64,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     match epoch::on() {
-        Some(epochs) => epochs.writes(start, end, guarded),
-        None => writes_in(&JOURNAL, start, end, guarded),
+        Some(epochs) => epochs
+            .writes(start, end, guarded)
+            .map(|(now, w)| (now, after(w, since))),
+        None => writes_in(&JOURNAL, start, end, guarded, since),
     }
+}
+
+/// Of the epoch tables' answer `written`, the pages written after `since`.
+fn after(written: Vec<(usize, u64)>, since: u64) -> Vec<(usize, u64)> {
+    written.into_iter().filter(|w| w.1 > since).collect()
 }
 
 /// [`writes`] in `journal`.
@@ -590,6 +576,7 @@ fn writes_in(
     start: usize,
     end: usize,
     guarded: bool,
+    since: u64,
 ) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
@@ -599,13 +586,13 @@ fn writes_in(
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((j.ahead_asked, j.pages(first, last)));
+        return Some((j.ahead_asked, j.pages(first, last, since)));
     }
     // Read-only since an asking noted it (`VICTORY_LIGHT_REFRESH=1`): the
     // journal has every write of it.
     if guarded && published(first * PAGE, last * PAGE) {
         j.asked += 1;
-        return Some((j.asked, j.pages(first, last)));
+        return Some((j.asked, j.pages(first, last, since)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -673,16 +660,19 @@ fn writes_in(
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
+    j.mark_pages(
+        j.found[..count]
+            .iter()
+            .map(|&at| at / PAGE)
+            .chain(guarded.iter().copied()),
+        now,
+    );
     // Noted: from now on the bits tell of it (the journal's lock is still
     // held, no other asking of it came between).
     if let Some(pages) = publishing {
         publish(&pages);
     }
-    Some((now, j.pages(first, last)))
+    Some((now, j.pages(first, last, since)))
 }
 
 impl Tracked {
@@ -693,7 +683,9 @@ impl Tracked {
         if from >= to {
             return Vec::new();
         }
-        let Some((_, pages)) = writes(from, to, true) else {
+        // shortcut: every page ever written, filtered by `seen` below; a
+        // stamp per page taken (one `since` for the range) is later work.
+        let Some((_, pages)) = writes(from, to, true, 0) else {
             return Vec::new();
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -959,19 +951,16 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64])
     }
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
-    let pages = match epoch::on() {
-        Some(epochs) => epochs.known(first, last, known),
-        None => {
-            let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-            (known || j.ahead.iter().any(|&(a, b)| a <= first && last <= b))
-                .then(|| j.pages(first, last))
-        }
-    };
-    pages.is_some_and(|pages| {
-        pages
-            .iter()
-            .all(|&(page, write)| write <= taken[page - first])
-    })
+    if let Some(epochs) = epoch::on() {
+        return epochs.known(first, last, known).is_some_and(|pages| {
+            pages
+                .iter()
+                .all(|&(page, write)| write <= taken[page - first])
+        });
+    }
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    (known || j.ahead.iter().any(|&(a, b)| a <= first && last <= b))
+        && j.stamps.none_above(first, last, taken)
 }
 
 /// Whether the block holding `start` is view memory the guards already
@@ -2138,22 +2127,43 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
+        let (_, before) = writes(start, end, false, 0).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
+        let (now, after) = writes(start, end, false, 0).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false, 0).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        // An asker that took the range after `now` (a texture's last
+        // asking) hears of what was written since only.
+        let (_, none) = writes(start, end, false, now).expect("watched");
+        assert!(none.is_empty(), "nothing since {now}");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 3 * PAGE) as *mut u8).write(1) };
+        let (newest, since) = writes(start, end, false, later).expect("watched");
+        assert_eq!(
+            since,
+            [(p / PAGE + 3, newest)],
+            "only the page written since"
+        );
+        let (_, all) = writes(start, end, false, 0).expect("watched");
+        assert_eq!(all, [(p / PAGE + 1, now), (p / PAGE + 3, newest)]);
+        assert!(
+            writes(start, end, false, newest)
+                .expect("watched")
+                .1
+                .is_empty()
+        );
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
                 plain.as_mut_ptr() as usize,
                 plain.as_ptr() as usize + PAGE,
-                true
+                true,
+                0
             )
             .is_none()
         );
@@ -2664,7 +2674,7 @@ mod tests {
     /// What a copy of a range has taken: the asking after which it took
     /// each page, as `crate::shadow::Shadow::copy_stale` notes it.
     fn take(start: usize, end: usize, guarded: bool, copied: &mut [u64]) {
-        let (now, written) = writes(start, end, guarded).expect("watched or a view");
+        let (now, written) = writes(start, end, guarded, 0).expect("watched or a view");
         let base = start / PAGE;
         for (page, at) in copied.iter_mut().enumerate() {
             let write = written
@@ -2833,6 +2843,7 @@ mod tests {
                             all[asked] + page * PAGE,
                             all[asked] + (page + 1) * PAGE,
                             true,
+                            0,
                         )
                         .expect("a view");
                         let number = written.first().map_or(0, |w| w.1);
@@ -2880,7 +2891,7 @@ mod tests {
                                 usize::from(published(at + from * PAGE, at + to * PAGE)),
                                 std::sync::atomic::Ordering::Relaxed,
                             );
-                            let (now, _) = writes(at + from * PAGE, at + to * PAGE, true).expect("a view");
+                            let (now, _) = writes(at + from * PAGE, at + to * PAGE, true, 0).expect("a view");
                             for l in &mut last[from..to] {
                                 *l = now;
                             }
@@ -2893,7 +2904,7 @@ mod tests {
                         }
                         // SAFETY: a word of the test's views, this thread's.
                         unsafe { (word as *mut u64).write_volatile(1) };
-                        let (now, written) = writes(at + from * PAGE, at + to * PAGE, true).expect("a view");
+                        let (now, written) = writes(at + from * PAGE, at + to * PAGE, true, 0).expect("a view");
                         let number = written.iter().find(|w| w.0 == at / PAGE + page).map_or(0, |w| w.1);
                         assert!(
                             number > last[page],
@@ -2925,7 +2936,7 @@ mod tests {
             // bits.
             std::thread::sleep(super::rest().max(rest) + std::time::Duration::from_millis(1));
             for &at in &all {
-                writes(at, at + PAGES * PAGE, true).expect("a view");
+                writes(at, at + PAGES * PAGE, true, 0).expect("a view");
             }
             for &at in &all {
                 assert!(
@@ -3021,7 +3032,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
             assert!(writable(two), "no fault for the next write");
-            assert!(writes(two, two + BLOCK, true).is_some());
+            assert!(writes(two, two + BLOCK, true, 0).is_some());
             assert!(!published(two, two + BLOCK) && !published(one, one + BLOCK));
             unsafe { ((two + 8) as *mut u8).write(1) };
         }
@@ -3201,7 +3212,7 @@ mod tests {
         );
         let end = at + BLOCKS * PAGE;
         let ask = |since: u64| -> (u64, Vec<usize>) {
-            let (now, written) = writes(at, end, true).expect("a view");
+            let (now, written) = writes(at, end, true, 0).expect("a view");
             let written = written
                 .into_iter()
                 .filter(|w| w.1 > since)
@@ -3395,8 +3406,8 @@ mod wrote_tests {
         ask_once(&[(p, p + PAGE)]);
         wrote(p, PAGE);
 
-        let (now, written) = writes(p, p + PAGE, false).expect("write-watched page");
-        let (asked_now, asked_written) = asked(p, p + PAGE).expect("in ask_once range");
+        let (now, written) = writes(p, p + PAGE, false, 0).expect("write-watched page");
+        let (asked_now, asked_written) = asked(p, p + PAGE, 0).expect("in ask_once range");
         ask_once_end();
 
         // SAFETY: freeing our private reservation.
@@ -3417,85 +3428,353 @@ mod wrote_tests {
 }
 
 #[cfg(test)]
-mod gpu_range_tests {
-    use super::{GPU_RANGE_PAGES, GPU_RANGES, Journal, PAGE, gpu_wrote_in};
-    use std::collections::BTreeMap;
+mod journal_tests {
+    //! The journal against host copies of title memory kept as
+    //! `crate::shadow::Shadow` keeps them. (The epoch tables' tests, which
+    //! checked them against the journal of ordered maps the stamps replace.)
+    use super::{
+        Journal, KERNEL_PAGE, PAGE, ask_ahead_done_in, ask_ahead_in, ask_once_end_in, ask_once_in,
+        asked_in, gpu_wrote_in, writes_in, wrote_in,
+    };
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc,
+        VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
-    /// GPU writes noted as ranges answer as noting every page would: the
-    /// newest asking per page, whatever the sizes and overlaps, past the
-    /// most ranges kept (the oldest folded into the pages), and mixed with
-    /// pages the kernel reported.
-    #[test]
-    fn gpu_ranges_answer_as_pages_would() {
-        let journal = Mutex::new(Journal::new());
-        // The model: one entry per page, as before.
-        let mut model: BTreeMap<usize, u64> = BTreeMap::new();
-        let mut asked = 0u64;
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = |below: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % below as u64) as usize
-        };
-        const SPACE: usize = 4096;
-        for step in 0..4000 {
-            if next(4) == 0 {
-                // A page the kernel reported, noted as `writes_in` does.
-                let page = next(SPACE);
-                let mut j = journal.lock().unwrap();
-                j.asked += 1;
-                let now = j.asked;
-                j.written.insert(page, now);
-                asked = now;
-                model.insert(page, now);
-            } else {
-                // Mostly small, now and then big, writes of the GPU.
-                let pages = if next(3) == 0 {
-                    GPU_RANGE_PAGES + next(400)
-                } else {
-                    1 + next(GPU_RANGE_PAGES)
+    /// Write-watched memory of ours, committed, freed when dropped.
+    struct Region(usize, usize);
+
+    impl Region {
+        /// Its pages are all there and none counts as written, as in title
+        /// memory the title has used: the kernel counts a page's first
+        /// touch as a write, even a read's.
+        fn new(len: usize) -> Self {
+            // SAFETY: a fresh write-watched allocation, freed on drop.
+            let at = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    len,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(at, 0);
+            for page in (at..at + len).step_by(KERNEL_PAGE) {
+                // SAFETY: inside the allocation, committed read-write.
+                unsafe { (page as *mut u8).write_volatile(0) };
+            }
+            // SAFETY: our allocation.
+            assert_eq!(unsafe { ResetWriteWatch(at as *const _, len) }, 0);
+            Self(at, len)
+        }
+
+        fn write(&self, offset: usize, value: u8) {
+            assert!(offset < self.1);
+            // SAFETY: inside our committed read-write allocation.
+            unsafe { ((self.0 + offset) as *mut u8).write_volatile(value) };
+        }
+    }
+
+    impl Drop for Region {
+        fn drop(&mut self) {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// A host copy of `[start, start + len)` as `crate::shadow::Shadow`
+    /// keeps one: the bytes and, per 64 KiB page, the asking after which it
+    /// was last taken (0: never).
+    struct Copy {
+        start: usize,
+        len: usize,
+        data: Vec<u8>,
+        copied: Vec<u64>,
+    }
+
+    impl Copy {
+        fn new(start: usize, len: usize) -> Self {
+            let pages = (start + len).div_ceil(PAGE) - start / PAGE;
+            Self {
+                start,
+                len,
+                data: vec![0; len],
+                copied: vec![0; pages],
+            }
+        }
+
+        /// The lowest asking a page of `[from, to)` was taken at (0: one
+        /// never was): what was written before it the copy holds.
+        fn since(&self, from: usize, to: usize) -> u64 {
+            let base = self.start / PAGE;
+            self.copied[from / PAGE - base..=(to - 1) / PAGE - base]
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(0)
+        }
+
+        /// `Shadow::copy_stale`: copies the pages of `[from, to)` (inside
+        /// the copy) written after their last copy, notes the whole ones
+        /// taken at `now`; the pages copied, from the copy's first.
+        fn refresh(
+            &mut self,
+            from: usize,
+            to: usize,
+            now: u64,
+            written: &[(usize, u64)],
+        ) -> Vec<usize> {
+            let (start, end) = (self.start, self.start + self.len);
+            let base = start / PAGE;
+            let mut writes = written.iter().peekable();
+            let mut taken = Vec::new();
+            for page in from / PAGE..=(to - 1) / PAGE {
+                let write = match writes.peek() {
+                    Some(&&(p, w)) if p == page => {
+                        writes.next();
+                        w
+                    }
+                    _ => 0,
                 };
-                let first = next(SPACE);
-                let at = first * PAGE + next(PAGE);
-                let len = (pages - 1) * PAGE + 1;
-                gpu_wrote_in(&journal, at, len);
-                asked += 1;
-                for page in at / PAGE..(at + len).div_ceil(PAGE) {
-                    model.insert(page, asked);
+                let at = &mut self.copied[page - base];
+                if *at == 0 || write > *at {
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        *at = now;
+                    }
+                    let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                    // SAFETY: inside the caller's committed region.
+                    let title = unsafe { std::slice::from_raw_parts(lo as *const u8, hi - lo) };
+                    self.data[lo - start..hi - start].copy_from_slice(title);
+                    taken.push(page - base);
                 }
             }
-            let j = journal.lock().unwrap();
-            assert_eq!(j.asked, asked);
-            assert!(j.gpu.len() <= GPU_RANGES, "step {step}: ranges kept");
-            let (a, b) = (next(SPACE + 600), next(SPACE + 600));
-            let (first, last) = (a.min(b), a.max(b) + 1);
-            let want: Vec<(usize, u64)> = model.range(first..last).map(|(&p, &w)| (p, w)).collect();
-            assert_eq!(
-                j.pages(first, last),
-                want,
-                "step {step}: pages {first}..{last}"
-            );
+            taken
         }
-        let all: Vec<(usize, u64)> = model.iter().map(|(&p, &w)| (p, w)).collect();
-        assert_eq!(journal.lock().unwrap().pages(0, usize::MAX / PAGE), all);
-        // The same big ranges again and again, as submissions write them:
-        // nothing more page by page, and as many ranges as there are.
-        let entries = journal.lock().unwrap().written.len();
-        for round in 0..2000 {
-            let first = SPACE + 1000 + (round % 8) * 300;
-            gpu_wrote_in(&journal, first * PAGE, 200 * PAGE);
-            asked += 1;
-            for page in first..first + 200 {
-                model.insert(page, asked);
+
+        /// Whether the copy holds the title's bytes of `[from, to)`.
+        fn holds(&self, from: usize, to: usize) -> bool {
+            // SAFETY: inside the caller's committed region.
+            let title = unsafe { std::slice::from_raw_parts(from as *const u8, to - from) };
+            self.data[from - self.start..to - self.start] == *title
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self, below: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % below as u64) as usize
+        }
+    }
+
+    /// Random writes of the title's, writes of the GPU's (unseen by the
+    /// kernel, told as `gpu_wrote` does, big ones over whole groups of the
+    /// stamps), our own told writes, askings ahead and a submission's one
+    /// asking, and refreshes of nested and overlapping copies, half of them
+    /// asking only for what was written since their lowest take: every
+    /// refresh leaves the copy holding the title's bytes.
+    #[test]
+    fn refreshes_copy_every_write() {
+        const SIZE: usize = 40 << 20;
+        let journal = Mutex::new(Journal::new());
+        let r = Region::new(SIZE);
+        // Nested and overlapping copies, some not on page bounds, in three
+        // groups far enough apart to be asked about apart.
+        let shapes: [(usize, usize); 9] = [
+            (0, 4 << 20),
+            (PAGE + 100, 5 * PAGE),
+            (2 * PAGE, PAGE / 2),
+            (3 * PAGE - 8, 2 * PAGE + 16),
+            (20 << 20, 4 << 20),
+            ((21 << 20) + KERNEL_PAGE, 3 * PAGE + 8),
+            ((22 << 20) + 7, PAGE),
+            (36 << 20, 4 << 20),
+            ((37 << 20) + PAGE / 3, 9 * PAGE),
+        ];
+        let mut copies: Vec<Copy> = shapes
+            .iter()
+            .map(|&(at, len)| Copy::new(r.0 + at, len))
+            .collect();
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut standing = false;
+        let (mut stood, mut from_stand, mut gpu) = (0, 0, 0);
+        for step in 0..3000 {
+            match rng.next(11) {
+                // The title writes (no asking may stand: it does not tell).
+                0..=2 => {
+                    if standing {
+                        ask_once_end_in(&journal);
+                        standing = false;
+                    }
+                    for _ in 0..1 + rng.next(8) {
+                        let (at, len) = shapes[rng.next(shapes.len())];
+                        r.write(at + rng.next(len), rng.next(256) as u8);
+                    }
+                }
+                // A refresh of part of a copy.
+                3..=5 => {
+                    let i = rng.next(copies.len());
+                    let (at, len) = shapes[i];
+                    let from = r.0 + at + rng.next(len);
+                    let to = from + 1 + rng.next(r.0 + at + len - from);
+                    let since = if i.is_multiple_of(2) {
+                        copies[i].since(from, to)
+                    } else {
+                        0
+                    };
+                    from_stand += usize::from(asked_in(&journal, from, to, since).is_some());
+                    let (now, written) =
+                        writes_in(&journal, from, to, false, since).expect("watched");
+                    assert!(
+                        written.iter().all(|w| w.1 > since),
+                        "step {step}: since {since}"
+                    );
+                    copies[i].refresh(from, to, now, &written);
+                    assert!(copies[i].holds(from, to), "step {step}: copy {i}");
+                }
+                // A submission's one asking, over some of the copies.
+                6 => {
+                    let picked: Vec<(usize, usize)> = shapes
+                        .iter()
+                        .filter(|_| rng.next(3) != 0)
+                        .map(|&(at, len)| (r.0 + at, r.0 + at + len))
+                        .collect();
+                    ask_once_in(&journal, &picked);
+                    standing = journal.lock().unwrap().kept;
+                    stood += usize::from(standing);
+                }
+                // Our own write while it stands, told.
+                7 => {
+                    let (at, len) = shapes[rng.next(shapes.len())];
+                    let offset = at + rng.next(len);
+                    let n = 1 + rng.next((at + len - offset).min(3 * PAGE));
+                    let value = rng.next(256) as u8;
+                    for k in offset..offset + n {
+                        r.write(k, value);
+                    }
+                    wrote_in(&journal, r.0 + offset, n);
+                }
+                // The GPU writes, unseen by the write watch, and is told.
+                8 => {
+                    let offset = rng.next(SIZE);
+                    let most = [3 * PAGE, 12 << 20][rng.next(2)];
+                    let n = 1 + rng.next((SIZE - offset).min(most));
+                    let value = rng.next(256) as u8;
+                    for k in (offset..offset + n).step_by(1 + rng.next(2 * KERNEL_PAGE)) {
+                        r.write(k, value);
+                    }
+                    // SAFETY: our allocation; what the GPU writes the write
+                    // watch does not see.
+                    let pages = r.0 + offset / KERNEL_PAGE * KERNEL_PAGE;
+                    let end = (r.0 + offset + n).next_multiple_of(KERNEL_PAGE);
+                    assert_eq!(
+                        unsafe { ResetWriteWatch(pages as *const _, end - pages) },
+                        0
+                    );
+                    gpu_wrote_in(&journal, r.0 + offset, n);
+                    // Over a whole group of the stamps (4 MiB, aligned).
+                    let group = 64 * PAGE;
+                    gpu += usize::from(
+                        (r.0 + offset).next_multiple_of(group) + group <= r.0 + offset + n,
+                    );
+                }
+                // An asking ahead for a flush, then its refreshes.
+                9 => {
+                    let all: Vec<_> = shapes
+                        .iter()
+                        .map(|&(at, len)| (r.0 + at, r.0 + at + len))
+                        .collect();
+                    ask_ahead_in(&journal, &all);
+                    for (i, &(from, to)) in all.iter().enumerate() {
+                        let since = if i.is_multiple_of(2) {
+                            copies[i].since(from, to)
+                        } else {
+                            0
+                        };
+                        let (now, written) =
+                            writes_in(&journal, from, to, false, since).expect("watched");
+                        copies[i].refresh(from, to, now, &written);
+                        assert!(copies[i].holds(from, to), "step {step}: copy {i} ahead");
+                    }
+                    ask_ahead_done_in(&journal);
+                }
+                _ => {
+                    ask_once_end_in(&journal);
+                    standing = false;
+                }
             }
         }
-        let j = journal.lock().unwrap();
-        assert_eq!(j.written.len(), entries, "not noted page by page");
-        let ours = |&(a, _, _): &(usize, usize, u64)| a >= SPACE + 1000;
-        assert_eq!(j.gpu.iter().filter(|r| ours(r)).count(), 8);
-        let all: Vec<(usize, u64)> = model.iter().map(|(&p, &w)| (p, w)).collect();
-        assert_eq!(j.pages(0, usize::MAX / PAGE), all);
+        assert!(
+            stood > 100 && from_stand > 100,
+            "the asking that stands was used: {stood}, {from_stand}"
+        );
+        assert!(gpu > 10, "big writes of the GPU: {gpu}");
+    }
+
+    /// Threads asking about overlapping copies while the title writes, one
+    /// of them asking ahead: once the writes stop, every copy brought up to
+    /// date holds the title's bytes.
+    #[test]
+    fn concurrent_askers_miss_no_write() {
+        const SIZE: usize = 64 * PAGE;
+        const THREADS: usize = 4;
+        let journal: &'static Mutex<Journal> = Box::leak(Box::new(Mutex::new(Journal::new())));
+        let r = std::sync::Arc::new(Region::new(SIZE));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let still = std::sync::Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let shapes: [(usize, usize); THREADS] = [
+            (0, SIZE),
+            (3 * PAGE + 5, 20 * PAGE),
+            (16 * PAGE, 40 * PAGE + 3),
+            (60 * PAGE - 1, 4 * PAGE + 1),
+        ];
+        let askers: Vec<_> = shapes
+            .iter()
+            .enumerate()
+            .map(|(n, &(at, len))| {
+                let (r, done, still) = (r.clone(), done.clone(), still.clone());
+                std::thread::spawn(move || {
+                    let (start, end) = (r.0 + at, r.0 + at + len);
+                    let mut copy = Copy::new(start, len);
+                    let all: Vec<(usize, usize)> = shapes
+                        .iter()
+                        .map(|&(a, l)| (r.0 + a, r.0 + a + l))
+                        .collect();
+                    while !done.load(Ordering::SeqCst) {
+                        if n == 0 {
+                            ask_ahead_in(journal, &all);
+                        }
+                        let since = copy.since(start, end);
+                        let (now, written) =
+                            writes_in(journal, start, end, false, since).expect("watched");
+                        copy.refresh(start, end, now, &written);
+                        if n == 0 {
+                            ask_ahead_done_in(journal);
+                        }
+                    }
+                    still.wait();
+                    let since = copy.since(start, end);
+                    let (now, written) =
+                        writes_in(journal, start, end, false, since).expect("watched");
+                    copy.refresh(start, end, now, &written);
+                    assert!(copy.holds(start, end), "copy {n}");
+                })
+            })
+            .collect();
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for round in 0..200_000 {
+            r.write(rng.next(SIZE), round as u8);
+        }
+        done.store(true, Ordering::SeqCst);
+        still.wait();
+        for asker in askers {
+            asker.join().unwrap();
+        }
     }
 }

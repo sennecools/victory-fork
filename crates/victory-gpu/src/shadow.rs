@@ -3467,10 +3467,11 @@ impl Shadow {
         }
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
-            None => true,
-        })
+        busy.into_iter()
+            .any(|(a, e)| match crate::watch::asked(a, e, 0) {
+                Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+                None => true,
+            })
     }
 
     /// Where [`Shadow::stale_under_writes`] says yes: puts the bytes the
@@ -3518,7 +3519,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written)) = crate::watch::writes(a, e, true, 0) else {
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3688,7 +3689,7 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some((now, written)) = crate::watch::writes(from, to, true, 0) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
