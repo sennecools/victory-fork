@@ -436,7 +436,15 @@ impl Drop for Section {
 /// Off, an allocation is one section made with it, reserved, as before:
 /// the title asks for 6.1 GiB at once, which a busy PC often cannot commit
 /// (error 1450). With the pool, the commit charge is that of the chunks the
-/// title touches, each whole.
+/// title touches, each whole: it can pass what the title uses by up to a
+/// chunk's size per chunk, so with small chunks
+/// (`VICTORY_MEMORY_POOL_CHUNK_MB`, `victory_gpu::memory_pool_chunk_bytes`)
+/// it follows what the title touches.
+///
+/// With `VICTORY_MEMORY_POOL_OPEN_PCT` (`victory_gpu::memory_pool_open_pct`)
+/// each chunk counts the pages of it some view shows ([`Chunk::shown`]), and
+/// the GPU side is told when that passes the share either way, so that it
+/// opens a chunk as a heap only for one the title maps enough of.
 ///
 /// With the pool `XMemAllocatePhysicalPages` makes no section and so never
 /// fails for the host's sake; a chunk the host can make no section for
@@ -452,12 +460,16 @@ struct Pool {
     /// Whether the GPU side can make homes in a chunk at all
     /// (`victory_gpu::memory_pool_homes_possible`).
     homes: fn() -> bool,
+    /// The share of a chunk's pages, in percent, whose mapping the GPU side
+    /// is told of ([`Chunk::shown`]); 0: none told.
+    open_pct: u32,
 }
 
-/// A chunk of 256 MiB: a chunk the title touches one page of is committed
-/// whole, so the pool's commit charge can pass what the title uses by up
-/// to this per chunk.
-const CHUNK_PAGES: usize = 4096;
+/// Pages of a chunk of `bytes` (`victory_gpu::memory_pool_chunk_bytes`: a
+/// multiple of 16 MiB, so of pages).
+fn chunk_pages(bytes: u64) -> usize {
+    bytes as usize / PAGE
+}
 
 /// What a chunk must leave free of the PC's commit charge.
 const COMMIT_HEADROOM: usize = 1 << 30;
@@ -471,11 +483,12 @@ impl Pool {
     /// committed whole already, and opening them as heaps there is
     /// untried).
     fn process() -> Option<Pool> {
-        (victory_gpu::memory_pool_on() && !on_wine()).then_some(Pool {
-            chunk_pages: CHUNK_PAGES,
+        (victory_gpu::memory_pool_on() && !on_wine()).then(|| Pool {
+            chunk_pages: chunk_pages(victory_gpu::memory_pool_chunk_bytes()),
             room: commit_room,
             build: windows_build,
             homes: victory_gpu::memory_pool_homes_possible,
+            open_pct: victory_gpu::memory_pool_open_pct(),
         })
     }
 
@@ -566,6 +579,10 @@ struct Chunk {
     making: Mutex<()>,
     /// With the pool: how to make `section`.
     pool: Option<Pool>,
+    /// With the pool and its share ([`Pool::open_pct`]): the pages of the
+    /// chunk some view shows now (keys of `Physical::shown`). Changed with
+    /// the page table's lock held.
+    mapped: AtomicUsize,
 }
 
 impl Chunk {
@@ -576,6 +593,41 @@ impl Chunk {
             section: std::sync::OnceLock::from(section),
             making: Mutex::new(()),
             pool: None,
+            mapped: AtomicUsize::new(0),
+        }
+    }
+
+    /// The share of the chunk's pages whose mapping is counted, in percent
+    /// ([`Pool::open_pct`]); `None`: nothing is counted.
+    fn open_pct(&self) -> Option<u32> {
+        self.pool.map(|pool| pool.open_pct).filter(|&pct| pct > 0)
+    }
+
+    /// `gained` pages of the chunk are shown by a view now that none showed,
+    /// and `lost` no longer by any. With the pool's share, the GPU side is
+    /// told when the pages shown pass it either way
+    /// (`victory_gpu::title_memory_pool_chunk_mapped`). Called with the page
+    /// table's lock held, as the GPU side is told of views, once per change
+    /// of the page table with its net count ([`Shown`]): a view cut in two
+    /// is unmapped whole and its parts mapped again, and a chunk near its
+    /// share must not be told it dropped below and passed it again in
+    /// between, where a home asked for meanwhile would stay a copy.
+    fn shown(&self, gained: usize, lost: usize) {
+        let Some(pct) = self.open_pct() else {
+            return;
+        };
+        let Some(section) = self.section.get() else {
+            return;
+        };
+        let before = self.mapped.load(Ordering::Relaxed);
+        let after = (before + gained).saturating_sub(lost);
+        self.mapped.store(after, Ordering::Relaxed);
+        let pages = self.bytes / PAGE;
+        let enough = |n: usize| n * 100 >= pct as usize * pages;
+        if enough(before) != enough(after) {
+            #[cfg(test)]
+            SHARE_TOLD.fetch_add(1, Ordering::Relaxed);
+            victory_gpu::title_memory_pool_chunk_mapped(section.handle as usize, enough(after));
         }
     }
 
@@ -664,6 +716,38 @@ impl Slice {
     }
 }
 
+/// The pages of chunks newly shown and no longer shown in one change of the
+/// page table, told at its end with their net count ([`Chunk::shown`]).
+/// Only chunks whose mapping is counted are kept.
+#[derive(Default)]
+struct Shown(Vec<(Arc<Chunk>, usize, usize)>);
+
+impl Shown {
+    fn add(&mut self, chunk: &Arc<Chunk>, gained: usize, lost: usize) {
+        if gained == 0 && lost == 0 || chunk.open_pct().is_none() {
+            return;
+        }
+        match self.0.iter_mut().find(|(c, ..)| Arc::ptr_eq(c, chunk)) {
+            Some((_, g, l)) => {
+                *g += gained;
+                *l += lost;
+            }
+            None => self.0.push((chunk.clone(), gained, lost)),
+        }
+    }
+
+    /// Tells each chunk its net count; with the page table's lock held.
+    fn tell(self) {
+        for (chunk, gained, lost) in self.0 {
+            chunk.shown(gained, lost);
+        }
+    }
+}
+
+/// How often a chunk was told its share was passed (tests only).
+#[cfg(test)]
+static SHARE_TOLD: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
@@ -732,6 +816,7 @@ fn allocate_pages(pages: &mut [usize], pool: Option<Pool>) -> bool {
                     section: std::sync::OnceLock::new(),
                     making: Mutex::new(()),
                     pool: Some(pool),
+                    mapped: AtomicUsize::new(0),
                 })
             })
             .collect(),
@@ -1005,7 +1090,22 @@ pub extern "system" fn XMemMapPhysicalPages(
 #[track_caller]
 fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {
     let _changing = changing(physical, base, n * PAGE);
-    unmap(physical, base, n * PAGE);
+    let mut shown = Shown::default();
+    let mapped = remap(physical, base, n, pages, &mut shown);
+    shown.tell();
+    mapped
+}
+
+/// [`map_pages`] within its remapping lock; the pages shown and no longer
+/// shown are added to `shown`.
+fn remap(
+    physical: &mut Physical,
+    base: usize,
+    n: usize,
+    pages: Option<&[usize]>,
+    shown: &mut Shown,
+) -> bool {
+    unmap(physical, base, n * PAGE, shown);
     let Some(pages) = pages else {
         return true;
     };
@@ -1026,7 +1126,7 @@ fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usi
                 })
             })
             .count();
-        if !map(physical, base + i * PAGE, run * PAGE, first) {
+        if !map(physical, base + i * PAGE, run * PAGE, first, shown) {
             return false;
         }
         i += run;
@@ -1076,7 +1176,16 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let mut physical = physical();
     // As in `map_pages`: no read in place meets the gap.
     let _changing = changing(&physical, to, len);
-    unmap(&mut physical, to, len);
+    let mut shown = Shown::default();
+    let mapped = alias(&mut physical, to, from, len, &mut shown);
+    shown.tell();
+    mapped
+}
+
+/// [`map_alias`] within its remapping lock; the pages shown and no longer
+/// shown are added to `shown`.
+fn alias(physical: &mut Physical, to: usize, from: usize, len: usize, shown: &mut Shown) -> bool {
+    unmap(physical, to, len, shown);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -1094,7 +1203,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !map(physical, to + k, PAGE, slice, shown) {
             return false;
         }
     }
@@ -1162,8 +1271,8 @@ fn remap_time_line() {
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
-fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+/// must lie in one placeholder; the pages newly shown are added to `shown`.
+fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice, shown: &mut Shown) -> bool {
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     // With the memory pool, the chunk's section may be made now.
@@ -1219,9 +1328,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         section.handle as usize,
         (slice.index * PAGE) as u64,
     );
+    let mut gained = 0;
     for k in 0..len.div_ceil(PAGE) {
-        physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
+        let addresses = physical.shown.entry(slice.key(k)).or_default();
+        gained += usize::from(addresses.is_empty());
+        addresses.push(base + k * PAGE);
     }
+    shown.add(&slice.chunk, gained, 0);
     physical.views.insert(base, (len, slice));
     #[cfg(feature = "diagnostics")]
     remap_time(4, books);
@@ -1284,8 +1397,9 @@ fn commit_limit_message(
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
-/// are mapped again outside it.
-fn unmap(physical: &mut Physical, base: usize, len: usize) {
+/// are mapped again outside it. The pages no longer shown, and those shown
+/// again, are added to `shown`.
+fn unmap(physical: &mut Physical, base: usize, len: usize, shown: &mut Shown) {
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
@@ -1316,15 +1430,18 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        let mut lost = 0;
         for k in 0..size.div_ceil(PAGE) {
             let key = slice.key(k);
             if let Some(addresses) = physical.shown.get_mut(&key) {
                 addresses.retain(|&a| a != at + k * PAGE);
                 if addresses.is_empty() {
                     physical.shown.remove(&key);
+                    lost += 1;
                 }
             }
         }
+        shown.add(&slice.chunk, 0, lost);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1337,11 +1454,14 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             )
         };
         if at < base {
-            map(physical, at, base - at, slice.clone());
+            map(physical, at, base - at, slice.clone(), shown);
         }
         if at + size > end {
-            let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            let rest = Slice {
+                index: slice.index + (end - at) / PAGE,
+                ..slice
+            };
+            map(physical, end, at + size - end, rest, shown);
         }
     }
 }
@@ -1954,6 +2074,7 @@ mod tests {
         room: all_the_room,
         build: windows_11,
         homes: || true,
+        open_pct: 0,
     };
 
     fn all_the_room() -> Option<usize> {
@@ -2079,46 +2200,139 @@ mod tests {
         }
     }
 
+    /// The chunk sizes the switch takes are whole pages: 16 per MiB.
+    #[test]
+    fn chunk_sizes_are_whole_pages() {
+        for mb in [16u64, 32, 64, 128, 256] {
+            assert_eq!(chunk_pages(mb << 20), mb as usize * 16);
+        }
+    }
+
     /// Pages that follow on across a chunk's end are two runs, and two views
-    /// when mapped: no run, view or page window crosses a chunk.
+    /// when mapped: no run, view or page window crosses a chunk, whatever
+    /// the chunk's size (down to two pages, and the smallest the switch
+    /// takes, 16 MiB).
     #[test]
     fn a_run_never_crosses_a_chunk() {
-        let pages = allocate_pool(6, ROOMY);
-        let lengths = |offset, len| {
-            runs(&pages, offset, len).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>())
-        };
-        assert_eq!(lengths(0, 6 * PAGE), Some(vec![4, 2]));
-        assert_eq!(lengths(3 * PAGE, 2 * PAGE), Some(vec![1, 1]));
-        assert!(page_window(&pages, 3 * PAGE, 2 * PAGE).is_none());
-        assert!(page_window(&pages, 4 * PAGE, 2 * PAGE).is_some());
-        let a = XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            6 * PAGE,
-            MEM_RESERVE | PAGES_64K,
-            0,
-            PAGE_READWRITE,
-        );
-        assert!(!a.is_null());
-        assert_eq!(XMemMapPhysicalPages(a, 6, pages.as_ptr()), a);
-        {
-            let physical = physical();
-            let views: Vec<usize> = physical
-                .views
-                .range(a as usize..a as usize + 6 * PAGE)
-                .map(|(_, v)| v.0)
-                .collect();
-            assert_eq!(views, vec![4 * PAGE, 2 * PAGE]);
+        for chunk in [2, 4, chunk_pages(16 << 20)] {
+            let n = chunk + 2;
+            let pages = allocate_pool(
+                n,
+                Pool {
+                    chunk_pages: chunk,
+                    ..ROOMY
+                },
+            );
+            let lengths = |offset, len| {
+                runs(&pages, offset, len).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>())
+            };
+            assert_eq!(lengths(0, n * PAGE), Some(vec![chunk, 2]));
+            assert_eq!(lengths((chunk - 1) * PAGE, 2 * PAGE), Some(vec![1, 1]));
+            assert!(page_window(&pages, (chunk - 1) * PAGE, 2 * PAGE).is_none());
+            assert!(page_window(&pages, chunk * PAGE, 2 * PAGE).is_some());
+            let a = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                n * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!a.is_null());
+            assert_eq!(XMemMapPhysicalPages(a, n, pages.as_ptr()), a);
+            {
+                let physical = physical();
+                let views: Vec<usize> = physical
+                    .views
+                    .range(a as usize..a as usize + n * PAGE)
+                    .map(|(_, v)| v.0)
+                    .collect();
+                assert_eq!(views, vec![chunk * PAGE, 2 * PAGE]);
+            }
+            // SAFETY: mapped read-write, across the two views.
+            unsafe {
+                a.wrapping_byte_add(chunk * PAGE - 1)
+                    .cast::<[u8; 2]>()
+                    .write_unaligned([1, 2])
+            };
+            assert_eq!(page_bytes(pages[chunk - 1])[PAGE - 1], 1);
+            assert_eq!(page_bytes(pages[chunk])[0], 2);
+            assert_eq!(XMemMapPhysicalPages(a, n, std::ptr::null()), a);
+            assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
         }
-        // SAFETY: mapped read-write, across the two views.
-        unsafe {
-            a.wrapping_byte_add(4 * PAGE - 1)
-                .cast::<[u8; 2]>()
-                .write_unaligned([1, 2])
+    }
+
+    /// With the pool's share, a chunk counts the pages its views show, each
+    /// once however many views show it, and the GPU side is told when that
+    /// passes the share either way; without the share it is told nothing.
+    #[test]
+    fn the_mapped_share_of_a_chunk_is_told_when_it_passes() {
+        let half = Pool {
+            open_pct: 50,
+            ..ROOMY
         };
-        assert_eq!(page_bytes(pages[3])[PAGE - 1], 1);
-        assert_eq!(page_bytes(pages[4])[0], 2);
-        assert_eq!(XMemMapPhysicalPages(a, 6, std::ptr::null()), a);
-        assert_eq!(XMemFreePhysicalPages(6, pages.as_ptr()), 1);
+        let pages = allocate_pool(4, half);
+        let reserve = |n: usize| {
+            let a = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                n * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!a.is_null());
+            a
+        };
+        let (a, b) = (reserve(2), reserve(1));
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        let section = chunk_of(pages[0]).0.section.get().expect("made").handle as usize;
+        let enough = || victory_gpu::title_memory_pool_chunk_mapped_enough(section);
+        assert_eq!(enough(), Some(false), "a quarter");
+        // The same page at a second place: still one page shown.
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages.as_ptr()), b);
+        assert_eq!(enough(), Some(false), "a page counts once");
+        assert_eq!(chunk_of(pages[0]).0.mapped.load(Ordering::Relaxed), 1);
+        // A second page: half.
+        let second = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(second, 1, pages[1..].as_ptr()), second);
+        assert_eq!(enough(), Some(true), "half");
+        // The first page's first view gone: still shown at `b`.
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(enough(), Some(true), "still shown elsewhere");
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(enough(), Some(false), "a quarter again");
+        assert_eq!(XMemMapPhysicalPages(second, 1, std::ptr::null()), second);
+        assert_eq!(chunk_of(pages[1]).0.mapped.load(Ordering::Relaxed), 0);
+        // A view cut in two, or a page mapped again where it is, keeps the
+        // share without telling that it dropped below in between.
+        let d = reserve(3);
+        assert_eq!(XMemMapPhysicalPages(d, 3, pages.as_ptr()), d);
+        assert_eq!(enough(), Some(true), "three quarters");
+        let told = SHARE_TOLD.load(Ordering::Relaxed);
+        let middle = d.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        assert_eq!(chunk_of(pages[0]).0.mapped.load(Ordering::Relaxed), 2);
+        assert_eq!(XMemMapPhysicalPages(d, 1, pages.as_ptr()), d);
+        assert_eq!(chunk_of(pages[0]).0.mapped.load(Ordering::Relaxed), 2);
+        let now = SHARE_TOLD.load(Ordering::Relaxed);
+        assert_eq!(now, told, "never below in between");
+        assert_eq!(enough(), Some(true), "half");
+        assert_eq!(XMemMapPhysicalPages(d, 3, std::ptr::null()), d);
+        assert_eq!(enough(), Some(false), "none");
+        // Without the share nothing is counted or told.
+        let other = allocate_pool(2, ROOMY);
+        let c = reserve(2);
+        assert_eq!(XMemMapPhysicalPages(c, 2, other.as_ptr()), c);
+        let (chunk, _) = chunk_of(other[0]);
+        let section = chunk.section.get().expect("made").handle as usize;
+        assert_eq!(chunk.mapped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            victory_gpu::title_memory_pool_chunk_mapped_enough(section),
+            Some(false)
+        );
+        drop(chunk);
+        assert_eq!(XMemMapPhysicalPages(c, 2, std::ptr::null()), c);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(2, other.as_ptr()), 1);
     }
 
     /// Once its pages are freed and its views unmapped, a chunk's section

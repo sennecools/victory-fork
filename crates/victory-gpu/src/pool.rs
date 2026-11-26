@@ -3,13 +3,23 @@
 //! second slice of the memory core (`crate::home`).
 //!
 //! With the switch on, `xmem` backs each allocation of physical pages by
-//! chunks of 256 MiB, each a section made on the first map or write into
-//! it, committed whole (`SEC_COMMIT`) when the PC has room for it, and
-//! tells this module ([`title_memory_pool_chunk`]). A committed section can
-//! be opened as a heap (`OpenExistingHeapFromFileMapping`,
+//! chunks of 256 MiB (`VICTORY_MEMORY_POOL_CHUNK_MB`: 16, 32, 64 or 128
+//! instead, [`memory_pool_chunk_bytes`]), each a section made on the first
+//! map or write into it, committed whole (`SEC_COMMIT`) when the PC has room
+//! for it, and tells this module ([`title_memory_pool_chunk`]). A committed
+//! section can be opened as a heap (`OpenExistingHeapFromFileMapping`,
 //! `crate::inplace::open`): each chunk is opened once, when a home is first
 //! wanted in it, with one buffer placed over all of it, if the shared part
-//! of the card's budget has room for the whole chunk ([`fits_shared`]).
+//! of the card's budget has room for the whole chunk ([`fits_shared`]) and,
+//! with `VICTORY_MEMORY_POOL_OPEN_PCT` (1 to 100; 0, the default, asks
+//! nothing), once the title maps at least that share of its pages
+//! ([`title_memory_pool_chunk_mapped`]): the card makes an opened chunk
+//! resident whole, and charges the shared budget and the working set all of
+//! it, for however few homes it holds (11 chunks, 2.75 GiB, for 286 MB of
+//! homes in the measured run). Smaller chunks bound that per chunk, and the
+//! commit charge too: a chunk is committed whole as soon as the title
+//! touches one page of it, so with small chunks the commit follows what the
+//! title touches. The share holds back an opening, not the commit.
 //! A title buffer or a
 //! window whose bytes are one run of one chunk's pages at one title view
 //! (`crate::inplace::Cover::Run`) then has its home in that buffer, at the
@@ -32,7 +42,10 @@
 //! A chunk that is not committed (no room in the PC's commit charge, a
 //! Windows before build 20348, a process where the core can make no home,
 //! or the host refused) keeps today's path: its views are copied, guarded
-//! by the watch.
+//! by the watch. So do the views of a committed chunk not opened yet
+//! because the title maps less than the share of it; the copies made then
+//! stay copies once it is opened, until they are let go (as those turned
+//! down for the shared budget do).
 //!
 //! Buffer views the title writes into view heaps are made on the C-pool
 //! home as every other use of the buffer is (one place for the card's
@@ -74,8 +87,16 @@ pub(crate) fn on() -> bool {
         let asked = std::env::var_os("VICTORY_MEMORY_POOL").is_some_and(|v| v == "1");
         let on = asked && crate::home::on();
         if on {
+            let pct = memory_pool_open_pct();
             tracing::info!(
-                "memory pool on (VICTORY_MEMORY_POOL=1): the page pool is made in committed chunks of 256 MiB, and title buffers and windows in one run of one are used by the card in place"
+                chunk_mb = memory_pool_chunk_bytes() >> 20,
+                open_pct = pct,
+                "memory pool on (VICTORY_MEMORY_POOL=1): the page pool is made in committed chunks, and title buffers and windows in one run of one are used by the card in place{}",
+                if pct == 0 {
+                    ""
+                } else {
+                    " once the title maps the share of its chunk"
+                }
             );
         } else if asked {
             tracing::warn!("VICTORY_MEMORY_POOL=1 is ignored without VICTORY_MEMORY_CORE=1");
@@ -90,10 +111,94 @@ pub fn memory_pool_on() -> bool {
     on()
 }
 
+/// The chunk sizes `VICTORY_MEMORY_POOL_CHUNK_MB` takes, in MiB.
+const CHUNK_MBS: [u64; 5] = [16, 32, 64, 128, 256];
+
+/// The chunk size without `VICTORY_MEMORY_POOL_CHUNK_MB`, in MiB.
+const CHUNK_MB: u64 = 256;
+
+/// The chunk size `value` of `VICTORY_MEMORY_POOL_CHUNK_MB` asks for, in
+/// MiB: one of [`CHUNK_MBS`], [`CHUNK_MB`] if unset; `Err` for anything
+/// else.
+fn chunk_mb(value: Option<&str>) -> Result<u64, ()> {
+    let Some(value) = value else {
+        return Ok(CHUNK_MB);
+    };
+    value
+        .trim()
+        .parse()
+        .ok()
+        .filter(|mb| CHUNK_MBS.contains(mb))
+        .ok_or(())
+}
+
+/// The share `value` of `VICTORY_MEMORY_POOL_OPEN_PCT` asks for, in percent
+/// of a chunk's pages: 0 to 100, 0 if unset; `Err` for anything else.
+fn open_pct(value: Option<&str>) -> Result<u32, ()> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    value
+        .trim()
+        .parse()
+        .ok()
+        .filter(|pct| *pct <= 100)
+        .ok_or(())
+}
+
+/// The bytes of a chunk of the pool, for `xmem`
+/// (`VICTORY_MEMORY_POOL_CHUNK_MB`, 256 MiB by default; a value not in
+/// [`CHUNK_MBS`] is warned of and the default used). Read once.
+pub fn memory_pool_chunk_bytes() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let mb = *MB.get_or_init(|| {
+        let value = std::env::var("VICTORY_MEMORY_POOL_CHUNK_MB").ok();
+        chunk_mb(value.as_deref()).unwrap_or_else(|()| {
+            tracing::warn!(
+                value,
+                ?CHUNK_MBS,
+                "VICTORY_MEMORY_POOL_CHUNK_MB is none of the chunk sizes; chunks of {CHUNK_MB} MiB"
+            );
+            CHUNK_MB
+        })
+    });
+    mb << 20
+}
+
+/// The share of a chunk's pages the title must map before the chunk is
+/// opened as a heap, in percent (`VICTORY_MEMORY_POOL_OPEN_PCT`, 0 by
+/// default: opened when a home is first wanted in it, whatever is mapped;
+/// a value over 100 or no number is warned of and 0 used). Read once; for
+/// `xmem`, which tells [`title_memory_pool_chunk_mapped`] when a chunk's
+/// share passes it.
+pub fn memory_pool_open_pct() -> u32 {
+    static PCT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        let value = std::env::var("VICTORY_MEMORY_POOL_OPEN_PCT").ok();
+        open_pct(value.as_deref()).unwrap_or_else(|()| {
+            tracing::warn!(
+                value,
+                "VICTORY_MEMORY_POOL_OPEN_PCT is no share of 0 to 100; chunks open whatever is mapped"
+            );
+            0
+        })
+    })
+}
+
+/// [`memory_pool_open_pct`], or the test's own ([`set_test_open_pct`]).
+fn open_share() -> u32 {
+    #[cfg(test)]
+    if let Some(pct) = TEST_OPEN_PCT.with(std::cell::Cell::get) {
+        return pct;
+    }
+    memory_pool_open_pct()
+}
+
 // The tests' switch, per thread, as `crate::home`'s.
 #[cfg(test)]
 thread_local! {
     static TEST_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_OPEN_PCT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -106,10 +211,18 @@ fn test_on() -> bool {
     false
 }
 
-/// Sets the pool on for this thread's lookups (tests).
+/// Sets the pool on for this thread's lookups (tests), with the switch's
+/// share to open a chunk at ([`set_test_open_pct`]) again.
 #[cfg(test)]
 pub(crate) fn set_test(on: bool) {
     TEST_ON.with(|t| t.set(on));
+    TEST_OPEN_PCT.with(|t| t.set(None));
+}
+
+/// Sets the share to open a chunk at for this thread's lookups (tests).
+#[cfg(test)]
+pub(crate) fn set_test_open_pct(pct: u32) {
+    TEST_OPEN_PCT.with(|t| t.set(Some(pct)));
 }
 
 /// How `xmem` made a chunk of the pool ([`title_memory_pool_chunk`]).
@@ -160,7 +273,9 @@ impl Drop for Opened {
 
 /// The opened chunks' placed buffers (their COM pointers; 0: an empty
 /// place), so that [`is_chunk_buffer`], asked for every view heap slot made
-/// with the pool on, takes no lock. 1,024 chunks of 256 MiB are 256 GiB.
+/// with the pool on, takes no lock. 1,024 chunks of 256 MiB are 256 GiB,
+/// of 16 MiB ([`CHUNK_MBS`]) 16 GiB, well over the 6.1 GiB the title asks
+/// for.
 static CHUNK_BUFFERS: [AtomicUsize; 1024] = [const { AtomicUsize::new(0) }; 1024];
 
 /// Opened chunks' buffers that found no place in [`CHUNK_BUFFERS`]: while
@@ -212,10 +327,15 @@ fn unlist(raw: usize) {
 struct Chunk {
     bytes: u64,
     committed: bool,
-    /// Opened when a home was first wanted in it.
+    /// Opened when a home was first wanted in it (with the switch's share,
+    /// once the title maps that: `mapped_enough`).
     opened: Option<Opened>,
     /// The host refused to open it: never asked again.
     refused: bool,
+    /// `xmem` told that the title maps at least the share of its pages the
+    /// switch asks for ([`title_memory_pool_chunk_mapped`]; looked at only
+    /// with one, [`open_share`]).
+    mapped_enough: bool,
     /// Which chunk made at this handle it is ([`MADE_CHUNKS`]): an opening
     /// made with the lock let go goes in only if the chunk is still the one
     /// it was made for ([`home`]).
@@ -265,10 +385,51 @@ mod at {
     /// View heap slots made on a C-pool home that a let-go of the home had
     /// made anew at their next use ([`super::slots_made_anew`]).
     pub(super) const SLOTS_ANEW: usize = 15;
-    pub(super) const ALL: usize = 16;
+    /// Asks for a home in an unopened chunk turned down because the title
+    /// maps less than the share of it the switch asks for ([`super::home`]).
+    pub(super) const BELOW_SHARE: usize = 16;
+    /// Now: chunks made committed and their bytes (the commit charge they
+    /// hold whole), chunks opened as heaps and their bytes (what the card
+    /// holds resident for the homes in them). A chunk gone stops counting
+    /// at once ([`super::forget`]), while homes still standing in it hold
+    /// its heap until the tables let them go: right after remaps the card
+    /// can hold more than the opened bytes say.
+    pub(super) const COMMITTED_NOW: usize = 17;
+    pub(super) const COMMITTED_BYTES: usize = 18;
+    pub(super) const OPENED_NOW: usize = 19;
+    pub(super) const OPENED_BYTES: usize = 20;
+    pub(super) const ALL: usize = 21;
 }
 
 static COUNTS: [AtomicU64; at::ALL] = [const { AtomicU64::new(0) }; at::ALL];
+
+/// Chunks made committed and chunks opened as heaps since the start, by
+/// size: the first of [`CHUNK_MBS`] they fit in ([`size_class`]; the last
+/// chunk of an allocation can be smaller than the rest).
+static COMMITTED_BY_SIZE: [AtomicU64; CHUNK_MBS.len()] =
+    [const { AtomicU64::new(0) }; CHUNK_MBS.len()];
+static OPENED_BY_SIZE: [AtomicU64; CHUNK_MBS.len()] =
+    [const { AtomicU64::new(0) }; CHUNK_MBS.len()];
+
+/// The place in [`COMMITTED_BY_SIZE`] of a chunk of `bytes`.
+fn size_class(bytes: u64) -> usize {
+    CHUNK_MBS
+        .iter()
+        .position(|&mb| bytes <= mb << 20)
+        .unwrap_or(CHUNK_MBS.len() - 1)
+}
+
+/// A chunk is gone from the table: what it held is no longer counted now.
+fn forget(chunk: &Chunk) {
+    if chunk.committed {
+        COUNTS[at::COMMITTED_NOW].fetch_sub(1, Ordering::Relaxed);
+        COUNTS[at::COMMITTED_BYTES].fetch_sub(chunk.bytes, Ordering::Relaxed);
+    }
+    if chunk.opened.is_some() {
+        COUNTS[at::OPENED_NOW].fetch_sub(1, Ordering::Relaxed);
+        COUNTS[at::OPENED_BYTES].fetch_sub(chunk.bytes, Ordering::Relaxed);
+    }
+}
 
 /// What a chunk's opening must leave of the shared part of the card's
 /// budget (the PC's memory the card uses, where the system also moves
@@ -337,16 +498,26 @@ pub fn title_memory_pool_chunk(section: usize, bytes: u64, how: PoolChunk) {
             "memory pool: a chunk of the page pool is reserved; its views keep their copies"
         );
     }
+    let committed = how == PoolChunk::Committed;
+    if committed {
+        COMMITTED_BY_SIZE[size_class(bytes)].fetch_add(1, Ordering::Relaxed);
+        COUNTS[at::COMMITTED_NOW].fetch_add(1, Ordering::Relaxed);
+        COUNTS[at::COMMITTED_BYTES].fetch_add(bytes, Ordering::Relaxed);
+    }
     let chunk = Chunk {
         bytes,
-        committed: how == PoolChunk::Committed,
+        committed,
         opened: None,
         refused: false,
+        mapped_enough: false,
         serial: MADE_CHUNKS.fetch_add(1, Ordering::Relaxed),
     };
     let old = chunks().insert(section, chunk);
-    if let Some(opened) = old.as_ref().and_then(|chunk| chunk.opened.as_ref()) {
-        crate::memory::chunk_gone(section, &opened.buffer);
+    if let Some(old) = &old {
+        forget(old);
+        if let Some(opened) = &old.opened {
+            crate::memory::chunk_gone(section, &opened.buffer);
+        }
     }
     drop(old);
 }
@@ -357,11 +528,25 @@ pub fn title_memory_pool_chunk(section: usize, bytes: u64, how: PoolChunk) {
 /// charge, after the title freed its pages.
 pub fn title_memory_pool_chunk_gone(section: usize) {
     let old = chunks().remove(&section);
-    // The memory directory's number for it goes too (it holds the buffer).
-    if let Some(opened) = old.as_ref().and_then(|chunk| chunk.opened.as_ref()) {
-        crate::memory::chunk_gone(section, &opened.buffer);
+    if let Some(old) = &old {
+        forget(old);
+        // The memory directory's number for it goes too (it holds the buffer).
+        if let Some(opened) = &old.opened {
+            crate::memory::chunk_gone(section, &opened.buffer);
+        }
     }
     drop(old);
+}
+
+/// `xmem`, with `VICTORY_MEMORY_POOL_OPEN_PCT` ([`memory_pool_open_pct`]):
+/// the title now maps at least that share of the pages of the chunk with
+/// section `section` (`enough`), or no longer does. Told when the share
+/// passes the switch's either way, not at every map. An unopened chunk is
+/// opened only while it does ([`home`]); an opened one stays opened.
+pub fn title_memory_pool_chunk_mapped(section: usize, enough: bool) {
+    if let Some(chunk) = chunks().get_mut(&section) {
+        chunk.mapped_enough = enough;
+    }
 }
 
 /// Whether the GPU side knows `section` as a chunk of the pool (made, and
@@ -371,6 +556,15 @@ pub fn title_memory_pool_chunk_gone(section: usize) {
 #[doc(hidden)]
 pub fn title_memory_pool_chunk_known(section: usize) -> Option<bool> {
     chunks().get(&section).map(|chunk| chunk.opened.is_some())
+}
+
+/// Whether the GPU side was told the title maps at least the switch's share
+/// of the chunk with section `section` ([`title_memory_pool_chunk_mapped`]);
+/// `None` for no chunk known there. Only for `xmem`'s tests, as
+/// [`title_memory_pool_chunk_known`].
+#[doc(hidden)]
+pub fn title_memory_pool_chunk_mapped_enough(section: usize) -> Option<bool> {
+    chunks().get(&section).map(|chunk| chunk.mapped_enough)
 }
 
 /// Whether the memory core can make a C-pool home in this process: the
@@ -385,9 +579,11 @@ pub fn memory_pool_homes_possible() -> bool {
 /// The home of `len` title bytes that are the bytes from `offset` on of the
 /// chunk with section `section`: a buffer over the whole chunk, with the
 /// title bytes at `offset` in it. The chunk is opened now if no home was
-/// wanted in it before, with the chunks' lock let go meanwhile: the opening
-/// takes the host's own time. (Two threads that open one chunk at once both
-/// open it; the first opening to go in is the chunk's, the other is let go.)
+/// wanted in it before (and, with `VICTORY_MEMORY_POOL_OPEN_PCT`, once the
+/// title maps its share of it), with the chunks' lock let go meanwhile:
+/// the opening takes the host's own time. (Two threads that open one chunk
+/// at once both open it; the first opening to go in is the chunk's, the
+/// other is let go.)
 pub(crate) fn home(section: usize, offset: u64, len: u64) -> Result<crate::inplace::Placed, Why> {
     let placed = |opened: &Opened| crate::inplace::Placed {
         buffer: opened.buffer.clone(),
@@ -416,6 +612,11 @@ pub(crate) fn home(section: usize, offset: u64, len: u64) -> Result<crate::inpla
         }
         if let Some(opened) = &chunk.opened {
             return Ok(placed(opened));
+        }
+        // Not latched: asked again once `xmem` tells the share is mapped.
+        if !chunk.mapped_enough && open_share() > 0 {
+            COUNTS[at::BELOW_SHARE].fetch_add(1, Ordering::Relaxed);
+            return Err(Why::BelowShare);
         }
         (chunk.bytes, chunk.serial)
     };
@@ -476,6 +677,9 @@ pub(crate) fn home(section: usize, offset: u64, len: u64) -> Result<crate::inpla
                 (Ok(mut opened), None) => {
                     use windows::core::Interface;
                     COUNTS[at::OPENED].fetch_add(1, Ordering::Relaxed);
+                    OPENED_BY_SIZE[size_class(bytes)].fetch_add(1, Ordering::Relaxed);
+                    COUNTS[at::OPENED_NOW].fetch_add(1, Ordering::Relaxed);
+                    COUNTS[at::OPENED_BYTES].fetch_add(bytes, Ordering::Relaxed);
                     crate::host::name(&opened.buffer, || {
                         format!("page pool chunk {section:#x} in place")
                     });
@@ -624,22 +828,53 @@ pub(crate) fn line() -> String {
     let c: Vec<u64> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let [kept, dropped, held, due] =
         [0, 1, 2, 3].map(|i| crate::descriptor::host::POOL_WRITES[i].load(Ordering::Relaxed));
+    let by_size = |counts: &[AtomicU64]| {
+        counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed).to_string())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let sizes = CHUNK_MBS.map(|mb| mb.to_string()).join("/");
+    // The pool's switches only with the pool on: off, they are ignored, and
+    // a bad value of them is not warned of.
+    let rule = if on() {
+        let pct = open_share();
+        format!(
+            " (chunks of {} MiB, opened {})",
+            memory_pool_chunk_bytes() >> 20,
+            if pct == 0 {
+                "whatever is mapped".to_owned()
+            } else {
+                format!("once {pct} % mapped")
+            }
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "memory pool: chunks {} committed, {} reserved ({} short of commit, {} before build 20348, {} refused by the host, {} where no home can be made); \
-         {} opened as heaps when a home was first wanted ({} refused, {} us, slowest {} us; {} asks turned down by the shared budget); \
-         {} C-pool homes {} MB (made {}, {} let go by remaps; {} view heap slots on them made anew after a let-go); {} GPU-written ranges told to placed textures \
+        "memory pool{rule}: chunks {} committed (by size up to {sizes} MiB: {}), {} reserved ({} short of commit, {} before build 20348, {} refused by the host, {} where no home can be made); \
+         {} opened as heaps when a home was first wanted and the share mapped (by size: {}; {} refused, {} us, slowest {} us; {} asks turned down by the shared budget, {} below the mapped share); \
+         now {} chunks {} MB committed, {} opened {} MB, for {} C-pool homes {} MB (made {}, {} let go by remaps; {} view heap slots on them made anew after a let-go); {} GPU-written ranges told to placed textures \
          ({kept} under texture views kept for the texture pass, {dropped} dropped; {held} slots held their bytes, {due} uploaded before and made due)",
         c[at::COMMITTED],
+        by_size(&COMMITTED_BY_SIZE),
         c[at::SHORT] + c[at::OLD] + c[at::REFUSED] + c[at::NO_HOMES],
         c[at::SHORT],
         c[at::OLD],
         c[at::REFUSED],
         c[at::NO_HOMES],
         c[at::OPENED],
+        by_size(&OPENED_BY_SIZE),
         c[at::OPEN_REFUSED],
         c[at::OPEN_US],
         c[at::OPEN_MOST_US],
         c[at::OVER_BUDGET],
+        c[at::BELOW_SHARE],
+        c[at::COMMITTED_NOW],
+        c[at::COMMITTED_BYTES] >> 20,
+        c[at::OPENED_NOW],
+        c[at::OPENED_BYTES] >> 20,
         c[at::LIVE],
         c[at::LIVE_BYTES] >> 20,
         c[at::MADE],
@@ -686,5 +921,38 @@ mod tests {
         assert!(!fits_shared(16 * GIB, 16 * GIB, chunk), "over: refused");
         assert!(!fits_shared(GIB / 2, 0, chunk), "a budget below the margin");
         assert!(fits_shared(0, u64::MAX, chunk), "no budget reported");
+    }
+
+    /// The chunk size switch takes the sizes it lists and nothing else; the
+    /// share switch 0 to 100; unset, each is today's.
+    #[test]
+    fn the_chunk_switches_take_what_they_list() {
+        assert_eq!(chunk_mb(None), Ok(256));
+        for mb in CHUNK_MBS {
+            assert_eq!(chunk_mb(Some(&mb.to_string())), Ok(mb));
+        }
+        assert_eq!(chunk_mb(Some(" 16 ")), Ok(16));
+        for wrong in ["0", "8", "48", "512", "-16", "16m", ""] {
+            assert_eq!(chunk_mb(Some(wrong)), Err(()), "{wrong:?}");
+        }
+        assert_eq!(open_pct(None), Ok(0));
+        assert_eq!(open_pct(Some("50")), Ok(50));
+        assert_eq!(open_pct(Some("100")), Ok(100));
+        for wrong in ["101", "-1", "half", "50%"] {
+            assert_eq!(open_pct(Some(wrong)), Err(()), "{wrong:?}");
+        }
+    }
+
+    /// A chunk is counted under the first size it fits in: the last chunk of
+    /// an allocation, smaller, under the size at or above it.
+    #[test]
+    fn chunks_are_counted_by_the_size_they_fit_in() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(size_class(64 << 10), 0);
+        assert_eq!(size_class(16 * MIB), 0);
+        assert_eq!(size_class(16 * MIB + 1), 1);
+        assert_eq!(size_class(100 * MIB), 3);
+        assert_eq!(size_class(256 * MIB), 4);
+        assert_eq!(size_class(1 << 40), 4, "none bigger is made");
     }
 }

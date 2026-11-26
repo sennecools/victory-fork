@@ -279,6 +279,10 @@ pub(crate) enum Why {
     /// budget has no room for it (`crate::pool::fits_shared`); asked again
     /// later.
     OverBudget,
+    /// View memory of an unopened chunk the title maps less than
+    /// `VICTORY_MEMORY_POOL_OPEN_PCT` of (`crate::pool::home`); asked again
+    /// later.
+    BelowShare,
     /// View memory whose run reaches past its chunk's end: the census of
     /// views and the chunk table disagree (never expected).
     PastChunk,
@@ -299,7 +303,7 @@ pub(crate) enum Why {
     Refused,
 }
 
-const WHYS: [(Why, &str); 18] = [
+const WHYS: [(Why, &str); 19] = [
     (Why::Late, "late waits"),
     (Why::NoDevice13, "no ID3D12Device13"),
     (Why::Latched, "after the host's refusals"),
@@ -315,6 +319,10 @@ const WHYS: [(Why, &str); 18] = [
     (
         Why::OverBudget,
         "view memory in a pool chunk the shared budget has no room for",
+    ),
+    (
+        Why::BelowShare,
+        "view memory in a pool chunk mapped below VICTORY_MEMORY_POOL_OPEN_PCT",
     ),
     (Why::PastChunk, "view memory past its pool chunk's end"),
     (Why::Remapping, "view memory being remapped"),
@@ -3499,6 +3507,88 @@ pub(crate) mod tests {
         drop((copy, home));
         place.unmap(0, 2 * K64);
         place.unmap(2 * K64, 2 * K64);
+    }
+
+    /// Chunks of the smallest size `VICTORY_MEMORY_POOL_CHUNK_MB` takes
+    /// (16 MiB) side by side: a buffer inside one is a home in it at its
+    /// offset, and one across their seam keeps its copy.
+    #[test]
+    fn warp_pool_small_chunks_are_homes_and_a_view_across_them_stays_a_copy() {
+        const MIB16: u64 = 16 << 20;
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::pool();
+        let (a, b) = (
+            TestChunk::new(MIB16 as usize, crate::pool::PoolChunk::Committed),
+            TestChunk::new(MIB16 as usize, crate::pool::PoolChunk::Committed),
+        );
+        let place = Place::new(2 * MIB16 as usize);
+        place.map(0, MIB16, &a, 0);
+        place.map(MIB16, MIB16, &b, 0);
+        let (inside, len) = (place.base + MIB16 + 3 * K64, K64);
+        register(0xc0de_2111, inside, len);
+        let home = find(inside, len).expect("a home");
+        assert_eq!(home.home_kind(), Some(Kind::Pool));
+        assert_eq!(
+            home.offset(inside),
+            3 * K64,
+            "at its offset in the second chunk"
+        );
+        let scattered = turned(Why::Scattered);
+        let across = place.base + MIB16 - K64;
+        register(0xc0de_2112, across, 2 * K64);
+        let copy = find(across, 2 * K64).expect("a copy");
+        assert!(!copy.is_home(), "across the seam: a copy");
+        assert_eq!(turned(Why::Scattered), scattered + 1);
+        unregister(0xc0de_2111, inside);
+        unregister(0xc0de_2112, across);
+        drop((home, copy));
+        place.unmap(0, MIB16);
+        place.unmap(MIB16, MIB16);
+    }
+
+    /// With `VICTORY_MEMORY_POOL_OPEN_PCT`, a chunk is opened only once
+    /// `xmem` tells that the title maps its share of it: before, a buffer in
+    /// it keeps its copy, counted for that, and the chunk stays unopened;
+    /// after, the next buffer is a home; and an opened chunk stays opened
+    /// when the share drops again.
+    #[test]
+    fn warp_pool_a_chunk_opens_only_once_the_title_maps_its_share() {
+        let Some(_host) = warp13() else { return };
+        let _on = Switched::pool();
+        crate::pool::set_test_open_pct(50);
+        let chunk = TestChunk::new(4 * K64 as usize, crate::pool::PoolChunk::Committed);
+        let opened = || crate::pool::title_memory_pool_chunk_known(chunk.handle);
+        let place = Place::new(4 * K64 as usize);
+        place.map(0, K64, &chunk, 0);
+        let below = turned(Why::BelowShare);
+        let (start, len) = (place.base + 0x100, 0x1000);
+        register(0xc0de_2121, start, len);
+        let copy = find(start, len).expect("a copy");
+        assert!(!copy.is_home(), "a quarter mapped: a copy");
+        assert_eq!(turned(Why::BelowShare), below + 1);
+        assert_eq!(opened(), Some(false), "not opened");
+        // A second page mapped: half of it, which `xmem` tells.
+        place.map(K64, K64, &chunk, K64);
+        crate::pool::title_memory_pool_chunk_mapped(chunk.handle, true);
+        let (next, small) = (place.base + K64 + 0x200, 0x1000);
+        register(0xc0de_2122, next, small);
+        let home = find(next, small).expect("a home");
+        assert_eq!(home.home_kind(), Some(Kind::Pool));
+        assert_eq!(home.offset(next), K64 + 0x200);
+        assert_eq!(opened(), Some(true), "opened");
+        // Less than the share again: the chunk stays opened.
+        crate::pool::title_memory_pool_chunk_mapped(chunk.handle, false);
+        let third = place.base + 0x4000;
+        register(0xc0de_2123, third, small);
+        let again = find(third, small).expect("a home");
+        assert_eq!(again.home_kind(), Some(Kind::Pool));
+        assert_eq!(turned(Why::BelowShare), below + 1, "not asked of the share");
+        unregister(0xc0de_2121, start);
+        unregister(0xc0de_2122, next);
+        unregister(0xc0de_2123, third);
+        drop((copy, home, again));
+        place.unmap(0, K64);
+        place.unmap(K64, K64);
     }
 
     /// A chunk made reserved (no room in the commit charge) keeps its views'

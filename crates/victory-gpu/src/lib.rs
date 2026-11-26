@@ -84,8 +84,10 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use pool::{
-    PoolChunk, memory_pool_homes_possible, memory_pool_on, title_memory_pool_chunk,
-    title_memory_pool_chunk_gone, title_memory_pool_chunk_known,
+    PoolChunk, memory_pool_chunk_bytes, memory_pool_homes_possible, memory_pool_on,
+    memory_pool_open_pct, title_memory_pool_chunk, title_memory_pool_chunk_gone,
+    title_memory_pool_chunk_known, title_memory_pool_chunk_mapped,
+    title_memory_pool_chunk_mapped_enough,
 };
 #[cfg(windows)]
 pub use upscale::{hook as upscaler_dispatch, standin as upscaler_standin};
