@@ -86,6 +86,10 @@ pub(crate) struct HostHeap {
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
+    /// With [`away_ms`]: the slots made from a texture whose memory was
+    /// found away, with what each was made from and when that was first
+    /// found ([`HostHeap::texture_slot_gone`]).
+    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -822,6 +826,25 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// How long a slot made from a texture whose memory is not mapped stays as
+/// it is, in milliseconds (`VICTORY_TEXTURE_AWAY_MS`; unset or 0, the
+/// default: made null at the first look, as before).
+///
+/// A title that moves a texture in its streaming memory unmaps it before it
+/// maps it again, and what the slot showed went black for the pictures in
+/// between (cool_fox saw faces, books and posters black for 0.3 to 2 s, and
+/// runs with 3000). Kept, the slot shows the host copy it was made from,
+/// which stays until the slot is made null.
+fn away_ms() -> u64 {
+    static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_AWAY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
 /// ranges dropped because no pass took them; slots made due by such
@@ -1435,6 +1458,7 @@ impl HostHeap {
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
+            away: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -2306,14 +2330,47 @@ impl HostHeap {
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
+    ///
+    /// With `VICTORY_TEXTURE_AWAY_MS` ([`away_ms`]) not at the first look,
+    /// only once the memory is still away that long after it was first
+    /// found away (the slot made from the same view meanwhile).
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
         let _made = self.lock_made(Some(hold::GONE));
         let Ok(mut claim) = self.claim(index, |key| key != 0) else {
             return false;
         };
+        let wait = away_ms();
+        if wait != 0 {
+            let now = crate::host::now_ms();
+            let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+            match away.get(&index) {
+                Some(&(was, since)) if was == claim.value && now.saturating_sub(since) < wait => {
+                    return false;
+                }
+                Some(&(was, _)) if was == claim.value => {
+                    away.remove(&index);
+                }
+                _ => {
+                    away.insert(index, (claim.value, now));
+                    return false;
+                }
+            }
+        }
         self.unmake(&mut claim, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// The memory of the texture title slot `index` views is there (again):
+    /// see [`HostHeap::texture_slot_gone`]. Nothing without [`away_ms`].
+    pub(crate) fn texture_slot_here(&self, index: u32) {
+        if away_ms() == 0 {
+            return;
+        }
+        let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+        if !away.is_empty() {
+            away.remove(&index);
+        }
     }
 
     /// Makes host slot `index`, claimed by `claim`, null again, as it is

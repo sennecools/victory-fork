@@ -2281,6 +2281,7 @@ impl State {
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
+                host.texture_slot_here(index);
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
