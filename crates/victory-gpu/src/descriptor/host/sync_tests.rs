@@ -132,6 +132,11 @@ fn words_agree(heap: &HostHeap) {
 /// is made on first use (`crate::resource::host_waits` until then). Left
 /// to the process.
 fn title_texture() -> This {
+    title_texture_of(16, 16)
+}
+
+/// [`title_texture`] of `width` x `height` texels.
+fn title_texture_of(width: u64, height: u32) -> This {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC,
         D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE, D3D12_TEXTURE_LAYOUT_UNKNOWN,
@@ -144,8 +149,8 @@ fn title_texture() -> This {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         Alignment: 0,
-        Width: 16,
-        Height: 16,
+        Width: width,
+        Height: height,
         DepthOrArraySize: 1,
         MipLevels: 1,
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1075,4 +1080,699 @@ fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
     assert!(written() > 0, "without the switch the page is written");
     // SAFETY: this allocation belongs to the test.
     unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+}
+
+/// The oracle the heap sync is held to (wave 1, step W1.8): random title
+/// work on a placed heap (views written by calls and mirrored at once, records
+/// copied in as bytes or by calls, draws that read slots through tables or
+/// make tables, table marks that age, bytes that are no view, released
+/// textures), and at every submission the pass ahead
+/// ([`crate::descriptor::ahead::wait_and_make`]) against a reference heap
+/// that is mirrored slowly: every slot no table had lately, made again from
+/// the record the title holds now. After each submission each slot of the
+/// two must agree on what it was made from (`made`), its word in the table of
+/// strides and the host resource it keeps, and what it was made from must be
+/// the record the title holds there (or nothing, for a view left for later).
+/// Every [`GPU_EVERY`] submissions a compute read through a table of the
+/// placed heap's host slots checks that the slots made from views of texture
+/// objects show those textures.
+///
+/// Left out of the comparison, as the pass leaves them by design:
+/// - slots a table had lately: their draws make them, and the pass looks at
+///   them again next time;
+/// - slots that went on showing an older view of the same placed texture
+///   (`keep_views`);
+/// - slots made from a record whose resource was released since, where the
+///   record did not change: nothing tells the pass of a release, and the
+///   slot keeps its host resource until it is written;
+/// - placed texture views made null in one heap alone as stale (`Spans`)
+///   while that heap holds a rival view of the same memory: which of the two
+///   is the newer depends on the order the writes were seen in;
+/// - views left for later (made only for draws) that one heap shows from a
+///   draw of the same record and the other made null at a write of another
+///   view it saw in between;
+/// - the word of a slot made from nothing (a view left for later, or none):
+///   it is the word of the last write the mirror saw, which differs.
+struct Oracle {
+    placed: Placed,
+    reference: HostHeap,
+    ahead: Ahead,
+    views: Vec<Option<View>>,
+    /// Texture objects with their host copies (held, so the sweep lets none
+    /// go) and their sizes; none in a sampler heap.
+    objects: Vec<(This, std::sync::Arc<crate::resource::HostTexture>, [u32; 2])>,
+    /// Records outside the heap to copy from.
+    scratch: Box<[[u32; 8]; 2]>,
+    /// Slots mirrored at once since a pass last took them (a view written
+    /// or copied by a call, a draw): with `blind_spots` off, no record is
+    /// copied into them as bytes until then.
+    eager: Vec<bool>,
+    blind_spots: bool,
+    gpu: Option<GpuCheck>,
+    /// Submissions, slots compared, slots left out (tables', kept, released),
+    /// GPU checks, placed texture views left out as stale in one heap alone,
+    /// views left for later in one heap alone.
+    counts: [u64; 6],
+}
+
+/// Slots of the heaps the oracle makes.
+const ORACLE_SLOTS: u32 = 64;
+
+/// Submissions between two GPU checks of the oracle.
+const GPU_EVERY: u64 = 8;
+
+impl Oracle {
+    /// An oracle over a heap of `kind`; `blind_spots`: records may be copied
+    /// in as bytes over slots mirrored at once since the last pass. `None`
+    /// with no host GPU.
+    fn new(kind: u32, blind_spots: bool) -> Option<Self> {
+        let placed = Placed::with_slots(kind, ORACLE_SLOTS);
+        placed.host()?;
+        let samplers = kind == descriptor::SAMPLERS;
+        let reference = HostHeap::new(samplers, ORACLE_SLOTS)?;
+        let (views, objects) = if samplers {
+            let sampler = |filter: u32, address: u32| {
+                let mut desc = [filter, address, address, address, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+                desc[11] = 0x7f7f_ffff;
+                Some(View::Sampler(desc))
+            };
+            (
+                vec![
+                    sampler(21, 3),
+                    sampler(0, 1),
+                    sampler(21, 1),
+                    sampler(1, 2),
+                    None,
+                ],
+                Vec::new(),
+            )
+        } else {
+            let objects: Vec<_> = [[16u32, 16u32], [32, 8], [8, 4]]
+                .into_iter()
+                .map(|[width, height]| {
+                    let texture = title_texture_of(u64::from(width), height);
+                    let host = crate::resource::host_copy(texture).expect("a host copy");
+                    (texture, host, [width, height])
+                })
+                .collect();
+            let mut views = views(memory());
+            views.extend(
+                objects
+                    .iter()
+                    .map(|&(t, _, _)| Some(View::Shader(t as usize, None))),
+            );
+            (views, objects)
+        };
+        Some(Self {
+            placed,
+            reference,
+            ahead: Ahead::start(descriptor::sync_heaps)?,
+            views,
+            objects,
+            scratch: Box::new([[0; 8]; 2]),
+            eager: vec![false; ORACLE_SLOTS as usize],
+            blind_spots,
+            gpu: if samplers { None } else { GpuCheck::new() },
+            counts: [0; 6],
+        })
+    }
+
+    fn real(&self) -> &HostHeap {
+        self.placed.host().expect("the host heap")
+    }
+
+    /// The record's bytes of the heap's kind.
+    fn step(&self) -> usize {
+        if self.reference.sampler { 16 } else { 32 }
+    }
+
+    /// `view` written at `handle` by a call.
+    fn call(&mut self, s: u32, view: &Option<View>) {
+        let at = self.placed.at(s);
+        match view {
+            Some(view) => descriptor::record(at, view.clone()),
+            // No view: zeros copied in by a call.
+            None => {
+                self.scratch[0] = [0; 8];
+                let from = self.scratch.as_ptr() as u64;
+                descriptor::copy_simple(std::ptr::null(), 1, at, from, self.kind());
+            }
+        }
+        self.eager[s as usize] = true;
+    }
+
+    fn kind(&self) -> u32 {
+        if self.reference.sampler {
+            descriptor::SAMPLERS
+        } else {
+            descriptor::VIEWS_KIND
+        }
+    }
+
+    /// `view` copied into slot `s` from a record outside the heap: by a call
+    /// (mirrored at once), or as bytes.
+    fn copy(&mut self, s: u32, view: &Option<View>, by_call: bool) {
+        if !by_call && self.eager[s as usize] && !self.blind_spots {
+            return;
+        }
+        let from = self.scratch.as_ptr() as u64 + 32;
+        write(from, view);
+        if by_call {
+            descriptor::copy_simple(std::ptr::null(), 1, self.placed.at(s), from, self.kind());
+            self.eager[s as usize] = true;
+        } else {
+            copy_record(from, self.placed.at(s), self.step());
+        }
+    }
+
+    /// Bytes that are no view of ours written into slot `s`.
+    fn garbage(&mut self, s: u32, r: u64) {
+        if self.eager[s as usize] && !self.blind_spots {
+            return;
+        }
+        let words = [
+            0x7e57_0000 | (r >> 20) as u32 & 0xffff,
+            (r >> 36) as u32,
+            1,
+            2,
+        ];
+        // SAFETY: a record of the heap, at least 16 bytes.
+        unsafe { (self.placed.at(s) as *mut [u32; 4]).write_unaligned(words) };
+    }
+
+    /// A draw reads slot `s` through a table (`tabled`: and marks it a
+    /// table's first), in both heaps.
+    fn draw(&mut self, s: u32, tabled: Option<bool>) {
+        let at = self.placed.at(s);
+        for heap in [self.real(), &self.reference] {
+            if let Some(read) = tabled {
+                heap.texture_slot_tabled(s, read);
+            }
+            heap.mirror(s, at, true);
+        }
+        self.eager[s as usize] = true;
+    }
+
+    /// Slot `s` no table's for long: its stamp aged out, in both heaps.
+    fn age(&self, s: u32) {
+        for heap in [self.real(), &self.reference] {
+            if let Some(stamp) = heap.tabled.get(s as usize) {
+                stamp.store(0, Relaxed);
+            }
+        }
+    }
+
+    /// One random step of title work.
+    fn step_once(&mut self, rng: &mut u64) {
+        let r = next(rng);
+        let s = (r % u64::from(ORACLE_SLOTS)) as u32;
+        let view = self.views[(r >> 16) as usize % self.views.len()].clone();
+        match r >> 8 & 15 {
+            0..=3 => self.call(s, &view),
+            4..=6 => self.copy(s, &view, false),
+            7 | 8 => self.copy(s, &view, true),
+            9 | 10 => self.draw(s, None),
+            11 => self.draw(s, Some(r >> 40 & 1 == 0)),
+            12 => self.age(s),
+            13 => self.garbage(s, r),
+            14 if r >> 40 & 7 == 0 && !self.objects.is_empty() => {
+                let (texture, _, _) = self.objects[(r >> 44) as usize % self.objects.len()];
+                descriptor::forget(texture as usize);
+            }
+            _ => self.submit(),
+        }
+    }
+
+    /// A submission: the pass ahead for the heap and its wait, the
+    /// reference's slow mirror, and the comparison.
+    fn submit(&mut self) {
+        let heaps = [self.placed.registered()];
+        let seq = self.ahead.request(&heaps).expect("a request");
+        crate::descriptor::ahead::wait_and_make(Some(&self.ahead), Some(seq), &heaps);
+        let frame = crate::frame::current();
+        for s in 0..ORACLE_SLOTS {
+            if !self.real().tabled_lately(s, frame) {
+                // The pass took the slot's record.
+                self.eager[s as usize] = false;
+            }
+            if !self.reference.tabled_lately(s, frame) {
+                self.reference.mirror_synced(s, self.placed.at(s));
+            }
+        }
+        self.counts[0] += 1;
+        self.compare(frame);
+        if self.counts[0].is_multiple_of(GPU_EVERY) {
+            self.gpu_check();
+        }
+    }
+
+    /// The comparison of every slot after a submission.
+    fn compare(&mut self, frame: u64) {
+        let n = self.counts[0];
+        for s in 0..ORACLE_SLOTS {
+            let real = self.placed.host().expect("the host heap");
+            if real.tabled_lately(s, frame) {
+                self.counts[2] += 1;
+                continue;
+            }
+            let record = title_key(self.placed.at(s));
+            let (made, slow) = (key(real, s), key(&self.reference, s));
+            let of = |k: u64| {
+                (k != 0)
+                    .then(|| view_at(k as u32, (k >> 32) as u32))
+                    .flatten()
+            };
+            // A record of a released view, unchanged since: the pass does
+            // not look at it.
+            let released = record != 0 && of(record).is_none() && made == record;
+            // An older view of the same placed texture, shown on.
+            let kept = matches!(
+                (of(made), of(slow)),
+                (Some(a), Some(b)) if a != b && same_placed_texture(&a, &b)
+            );
+            if released || kept {
+                self.counts[2] += 1;
+                continue;
+            }
+            // A placed texture view made null in one heap alone, as stale: a
+            // rival there, another slot made from a view of a texture placed
+            // at the same memory that is no view of the record's texture,
+            // made it stale (`Spans`). The spans see the writes in another
+            // order in each heap (the title's calls at once, the slow mirror
+            // at the submission, slot by slot), so which of the two is the
+            // newer differs. Both null is compared as any other slot.
+            if (made == 0) != (slow == 0)
+                && let Some(view) = of(record)
+                && self.rival_in(if made == 0 { real } else { &self.reference }, s, &view)
+            {
+                self.counts[4] += 1;
+                continue;
+            }
+            // A view left for later (of placed memory, or a buffer's: made
+            // only for a draw) shown in one heap, from a draw of the same
+            // record, and made null in the other by a mirror not for a draw:
+            // one heap saw a write of another view in between and the other
+            // did not (a table held the slot meanwhile, so the slow mirror
+            // left it). Neither heap's pass skipped a record it should have
+            // looked at.
+            if (made == 0) != (slow == 0)
+                && made.max(slow) == record
+                && of(record).is_some_and(|view| HostHeap::deferred(&view, false).1)
+            {
+                self.counts[5] += 1;
+                continue;
+            }
+            assert_eq!(
+                made,
+                slow,
+                "the oracle: slot {s} made from another record, submission {n} \
+                 (record {:?}, slow {:?})",
+                of(record),
+                of(slow)
+            );
+            assert!(
+                made == record || made == 0,
+                "the oracle: slot {s} made from {made:#x}, its record is {record:#x}, \
+                 submission {n}"
+            );
+            // A slot made from nothing holds the word of what was last
+            // written into it, a view left for later or none: the pass and
+            // the slow mirror see other last writes.
+            if made != 0 {
+                assert_eq!(
+                    real.word(s),
+                    self.reference.word(s),
+                    "the oracle: slot {s} word, submission {n}"
+                );
+            }
+            assert_eq!(
+                real.kept_raw(s),
+                self.reference.kept_raw(s),
+                "the oracle: slot {s} keeps another resource, submission {n}"
+            );
+            self.counts[1] += 1;
+        }
+    }
+
+    /// Whether `heap` has a slot other than `s` made from a view of a texture
+    /// placed at the memory of `view`'s, of another texture than `view`'s
+    /// (one that makes `view` stale in the spans). `view` must be a placed
+    /// texture view: not a placed buffer (`resource[0] != 1`, the dimension
+    /// word of the resource description, 1 for a buffer).
+    fn rival_in(&self, heap: &HostHeap, s: u32, view: &View) -> bool {
+        let View::Placed(false, resource, desc) = view else {
+            return false;
+        };
+        if resource[0] == 1 {
+            return false;
+        }
+        (0..ORACLE_SLOTS).filter(|&other| other != s).any(|other| {
+            let made = key(heap, other);
+            let rival = (made != 0)
+                .then(|| view_at(made as u32, (made >> 32) as u32))
+                .flatten();
+            matches!(
+                &rival,
+                Some(rival @ View::Placed(false, other_resource, other_desc))
+                    if other_resource[0] != 1
+                        && other_desc[10..12] == desc[10..12]
+                        && !same_placed_texture(rival, view)
+            )
+        })
+    }
+
+    /// The slots of the placed heap made from a view of a texture object, read
+    /// on the card through a table: each shows its texture's size.
+    fn gpu_check(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+        let mut slots = Vec::new();
+        let mut sizes = Vec::new();
+        for s in 0..ORACLE_SLOTS {
+            let made = key(self.real(), s);
+            if made == 0 || made != title_key(self.placed.at(s)) {
+                continue;
+            }
+            if let Some(View::Shader(t, None)) = view_at(made as u32, (made >> 32) as u32)
+                && let Some((_, host, size)) = self.objects.iter().find(|o| o.0 as usize == t)
+            {
+                assert_eq!(
+                    self.real().kept_raw(s),
+                    Some(windows::core::Interface::as_raw(&host.texture)),
+                    "the oracle: slot {s} keeps its texture"
+                );
+                slots.push(s);
+                sizes.push(*size);
+            }
+        }
+        if slots.is_empty() {
+            return;
+        }
+        let read = gpu
+            .sizes(self.real(), &slots)
+            .expect("the card ran every dispatch");
+        assert_eq!(read, sizes, "the oracle: the card reads slots {slots:?}");
+        self.counts[3] += 1;
+    }
+}
+/// The key of the title's record at `handle` (`made`'s, 0 for no view).
+fn title_key(handle: u64) -> u64 {
+    // SAFETY: a record of the caller's heap.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag == descriptor::VIEW_TAG {
+        u64::from(generation) << 32 | u64::from(i)
+    } else {
+        0
+    }
+}
+
+/// A compute program that reads the size of the texture in a slot of a view
+/// heap through a table of that one slot.
+struct GpuCheck {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    out: ID3D12Resource,
+    data: *mut u8,
+}
+
+impl GpuCheck {
+    fn new() -> Option<Self> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0), RootConstants(num32BitConstants = 1, b0)"
+Texture2D<float4> t : register(t0);
+RWByteAddressBuffer o : register(u0);
+cbuffer Slot : register(b0) { uint at; };
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint w, h;
+    t.GetDimensions(w, h);
+    o.Store2(8 * at, uint2(w, h));
+}
+"#;
+        let host = crate::host::host()?;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names outlive the call; the out pointer is ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("oracle"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the oracle's shader compiles");
+        let code = code?;
+        // SAFETY: the blob's own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: the root signature is in the shader.
+        let root: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, bytes) }.ok()?;
+        // SAFETY: the bytecode and root signature live through the call.
+        let pso: ID3D12PipelineState = unsafe {
+            host.device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+        }
+        .ok()?;
+        let (out, data) = host.shared_buffer(2048)?;
+        Some(Self {
+            root,
+            pso,
+            out,
+            data,
+        })
+    }
+
+    /// The size the card reads for the texture in each of `slots` of `heap`,
+    /// on a queue of the check's own (the host's submissions are not
+    /// involved), waited for; `None` if the card left out a dispatch (it
+    /// leaves its mark, all ones, as it was).
+    fn sizes(&self, heap: &HostHeap, slots: &[u32]) -> Option<Vec<[u32; 2]>> {
+        let device = &crate::host::host().expect("the host GPU").device;
+        // SAFETY: the mapping of 2,048 bytes; nothing of ours runs now.
+        unsafe { std::ptr::write_bytes(self.data, 0xff, 8 * slots.len()) };
+        // SAFETY: plain D3D12 calls on objects of ours; the list's heap,
+        // root signature, pipeline and buffer live until it has run, which
+        // the fence waits for.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("an allocator");
+            let l: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .expect("a list");
+            l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.SetComputeRootSignature(&self.root);
+            l.SetPipelineState(&self.pso);
+            l.SetComputeRootUnorderedAccessView(1, self.out.GetGPUVirtualAddress());
+            // A slot a dispatch, as a table of one view.
+            for (k, &s) in slots.iter().enumerate() {
+                l.SetComputeRootDescriptorTable(0, heap.gpu_handle(s));
+                l.SetComputeRoot32BitConstant(2, k as u32, 0);
+                l.Dispatch(1, 1, 1);
+            }
+            l.Close().expect("the list closes");
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("a queue");
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&l).expect("a list"))]);
+            let fence: ID3D12Fence = device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("a fence");
+            queue.Signal(&fence, 1).expect("a signal");
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            while fence.GetCompletedValue() < 1 {
+                assert!(std::time::Instant::now() < until, "the card ran the list");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // SAFETY: the mapping; the list has run.
+        let read: Vec<[u32; 2]> = (0..slots.len())
+            .map(|k| unsafe { self.data.add(8 * k).cast::<[u32; 2]>().read_volatile() })
+            .collect();
+        (!read.contains(&[u32::MAX; 2])).then_some(read)
+    }
+}
+/// [`Oracle`] over `rounds` submissions of a heap of `kind` from `seed`.
+fn oracle_run(kind: u32, seed: u64, rounds: u64, blind_spots: bool) {
+    let _census = crate::census::lock_tests();
+    let Some(mut oracle) = Oracle::new(kind, blind_spots) else {
+        return; // no host GPU
+    };
+    let mut rng = seed;
+    while oracle.counts[0] < rounds {
+        oracle.step_once(&mut rng);
+    }
+    let [submissions, compared, left, gpu, stale, later] = oracle.counts;
+    // Few slots are left out as stale or left for later: a rule that hid
+    // real faults would hide many.
+    assert!(stale * 20 < compared, "stale: {:?}", oracle.counts);
+    assert!(later * 20 < compared, "left for later: {:?}", oracle.counts);
+    assert!(
+        compared > submissions * u64::from(ORACLE_SLOTS) / 4,
+        "{:?}",
+        oracle.counts
+    );
+    if kind == descriptor::VIEWS_KIND {
+        assert!(left > 0, "slots left out: {:?}", oracle.counts);
+        assert!(gpu > 0, "GPU checks: {:?}", oracle.counts);
+    }
+    if kind == descriptor::VIEWS_KIND {
+        // Every made slot holds its view's word (a released view's slot
+        // keeps what it had).
+        let real = oracle.real();
+        for s in 0..ORACLE_SLOTS {
+            let made = key(real, s);
+            if let Some(view) = (made != 0)
+                .then(|| view_at(made as u32, (made >> 32) as u32))
+                .flatten()
+            {
+                assert_eq!(real.word(s), Some(slot_word(Some(&view))), "slot {s}");
+            }
+        }
+    }
+    assert!(alive());
+}
+
+/// [`Oracle`] on a view heap, from three seeds.
+#[test]
+fn the_heap_sync_makes_what_a_slow_mirror_makes_in_a_view_heap() {
+    for seed in [
+        0x9e37_79b9_7f4a_7c15,
+        0x2545_f491_4f6c_dd1d,
+        0x6a09_e667_f3bc_c908,
+    ] {
+        oracle_run(descriptor::VIEWS_KIND, seed, 160, false);
+    }
+}
+
+/// [`Oracle`] on a sampler heap.
+#[test]
+fn the_heap_sync_makes_what_a_slow_mirror_makes_in_a_sampler_heap() {
+    for seed in [0x9e37_79b9_7f4a_7c15, 0x0dd5_eed5_1f1a_4330] {
+        oracle_run(descriptor::SAMPLERS, seed, 160, false);
+    }
+}
+
+/// The blind spot of comparing records with the ones the pass saw last: a
+/// slot no table reads, made by a call from a record Y over the record X the
+/// pass saw, then given X back as bytes before the next pass. The pass finds
+/// X as it saw it and leaves the slot, which goes on showing Y. Today's code
+/// fails the oracle here (W1.9 makes the pass compare against what the slot
+/// is made from).
+#[test]
+#[should_panic(expected = "slot 5 shows another record")]
+fn the_oracle_finds_a_record_written_back_under_a_call() {
+    let _census = crate::census::lock_tests();
+    let placed = Placed::new(descriptor::VIEWS_KIND);
+    let Some(host) = placed.host() else {
+        panic!("slot 5 shows another record: no host GPU");
+    };
+    let (x, y) = (title_texture_of(16, 16), title_texture_of(32, 8));
+    let _hosts = [x, y].map(|t| crate::resource::host_copy(t).expect("a host copy"));
+    let mut elsewhere = [0u64; 4];
+    let source = elsewhere.as_mut_ptr() as u64;
+    write(source, &Some(View::Shader(x as usize, None)));
+    copy_record(source, placed.at(5), 32);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_eq!(key(host, 5), title_key(placed.at(5)), "the pass makes X");
+    write(placed.at(5), &Some(View::Shader(y as usize, None)));
+    assert_eq!(key(host, 5), title_key(placed.at(5)), "the call makes Y");
+    copy_record(source, placed.at(5), 32);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_eq!(
+        key(host, 5),
+        title_key(placed.at(5)),
+        "slot 5 shows another record"
+    );
+}
+/// The oracle's GPU check reads what a slot was made from: slots made from
+/// views of three textures of other sizes, read through one-view tables.
+#[test]
+fn the_oracle_s_card_read_sees_each_slot_s_texture() {
+    let _census = crate::census::lock_tests();
+    let (Some(heap), Some(gpu)) = (HostHeap::new(false, 8), GpuCheck::new()) else {
+        return; // no host GPU
+    };
+    let sizes = [[16u32, 16u32], [32, 8], [8, 4]];
+    let mut records = vec![[0u32; 8]; 8];
+    let base = records.as_mut_ptr() as u64;
+    let mut hosts = Vec::new();
+    for (k, &[width, height]) in sizes.iter().enumerate() {
+        let texture = title_texture_of(u64::from(width), height);
+        hosts.push(crate::resource::host_copy(texture).expect("a host copy"));
+        let at = base + 32 * (2 - k as u64);
+        write(at, &Some(View::Shader(texture as usize, None)));
+        heap.mirror(2 - k as u32, at, true);
+    }
+    let read = gpu
+        .sizes(&heap, &[0, 1, 2])
+        .expect("the card runs the list");
+    assert_eq!(read, [sizes[2], sizes[1], sizes[0]]);
+}
+
+/// Two view heaps read on the card in one list after the other: each shows
+/// its own slots.
+#[test]
+fn the_oracle_s_card_read_tells_two_heaps_apart() {
+    let _census = crate::census::lock_tests();
+    let (Some(one), Some(two), Some(gpu)) = (
+        HostHeap::new(false, 8),
+        HostHeap::new(false, 8),
+        GpuCheck::new(),
+    ) else {
+        return; // no host GPU
+    };
+    let mut records = vec![[0u32; 8]; 8];
+    let base = records.as_mut_ptr() as u64;
+    let mut hosts = Vec::new();
+    let mut textures = Vec::new();
+    for &[width, height] in &[[16u32, 16u32], [32, 8]] {
+        let texture = title_texture_of(u64::from(width), height);
+        hosts.push(crate::resource::host_copy(texture).expect("a host copy"));
+        textures.push(texture);
+    }
+    for (heap, order) in [(&one, [0, 1]), (&two, [1, 0])] {
+        for (s, &k) in order.iter().enumerate() {
+            let at = base + 32 * s as u64;
+            write(at, &Some(View::Shader(textures[k] as usize, None)));
+            heap.mirror(s as u32, at, true);
+        }
+    }
+    assert_eq!(
+        gpu.sizes(&one, &[0, 1]),
+        Some(vec![[16, 16], [32, 8]]),
+        "the first heap"
+    );
+    assert_eq!(
+        gpu.sizes(&two, &[0, 1]),
+        Some(vec![[32, 8], [16, 16]]),
+        "the second heap"
+    );
+    assert_eq!(
+        gpu.sizes(&one, &[0, 1]),
+        Some(vec![[16, 16], [32, 8]]),
+        "the first heap again"
+    );
 }
