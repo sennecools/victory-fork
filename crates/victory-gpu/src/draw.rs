@@ -3977,10 +3977,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    if let Some((shadow, resource, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
+        // The resource the slot shows, whose state the view needs.
+        let resource = resource.as_ref().unwrap_or(&shadow.buffer);
         if kind == ResourceType::Uav {
-            list.buffer_uav(&shadow.buffer);
+            list.buffer_uav(resource);
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
@@ -3993,7 +3995,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         } else {
-            list.buffer_read(&shadow.buffer);
+            list.buffer_read(resource);
         }
     }
     match (view, kind) {
@@ -4383,13 +4385,13 @@ fn walked_copy(
     let copy_began = if timed { crate::profile::stamp() } else { 0 };
     let copy = crate::descriptor::host::buffer_copy(view);
     *copy_ticks += crate::profile::elapsed(copy_began);
-    let (shadow, address, len) = copy?;
+    let (shadow, resource, address, len) = copy?;
     #[cfg(feature = "diagnostics")]
-    if host.shows(index, &shadow.buffer) == Some(false) {
+    if host.shows(index, resource.as_ref().unwrap_or(&shadow.buffer)) == Some(false) {
         HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
     }
     #[cfg(not(feature = "diagnostics"))]
-    let _ = (host, index);
+    let _ = (host, index, resource);
     Some((shadow, address, address + len))
 }
 
