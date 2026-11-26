@@ -1854,28 +1854,7 @@ pub(crate) fn install() {
                 None => EXCEPTION_CONTINUE_SEARCH,
             };
         }
-        let at = r.ExceptionInformation[1];
-        // Another thread opened the block since this one faulted ([`PROTECTED`]
-        // is cleared only once a block is writable again): nothing to wait for
-        // the guards' lock for (cool_fox 7bc7c07).
-        if !PROTECTED.any(at / BLOCK, at / BLOCK + 1) && writable(at) {
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
-        if open(&mut g, at, at + 1) {
-            // (`VICTORY_GUARD_REST`: left open for a while.)
-            if !rest().is_zero() {
-                g.opened(at / BLOCK);
-            }
-            crate::host::r5_flush::count(crate::host::r5_flush::Count::Faults, 1);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
+        if write_fault_taken(r.ExceptionInformation[1]) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         match ours {
@@ -1888,6 +1867,48 @@ pub(crate) fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// What the handler of [`install`] does with a write fault at `at`: whether
+/// the write can go on (a block of ours opened, or one already writable).
+fn write_fault_taken(at: usize) -> bool {
+    let protected = PROTECTED.any(at / BLOCK, at / BLOCK + 1);
+    #[cfg(test)]
+    if let Some(between) = BETWEEN_IN_TEST.get() {
+        between(at);
+    }
+    // Another thread opened the block since this one faulted ([`PROTECTED`]
+    // is cleared only once a block is writable again): nothing to wait for
+    // the guards' lock for, which a guard pass may hold across its kernel
+    // calls (cool_fox 7bc7c07). A clear bit alone does not say the block is
+    // not ours: it may have been opened and guarded again since the bit was
+    // read (a guard pass lets the lock go between its runs), so a block not
+    // writable now is looked at under the lock.
+    if !protected && writable(at) {
+        return true;
+    }
+    // Held across both checks: another thread may have opened the block
+    // since this one faulted, and a copy may have guarded it again since
+    // (then it is ours again, not read-only for some other reason).
+    let mut g = guards();
+    if open(&mut g, at, at + 1) {
+        // (Left open for a while, [`rest`].)
+        if !rest().is_zero() {
+            g.opened(at / BLOCK);
+        }
+        crate::host::r5_flush::count(crate::host::r5_flush::Count::Faults, 1);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        return true;
+    }
+    writable(at)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run by [`write_fault_taken`] on this thread between its look at the
+    /// bits and its look at the memory, for a test of what may come between.
+    static BETWEEN_IN_TEST: std::cell::Cell<Option<fn(usize)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -2091,6 +2112,91 @@ mod tests {
         title_memory_remapped(view, 2 * BLOCK);
     }
 
+    /// A write fault on a block that another thread opened since (its
+    /// [`PROTECTED`] bit clear, the memory writable) is answered without the
+    /// guards' lock, while another thread holds it as a guard pass does
+    /// across its kernel calls.
+    #[test]
+    fn faults_on_opened_blocks_take_no_lock() {
+        // SAFETY: a fresh read-write allocation of ours, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        assert!(!PROTECTED.any(p / BLOCK, p / BLOCK + 1));
+        let held = guards();
+        let (done, taken) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            done.send(write_fault_taken(p + 8)).ok();
+        });
+        let taken = taken.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        assert_eq!(
+            taken,
+            Ok(true),
+            "taken at once, the guards' lock not waited for"
+        );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A write faults on a guarded block; before the handler looks at the
+    /// bits another thread opens the block (as `writing` does, noting no
+    /// rest), and before it looks at the memory a guard pass makes the block
+    /// read-only again. The bit read was clear, the memory is not writable:
+    /// the block is ours again, and the handler opens it under the guards'
+    /// lock rather than taking the title's write for a crash.
+    #[test]
+    fn a_block_guarded_again_during_a_fault_is_opened() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        no_rest();
+        // SAFETY: a pagefile section of one block, mapped read-write; both
+        // are let go at the end.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + BLOCK).is_some());
+        assert!(!writable(view), "guarded");
+        // The fault's thread reads the bit after another thread opened the
+        // block; the guard pass comes between that read and the look at the
+        // memory.
+        writing(view, 8);
+        assert!(writable(view) && !PROTECTED.any(view / BLOCK, view / BLOCK + 1));
+        BETWEEN_IN_TEST.set(Some(|at| {
+            protect(&mut guards(), at / BLOCK, at / BLOCK + 1)
+        }));
+        let taken = write_fault_taken(view + 8);
+        BETWEEN_IN_TEST.set(None);
+        assert!(taken, "the title's write goes on");
+        assert!(writable(view), "opened again");
+        title_memory_remapped(view, BLOCK);
+        // SAFETY: our view and its section's handle.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
