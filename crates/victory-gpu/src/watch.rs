@@ -938,8 +938,7 @@ struct Guards {
     /// no longer clean ([`open`]). A write range can be huge (`fread`), so
     /// only these are looked up.
     aliased: Blocks,
-    /// Blocks opened by a write fault, and when (`VICTORY_GUARD_REST`,
-    /// [`rest`]).
+    /// Blocks opened by a write fault, and when ([`rest`]).
     opened: std::collections::HashMap<usize, std::time::Instant, OpenedHash>,
 }
 
@@ -1010,8 +1009,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 }
 
 /// How long a block the title has just opened by a write fault is left open
-/// by the refreshes that take it (`VICTORY_GUARD_REST=<milliseconds>`; unset
-/// or 0: not at all, as before; cool_fox runs 3).
+/// by the refreshes that take it: [`REST`].
 ///
 /// cool_fox measured 220 of a frame's 586 faults coming within 3 ms after a
 /// refresh had taken the block and made it read-only, while the title was
@@ -1019,22 +1017,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// within a millisecond: made read-only, written, opened, up to a dozen
 /// times a frame. A block that rests is told as written at each asking, at
 /// every view of its page, so nothing is missed; it is made read-only at the
-/// first asking after its rest. Ported from cool_fox 7bc7c07 (microseconds
-/// there, 3,000 unless given).
+/// first asking after its rest. Ported from cool_fox 7bc7c07 (its
+/// `VICTORY_GUARD_REST`, microseconds there, 3,000 unless given).
 fn rest() -> std::time::Duration {
     #[cfg(test)]
     if let Some(rest) = REST_IN_TEST.get() {
         return rest;
     }
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let ms = *MS.get_or_init(|| {
-        std::env::var("VICTORY_GUARD_REST")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    });
-    std::time::Duration::from_millis(ms)
+    REST
 }
+
+/// [`rest`]: what cool_fox runs.
+const REST: std::time::Duration = std::time::Duration::from_millis(3);
 
 #[cfg(test)]
 thread_local! {
@@ -1087,10 +1081,9 @@ fn cover(g: &mut Guards, block: usize) -> bool {
 ///
 /// Letting go is safe: no other asking guards these blocks meanwhile (the
 /// caller holds the journal's lock), and what a fault or the runtime does
-/// meanwhile only opens or forgets blocks.
-/// A block opened after the look below was not clean at it, or is told as
-/// written at the next asking; one forgotten is made read-only again, as
-/// any block that is not clean.
+/// meanwhile only opens or forgets blocks. A block opened after the look
+/// below was not clean at it, or is told as written at the next asking; one
+/// forgotten is made read-only again, as any block that is not clean.
 fn guard_blocks(first: usize, last: usize) -> Vec<usize> {
     let g = guards();
     if g.clean.all(first, last) {
@@ -1754,8 +1747,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         PROTECTED.clear(block);
     });
     aliased.remove_range(range.start, range.end, |_| {});
-    // What rested there was the old mapping's (`VICTORY_GUARD_REST`,
-    // [`rest`]): the new one is guarded at the next asking, as any other.
+    // What rested there was the old mapping's ([`rest`]): the new one is
+    // guarded at the next asking, as any other.
     if !g.opened.is_empty() {
         if range.len() < g.opened.len() {
             for block in range {
@@ -1883,7 +1876,7 @@ mod tests {
 
     /// For a test that checks how blocks are guarded again after a write
     /// fault, not how they rest: no block written on this thread rests
-    /// ([`rest`]), whatever `VICTORY_GUARD_REST` says. With a rest, a block
+    /// ([`rest`]), whatever [`REST`] is. With a rest, a block
     /// the test has just written is told as written, and left open, at every
     /// asking within the rest (at every view of its page); a test that
     /// expects it clean at the next asking would hold only if the rest were
@@ -2641,7 +2634,7 @@ mod tests {
     /// through any of its views, or by us after telling of it (`writing`),
     /// and with views of its pages mapped and unmapped meanwhile: every
     /// asking after a write tells of it, at every view, whatever is known by
-    /// the bits and whichever switches of the guards are on. Ported from cool_fox 2aa8134/7bc7c07/2be0515's
+    /// the bits. Ported from cool_fox 2aa8134/7bc7c07/2be0515's
     /// `writes_to_views_are_not_lost` (without its writes past the guards,
     /// which our line does not have).
     fn writes_to_views_are_not_lost<const VIEWS: usize>(rest_us: u64) {
@@ -2677,9 +2670,7 @@ mod tests {
         std::thread::scope(|s| {
             if VIEWS > 1 {
                 s.spawn(move || {
-                    if !rest.is_zero() {
-                        set_rest_in_test(rest);
-                    }
+                    set_rest_in_test(rest);
                     let mut last = [0u64; VIEWS];
                     for round in 0..300usize {
                         let (page, asked) = (round * 5 % PAGES, round % VIEWS);
@@ -2729,9 +2720,7 @@ mod tests {
             for t in 0..THREADS {
                 let by_bits = &by_bits;
                 s.spawn(move || {
-                    if !rest.is_zero() {
-                        set_rest_in_test(rest);
-                    }
+                    set_rest_in_test(rest);
                     let mut last = [[0u64; PAGES]; VIEWS];
                     let mut seed = t as u64 * 7919 + 1;
                     let mut next = |n: usize| {
@@ -2780,20 +2769,19 @@ mod tests {
                 });
             }
         });
-        // A block that rests after a write (`VICTORY_GUARD_REST`) is not
-        // clean, so not known by its bits, until an asking after its
-        // rest; here the title writes every page again within
-        // milliseconds, and with three views a page is clean only once
-        // none of its views rests: with a rest of milliseconds the bits
-        // may answer none of the askings above. Without a rest they
-        // must.
-        if super::rest().is_zero() {
+        // A block that rests after a write ([`rest`]) is not clean, so not
+        // known by its bits, until an asking after its rest; here the title
+        // writes every page again within milliseconds, and with three views
+        // a page is clean only once none of its views rests: with a rest of
+        // milliseconds the bits may answer none of the askings above.
+        // Without a rest they must.
+        if rest.is_zero() {
             assert!(by_bits.into_inner() > 0, "the bits answered none");
         }
         // Either way: once nothing has been written for longer than any
-        // rest, one asking at each view has every view known by its
-        // bits.
-        std::thread::sleep(super::rest().max(rest) + std::time::Duration::from_millis(1));
+        // rest, one asking at each view has every view known by its bits.
+        set_rest_in_test(rest);
+        std::thread::sleep(rest + std::time::Duration::from_millis(1));
         for &at in &all {
             writes(at, at + PAGES * PAGE, true, 0).expect("a view");
         }
@@ -2810,8 +2798,8 @@ mod tests {
         writes_to_views_are_not_lost::<1>(0);
     }
 
-    /// The same with blocks that rest after a write (`VICTORY_GUARD_REST`,
-    /// here 50 microseconds whatever the switch says).
+    /// The same with blocks that rest after a write ([`rest`], here 50
+    /// microseconds whatever [`REST`] is).
     #[test]
     fn no_write_to_resting_views_is_lost_between_askers() {
         writes_to_views_are_not_lost::<1>(50);
@@ -2857,7 +2845,7 @@ mod tests {
 
     /// A block the title has just written is not made read-only, and is told
     /// as written at each asking, at every view of it, until it has rested
-    /// (`VICTORY_GUARD_REST`, set here for this thread). Ported from
+    /// ([`rest`], set here for this thread). Ported from
     /// cool_fox 7bc7c07.
     #[test]
     fn a_block_just_written_rests() {
