@@ -1,7 +1,6 @@
 //! The heap sync (`super::super::sync_heaps`): a changed page's records at
 //! once and the early skip (`VICTORY_HEAP_SYNC_FAST=1`), and the pass run
-//! ahead on its own thread (`VICTORY_HEAP_SYNC_AHEAD=1`,
-//! `super::super::ahead`).
+//! ahead on its own thread (`super::super::ahead`).
 
 use super::made_tests::{alive, key, memory, next, record_key, texture, views, write};
 use super::*;
@@ -490,7 +489,7 @@ fn a_wait_under_the_submission_lock_ends() {
         std::thread::spawn(move || {
             let seq = ahead.request(&heaps).expect("a request");
             let held = crate::host::flights::submission_lock(gpu);
-            crate::descriptor::ahead::wait_and_make(Some(&ahead), seq, &heaps);
+            crate::descriptor::ahead::wait_and_make(Some(&ahead), Some(seq), &heaps);
             drop(held);
             let _ = done.send(());
         });
@@ -535,7 +534,7 @@ fn slots_left_waiting_are_made_by_the_next_wait() {
     }
     let ahead = Ahead::start(descriptor::sync_heaps).expect("a helper thread");
     let seq = ahead.request(&[placed.registered()]).expect("a request");
-    crate::descriptor::ahead::wait_and_make(Some(&ahead), seq, &[placed.registered()]);
+    crate::descriptor::ahead::wait_and_make(Some(&ahead), Some(seq), &[placed.registered()]);
     assert!(crate::resource::host_waits(title));
     for s in 0..4 {
         assert!(!host.made(s), "slot {s} waits for its texture");
@@ -543,7 +542,7 @@ fn slots_left_waiting_are_made_by_the_next_wait() {
     // Made by a draw before the next submission.
     assert!(crate::resource::host_copy(title).is_some());
     let seq = ahead.request(&[placed.registered()]).expect("a request");
-    crate::descriptor::ahead::wait_and_make(Some(&ahead), seq, &[placed.registered()]);
+    crate::descriptor::ahead::wait_and_make(Some(&ahead), Some(seq), &[placed.registered()]);
     for s in 0..4 {
         assert!(host.made(s), "slot {s} made with its texture");
         assert_eq!(host.word(s), Some(slot_word(Some(&view))), "slot {s}");

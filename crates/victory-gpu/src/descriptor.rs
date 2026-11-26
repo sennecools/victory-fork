@@ -387,10 +387,10 @@ pub(crate) fn sync_heaps(bound: &[usize]) {
 }
 
 /// At the title's end (`crate::release`), after `crate::host::end_submissions`:
-/// waits until `until` for a heap sync pass that is still running (the ahead
-/// helper's, `VICTORY_HEAP_SYNC_AHEAD`, which a refused submission does not
-/// wait for). A pass that starts later sees `ending()` and does nothing.
-/// False if a pass still runs at `until`.
+/// waits until `until` for a heap sync pass that is still running (the
+/// helper's, `ahead`, which a refused submission does not wait for). A
+/// pass that starts later sees `ending()` and does nothing. False if a pass
+/// still runs at `until`.
 #[cfg(windows)]
 pub(crate) fn sync_quiet(until: std::time::Instant) -> bool {
     use std::sync::TryLockError;

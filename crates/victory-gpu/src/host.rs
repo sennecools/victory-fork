@@ -7622,8 +7622,9 @@ impl Host {
         let entered = crate::profile::stamp();
         // The title heaps the lists bind: those the heap sync looks at.
         let bound = HostList::bound_heaps(runs);
-        // Unless `VICTORY_HEAP_SYNC_AHEAD=0`: the heap sync below runs on its
-        // own thread from here, while this one waits and prepares.
+        // The heap sync runs on its own thread from here, while this one
+        // waits and prepares (waited for below, before the lists go to the
+        // card).
         let heap_sync = crate::descriptor::sync_ahead(&bound);
         // Lists whose binds lost the heap buffer pass's claim: not before
         // its walk has ended, and before the submission lock.
@@ -7706,13 +7707,6 @@ impl Host {
         }
         if let Some(submit) = submit.as_mut() {
             gate_args(submit, runs, [entered, walked, locked, waiting]);
-        }
-        // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted. (Its span,
-        // `sync heaps`, is its own.) Ahead of the submission, waited for
-        // before its lists go to the card (`heap_sync`).
-        if heap_sync.is_none() {
-            crate::descriptor::sync_heaps(&bound);
         }
         // Idle host objects are let go by a thread of their own, outside
         // this lock and behind flights too (`sweeper`).
@@ -7881,14 +7875,14 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
-        // The heap sync run ahead (`heap_sync`) has seen what the title
-        // copied into its heaps before this submission, before anything of
+        // Descriptors the title copied into placed heaps directly, before
+        // command lists that index those slots are submitted: the heap sync
+        // run ahead (`heap_sync`) has seen what the title copied into the
+        // heaps the lists bind before this submission, before anything of
         // it goes to the card. The submission lock is held: the sync's
         // thread takes nothing this one holds. Slots it left waiting for a
         // texture made meanwhile are made then too.
-        if let Some(seq) = heap_sync {
-            crate::descriptor::sync_ahead_wait(seq, &bound);
-        }
+        crate::descriptor::sync_ahead_wait(heap_sync, &bound);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.

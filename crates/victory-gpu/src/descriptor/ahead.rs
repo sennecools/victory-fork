@@ -1,17 +1,18 @@
-//! The heap sync run ahead of the submission, on a thread of its own
-//! (on by default, as the play set runs it; `VICTORY_HEAP_SYNC_AHEAD=0`:
-//! [`super::sync_heaps`] runs in place in the submission, as before).
+//! The heap sync ([`super::sync_heaps`]), run ahead of the submission on a
+//! thread of its own.
 //!
 //! Lists read the host heap when they run, so a record the title copied
 //! into its heap as bytes before its `ExecuteCommandLists` must be in the
 //! host heap before ours: the pass for a submission must start after the
-//! title's call and end before the submission goes to the card. In place it
-//! runs on the submitting thread before the submission is prepared (45 to
-//! 49 ms a frame in the R5 profile), though nothing in the preparing reads
-//! what it makes. Here the submission asks for a pass when it begins
+//! title's call and end before the submission goes to the card. In place,
+//! on the submitting thread before the submission is prepared, it took 45
+//! to 49 ms a frame in the R5 profile, though nothing in the preparing
+//! reads what it makes. So the submission asks for a pass when it begins
 //! ([`sync_ahead`]), and waits for it only if it has not ended by the time
 //! the lists go to the card ([`sync_ahead_wait`]): the waits for flights
-//! and the preparing run meanwhile.
+//! and the preparing run meanwhile. Only if the helper cannot run (no
+//! thread could be started, or a pass panicked) does the pass run in place,
+//! at that wait.
 //!
 //! A pass covers the requests made before it began: the helper reads the
 //! number of the last request before the pass looks at a page, and marks
@@ -35,13 +36,6 @@
 //! heaps of the requests the last pass covered; those answer no request.
 
 use std::sync::{Arc, Condvar, Mutex};
-
-/// Whether the heap sync runs ahead on its own thread (unless
-/// `VICTORY_HEAP_SYNC_AHEAD=0`).
-fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_AHEAD").is_none_or(|v| v != "0"))
-}
 
 /// How long the helper waits with no request before it runs a pass of its
 /// own, while submissions come (`VICTORY_HEAP_SYNC_EARLY=<ms>`; unset, the
@@ -72,17 +66,14 @@ fn early() -> Option<std::time::Duration> {
 pub(super) const EARLY_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The helper of the process, started at the first request; `None` if no
-/// thread could be started (the pass then runs in place).
+/// thread could be started (the passes then run in place).
 static AHEAD: std::sync::OnceLock<Option<Ahead>> = std::sync::OnceLock::new();
 
 /// At a submission's start: asks the helper for a pass over `heaps` (the
 /// heaps its lists bind), and returns the request's number for
-/// [`sync_ahead_wait`]. `None` with `VICTORY_HEAP_SYNC_AHEAD` off, or with
-/// no helper: the caller runs [`super::sync_heaps`] in place.
+/// [`sync_ahead_wait`]. `None` with no helper: the pass runs in place at
+/// that wait.
 pub(crate) fn sync_ahead(heaps: &[usize]) -> Option<u64> {
-    if !on() {
-        return None;
-    }
     AHEAD
         .get_or_init(|| Ahead::start_with(super::sync_heaps, early()))
         .as_ref()?
@@ -92,22 +83,23 @@ pub(crate) fn sync_ahead(heaps: &[usize]) -> Option<u64> {
 /// Before the submission of request `seq` ([`sync_ahead`]) goes to the
 /// card: waits until a pass that began after the request has ended. On the
 /// profile, a wait is `sync heaps wait` (`seq`; `behind`: requests not yet
-/// covered when it began). If the helper failed, the pass runs here.
+/// covered when it began). With no request (`None`: no helper), or if the
+/// helper failed, the pass over `heaps` runs here.
 ///
 /// Then the slots a pass left waiting for a texture whose host copy was
 /// made meanwhile are made ([`super::make_waiting`]), as when the pass ran
 /// in place before the submission's own `make_waiting`: the next pass sees
 /// their records as the ones last seen, and leaves them.
-pub(crate) fn sync_ahead_wait(seq: u64, heaps: &[usize]) {
+pub(crate) fn sync_ahead_wait(seq: Option<u64>, heaps: &[usize]) {
     wait_and_make(AHEAD.get().and_then(Option::as_ref), seq, heaps);
 }
 
 /// [`sync_ahead_wait`] with the helper `ahead` (`None`: none, the pass over
 /// `heaps`, the request's, runs here).
-pub(super) fn wait_and_make(ahead: Option<&Ahead>, seq: u64, heaps: &[usize]) {
-    match ahead {
+pub(super) fn wait_and_make(ahead: Option<&Ahead>, seq: Option<u64>, heaps: &[usize]) {
+    match ahead.zip(seq) {
         None => super::sync_heaps(heaps),
-        Some(ahead) => {
+        Some((ahead, seq)) => {
             let behind = ahead.behind(seq);
             if behind > 0 {
                 let _wait = crate::profile::span_args(
