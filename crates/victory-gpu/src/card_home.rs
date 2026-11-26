@@ -729,7 +729,9 @@ pub(crate) fn before(
     }
     // A list whose submission has finished, or a new one; this
     // submission's until it has (with flights, each in the air has its own).
-    let (allocator, list) = match before.lists.take_with(crate::host::finished(), |(_, list)| crate::spans::forget(&list)) {
+    let (allocator, list) = match before.lists.take_with(crate::host::finished(), |(_, list)| {
+        crate::spans::forget(&list)
+    }) {
         Some(made) => {
             // (Diagnostics: its last run is over; its time goes to the sums
             // before it records again, `crate::spans`.)
