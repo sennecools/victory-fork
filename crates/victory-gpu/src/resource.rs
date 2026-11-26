@@ -1160,6 +1160,12 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// With `VICTORY_TEXTURE_SAME=1`: the hash of the title memory its last
+    /// upload was detiled from (`crate::texture::unchanged`).
+    pub(crate) holds: std::sync::Mutex<Option<crate::texture::Hash>>,
+    /// With `VICTORY_TEXTURE_SAME=1`: its last upload was left out as it
+    /// held those bytes (`crate::texture::left_out_memory`).
+    pub(crate) left_out: std::sync::atomic::AtomicBool,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1550,11 +1556,24 @@ pub(crate) fn room() -> bool {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        crate::host::host().and_then(|h| h.video_memory()).map(|[budget, used, a, b]| {
-            [budget, used + crate::shadow::card_room_kept() + targets_room_kept(), a, b]
-        })
+        // used; the empty blocks of `crate::texture_pool`, which new
+        // textures take first, do not ([`kept_used`]).
+        crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, used, a, b]| [budget, kept_used(used), a, b])
     })
+}
+
+/// The card's `used` bytes as the room tests count them: less the empty
+/// blocks of `crate::texture_pool` (0 with its texture half off), plus the
+/// room kept for card copies of title buffers not made yet
+/// (`crate::shadow::card_room_kept`) and for the first world frame's render
+/// targets ([`targets_room_kept`]). As cool_fox 8d79927 counts it.
+#[cfg(windows)]
+fn kept_used(used: u64) -> u64 {
+    used.saturating_sub(crate::texture_pool::texture_room())
+        + crate::shadow::card_room_kept()
+        + targets_room_kept()
 }
 
 #[cfg(any(windows, test))]
@@ -1902,20 +1921,57 @@ pub(crate) fn let_go_idle(
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return None;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    // With `VICTORY_TEXTURE_KEEP=1` kept for minutes while the card has
+    // room, and past it the longest idle first, as many bytes as must go
+    // (`crate::host::vram_keep`).
+    let (idle_ms, most) = match memory {
+        Some([budget, used, ..]) if crate::host::texture_keep() => {
+            crate::host::vram_keep(budget, kept_used(used))
+        }
+        // The idle tiers do not count the pool's empty blocks either (0 with
+        // its texture half off: as before).
+        _ => {
+            let spare = crate::texture_pool::texture_room();
+            let memory =
+                memory.map(|[budget, used, a, b]| [budget, used.saturating_sub(spare), a, b]);
+            (crate::host::vram_idle_ms(memory), u64::MAX)
+        }
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
     let after = from.map_or(Unbounded, Excluded);
+    // With a limit, the textures idle long enough, the longest idle first,
+    // all in this slice (a pass that started without one ends here).
+    let by_age: Option<Vec<usize>> = (most != u64::MAX).then(|| {
+        let mut by_age: Vec<(u64, usize)> = all
+            .iter()
+            .filter_map(|&at| {
+                // SAFETY: as below.
+                let r = unsafe { &*(at as *const Resource) };
+                let used = r.host.used.load(Relaxed);
+                (fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES))
+                    .then_some((used & 0xffff_ffff, at))
+            })
+            .collect();
+        by_age.sort_unstable();
+        by_age.into_iter().map(|(_, at)| at).collect()
+    });
+    let in_order = if by_age.is_some() { 0 } else { usize::MAX };
     let stopped = crate::host::sweep_walk(
-        all.range((after, Unbounded)).map(|&at| (at, ())),
-        until,
+        by_age
+            .iter()
+            .flatten()
+            .chain(all.range((after, Unbounded)).take(in_order))
+            .map(|&at| (at, ())),
+        until.filter(|_| by_age.is_none()),
         |at, ()| {
             // SAFETY: a texture leaves the table before it is freed, under the
             // lock held here (`Drop for Resource`).
             let r = unsafe { &*(at as *const Resource) };
-            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            if bytes >= most || !fills(&r.desc) || crate::texture::host_wrote(at) {
                 return;
             }
             let taken = {
@@ -2104,6 +2160,8 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            holds: std::sync::Mutex::new(None),
+            left_out: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2121,6 +2179,8 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            holds: std::sync::Mutex::new(None),
+            left_out: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -2291,6 +2351,39 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // A texture the title fills, whose every subresource is uploaded from
+    // its staging buffer before anything reads it, or zeroed before a host
+    // copy that comes first (`crate::texture::card_writes`): cut from a
+    // block of `crate::texture_pool` (`VICTORY_TEXTURE_POOL`; what the piece
+    // held before shows in no texel). One plane only: the upload writes
+    // plane 0.
+    if !reserved
+        && crate::texture_pool::textures_on()
+        && fills(desc)
+        && d.sample_count <= 1
+        && clear_value.is_none()
+        && texture_layout(desc)
+            .is_some_and(|t| t.planes.len() == 1 && !t.planes[0].layout.desc.swizzle.xor())
+        // SAFETY: the description has the host layout, as below.
+        && let Some(t) = unsafe {
+            crate::texture_pool::texture(
+                &host.device,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                ),
+            )
+        }
+    {
+        crate::host::label_texture(&t, "host texture (in a block)");
+        crate::host::name(&t, || {
+            format!(
+                "texture {}x{} f{} flags {:#x} (in a block)",
+                d.width, d.height, d.format, d.flags
+            )
+        });
+        return Ok(t);
+    }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture

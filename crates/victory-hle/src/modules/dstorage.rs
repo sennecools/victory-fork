@@ -145,7 +145,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let files = Files::new(file, Io::chosen());
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -223,13 +224,42 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails. The limit on staging
+/// bytes in flight is what it asks for, or the floor if that is more
+/// ([`staging_floor`]).
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let limit = staging_limit(u64::from(size), staging_floor());
+    tracing::info!(size, limit, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = limit;
     }
     S_OK
+}
+
+/// A floor on the staging bytes compressed and buffered reads may hold in
+/// flight (`VICTORY_DSTORAGE_STAGING_MB`, in MiB; unset or 0: none, the
+/// limit is the staging buffer the title asks for, as before). The console
+/// holds the staging buffer for its decompression hardware; here it only
+/// bounds how many buffered reads the workers run at once, so with requests
+/// of a few MiB a buffer of 32 MiB leaves most workers waiting. cool_fox
+/// uses 256.
+fn staging_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let mb = std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if mb > 0 {
+            tracing::info!(mb, "dstorage: staging floor (VICTORY_DSTORAGE_STAGING_MB)");
+        }
+        mb.saturating_mul(1 << 20)
+    })
+}
+
+/// The limit on staging bytes in flight for a staging buffer of `size`.
+fn staging_limit(size: u64, floor: u64) -> u64 {
+    size.max(floor)
 }
 
 fn text(name: *const c_char) -> String {
@@ -264,7 +294,96 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    file: std::fs::File,
+    files: Files,
+}
+
+/// How the workers read files (`VICTORY_DSTORAGE_IO`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Io {
+    /// Unset (or anything but `handles`): every worker reads through the
+    /// one handle the title opened, as before. The host does the reads of a
+    /// handle one after the other.
+    Shared,
+    /// `handles`: a handle of its own for each worker, opened again from
+    /// the title's when the worker first reads the file. cool_fox measured
+    /// 185 MB/s on one handle and 990 MB/s on a handle per worker, 24
+    /// workers reading 48 KiB at random from one of the title's files.
+    Handles,
+}
+
+impl Io {
+    fn chosen() -> Io {
+        static CHOSEN: OnceLock<Io> = OnceLock::new();
+        *CHOSEN.get_or_init(|| {
+            let io = match std::env::var("VICTORY_DSTORAGE_IO")
+                .as_deref()
+                .map(str::trim)
+            {
+                Ok("handles") => Io::Handles,
+                _ => Io::Shared,
+            };
+            tracing::info!(?io, "dstorage: how files are read (VICTORY_DSTORAGE_IO)");
+            io
+        })
+    }
+}
+
+/// A file as the workers read it: the handle the title opened, and with
+/// [`Io::Handles`] those opened again from it, one per worker.
+struct Files {
+    first: std::fs::File,
+    others: Box<[OnceLock<Option<std::fs::File>>]>,
+}
+
+impl Files {
+    fn new(first: std::fs::File, io: Io) -> Files {
+        let others = match io {
+            Io::Shared => 0,
+            Io::Handles => std::thread::available_parallelism().map_or(4, |n| n.get()),
+        };
+        Files {
+            first,
+            others: (0..others).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    /// Reads at `offset`, as [`FileExt::seek_read`]: on this thread's handle
+    /// if there is one, else on the first.
+    fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let other = match self.others.len() {
+            0 => None,
+            n => self.others[this_thread() % n]
+                .get_or_init(|| reopen(&self.first))
+                .as_ref(),
+        };
+        other.unwrap_or(&self.first).seek_read(out, offset)
+    }
+}
+
+/// A number for this thread: 0 for the first that asks, and so on.
+fn this_thread() -> usize {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static NUMBER: usize = NEXT.fetch_add(1, Ordering::Relaxed) as usize;
+    }
+    NUMBER.with(|n| *n)
+}
+
+/// Another handle to `file`, for reading; `None` if the host gives none
+/// (then the first one is used).
+fn reopen(file: &std::fs::File) -> Option<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, ReOpenFile};
+    // SAFETY: a file we hold open.
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, 0) };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(%error, "dstorage: a file could not be opened again; read on the first handle");
+        return None;
+    }
+    // SAFETY: a handle just opened, ours alone.
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -381,6 +500,9 @@ struct Lane {
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
+    /// An automatic queue submits itself only once it is full, not at half
+    /// its capacity ([`submit_when_full`]).
+    submit_full: bool,
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
@@ -412,7 +534,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_limit(STAGING, staging_floor()),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -645,6 +767,7 @@ impl Lane {
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
             closed: false,
+            submit_full: submit_when_full(),
         }
     }
 
@@ -832,7 +955,30 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Blocks while full. Automatic queues submit when half their capacity is pending.
+/// Whether an automatic queue waits for the title's submit
+/// (`VICTORY_DSTORAGE_SUBMIT_FULL=1`; unset: it submits itself once half
+/// its capacity is enqueued, as DirectStorage for the PC does and as ours
+/// did). The title fills in the page lists of a batch, and maps the pages
+/// they name, in its own submit, after it has enqueued the whole batch, and
+/// its batches can hold more than half of a queue: the requests started at
+/// half ran on lists not filled in yet, page 0 (waited for) or the pages an
+/// earlier mapping left there (written: somebody else's memory). With the
+/// switch, a queue submits itself only when it is full of commands nobody
+/// submitted and nothing of it runs, since nothing else could make room.
+fn submit_when_full() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DSTORAGE_SUBMIT_FULL").is_some_and(|v| v == "1");
+        tracing::info!(
+            on,
+            "dstorage: automatic queues wait for the submit (VICTORY_DSTORAGE_SUBMIT_FULL)"
+        );
+        on
+    })
+}
+
+/// Blocks while full. Automatic queues submit when half their capacity is
+/// pending, or with [`submit_when_full`] when they are full.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let Queue { id, auto_submit } = unsafe { &*this }.state;
@@ -848,6 +994,21 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        if auto_submit
+            && lane.submit_full
+            && !lane.unsubmitted.is_empty()
+            && lane.reads.is_empty()
+            && lane.running.is_empty()
+        {
+            tracing::warn!(
+                queue = id,
+                commands = lane.unsubmitted.len(),
+                "dstorage: a queue full of commands that are not submitted submits itself"
+            );
+            lanes.submit(id);
+            scheduler.work.notify_all();
+            continue;
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -857,7 +1018,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if auto_submit && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if auto_submit && !lane.submit_full && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -1073,16 +1234,16 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
+    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
-        .file;
+        .files;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match files.read_at(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1534,6 +1695,97 @@ mod tests {
         }
     }
 
+    /// Makes an automatic queue wait for the submit, as
+    /// `VICTORY_DSTORAGE_SUBMIT_FULL=1` does.
+    fn submit_when_full(queue: *mut c_void) {
+        // SAFETY: a live queue the test created.
+        let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+        scheduler()
+            .unwrap()
+            .lock()
+            .lanes
+            .get_mut(&id)
+            .unwrap()
+            .submit_full = true;
+    }
+
+    #[test]
+    fn half_a_queue_waits_for_the_submit() {
+        use crate::modules::xmem;
+        // Two pages the title owns: the one its list still names from
+        // earlier, and the one it maps for this batch when it submits.
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        let [stale, right] = pages;
+        let plain = pattern(64);
+        let mut list = [stale];
+        let (queue, array) = (queue_with_options(1, 0x80, 0), status_array(1));
+        submit_when_full(queue);
+        // More than half of the queue's 128.
+        for i in 0..100 {
+            let mut r = request(
+                PAGE_DESTINATION | MEMORY_SOURCE,
+                list.as_mut_ptr().cast(),
+                plain.len(),
+                plain.as_ptr().cast(),
+                0,
+                plain.len(),
+            );
+            r.page_offset = i * 64;
+            enqueue(queue, &r);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: our own list, which a worker may be reading.
+        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), right) };
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        let bytes = |page: usize| -> Vec<u8> {
+            xmem::page_window(&[page], 0, 6400)
+                .unwrap()
+                .bytes()
+                .to_vec()
+        };
+        assert!(
+            bytes(stale) == [0; 6400],
+            "written to the page the list named before"
+        );
+        assert!(
+            bytes(right) == plain.repeat(100),
+            "not written to the page the list names"
+        );
+        release::<Queue>(queue.cast());
+        release::<StatusArray>(array.cast());
+    }
+
+    #[test]
+    fn a_full_queue_submits_itself() {
+        let (_dir, file) = file_with(&pattern(64));
+        let queue = queue_with_options(0, 4, 0);
+        submit_when_full(queue);
+        let array = status_array(1);
+        let mut outs = [[0u8; 16]; 4];
+        for out in &mut outs[..2] {
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+        }
+        enqueue_status(queue, array, 0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(result(array, 0), E_PENDING, "three of four: not submitted");
+        // One more than fits: would wait for good.
+        for out in &mut outs[2..] {
+            enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
+        }
+        assert_eq!(wait(array, 0), S_OK);
+        void(queue, 0x40);
+        assert!(outs[..2].iter().all(|out| out[..] == pattern(64)[8..24]));
+        release::<Queue>(queue.cast());
+        release::<StatusArray>(array.cast());
+    }
+
     /// Lanes without workers: what `start` picks, and when statuses land.
     fn lanes(staging: u64) -> Lanes {
         Lanes {
@@ -1604,6 +1856,21 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn the_staging_floor_only_raises_the_limit() {
+        assert_eq!(staging_limit(32 << 20, 0), 32 << 20, "no floor: as asked");
+        assert_eq!(staging_limit(32 << 20, 256 << 20), 256 << 20);
+        assert_eq!(staging_limit(512 << 20, 256 << 20), 512 << 20);
+        // A raised limit lets more buffered reads run at once.
+        let mut l = lanes(staging_limit(100, 200));
+        l.lanes.insert(0, Lane::new(0, 64));
+        (0..4).for_each(|_| read(&mut l, 0, ZLIB, 60));
+        l.submit(0);
+        let started: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
+        assert!(l.start().is_none(), "60 * 4 > 200");
+        assert_eq!(started.iter().map(|j| j.staging).sum::<u64>(), 180);
     }
 
     #[test]
@@ -1935,5 +2202,129 @@ mod tests {
         assert_eq!(release_fn2(file2), 2); // 1 held by test + 1 held by queue2
         void(queue2, 0x40); // Close: drops unsubmitted read and releases file2
         assert_eq!(release_fn2(file2), 0); // last ref was the test's
+    }
+
+    /// A file of `path` as the workers would read it.
+    fn files_at(path: &std::path::Path, io: Io) -> Files {
+        Files::new(std::fs::File::open(path).unwrap(), io)
+    }
+
+    /// Both ways of reading a file give its bytes, also past its end, on
+    /// this thread and on others (each with a handle of its own).
+    #[test]
+    fn every_way_of_reading_gives_the_same_bytes() {
+        let plain = pattern(300_001);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, &plain).unwrap();
+        for io in [Io::Shared, Io::Handles] {
+            let file = files_at(&path, io);
+            let check = || {
+                for (at, len) in [
+                    (0, 4096),
+                    (1, 100),
+                    (4095, 2),
+                    (8192, 200_000),
+                    (12_345, 250_000),
+                    (299_990, 11),
+                    (300_000, 1),
+                ] {
+                    let mut out = vec![0u8; len];
+                    let mut done = 0;
+                    while done < len {
+                        let n = file.read_at(&mut out[done..], (at + done) as u64).unwrap();
+                        assert_ne!(n, 0, "{io:?} {at} {len}");
+                        done += n;
+                    }
+                    assert!(out == plain[at..at + len], "{io:?} {at} {len}");
+                }
+                let mut out = [0u8; 16];
+                assert_eq!(file.read_at(&mut out, 299_999).unwrap(), 2, "{io:?}");
+                assert_eq!(file.read_at(&mut out, 300_001).unwrap(), 0, "{io:?}");
+                assert_eq!(file.read_at(&mut out, 400_000).unwrap(), 0, "{io:?}");
+            };
+            std::thread::scope(|s| {
+                for _ in 0..3 {
+                    s.spawn(check);
+                }
+            });
+            check();
+            let opened = file
+                .others
+                .iter()
+                .filter(|o| o.get().is_some_and(Option::is_some))
+                .count();
+            match io {
+                Io::Shared => assert_eq!(opened, 0),
+                Io::Handles => assert!(opened >= 1, "no handle of a worker's own"),
+            }
+        }
+    }
+
+    /// What the ways of reading a file give at `VICTORY_BENCH_FILE` (any
+    /// large file, only read): 24 threads, requests of 48 KiB at random,
+    /// first from places nobody read lately, then the same once more.
+    /// `VICTORY_BENCH_FILE=... cargo test --release -p victory-hle --lib
+    /// read_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a benchmark"]
+    fn read_bench() {
+        const THREADS: usize = 24;
+        const SIZE: usize = 48 << 10;
+        const READS: usize = 12_000;
+        let path = std::path::PathBuf::from(
+            std::env::var("VICTORY_BENCH_FILE").expect("VICTORY_BENCH_FILE"),
+        );
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+            | 1;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..2 {
+            for io in [Io::Shared, Io::Handles] {
+                let file = files_at(&path, io);
+                let at: Vec<u64> = (0..READS)
+                    .map(|_| (random() % (len - SIZE as u64)) & !15)
+                    .collect();
+                for pass in ["cold", "again"] {
+                    let next = std::sync::atomic::AtomicUsize::new(0);
+                    let busy = AtomicU64::new(0);
+                    let start = Instant::now();
+                    std::thread::scope(|s| {
+                        for _ in 0..THREADS {
+                            s.spawn(|| {
+                                let mut out = vec![0u8; SIZE];
+                                while let Some(&at) = at.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                    let began = Instant::now();
+                                    let mut done = 0;
+                                    while done < SIZE {
+                                        done += file
+                                            .read_at(&mut out[done..], at + done as u64)
+                                            .unwrap();
+                                    }
+                                    busy.fetch_add(
+                                        began.elapsed().as_micros() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                            });
+                        }
+                    });
+                    let took = start.elapsed().as_secs_f64();
+                    println!(
+                        "{round} {io:?} {pass}: {:.0} MB/s, {:.2} ms a read",
+                        (READS * SIZE) as f64 / took / 1e6,
+                        busy.load(Ordering::Relaxed) as f64 / READS as f64 / 1e3
+                    );
+                }
+            }
+        }
     }
 }

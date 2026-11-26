@@ -2341,6 +2341,7 @@ impl State {
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
+                host.texture_slot_here(index);
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
@@ -2431,7 +2432,10 @@ impl State {
                 crate::texture::upload_again(resource);
             }
             if let Some(view) = &view {
+                // (Not tabled: the staging state made here goes below.)
+                crate::texture::PICKING.set(!tabled);
                 readable(list, sampled.kind, view);
+                crate::texture::PICKING.set(false);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2477,7 +2481,10 @@ impl State {
             // streamed texture of the heap held a staging buffer of its full
             // size for good.)
             let memory = if again.is_none() && heap_recheck() {
+                // (An upload left out as the host copy holds those bytes
+                // has no staging state: looked at again all the same.)
                 crate::texture::staged_memory(resource)
+                    .or_else(|| crate::texture::left_out_memory(resource))
             } else {
                 None
             };
