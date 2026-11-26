@@ -413,7 +413,6 @@ impl<B: Clone> Pool<B> {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
@@ -459,6 +458,12 @@ mod d3d {
 
     /// Bytes of the pieces textures hold now.
     static HELD: AtomicU64 = AtomicU64::new(0);
+
+    /// Bytes of the texture blocks no texture holds: memory of the card in
+    /// use by us that new textures take first (0 with the pool off).
+    pub(crate) fn texture_room() -> u64 {
+        (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    }
 
     /// Part of a block of mapped upload memory, back in the pool when
     /// dropped.
