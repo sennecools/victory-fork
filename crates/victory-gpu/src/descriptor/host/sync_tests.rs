@@ -219,8 +219,8 @@ fn a_page_at_once_with_the_early_skip_makes_what_one_by_one_makes() {
 /// The two tests above: the early skip on for the page at once if `skip`.
 fn page_against_one_by_one(skip: bool) {
     let (Some(one), Some(page)) = (
-        HostHeap::with_made(false, SLOTS, false),
-        HostHeap::with_made(false, SLOTS, false),
+        HostHeap::with_made(false, SLOTS),
+        HostHeap::with_made(false, SLOTS),
     ) else {
         return; // no host GPU
     };
@@ -294,12 +294,12 @@ fn page_against_one_by_one(skip: bool) {
 }
 
 /// The early skip: a slot made from a record of a view still there is done
-/// with without the heap-wide lock (held here by the test the whole time);
-/// a slot made from a record whose resource was released since goes on to
-/// the lock and is made null, as without the skip.
+/// with before its claim (counted as skipped); a slot made from a record
+/// whose resource was released since goes on to the claim and is made
+/// null, as without the skip.
 #[test]
-fn the_early_skip_takes_no_lock_and_still_nulls_a_released_view() {
-    let Some(heap) = HostHeap::with_made(false, SLOTS, false) else {
+fn the_early_skip_takes_no_claim_and_still_nulls_a_released_view() {
+    let Some(heap) = HostHeap::with_made(false, SLOTS) else {
         return; // no host GPU
     };
     let _fast = Fast::on();
@@ -317,11 +317,10 @@ fn the_early_skip_takes_no_lock_and_still_nulls_a_released_view() {
         record_key(live),
         "slot 0 made from its record"
     );
-    // Seen again by the sync with the lock held elsewhere: done at once.
+    // Seen again by the sync: done at once.
     let skipped = SKIPPED_MADE.load(Relaxed);
     let (done, finished) = std::sync::mpsc::channel();
     {
-        let _held = heap.made_lock.lock().unwrap();
         let heap = heap.clone();
         std::thread::spawn(move || {
             let view = heap.mirror_marking(0, live, false, true, hold::SYNC);
@@ -329,7 +328,7 @@ fn the_early_skip_takes_no_lock_and_still_nulls_a_released_view() {
         });
         let view = finished
             .recv_timeout(Duration::from_secs(30))
-            .expect("no made lock taken for a slot made from its record");
+            .expect("a slot made from its record is done with");
         assert_eq!(view, Some(View::Constant(0x7d_5000_0000, 256)));
     }
     assert_eq!(SKIPPED_MADE.load(Relaxed), skipped + 1);
@@ -339,7 +338,6 @@ fn the_early_skip_takes_no_lock_and_still_nulls_a_released_view() {
     write(gone, &Some(View::Shader(resource, None)));
     let stale = record_key(gone);
     {
-        let _made = heap.lock_made(None);
         let mut claim = heap.claim(1, |_| true).expect("not claimed");
         claim.value = stale;
         heap.write_word(1, slot_word(Some(&View::Constant(0, 256))));
@@ -678,7 +676,7 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
     assert!(looks > 0);
     assert!(
         SKIPPED_MADE.load(Relaxed) > skipped,
-        "records skipped before the lock"
+        "records skipped before the claim"
     );
     assert_eq!(wrong, [], "slots whose word is not their record's");
     words_agree(host);
@@ -695,8 +693,8 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
 /// without `shows_none`.
 fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
     let (Some(one), Some(sorted)) = (
-        HostHeap::with_made(false, SLOTS, false),
-        HostHeap::with_made(false, SLOTS, false),
+        HostHeap::with_made(false, SLOTS),
+        HostHeap::with_made(false, SLOTS),
     ) else {
         return; // no host GPU
     };

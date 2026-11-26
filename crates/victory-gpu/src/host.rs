@@ -4752,13 +4752,13 @@ pub(crate) fn settle_now(why: usize) {
 /// the submission is taken, so the waiting thread holds none a walk may
 /// wait for. The one exception is `crate::queue::release_held`, which
 /// submits holding a queue's `held` lock and `RELEASING`: a walk takes
-/// neither (it takes `HEAP_RANGES`, the heap's `made`, `kept`, `changed`,
+/// neither (it takes `HEAP_RANGES`, the heap's slot claims, `kept`, `changed`,
 /// `buffers`, `textures` and `placed` locks, the views' and the host
 /// copies' maps). No walk submits, so none waits here. A claimed walk ends
 /// however its pass leaves (its `Walking` is dropped), and between its
 /// claim and its end it waits only for `HEAP_RANGES`, which every holder
 /// gives back after its own walk, and for those locks, whose holders do
-/// not wait here while they hold them (`sync_heaps` takes `made` after
+/// not wait here while they hold them (`sync_heaps` claims slots after
 /// this wait). Only a walk whose thread is gone without unwinding never
 /// ends: the wait gives up after a time
 /// ([`crate::descriptor::host::WalkGate::wait`]), with a line in the log,

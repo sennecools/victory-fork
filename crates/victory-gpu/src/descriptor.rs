@@ -260,10 +260,10 @@ pub(crate) fn sync_heaps() {
         return;
     }
     // On the profile: what it did, and its time reading pages (`read_us`)
-    // and mirroring their slots (`mirror_us`, with the waits for the heaps'
-    // `made` locks), which alternate page by page; `skipped_made`: records
-    // whose slot was made from them already, done with before the `made`
-    // lock (`VICTORY_HEAP_SYNC_FAST=1`).
+    // and mirroring their slots (`mirror_us`, with the waits for slots'
+    // claims), which alternate page by page; `skipped_made`: records whose
+    // slot was made from them already, done with before its slot's claim
+    // (`VICTORY_HEAP_SYNC_FAST=1`).
     let mut span = crate::profile::span("sync heaps");
     let (mut read_ticks, mut mirror_ticks) = (0u64, 0u64);
     let started = std::time::Instant::now();
@@ -536,8 +536,8 @@ fn sync_parted_heap(
 /// For the profile's sample (`VICTORY_PROFILE_SAMPLES`): over the host
 /// heaps of shader-visible heaps, the distinct views their made slots were
 /// made from (which sizes a pool of one descriptor per distinct record),
-/// and the made slots. Each heap's slots are copied under its `made` lock
-/// and counted after.
+/// and the made slots. Each heap's slots are read a slot at a time, each
+/// once no thread changes it, and counted after.
 #[cfg(windows)]
 pub(crate) fn live_keys() -> (u64, u64) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -580,7 +580,7 @@ pub(crate) fn sync_line(frames: f64) {
         let since = skipped.wrapping_sub(LINED.swap(skipped, std::sync::atomic::Ordering::Relaxed));
         tracing::info!(
             "heap sync with VICTORY_HEAP_SYNC_FAST=1: per frame {:.0} records whose slot was \
-             made from them already, done with before the made lock; the count left to the \
+             made from them already, done with before their slot's claim; the count left to the \
              draws below is of changed records only",
             since as f64 / frames
         );
