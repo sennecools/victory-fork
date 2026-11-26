@@ -21,12 +21,21 @@
 //! its own reference to the device for the life of the process. Dropping
 //! an [`Awake`] stops the thread, waits for what it sent and closes its
 //! event, but only for callers of [`start`] that keep the handle.
+//!
+//! The sends may keep heaps the host let go from going: the software
+//! adapter lets such a heap go only once its queues at work ran on past it,
+//! this one too (with the sends going on, a decommit of the title's was
+//! refused, and done some two sends later). A free of the title's the host
+//! refuses for a heap while sends are on the way holds the sends, waits for
+//! those on the way and asks again ([`hold`]). A free that waits is tried
+//! again at a landing without a hold (the landing thread does not wait):
+//! it is done at a later landing.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
@@ -46,6 +55,103 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 /// Quiet this long after the last submission.
 const QUIET_MS: u64 = 250;
+
+/// How long [`hold`] waits at most for what was sent (about 2 ms a send on
+/// the card, two on the way; some 50 ms each on the software adapter).
+const SETTLE_MS: u64 = 500;
+
+/// A counting thread's fence and the last value it signalled on it.
+struct OnTheWay {
+    thread: u64,
+    fence: ID3D12Fence,
+    signalled: Arc<AtomicU64>,
+}
+
+// SAFETY: a D3D12 fence, free-threaded.
+unsafe impl Send for OnTheWay {}
+
+/// The counting threads at work ([`run`]).
+static ON_THE_WAY: Mutex<Vec<OnTheWay>> = Mutex::new(Vec::new());
+
+/// Taken by a counting thread from its look at [`HOLDS`] to the signal
+/// behind its send, and by [`hold`] around its change of it and its look at
+/// [`ON_THE_WAY`]: no send follows it.
+static GATE: Mutex<()> = Mutex::new(());
+
+/// The [`Held`]s alive: nothing is sent meanwhile.
+static HOLDS: AtomicUsize = AtomicUsize::new(0);
+
+fn gate() -> std::sync::MutexGuard<'static, ()> {
+    GATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What the counting threads signalled and the card has not yet run: each
+/// fence with its value.
+fn on_the_way() -> Vec<(ID3D12Fence, u64)> {
+    ON_THE_WAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|t| (t.fence.clone(), t.signalled.load(Ordering::Acquire)))
+        // SAFETY: a plain query of a fence of ours.
+        .filter(|(fence, value)| unsafe { fence.GetCompletedValue() } < *value)
+        .collect()
+}
+
+/// Waits until `marks` ran, for [`SETTLE_MS`] at most; whether they did.
+fn settle(marks: Vec<(ID3D12Fence, u64)>) -> bool {
+    if marks.is_empty() {
+        return true;
+    }
+    let until = Instant::now() + Duration::from_millis(SETTLE_MS);
+    // SAFETY: a plain event of our own, waited on here only and closed.
+    unsafe {
+        let Ok(event) = CreateEventW(None, false, false, None) else {
+            return false;
+        };
+        let mut ran = true;
+        for (fence, value) in marks {
+            let left = until.saturating_duration_since(Instant::now()).as_millis() as u32;
+            if fence.GetCompletedValue() < value
+                && (fence.SetEventOnCompletion(value, event).is_err()
+                    || WaitForSingleObject(event, left) != WAIT_OBJECT_0)
+            {
+                ran = false;
+                break;
+            }
+        }
+        let _ = CloseHandle(event);
+        ran
+    }
+}
+
+/// While it lives no counting thread sends ([`hold`]).
+pub(crate) struct Held {
+    /// Something was on the way when it was taken (and has run since, or
+    /// [`SETTLE_MS`] passed).
+    pub(crate) waited: bool,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HOLDS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// No counting thread sends while the result lives, and what they sent
+/// before has run (waited for [`SETTLE_MS`] at most): the host may keep a
+/// heap it let go for those sends (as the software adapter does), so a
+/// free of the title's refused for a heap asks again under it.
+pub(crate) fn hold() -> Held {
+    let marks = {
+        let _gate = gate();
+        HOLDS.fetch_add(1, Ordering::SeqCst);
+        on_the_way()
+    };
+    let waited = !marks.is_empty();
+    settle(marks);
+    Held { waited }
+}
 
 /// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
 const TURN_MS: u64 = 20_000;
@@ -123,8 +229,19 @@ pub(super) fn sent(device: &ID3D12Device) {
 /// The thread that keeps the card busy; it ends when this is dropped
 /// ([`sent`] forgets its own, so that one runs as long as the process).
 pub(super) struct Awake {
-    stop: std::sync::Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    /// Sends so far (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    sends: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl Awake {
+    /// Its sends so far.
+    pub(super) fn sends(&self) -> u64 {
+        self.sends.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for Awake {
@@ -141,18 +258,20 @@ pub(super) fn start(
     device: &ID3D12Device,
     wanted: impl Fn() -> bool + Send + 'static,
 ) -> Option<Awake> {
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let (device, ended) = (device.clone(), stop.clone());
+    let stop = Arc::new(AtomicBool::new(false));
+    let sends = Arc::new(AtomicU64::new(0));
+    let (device, ended, sent) = (device.clone(), stop.clone(), sends.clone());
     let thread = std::thread::Builder::new()
         .name("victory-card-awake".into())
         .spawn(move || {
-            if let Err(e) = run(&device, &wanted, &ended) {
+            if let Err(e) = run(&device, &wanted, &ended, &sent) {
                 tracing::warn!(error = %e, "the card is not kept awake (VICTORY_CARD_AWAKE)");
             }
         });
     match thread {
         Ok(thread) => Some(Awake {
             stop,
+            sends,
             thread: Some(thread),
         }),
         Err(e) => {
@@ -166,6 +285,7 @@ fn run(
     device: &ID3D12Device,
     wanted: &dyn Fn() -> bool,
     stop: &AtomicBool,
+    sends: &AtomicU64,
 ) -> windows::core::Result<()> {
     let code = super::compile(
         COUNT,
@@ -232,10 +352,21 @@ fn run(
         }
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
+        static THREADS: AtomicU64 = AtomicU64::new(0);
+        let thread = THREADS.fetch_add(1, Ordering::Relaxed);
+        let signalled = Arc::new(AtomicU64::new(0));
+        ON_THE_WAY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(OnTheWay {
+                thread,
+                fence: fence.clone(),
+                signalled: signalled.clone(),
+            });
         let mut value = 0u64;
         let mut result = Ok(());
         while !stop.load(Ordering::Relaxed) && result.is_ok() {
-            if !wanted() {
+            if !wanted() || HOLDS.load(Ordering::SeqCst) != 0 {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
@@ -248,9 +379,18 @@ fn run(
                 }
                 continue;
             }
+            let gate = gate();
+            if HOLDS.load(Ordering::SeqCst) != 0 {
+                continue;
+            }
             queue.ExecuteCommandLists(&lists[(value % 2) as usize..][..1]);
             value += 1;
             result = queue.Signal(&fence, value);
+            if result.is_ok() {
+                signalled.store(value, Ordering::Release);
+            }
+            drop(gate);
+            sends.store(value, Ordering::Relaxed);
         }
         // What was sent runs before its lists and the event go.
         if result.is_ok()
@@ -259,6 +399,10 @@ fn run(
         {
             WaitForSingleObject(event, INFINITE);
         }
+        ON_THE_WAY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|t| t.thread != thread);
         let _ = CloseHandle(event);
         result
     }
@@ -287,6 +431,34 @@ mod tests {
         assert!(!wanted_at(Mode::On, 101, 100 + QUIET_MS));
         // Off is off whatever was sent.
         assert!(!wanted_at(Mode::Off, 101, 100));
+    }
+
+    /// Until `awake` sent more than `sends`.
+    fn sends_after(awake: &Awake, sends: u64) {
+        let since = Instant::now();
+        while awake.sends() <= sends {
+            assert!(since.elapsed().as_secs() < 30, "the card is kept awake");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A hold stops the sends and waits for those on the way, and they go
+    /// on once it is let go.
+    #[test]
+    fn warp_nothing_is_sent_while_held() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let awake = start(&host.device, || true).expect("a thread");
+        sends_after(&awake, 1);
+        let held = hold();
+        assert!(held.waited, "a send was on the way");
+        assert!(on_the_way().is_empty(), "what was sent ran");
+        let sends = awake.sends();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(awake.sends(), sends, "nothing sent while held");
+        drop(held);
+        sends_after(&awake, sends);
     }
 
     #[test]
