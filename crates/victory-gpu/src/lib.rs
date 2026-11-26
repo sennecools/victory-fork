@@ -85,7 +85,7 @@ pub use home::{
     title_memory_committing, title_memory_region, title_virtual_free, title_virtual_protect,
 };
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{card_memory_in_use, on_failure};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

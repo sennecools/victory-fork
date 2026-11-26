@@ -1490,8 +1490,9 @@ pub struct WorkingSet {
     pub kernel_pool_limit: u32,
 }
 
-/// The title's budget and our process's commit as what it uses. No tools
-/// memory: a retail console.
+/// The title's budget and what it uses: our process's commit without the
+/// memory the graphics layer holds for the card. No tools memory: a retail
+/// console.
 // shortcut: all fields are filled whatever the flags ask for, and use is
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
@@ -1506,20 +1507,26 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    // The system charges every byte the layer places in the card's memory
+    // to this process's commit, one to one (measured on the RX 9070 XT:
+    // 3 GiB of card buffers added 3 GiB of commit and nothing to the
+    // working set). On the console those bytes are the title's own pages,
+    // already counted once; here they are a second copy that is the
+    // layer's, so they are left out.
+    // shortcut: the layer's host copies in PC memory (shadows, upload
+    // rings) stay counted as the title's: title memory opened as a heap
+    // shows in the same use figure, so the two cannot be told apart there.
+    let layer = victory_gpu::card_memory_in_use() as usize;
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used: counters.PagefileUsage.saturating_sub(layer),
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
     // What the title is told, logged at the first asking and at every
-    // 1,024th: "used" is all the process has committed, the layer's own
-    // memory and the card's included (27 GB in run 60's gameplay against a
-    // limit of 13.5 GB). A title that budgets its streaming from these two
-    // figures believes it is far over its limit.
-    // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
+    // 1,024th. (Before the layer's share was left out, "used" was the
+    // whole commit: 27 GB in run 60's gameplay against a limit of 13.5 GB,
+    // so a title budgeting its streaming from it believed itself far over.)
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
     if asked.is_multiple_of(1024) {
@@ -1528,6 +1535,8 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            commit_mb = counters.PagefileUsage >> 20,
+            layer_card_mb = layer >> 20,
             "the title asks how much memory it uses"
         );
     }

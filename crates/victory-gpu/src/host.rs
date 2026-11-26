@@ -923,6 +923,21 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// Bytes of the card's own memory this process uses, as the system counts
+/// them. The system charges them to the process's commit one to one, and
+/// they are always the layer's (title memory never lives there), so the
+/// title's figure leaves them out (the layer's host copies in PC memory
+/// stay in it). The PC's memory shared
+/// with the card is not counted here: title memory opened as a heap shows
+/// in that use too, without being charged twice. 0 before the device
+/// exists; asking never creates it.
+pub fn card_memory_in_use() -> u64 {
+    HOST.get()
+        .and_then(Option::as_ref)
+        .and_then(Host::video_memory)
+        .map_or(0, |[_, own, _, _]| own)
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
