@@ -18,10 +18,11 @@
 //! runtime tells us the views of the pages it wrote itself ([`writing`],
 //! xmem's `write_physical` and DirectStorage's page destinations), and a
 //! write by the title through any view of a guarded page faults like one
-//! at the guarded address (the guard makes every view of the page
-//! read-only, [`open`] gives them all back; not a page of more than
-//! [`MANY_VIEWS`] views). A
-//! system call writing into a guarded block fails (none is known to).
+//! at the guarded address: the guard makes every view of the page
+//! read-only, and [`open`] gives back the view written through, while the
+//! page's other views stay read-only and are told as written at their next
+//! asking (not so for a page of more than [`MANY_VIEWS`] views). A system
+//! call writing into a guarded block fails (none is known to).
 //!
 //! The journal's numbers are kept in [`stamps`]' tables: one per page and a
 //! summary per 4 MiB, so an answer costs what was written since the asker's

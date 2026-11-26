@@ -21,6 +21,16 @@ All cool_fox commits named here have the author `local`.
 
 ## 2. Switches
 
+> **Since change 1 (steps S1+S2) this lane's switches are gone.**
+> `VICTORY_GUARD_BITS`, `VICTORY_LIGHT_REFRESH`, `VICTORY_NOTHING_NEW`,
+> `VICTORY_GUARD_REST`, `VICTORY_OPEN_ONE_VIEW` and `VICTORY_KNOWN_HOLES`
+> no longer exist: their play-set behaviour is the only one (the rest is
+> fixed at 3 ms). The journal is `crates/victory-gpu/src/watch/stamps.rs`;
+> the ordered-map journal and the epoch tables (`VICTORY_EPOCH_JOURNAL`)
+> were deleted. `guard_switched` and `open_together` became `guard_blocks`
+> and `open`. Of the switches below only `VICTORY_SAFE_COPY` remains. The
+> rest of this file is the record of the port as it was.
+
 All off by default. Each is read once per process (`OnceLock`), so every
 combination needs its own process: a separate `cargo test` run or a
 separate game run.
@@ -62,6 +72,20 @@ untouched code was left as it was.
 
 ## 4. Tests to run on the PC
 
+> **Since change 1 (steps S1+S2) this lane's switches are gone.**
+> `VICTORY_GUARD_BITS`, `VICTORY_LIGHT_REFRESH`, `VICTORY_NOTHING_NEW`,
+> `VICTORY_GUARD_REST`, `VICTORY_OPEN_ONE_VIEW` and `VICTORY_KNOWN_HOLES`
+> no longer exist: their play-set behaviour is the only one (the rest is
+> fixed at 3 ms). The journal is `crates/victory-gpu/src/watch/stamps.rs`;
+> the ordered-map journal and the epoch tables (`VICTORY_EPOCH_JOURNAL`)
+> were deleted. `guard_switched` and `open_together` became `guard_blocks`
+> and `open`. Of the switches below only `VICTORY_SAFE_COPY` remains. The
+> rest of this file is the record of the port as it was.
+
+The per-switch runs and the "only with `VICTORY_*`" notes below are
+historical: today every test runs the one behaviour, and only
+`VICTORY_SAFE_COPY` still changes a run.
+
 Unit tests added:
 
 - `safecopy::tests`: `the_switch_is_off_by_default`,
@@ -76,7 +100,7 @@ Unit tests added:
   `a_write_told_at_a_view_that_cannot_be_guarded_is_not_lost`,
   `holes_are_known_until_the_runtime_tells`.
 
-Runs (PowerShell, repo root; clear the variables between runs with
+Historical runs (PowerShell, repo root; clear the variables between runs with
 `Remove-Item Env:VICTORY_*`):
 
 ```powershell
@@ -101,7 +125,8 @@ $env:VICTORY_SAFE_COPY=1; $env:VICTORY_GUARD_BITS=1; $env:VICTORY_LIGHT_REFRESH=
 cargo test -p victory-gpu --lib --release -- safecopy:: --ignored --nocapture
 ```
 
-Tests that check something only with switches set:
+Tests that checked something only with switches set (historical, before
+S1+S2):
 
 - `a_write_opens_the_view_it_goes_through`: only with `VICTORY_OPEN_ONE_VIEW=1`.
 - The three `*_between_askers` tests always check that no write is lost;
