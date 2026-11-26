@@ -6,13 +6,19 @@
 //! [`line`] says them once a second beside the frame lines.
 //!
 //! [`wave1_line`] says, beside it, what decides which of wave 1's steps are
-//! needed: H2 waits by class, and why card copies keep staging buffers.
+//! needed: H2 waits by class, why card copies keep staging buffers, what
+//! the descriptor mirrors make and what the heap sync reads, and the memory
+//! directory's numbers.
 //!
-//! Each counting site is one relaxed atomic add, but for these: the relay's
-//! clock at a phase change is a few atomic stores under a sequence number,
-//! without a lock ([`AtomicClock`]); and one lock, the H2 table's, taken
-//! after an H2 wait ([`h2_waited`]) and by [`line`]. None is on the path of
-//! a draw.
+//! Each counting site is one relaxed atomic add (or a load and a store, or
+//! a compare-exchange, on the hashed table of pages our own record writes
+//! went to, [`own_wrote`]), but for these: the relay's clock at a phase
+//! change is a few atomic stores under a sequence number, without a lock
+//! ([`AtomicClock`]); and two locks, the H2 table's, taken after an H2 wait
+//! ([`h2_waited`]) and by [`line`], and the changed pieces' set, taken once
+//! per heap sync pass after its threads, when no other pass runs
+//! ([`changed_pieces`]). None is on the path of a draw, nor on a resolve or
+//! a mirror (those count with atomics only).
 //!
 //! shortcut: no read tripwire on merged pages (the title's CPU reads of
 //! pages a landing merged): the guards and the write watch see writes only,
@@ -620,6 +626,163 @@ pub(crate) fn staging_kept(reason: Staging, bytes: u64) {
     seen!(Seen::Kept { reason, bytes });
 }
 
+/// What a mirror that changed a host slot made it from
+/// (`descriptor::host`'s mirror).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mirror {
+    Sampler,
+    /// A view of a texture object.
+    ObjectTexture,
+    /// A view of placed memory that is a texture.
+    PlacedTexture,
+    /// A buffer view left for a draw.
+    BufferDeferred,
+    /// No view: the slot made null.
+    Null,
+    Other,
+}
+
+impl Mirror {
+    const ALL: [Mirror; 6] = [
+        Mirror::Sampler,
+        Mirror::ObjectTexture,
+        Mirror::PlacedTexture,
+        Mirror::BufferDeferred,
+        Mirror::Null,
+        Mirror::Other,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Mirror::Sampler => "sampler",
+            Mirror::ObjectTexture => "object texture",
+            Mirror::PlacedTexture => "placed texture",
+            Mirror::BufferDeferred => "buffer left for a draw",
+            Mirror::Null => "null",
+            Mirror::Other => "other",
+        }
+    }
+}
+
+/// Per [`Mirror`], slots changed; then those of them a pre-made
+/// descriptor per view entry could have made (a table entry's view that
+/// needs no host copy).
+static MIRRORS: [AtomicU64; Mirror::ALL.len() + 1] =
+    [const { AtomicU64::new(0) }; Mirror::ALL.len() + 1];
+
+/// A mirror changed a slot, of `kind`; `eligible` for a pre-made
+/// descriptor.
+pub(crate) fn mirrored(kind: Mirror, eligible: bool) {
+    MIRRORS[kind as usize].fetch_add(1, Ordering::Relaxed);
+    if eligible {
+        MIRRORS[Mirror::ALL.len()].fetch_add(1, Ordering::Relaxed);
+    }
+    seen!(Seen::Mirror { kind, eligible });
+}
+
+/// The write-watch pages (`crate::watch::PAGE`) our own writes of the
+/// title's records (`descriptor::record`, `descriptor::copy_simple`) last
+/// went to, by a hash of the page, each as its number plus one: the heap
+/// sync takes a page out when it reads it. Two pages on one place keep the
+/// later: an estimate, counted low.
+const OWN_PAGES: usize = 4096;
+
+struct OwnPages([AtomicU64; OWN_PAGES]);
+
+impl OwnPages {
+    const fn new() -> OwnPages {
+        OwnPages([const { AtomicU64::new(0) }; OWN_PAGES])
+    }
+
+    fn slot(&self, page: u64) -> &AtomicU64 {
+        &self.0[((page ^ page >> 12) % OWN_PAGES as u64) as usize]
+    }
+
+    fn wrote(&self, address: u64, len: u64) {
+        let page = crate::watch::PAGE as u64;
+        let last = (address + len.max(1) - 1) / page;
+        for n in address / page..=last {
+            let slot = self.slot(n);
+            // A load first: most writes go to a page noted already.
+            if slot.load(Ordering::Relaxed) != n + 1 {
+                slot.store(n + 1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn read(&self, address: u64) -> bool {
+        let n = address / crate::watch::PAGE as u64;
+        self.slot(n)
+            .compare_exchange(n + 1, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+}
+
+static OWN: OwnPages = OwnPages::new();
+
+/// Our own write of title records `[address, address + len)`.
+pub(crate) fn own_wrote(address: u64, len: u64) {
+    OWN.wrote(address, len);
+}
+
+/// Whether the heap sync's read of the page at `address` follows a write
+/// of ours there (taken out: the next read is the title's again).
+pub(crate) fn own_page_read(address: u64) -> bool {
+    OWN.read(address)
+}
+
+/// Records the heap sync looked at on pages our own writes had changed,
+/// then distinct 4 KiB pieces with changed records in this frame.
+static SYNC_SEEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `n` records looked at on a page our own write had changed.
+pub(crate) fn own_looked(n: u64) {
+    SYNC_SEEN[0].fetch_add(n, Ordering::Relaxed);
+}
+
+/// The 4 KiB pieces with changed records seen in one frame.
+struct Pieces {
+    frame: u64,
+    seen: std::collections::BTreeSet<u64>,
+}
+
+impl Pieces {
+    /// `pieces` found changed in frame `frame`: how many are new to it.
+    fn add(&mut self, frame: u64, pieces: &[u64]) -> u64 {
+        if self.frame != frame {
+            self.frame = frame;
+            self.seen.clear();
+        }
+        pieces.iter().filter(|&&p| self.seen.insert(p)).count() as u64
+    }
+}
+
+/// Those of the heap sync's passes (one at a time).
+static PIECES: Mutex<Pieces> = Mutex::new(Pieces {
+    frame: 0,
+    seen: std::collections::BTreeSet::new(),
+});
+
+/// A heap sync pass of frame `frame` found changed records in the 4 KiB
+/// pieces `pieces` (their numbers): those not seen in the frame yet are
+/// counted. Once per pass, after its threads; the passes run one at a time
+/// (`descriptor`'s `SYNCING`), so the lock is never waited for.
+pub(crate) fn changed_pieces(frame: u64, pieces: &[u64]) {
+    if pieces.is_empty() {
+        return;
+    }
+    let new = lock(&PIECES).add(frame, pieces);
+    SYNC_SEEN[1].fetch_add(new, Ordering::Relaxed);
+}
+
+/// The memory directory's numbers handed out (`crate::memory`), most so far.
+static NUMBERS: AtomicU64 = AtomicU64::new(0);
+
+/// The directory has handed out `n` numbers.
+pub(crate) fn directory_numbers(n: usize) {
+    NUMBERS.fetch_max(n as u64, Ordering::Relaxed);
+}
+
 /// What was counted on this thread, in order (tests: the process's counters
 /// are shared with every other test).
 #[cfg(test)]
@@ -640,6 +803,10 @@ pub(crate) enum Seen {
     Kept {
         reason: Staging,
         bytes: u64,
+    },
+    Mirror {
+        kind: Mirror,
+        eligible: bool,
     },
 }
 
@@ -763,9 +930,13 @@ pub(crate) fn line(frames: f64, submitted: u64, views: [u64; 2], heap: u64) {
     );
 }
 
+/// The texture level changes at the last [`wave1_line`].
+static LEVELS_BEFORE: AtomicU64 = AtomicU64::new(0);
+
 /// The frame budget's second line, beside [`line`]: what decides which of
-/// wave 1's steps are needed, per frame over `frames`.
-pub(crate) fn wave1_line(frames: f64) {
+/// wave 1's steps are needed, per frame over `frames`. `levels`: texture
+/// level changes so far (`descriptor::host::levels_seen`).
+pub(crate) fn wave1_line(frames: f64, levels: u64) {
     let per = |n: u64| n as f64 / frames;
     let mb = |b: u64| b as f64 / f64::from(1 << 20) / frames;
     let classes: Vec<String> = H2Class::ALL
@@ -792,6 +963,13 @@ pub(crate) fn wave1_line(frames: f64) {
             (s[0] > 0).then(|| format!("{} {:.2} ({:.2} MB)", reason.name(), per(s[0]), mb(s[1])))
         })
         .collect();
+    let m: [u64; Mirror::ALL.len() + 1] =
+        std::array::from_fn(|i| MIRRORS[i].swap(0, Ordering::Relaxed));
+    let changed: u64 = m[..Mirror::ALL.len()].iter().sum();
+    let mirrors: Vec<String> = Mirror::ALL
+        .iter()
+        .map(|&kind| format!("{} {:.0}", kind.name(), per(m[kind as usize])))
+        .collect();
     let none = |v: Vec<String>| {
         if v.is_empty() {
             "none".to_owned()
@@ -800,9 +978,23 @@ pub(crate) fn wave1_line(frames: f64) {
         }
     };
     tracing::info!(
-        "frame budget for wave 1 per frame: H2 by class {}; card copies kept staging: {}",
+        "frame budget for wave 1 per frame: H2 by class {}; card copies kept staging: {}; slots mirrored: {} \
+         ({:.0}% eligible for a pre-made descriptor); {:.0} records looked at on pages our own writes changed; \
+         {:.0} distinct 4 KiB pieces with changed records; {:.2} texture level changes; directory numbers \
+         {} of {}",
         none(classes),
         none(staging),
+        mirrors.join(", "),
+        if changed > 0 {
+            100.0 * m[Mirror::ALL.len()] as f64 / changed as f64
+        } else {
+            0.0
+        },
+        per(SYNC_SEEN[0].swap(0, Ordering::Relaxed)),
+        per(SYNC_SEEN[1].swap(0, Ordering::Relaxed)),
+        per(levels.saturating_sub(LEVELS_BEFORE.swap(levels, Ordering::Relaxed))),
+        NUMBERS.load(Ordering::Relaxed),
+        crate::memory::COPIES,
     );
 }
 
@@ -1090,5 +1282,32 @@ mod tests {
                 assert_eq!(first_overlap(&ranges, from, to), reference, "{from}..{to}");
             }
         }
+    }
+
+    #[test]
+    fn changed_pieces_count_each_piece_once_a_frame() {
+        let mut pieces = Pieces {
+            frame: 0,
+            seen: Default::default(),
+        };
+        assert_eq!(pieces.add(7, &[1, 2, 3]), 3);
+        assert_eq!(pieces.add(7, &[2, 3, 4]), 1);
+        assert_eq!(pieces.add(8, &[1]), 1, "a new frame starts afresh");
+        assert_eq!(pieces.add(8, &[]), 0);
+    }
+
+    #[test]
+    fn own_pages_are_taken_once() {
+        // A table of the test's own.
+        let own = OwnPages::new();
+        let at = 0x7f00_dead_0000u64;
+        assert!(!own.read(at));
+        own.wrote(at + 0x20, 32);
+        assert!(own.read(at + 0x100), "the page our write went to");
+        assert!(!own.read(at), "taken: the next read is the title's");
+        // A write across a page line notes both pages.
+        let page = crate::watch::PAGE as u64;
+        own.wrote(at + page - 16, 32);
+        assert!(own.read(at) && own.read(at + page));
     }
 }

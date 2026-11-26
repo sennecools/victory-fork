@@ -117,5 +117,5 @@ pub(super) fn line(frames: f64) {
         crate::descriptor::views_in_use(),
         u64::from(victory_shader::emit::view_heap_limit()) + 1,
     );
-    crate::frame_budget::wave1_line(frames);
+    crate::frame_budget::wave1_line(frames, crate::descriptor::host::levels_seen());
 }

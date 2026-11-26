@@ -144,7 +144,7 @@ use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+pub(crate) const COPIES: u32 = 1023;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -545,6 +545,7 @@ impl Memory {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(Some(Numbered::Copy(shadow.clone())));
+                crate::frame_budget::directory_numbers(self.copies.len());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -628,6 +629,7 @@ impl Memory {
                     bytes,
                 }));
                 DIR[at::CHUNKS].fetch_add(1, Ordering::Relaxed);
+                crate::frame_budget::directory_numbers(self.copies.len());
                 self.copies.len() - 1
             }
             None => {

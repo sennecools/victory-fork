@@ -435,6 +435,7 @@ fn sync_parted_heap(
                 continue;
             }
             part.pages += 1;
+            let looked = part.looked;
             let slots = changed_slots(from, to, start as usize, step, mirrored_count);
             // SAFETY: the parts are ranges of the heap apart from one
             // another, and a record is the part's that holds its first byte.
@@ -449,6 +450,10 @@ fn sync_parted_heap(
                     &mut part,
                 )
             };
+            // (The frame budget: a page our own record writes changed.)
+            if crate::frame_budget::own_page_read(from as u64) {
+                part.own_looked += part.looked - looked;
+            }
         }
         *found[n].lock().unwrap_or_else(|e| e.into_inner()) = part;
     });
@@ -462,7 +467,12 @@ fn sync_parted_heap(
         all.nothing += part.nothing;
         all.read_ticks += part.read_ticks;
         all.make.append(&mut part.make);
+        all.own_looked += part.own_looked;
+        all.pieces.append(&mut part.pieces);
     }
+    // For the frame budget, once a pass (no other pass runs: `SYNCING`).
+    crate::frame_budget::own_looked(all.own_looked);
+    crate::frame_budget::changed_pieces(crate::frame::current(), &all.pieces);
     let make = &all.make;
     crate::draw::each_on(
         threads,
@@ -1168,7 +1178,10 @@ pub(crate) fn record(handle: u64, view: View) {
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     #[cfg(windows)]
-    mirror(handle, list_site::VIEW);
+    {
+        crate::frame_budget::own_wrote(handle, 12);
+        mirror(handle, list_site::VIEW);
+    }
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -1322,6 +1335,8 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         if !same {
             // SAFETY: as above.
             unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+            #[cfg(windows)]
+            crate::frame_budget::own_wrote(dst, len);
         }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
