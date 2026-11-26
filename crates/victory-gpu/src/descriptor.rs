@@ -805,6 +805,264 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+/// The views of [`Views`] as its readers see them, without its lock: every
+/// slot a draw reads through a table, the heap sync and the title's writes
+/// look a view up here, on many threads at once, and the lock and the copy
+/// of a view out from under it were the cost (`view_at`). Writers change it
+/// under [`VIEWS`]' write lock alone, entry by entry, as they change
+/// [`Views::list`] and [`Views::shapes`].
+///
+/// Entries live in chunks of [`CHUNK`] that are made as the table grows and
+/// never moved or freed, so a reader holds no reference that a writer could
+/// pull away. Each entry is a seqlock: its sequence word (odd while a writer
+/// changes the entry) is read before and after its generation and words,
+/// and a reader that finds it odd, or changed, reads again.
+/// A view holds only plain words (no reference of any kind), so a view read
+/// whole between two equal generations is the one that was written, and a
+/// changed generation (the resource released, `forget`) is never returned.
+mod table {
+    use std::sync::atomic::{
+        AtomicPtr, AtomicU32,
+        Ordering::{Acquire, Relaxed, Release},
+        fence,
+    };
+
+    /// Entries a chunk.
+    pub(super) const CHUNK: usize = 1 << 12;
+    /// Chunks: 4,194,304 entries in all. An entry past them is not in the
+    /// table: readers look it up under the lock, as before
+    /// (`super::entry_view`).
+    pub(super) const CHUNKS: usize = 1 << 10;
+    /// Words of an entry ([`super::View::words`]).
+    pub(super) const WORDS: usize = 32;
+
+    pub(super) struct Entry {
+        /// Odd while a writer changes the entry; one more after each change.
+        /// (Not the generation alone: an entry is written anew at the
+        /// generation it has, so a reader could find the same generation
+        /// before and after a write and take words of both.)
+        sequence: AtomicU32,
+        generation: AtomicU32,
+        words: [AtomicU32; WORDS],
+    }
+
+    impl Entry {
+        const fn new() -> Self {
+            Entry {
+                sequence: AtomicU32::new(0),
+                generation: AtomicU32::new(0),
+                words: [const { AtomicU32::new(0) }; WORDS],
+            }
+        }
+
+        /// Changes the entry with `change`, seen by readers as one change.
+        fn change(&self, change: impl FnOnce(&Self)) {
+            let at = self.sequence.load(Relaxed);
+            self.sequence.store(at.wrapping_add(1), Relaxed);
+            fence(Release);
+            change(self);
+            self.sequence.store(at.wrapping_add(2), Release);
+        }
+    }
+
+    /// One table of entries: the views ([`super::Views::list`]) or the
+    /// shapes of placed views ([`super::Views::shapes`]).
+    pub(super) struct Table {
+        chunks: [AtomicPtr<Entry>; CHUNKS],
+    }
+
+    impl Table {
+        pub(super) const fn new() -> Self {
+            Table {
+                chunks: [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS],
+            }
+        }
+
+        /// Entry `i`, if its chunk is made.
+        fn get(&self, i: u32) -> Option<&Entry> {
+            let i = i as usize;
+            let chunk = self.chunks.get(i / CHUNK)?.load(Acquire);
+            // SAFETY: a made chunk is `CHUNK` entries, never freed.
+            (!chunk.is_null()).then(|| unsafe { &*chunk.add(i % CHUNK) })
+        }
+
+        /// Entry `i`, its chunk made if it is not; `None` past the table.
+        /// Called under the write lock of [`super::VIEWS`] alone.
+        fn made(&self, i: u32) -> Option<&Entry> {
+            let at = self.chunks.get(i as usize / CHUNK)?;
+            if at.load(Acquire).is_null() {
+                let chunk: Box<[Entry]> = (0..CHUNK).map(|_| Entry::new()).collect();
+                at.store(Box::leak(chunk).as_mut_ptr(), Release);
+            }
+            self.get(i)
+        }
+
+        /// Writes entry `i`: `words` at `generation`. Under the write lock of
+        /// [`super::VIEWS`].
+        pub(super) fn write(&self, i: u32, generation: u32, words: &[u32; WORDS]) {
+            let Some(entry) = self.made(i) else {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(i, "view table full: views past it are read under the lock")
+                });
+                return;
+            };
+            entry.change(|entry| {
+                entry.generation.store(generation, Relaxed);
+                for (word, &w) in entry.words.iter().zip(words) {
+                    word.store(w, Relaxed);
+                }
+            });
+        }
+
+        /// Entry `i` is at `generation` from now on, its words as they are
+        /// (`forget`). Under the write lock of [`super::VIEWS`].
+        pub(super) fn age(&self, i: u32, generation: u32) {
+            if let Some(entry) = self.get(i) {
+                entry.change(|entry| entry.generation.store(generation, Relaxed));
+            }
+        }
+
+        /// The bytes of the chunks made so far (for the memory line).
+        #[cfg(all(windows, feature = "diagnostics"))]
+        pub(super) fn bytes(&self) -> u64 {
+            let made = self
+                .chunks
+                .iter()
+                .filter(|chunk| !chunk.load(Relaxed).is_null())
+                .count();
+            (made * CHUNK * size_of::<Entry>()) as u64
+        }
+
+        /// Tests: entry `i` as a writer leaves it while it changes it
+        /// (`busy`), or after it (not).
+        #[cfg(test)]
+        pub(super) fn hold_busy(&self, i: u32, busy: bool) {
+            if let Some(entry) = self.get(i) {
+                let at = entry.sequence.load(Relaxed);
+                if (at % 2 == 1) != busy {
+                    entry.sequence.store(at.wrapping_add(1), Release);
+                }
+            }
+        }
+
+        /// The words of entry `i` if it is at `generation`: read whole,
+        /// between two looks at its sequence that find it the same and no
+        /// writer at it.
+        pub(super) fn read(&self, i: u32, generation: u32) -> Option<[u32; WORDS]> {
+            let entry = self.get(i)?;
+            let mut spins = 0u32;
+            loop {
+                let before = entry.sequence.load(Acquire);
+                if before % 2 == 1 {
+                    #[cfg(test)]
+                    super::BUSY_READS.with(|n| n.set(n.get() + 1));
+                    spins += 1;
+                    if spins < 64 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                    continue;
+                }
+                let now = entry.generation.load(Relaxed);
+                let words = std::array::from_fn(|w| entry.words[w].load(Relaxed));
+                fence(Acquire);
+                if entry.sequence.load(Relaxed) == before {
+                    return (now == generation).then_some(words);
+                }
+            }
+        }
+    }
+}
+
+/// The views of [`Views::list`] for readers ([`table`]).
+static VIEW_TABLE: table::Table = table::Table::new();
+/// The shapes of [`Views::shapes`] for readers ([`table`]), each written
+/// once, at generation 1, before it is named.
+static SHAPE_TABLE: table::Table = table::Table::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: reads of the view table on this thread that found an entry
+    /// being written and read again.
+    static BUSY_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+impl View {
+    /// The view as the words of an entry of [`table`]: what it is, then its
+    /// fields.
+    fn words(&self) -> [u32; table::WORDS] {
+        let mut w = [0u32; table::WORDS];
+        let wide = |w: &mut [u32], v: u64| (w[0], w[1]) = (v as u32, (v >> 32) as u32);
+        match self {
+            View::Constant(address, size) => {
+                w[0] = 1;
+                wide(&mut w[1..], *address);
+                w[3] = *size;
+            }
+            View::Shader(r, desc) => {
+                w[0] = 2;
+                wide(&mut w[1..], *r as u64);
+                w[3] = u32::from(desc.is_some());
+                w[4..14].copy_from_slice(&desc.unwrap_or_default());
+            }
+            View::Unordered(r, counter, desc) => {
+                w[0] = 3;
+                wide(&mut w[1..], *r as u64);
+                wide(&mut w[3..], *counter as u64);
+                w[5] = u32::from(desc.is_some());
+                w[6..16].copy_from_slice(&desc.unwrap_or_default());
+            }
+            View::Sampler(desc) => {
+                w[0] = 4;
+                w[1..14].copy_from_slice(desc);
+            }
+            View::ConsoleSampler(desc) => {
+                w[0] = 5;
+                w[1..28].copy_from_slice(desc);
+            }
+            View::Placed(unordered, resource, desc) => {
+                w[0] = 6;
+                w[1] = u32::from(*unordered);
+                w[2..16].copy_from_slice(resource);
+                w[16..32].copy_from_slice(desc);
+            }
+        }
+        w
+    }
+
+    /// The view [`View::words`] wrote; `None` for words no view writes.
+    fn from_words(w: &[u32; table::WORDS]) -> Option<View> {
+        let wide = |at: usize| u64::from(w[at]) | u64::from(w[at + 1]) << 32;
+        let desc = |has: u32, at: usize| {
+            (has != 0).then(|| <[u32; 10]>::try_from(&w[at..at + 10]).unwrap_or_default())
+        };
+        Some(match w[0] {
+            1 => View::Constant(wide(1), w[3]),
+            2 => View::Shader(wide(1) as usize, desc(w[3], 4)),
+            3 => View::Unordered(wide(1) as usize, wide(3) as usize, desc(w[5], 6)),
+            4 => View::Sampler(w[1..14].try_into().ok()?),
+            5 => View::ConsoleSampler(w[1..28].try_into().ok()?),
+            6 => View::Placed(
+                w[1] != 0,
+                w[2..16].try_into().ok()?,
+                w[16..32].try_into().ok()?,
+            ),
+            _ => return None,
+        })
+    }
+}
+
+/// A shape ([`Shape`]) as the words of an entry of [`table`].
+fn shape_words(&(unordered, resource, rest): &Shape) -> [u32; table::WORDS] {
+    let mut w = [0u32; table::WORDS];
+    w[0] = u32::from(unordered);
+    w[1..15].copy_from_slice(&resource);
+    w[15..29].copy_from_slice(&rest);
+    w
+}
+
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
 /// what the other 62 bits are: 0, entry `i` of the table at that
@@ -905,21 +1163,11 @@ impl Views {
             return None;
         }
         let at = self.shapes.len() as u32;
+        // Written for readers before any record names it.
+        SHAPE_TABLE.write(at, 1, &shape_words(&shape));
         self.shapes.push(shape);
         self.shape_index.insert(shape, at);
         Some(at)
-    }
-
-    /// The view of placed memory [`placed_words`] named.
-    fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
-        let payload = payload(i, generation);
-        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
-        let mut desc = [0u32; 16];
-        desc[..10].copy_from_slice(&rest[..10]);
-        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
-        desc[12..].copy_from_slice(&rest[10..]);
-        Some(View::Placed(unordered, resource, desc))
     }
 
     /// The record words of `view` as a table entry, if it has one.
@@ -947,6 +1195,8 @@ impl Views {
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
                     self.by_resource.entry(r).or_default().push(i);
                 }
+                // For readers, before any record names it.
+                VIEW_TABLE.write(i, self.list[i as usize].1, &view.words());
                 self.index.insert(view, i);
                 i
             }
@@ -1000,7 +1250,8 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// For the memory line: the distinct views kept ([`Views`]), those of them
 /// free for reuse, and the bytes the table and its index hold for them (an
 /// estimate: an entry of the table, and one of the index with its share of
-/// a tree node; the shapes likewise); then the entries that are constant
+/// a tree node; the shapes likewise; and the chunks of the tables readers
+/// read them from without the lock, [`table`], made so far); then the entries that are constant
 /// buffer views and views of placed memory (those that did not fit a
 /// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
 /// placed views kept, and the views named whole in their records since the
@@ -1025,7 +1276,9 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
             + views.shapes.capacity() as u64 * shape
-            + views.shape_index.len() as u64 * shape * 3 / 2,
+            + views.shape_index.len() as u64 * shape * 3 / 2
+            + VIEW_TABLE.bytes()
+            + SHAPE_TABLE.bytes(),
         constants,
         placed,
         views.shapes.len() as u64,
@@ -1184,7 +1437,9 @@ pub(crate) fn forget(resource: usize) {
         }
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
-        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        let newer = ((generation + 1) & GENERATIONS).max(1);
+        views.list[i as usize].1 = newer;
+        VIEW_TABLE.age(i, newer);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -1192,18 +1447,45 @@ pub(crate) fn forget(resource: usize) {
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
-/// whole, or the view of entry `i` if `generation` is still its own.
+/// whole, or the view of entry `i` if `generation` is still its own. Takes
+/// no lock ([`table`]).
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
-        0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
-        }
+        0 => entry_view(i, generation, |i| {
+            views_read().list.get(i as usize).cloned()
+        }),
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
+        PLACED => placed_of(i, generation),
         _ => None,
     }
+}
+
+/// The view of table entry `i` at `generation`: from the reader table
+/// ([`table`]) without a lock, or, for an entry past it, from `list` (the
+/// entry and its generation, read under the lock of [`VIEWS`]).
+fn entry_view(
+    i: u32,
+    generation: u32,
+    list: impl FnOnce(u32) -> Option<(View, u32)>,
+) -> Option<View> {
+    if (i as usize) / table::CHUNK < table::CHUNKS {
+        return View::from_words(&VIEW_TABLE.read(i, generation)?);
+    }
+    let (view, current) = list(i)?;
+    (current == generation).then_some(view)
+}
+
+/// The view of placed memory [`placed_words`] named.
+fn placed_of(i: u32, generation: u32) -> Option<View> {
+    let payload = payload(i, generation);
+    let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+    let w = SHAPE_TABLE.read((payload >> PLACED_ADDRESS_BITS) as u32, 1)?;
+    let resource: [u32; 14] = w[1..15].try_into().ok()?;
+    let mut desc = [0u32; 16];
+    desc[..10].copy_from_slice(&w[15..25]);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    desc[12..].copy_from_slice(&w[25..29]);
+    Some(View::Placed(w[0] != 0, resource, desc))
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -1489,6 +1771,208 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// Two views of every word the table keeps, each word unlike the other's.
+    fn two_views() -> [View; 2] {
+        let placed = |base: u32| {
+            View::Placed(
+                base % 2 == 1,
+                std::array::from_fn(|w| base + w as u32),
+                std::array::from_fn(|w| base * 7 + w as u32),
+            )
+        };
+        [placed(1), placed(1000)]
+    }
+
+    /// Every kind of view comes back from the words of its entry as it was.
+    #[test]
+    fn a_view_comes_back_from_its_words() {
+        let desc: [u32; 10] = std::array::from_fn(|w| w as u32 + 3);
+        for view in [
+            View::Constant(0x7d_5000_1234, 4096),
+            View::Shader(0x1234_5678_9abc, None),
+            View::Shader(0x1234_5678_9abc, Some(desc)),
+            View::Unordered(0xdead_beef_0000, 0x77, Some(desc)),
+            View::Unordered(0xdead_beef_0000, 0, None),
+            View::Sampler(std::array::from_fn(|w| w as u32)),
+            View::ConsoleSampler(std::array::from_fn(|w| 100 + w as u32)),
+            two_views()[0].clone(),
+            two_views()[1].clone(),
+        ] {
+            assert_eq!(View::from_words(&view.words()), Some(view));
+        }
+        assert_eq!(View::from_words(&[0; table::WORDS]), None);
+    }
+
+    /// Four readers and a writer that rewrites one entry over and over: every
+    /// read is one of the two views whole, never words of both.
+    #[test]
+    fn view_table_seqlock_no_torn_reads() {
+        static TABLE: table::Table = table::Table::new();
+        const READS: u64 = if cfg!(debug_assertions) {
+            100_000
+        } else {
+            1_000_000
+        };
+        let views = two_views();
+        let words = views.clone().map(|v| v.words());
+        TABLE.write(5, 1, &words[0]);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let written = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            // The writer first, and some of its writes before any read.
+            let writer = scope.spawn(|| {
+                let mut n = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    TABLE.write(5, 1, &words[n % 2]);
+                    n += 1;
+                    written.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            while written.load(std::sync::atomic::Ordering::Relaxed) < 1_000
+                && !writer.is_finished()
+            {
+                std::hint::spin_loop();
+            }
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut seen = [0u64; 2];
+                        for _ in 0..READS {
+                            let read = TABLE.read(5, 1).expect("at its generation");
+                            let view = View::from_words(&read).expect("a whole view");
+                            let at = views
+                                .iter()
+                                .position(|v| *v == view)
+                                .expect("a view written");
+                            seen[at] += 1;
+                        }
+                        seen
+                    })
+                })
+                .collect();
+            // Every reader is joined and the writer stopped before anything
+            // is asserted: a reader that failed ends the test, not hangs it.
+            let seen: Vec<_> = readers.into_iter().map(|r| r.join()).collect();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let seen: Vec<[u64; 2]> = seen
+                .into_iter()
+                .map(|r| r.expect("a reader read only whole views"))
+                .collect();
+            assert!(seen.iter().all(|s| s[0] + s[1] == READS));
+            let both = seen.iter().fold([0u64; 2], |a, s| [a[0] + s[0], a[1] + s[1]]);
+            assert!(both[0] > 0 && both[1] > 0, "both views read: {both:?}");
+        });
+    }
+
+    /// An entry past the reader table is looked up as before, with its
+    /// generation checked; one inside it is read from the table.
+    #[test]
+    fn an_entry_past_the_reader_table_is_read_under_the_lock() {
+        let past = (table::CHUNK * table::CHUNKS) as u32;
+        let view = two_views()[0].clone();
+        let list = |i: u32| (i == past).then(|| (view.clone(), 7));
+        assert_eq!(entry_view(past, 7, list), Some(view.clone()));
+        assert_eq!(entry_view(past, 8, list), None, "another generation");
+        assert_eq!(entry_view(past + 1, 7, list), None, "no entry");
+        // Inside the table: the list is not asked.
+        assert_eq!(
+            entry_view(past - 1, 7, |_| panic!("asked the list")),
+            None,
+            "nothing written there"
+        );
+    }
+
+    /// A read of an entry a writer is changing waits for it and reads what
+    /// was written.
+    #[test]
+    fn view_table_busy_reads_retry() {
+        static TABLE: table::Table = table::Table::new();
+        let views = two_views();
+        TABLE.write(9, 3, &views[0].words());
+        TABLE.hold_busy(9, true);
+        let reader = std::thread::spawn(|| {
+            let read = TABLE.read(9, 3);
+            (read, BUSY_READS.with(std::cell::Cell::get))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!reader.is_finished(), "the read waits for the writer");
+        TABLE.hold_busy(9, false);
+        let (read, busy) = reader.join().unwrap();
+        assert_eq!(
+            read.and_then(|w| View::from_words(&w)),
+            Some(views[0].clone())
+        );
+        assert!(busy > 0, "it found the entry busy");
+    }
+
+    /// A record of an entry whose generation moved on (its resource
+    /// released) names nothing, and a chunk never made reads nothing.
+    #[test]
+    fn stale_generation_reads_none() {
+        static TABLE: table::Table = table::Table::new();
+        let views = two_views();
+        TABLE.write(4, 1, &views[0].words());
+        assert!(TABLE.read(4, 1).is_some());
+        TABLE.age(4, 2);
+        assert_eq!(TABLE.read(4, 1), None, "an older generation");
+        assert!(TABLE.read(4, 2).is_some(), "the entry at its own");
+        assert_eq!(
+            TABLE.read(4 + table::CHUNK as u32 * 3, 1),
+            None,
+            "no chunk there"
+        );
+    }
+
+    /// For the record, not gated: a read of the table against a read under
+    /// an uncontended lock with a clone of the view, as before.
+    #[test]
+    fn view_at_microbench() {
+        static TABLE: table::Table = table::Table::new();
+        const N: u32 = 200_000;
+        let view = two_views()[1].clone();
+        TABLE.write(1, 1, &view.words());
+        let locked = std::sync::RwLock::new(vec![(view.clone(), 1u32); 2]);
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(View::from_words(&TABLE.read(1, 1).unwrap()));
+        }
+        let table = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let list = locked.read().unwrap();
+            let (v, g) = &list[1];
+            std::hint::black_box((*g == 1).then(|| v.clone()));
+        }
+        let lock = started.elapsed();
+        // Four threads at once, as the recording threads and the heap sync.
+        let four = |read: &(dyn Fn() + Sync)| {
+            let started = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| (0..N).for_each(|_| read()));
+                }
+            });
+            started.elapsed()
+        };
+        let table_four = four(&|| {
+            std::hint::black_box(View::from_words(&TABLE.read(1, 1).unwrap()));
+        });
+        let lock_four = four(&|| {
+            let list = locked.read().unwrap();
+            let (v, g) = &list[1];
+            std::hint::black_box((*g == 1).then(|| v.clone()));
+        });
+        let ns = |d: std::time::Duration| d.as_nanos() as f64 / f64::from(N);
+        println!(
+            "view_at: one thread: table {:.1} ns, lock and clone {:.1} ns a read; four threads: \
+             table {:.1} ns, lock and clone {:.1} ns a read each",
+            ns(table),
+            ns(lock),
+            ns(table_four),
+            ns(lock_four)
+        );
+    }
 
     #[test]
     fn constant_buffer_staging_uses_only_the_host_addressable_prefix() {

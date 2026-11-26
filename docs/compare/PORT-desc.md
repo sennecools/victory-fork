@@ -280,3 +280,17 @@ garbled geometry, and hangs.
   for want of room are counted in `LEFT_DROPPED`, on the frame line when not
   zero. Tests: `a_record_left_to_a_table_is_read_again_once_its_mark_ages`,
   `slots_left_to_tables_past_the_limit_are_counted`.
+- **Views read without a lock (W1.10, 26 Nov 2026).** `view_at` reads table
+  entries from a copy of `Views::list` in fixed chunks of 4,096 entries that
+  are made as the table grows and never moved or freed (the `table` module in
+  `descriptor.rs`, 4,194,304 entries; an entry past them is read under the
+  lock as before). Each entry is a seqlock: a write counter, odd while a
+  writer (under the write lock, as before) changes it, is read before and
+  after the entry's generation and words. Shapes of placed views have a
+  table of their own. In a release build one thread reads a view in about
+  20 ns against 14 ns under an uncontended lock, and four threads at once in
+  about 19 ns each against 99 ns. Tests: `a_view_comes_back_from_its_words`,
+  `view_table_seqlock_no_torn_reads`, `view_table_busy_reads_retry`,
+  `stale_generation_reads_none`,
+  `an_entry_past_the_reader_table_is_read_under_the_lock`,
+  `view_at_microbench` (not gated).
