@@ -4649,8 +4649,9 @@ const LIFT_WITH_FILLS: usize = 6;
 /// [`LIFT_STATS`]: waits for flights to land left out.
 const LIFT_WAITS_LEFT: usize = 7;
 /// [`LIFT_STATS`]: with `VICTORY_LIFT_CLOSURE=1`, steps of those plans
-/// taken along (touching neither what flights write nor what a lifted copy
-/// ahead of them writes).
+/// taken beyond those that touch what flights write; this includes steps
+/// that `plan_lifts` would lift as well (one behind a lifted copy that
+/// reads what the copy writes), so it is not only what the closure adds.
 const LIFT_ALONG: usize = 8;
 
 /// Since the last frame-rate line: plans aborted, by [`LiftAbort`].
@@ -5726,7 +5727,8 @@ fn late_line(frames: f64) {
             if aborted.is_empty() { "none".to_owned() } else { aborted.join(", ") },
             if lift_closure::lift_closure() {
                 format!(
-                    "; {:.1} steps taken along (VICTORY_LIFT_CLOSURE=1, VICTORY_LIFT_JOIN={})",
+                    "; {:.1} steps taken beyond those over flights' writes (VICTORY_LIFT_CLOSURE=1, \
+                     VICTORY_LIFT_JOIN={})",
                     l[LIFT_ALONG],
                     u8::from(lift_closure::lift_join())
                 )

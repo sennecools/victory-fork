@@ -36,9 +36,11 @@ use super::*;
 /// ahead of it or behind it. What is left on the CPU then writes none of
 /// their bytes, and reads of them only where it stands ahead of the lifted
 /// copy that writes them (it reads them before that copy, as it did). A
-/// texture behind a lifted copy over its memory, a step of ours, a fill
-/// that cannot be lifted (`LiftAbort::BigScratch`) or a copy the card
-/// cannot do still abort, as do more than [`CLOSURE_MOST`] lifted steps.
+/// fill that cannot be lifted is not taken along but left on the CPU; it
+/// aborts (`LiftAbort::BigScratch`) only behind a lifted copy that writes
+/// what it reads, or where it reads what flights write. A texture behind a
+/// lifted copy over its memory, a step of ours or a copy the card cannot do
+/// still abort, as do more than [`CLOSURE_MOST`] lifted steps.
 ///
 /// Why: cool_fox measured 10 ms a frame of waits for flights for a copy
 /// whose destination another step of the submission read; ours aborts the
@@ -78,18 +80,20 @@ fn reads_writes(seen: Seen) -> Option<((usize, usize), (usize, usize))> {
 
 /// As [`plan_lifts`], with [`lift_closure`]: of `steps` (list, step, what it
 /// is) in submission order, the copies and fills to lift, in that order, and
-/// how many of them were taken along (touch neither what flights write nor
-/// what a lifted copy writes ahead of them); or why none. `join`:
-/// [`lift_join`].
+/// how many of them were taken beyond those that touch what flights write
+/// (including steps [`plan_lifts`] would lift too, behind a lifted copy
+/// whose destination they read); or why none. `join`: [`lift_join`].
 ///
 /// First taken, as by [`plan_lifts`]: every copy that reads or writes what
 /// flights write (`written`), every fill that reads it. Then, round by round,
 /// every copy that writes what a taken step reads or writes, or reads what a
-/// taken copy writes, and every fill that reads what a taken copy writes.
-/// Then each taken step is made a lift as [`plan_lifts`] makes it (`sole`,
-/// `scratch`, `fills` as there), and the steps left on the CPU are looked at
-/// in order: a texture over what flights write, or over what a taken copy
-/// ahead of it writes, aborts.
+/// taken copy writes, and every fill that can be lifted (`fills`, `scratch`)
+/// that reads what a taken copy writes. Then each taken step is made a lift
+/// as [`plan_lifts`] makes it (`sole`, `scratch`, `fills` as there), and the
+/// steps left on the CPU are looked at in order: a texture or a fill over
+/// what flights write, or over what a taken copy ahead of it writes,
+/// aborts. As cool_fox's 3e64a64 plan, which skips such fills in its rounds
+/// and aborts only for one behind a taken copy.
 pub(super) fn plan_closure<T: Clone, C>(
     written: &[(usize, usize)],
     steps: impl IntoIterator<Item = (usize, usize, Seen)>,
@@ -121,6 +125,9 @@ pub(super) fn plan_closure<T: Clone, C>(
     let (mut read, mut wrote): (Vec<(usize, usize)>, Vec<(usize, usize)>) =
         (Vec::new(), Vec::new());
     let mut count = 0;
+    // Per step, whether a fill can be lifted (`fills` and a scratch chunk
+    // holds it), asked once.
+    let mut liftable: Vec<Option<bool>> = vec![None; steps.len()];
     while !more.is_empty() {
         let (mut reads, mut writes) = (Vec::new(), Vec::new());
         for i in std::mem::take(&mut more) {
@@ -154,7 +161,14 @@ pub(super) fn plan_closure<T: Clone, C>(
                         || touches(&wrote, dst, dst + len)
                         || touches(&read, dst, dst + len)
                 }
-                Seen::Fill(_, src, len) => touches(&wrote, src, src + len),
+                // A fill that cannot be lifted stays on the CPU: it is in
+                // the way only behind a taken copy that writes what it
+                // reads, which the walk below aborts for.
+                Seen::Fill(dst, src, len) => {
+                    touches(&wrote, src, src + len)
+                        && *liftable[i]
+                            .get_or_insert_with(|| fills && scratch(steps[i].0, dst, len).is_some())
+                }
                 _ => false,
             };
             if along {
@@ -178,10 +192,20 @@ pub(super) fn plan_closure<T: Clone, C>(
     let mut behind: Vec<(usize, usize)> = Vec::new();
     for (i, &(list, step, seen)) in steps.iter().enumerate() {
         if !taken[i] {
-            if let Seen::Texture(at, len) = seen
-                && (touches(written, at, at + len) || touches(&behind, at, at + len))
-            {
-                return Err(LiftAbort::TextureAfter);
+            match seen {
+                Seen::Texture(at, len)
+                    if touches(written, at, at + len) || touches(&behind, at, at + len) =>
+                {
+                    return Err(LiftAbort::TextureAfter);
+                }
+                // A fill left on the CPU that reads what a taken copy ahead
+                // of it writes would read it too early.
+                Seen::Fill(_, src, len)
+                    if touches(written, src, src + len) || touches(&behind, src, src + len) =>
+                {
+                    return Err(LiftAbort::BigScratch);
+                }
+                _ => {}
             }
             continue;
         }
@@ -368,12 +392,22 @@ mod tests {
             planned(&W, &[Seen::Texture(2050, 4), taken]),
             Ok((vec![1], 0))
         );
-        // A fill taken along that cannot be lifted; into itself; across two
-        // copies.
+        // A fill that cannot be lifted, behind the copy that writes what it
+        // reads; or reading what flights write. Ahead of the copy it stays on
+        // the CPU.
         assert_eq!(
             planned(&W, &[taken, Seen::Fill(0x0f_0000, 2050, 4)]),
             Err(LiftAbort::BigScratch)
         );
+        assert_eq!(
+            planned(&W, &[Seen::Fill(0x0f_0000, 1050, 4)]),
+            Err(LiftAbort::BigScratch)
+        );
+        assert_eq!(
+            planned(&W, &[Seen::Fill(0x0f_0000, 2050, 4), taken]),
+            Ok((vec![1], 0))
+        );
+        // Into itself; across two copies.
         assert_eq!(
             planned(&W, &[Seen::Copy(1010, 1000, 20)]),
             Err(LiftAbort::InPlace)
