@@ -562,6 +562,18 @@ impl Epochs {
             .then(|| (ahead.now, self.fold(first, last)))
     }
 
+    /// For [`super::nothing_new`]: the pages of `[first, last)` as last
+    /// written, if the asking that stands covers them, or `known` (their
+    /// bits say every write of theirs is noted); `None` otherwise.
+    pub(super) fn known(
+        &self,
+        first: usize,
+        last: usize,
+        known: bool,
+    ) -> Option<Vec<(usize, u64)>> {
+        (known || self.ahead().covers(first, last)).then(|| self.fold(first, last))
+    }
+
     /// [`super::writes`].
     pub(super) fn writes(
         &self,
@@ -574,10 +586,17 @@ impl Epochs {
         if let Some(answer) = self.asked(start, end) {
             return Some(answer);
         }
+        // As the journal: read-only since an asking noted it
+        // (`VICTORY_LIGHT_REFRESH=1`), the tables have every write of it.
+        if guarded && super::published(first * PAGE, last * PAGE) {
+            return Some((self.next(), self.fold(first, last)));
+        }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // As the journal: view memory the guards hold is not asked about.
-        let known_view = guarded && super::known_view(first * PAGE);
+        let known_view = guarded
+            && (super::protected_bits(first * PAGE, last * PAGE)
+                || super::known_view(first * PAGE));
         self.rebase_if_due();
         let _held = self.lock(first, last);
         with_found(|found| {
@@ -621,8 +640,13 @@ impl Epochs {
             for &at in &found[..count] {
                 self.mark(at, at + 1, now);
             }
-            for page in views {
+            for &page in &views {
                 self.mark(page * PAGE, (page + 1) * PAGE, now);
+            }
+            // Noted, the span locks still held: from now on the bits tell
+            // of what the guards made clean of it (as the journal does).
+            if count == 0 && super::light() {
+                super::publish(&views);
             }
             Some((now, self.fold(first, last)))
         })

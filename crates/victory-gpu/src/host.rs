@@ -9941,11 +9941,24 @@ impl Batch {
         }
         ranges.merge();
         self.done.refreshes += 1;
+        if crate::watch::skip_unchanged() && Self::nothing_new(&shadow, &ranges) {
+            return;
+        }
         let copied = Self::update(&shadow, &ranges);
         if crate::profile::on() {
             self.done.asked += Self::bytes(&ranges);
             self.done.copied += copied;
         }
+    }
+
+    /// Whether no range of a copy has anything new, as far as is known
+    /// without asking (`VICTORY_NOTHING_NEW=1`,
+    /// `crate::shadow::Shadow::nothing_new`).
+    fn nothing_new(shadow: &crate::shadow::Shadow, ranges: &RefreshRanges) -> bool {
+        ranges
+            .as_slice()
+            .iter()
+            .all(|&(from, to)| shadow.nothing_new(from, to - from))
     }
 
     /// The bytes of a copy's merged ranges.
@@ -9999,6 +10012,19 @@ impl Batch {
         for (_, ranges) in &mut self.refreshes {
             ranges.merge();
         }
+        // Copies known to have nothing new (`VICTORY_NOTHING_NEW=1`): left
+        // out before anything is asked and any thread woken for them, from
+        // what the submission's asking found and the guards' bits. A flush
+        // of thousands of copies (the heap's buffer views) is looked at on
+        // the threads instead, below. (cool_fox 2aa8134.)
+        const FEW: usize = 256;
+        let skip = crate::watch::skip_unchanged();
+        if skip && self.refreshes.len() <= FEW {
+            let started = std::time::Instant::now();
+            self.refreshes
+                .retain(|(shadow, ranges)| !Self::nothing_new(shadow, ranges));
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // One write-watch asking for ranges that lie close together.
         let ahead = self.refreshes.len() > 1
             || self.refreshes.first().is_some_and(|(_, ranges)| ranges.as_slice().len() > 1);
@@ -10039,12 +10065,18 @@ impl Batch {
             // The bytes copied, summed across the threads.
             let copied =
                 profiling.then(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+            // (Not looked at above.)
+            let many = self.refreshes.len() > FEW;
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
                 .map(|(shadow, ranges)| {
                     let copied = copied.clone();
+                    let look = skip && many;
                     Box::new(move || {
+                        if look && Self::nothing_new(&shadow, &ranges) {
+                            return;
+                        }
                         let bytes = Self::update(&shadow, &ranges);
                         if let Some(copied) = copied {
                             copied.fetch_add(bytes, Ordering::Relaxed);
