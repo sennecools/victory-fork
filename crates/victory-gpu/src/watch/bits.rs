@@ -221,6 +221,28 @@ impl Blocks {
         all
     }
 
+    /// The first `n` from `first` on, in order.
+    pub(super) fn first_from(&self, first: usize, n: usize) -> Vec<usize> {
+        if !guard_bits() {
+            return self.tree.range(first..).take(n).copied().collect();
+        }
+        let mut all = Vec::new();
+        for (&piece, words) in self.words.range(first / Blocks::IN_PIECE..) {
+            let base = piece * Blocks::IN_PIECE;
+            let from = first.max(base) - base;
+            for (k, &bits) in words[from / 64..].iter().enumerate() {
+                let at = (from / 64 + k) * 64;
+                for bit in BitsOf(bits & in_word(at, from, Blocks::IN_PIECE)) {
+                    if all.len() == n {
+                        return all;
+                    }
+                    all.push(base + at + bit);
+                }
+            }
+        }
+        all
+    }
+
     /// How many of `[first, last)` there are.
     pub(super) fn count(&self, first: usize, last: usize) -> usize {
         if first >= last {
@@ -234,7 +256,6 @@ impl Blocks {
             .sum()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn len(&self) -> usize {
         self.len
     }
@@ -354,5 +375,11 @@ mod tests {
             }
         }
         assert_eq!(set.range(5, usize::MAX).first(), other.range(5..).next());
+        for from in [0, 5, 64, Blocks::IN_PIECE - 3, 3 * Blocks::IN_PIECE] {
+            for n in [0, 1, 7, 1000] {
+                let want: Vec<usize> = other.range(from..).take(n).copied().collect();
+                assert_eq!(set.first_from(from, n), want, "{from} {n}");
+            }
+        }
     }
 }

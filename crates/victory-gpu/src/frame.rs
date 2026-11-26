@@ -243,6 +243,10 @@ fn issued(token: u64) {
 
 /// `PresentX` flipped the frame of `token` (0: a present without a frame).
 pub(crate) fn flipped(token: u64) {
+    // Once a frame: a part of the holes taken as known is looked at again
+    // (`VICTORY_KNOWN_HOLES=1`; nothing without it).
+    #[cfg(windows)]
+    crate::watch::look_at_holes();
     if token == 0 {
         return;
     }

@@ -177,6 +177,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if core && !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER == 0 && kind & MEM_RESERVE != 0 {
         victory_gpu::title_memory_region(at as usize, size, title_kind, flags, title_protect);
     }
+    // Memory there now: holes of placeholders known there are looked at
+    // again (`VICTORY_KNOWN_HOLES=1`; nothing without it).
+    if !at.is_null() && !placeholder {
+        victory_gpu::title_memory_allocated(at as usize, size);
+    }
     at
 }
 
