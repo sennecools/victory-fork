@@ -35,14 +35,15 @@ mod stamps;
 
 use bits::{Bits, Blocks};
 use stamps::Stamps;
-pub(crate) use stamps::Taken;
+pub(crate) use stamps::{Taken, part_runs};
 
-/// The unit tracked and copied: 64 KiB, the console's page (the kernel's
-/// 4 KiB pages fold into it). Finer units made the checks of the world's
-/// big buffers cost more than the copies they saved.
+/// The unit tracked and checked: 64 KiB, the console's page. Finer units
+/// made the checks of the world's big buffers cost more than the copies
+/// they saved; what is copied of a stale page is its 4 KiB parts written
+/// since ([`stale_words`]).
 pub(crate) const PAGE: usize = 64 << 10;
-/// The kernel's page, the unit of its answers.
-const KERNEL_PAGE: usize = 4096;
+/// The kernel's page, the unit of its answers and of the parts of a page.
+pub(crate) const KERNEL_PAGE: usize = 4096;
 
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
@@ -403,8 +404,9 @@ fn ask_once_end_in(journal: &Mutex<Journal>) {
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking
-/// stands (the title's buffer copies, done at submission): its pages count
-/// as written after that asking, so the refreshes that follow copy them.
+/// stands (the title's buffer copies, done at submission): the 4 KiB parts
+/// it lies in count as written after that asking, so the refreshes that
+/// follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
     wrote_in(&JOURNAL, at, len);
 }
@@ -423,14 +425,14 @@ fn wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
-    j.stamps
-        .mark(at / PAGE, at.saturating_add(len).div_ceil(PAGE), now);
+    j.stamps.mark_bytes(at, at.saturating_add(len), now);
 }
 
 /// The GPU wrote title memory `[at, at + len)` through a home of the memory
-/// core (`crate::home::after_wait`), which write watching cannot see: its
-/// pages count as written now, whether or not an asking stands, so that
-/// every copy over them takes them again at its next refresh. ([`wrote`]
+/// core (`crate::home::after_wait`), which write watching cannot see: the
+/// 4 KiB parts it lies in count as written now, whether or not an asking
+/// stands, so that every copy over them takes them again at its next
+/// refresh. ([`wrote`]
 /// acts only while a submission's one asking stands.)
 pub(crate) fn gpu_wrote(at: usize, len: usize) {
     gpu_wrote_in(&JOURNAL, at, len);
@@ -448,8 +450,7 @@ fn gpu_wrote_in(journal: &Mutex<Journal>, at: usize, len: usize) {
     if !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    j.stamps
-        .mark(at / PAGE, at.saturating_add(len).div_ceil(PAGE), now);
+    j.stamps.mark_bytes(at, at.saturating_add(len), now);
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -507,7 +508,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    j.mark_pages(j.found[..count].iter().map(|&at| at / PAGE), j.ahead_asked);
+    j.stamps
+        .mark_found(&j.found[..count], granularity as usize, j.ahead_asked);
     true
 }
 
@@ -576,7 +578,8 @@ fn writes_now_in(journal: &Mutex<Journal>, start: usize, end: usize, guarded: bo
 
 /// Calls `f` with each page of `[first, last)` that the copy whose notes
 /// are `taken` must take from title memory before it holds the title's
-/// bytes, in page order: the one rule for every host copy of title memory
+/// bytes, in page order, and the 4 KiB parts of it to take (a bit each,
+/// all of them for a page never taken): the one rule for every host copy of title memory
 /// (`Stamps::stale_words`; texture staging asks [`writes`] with its own
 /// `since`).
 /// A caller asks first ([`writes_now`]) so the journal has the writes up to
@@ -585,7 +588,7 @@ pub(crate) fn stale_words(
     first: usize,
     last: usize,
     taken: &Taken,
-    f: impl FnMut(usize) -> std::ops::ControlFlow<()>,
+    f: impl FnMut(usize, u16) -> std::ops::ControlFlow<()>,
 ) -> std::ops::ControlFlow<()> {
     stale_words_in(&JOURNAL, first, last, taken, f)
 }
@@ -596,7 +599,7 @@ fn stale_words_in(
     first: usize,
     last: usize,
     taken: &Taken,
-    f: impl FnMut(usize) -> std::ops::ControlFlow<()>,
+    f: impl FnMut(usize, u16) -> std::ops::ControlFlow<()>,
 ) -> std::ops::ControlFlow<()> {
     let _journal = crate::profile::journal_timer();
     let j = journal.lock().unwrap_or_else(|e| e.into_inner());
@@ -682,13 +685,11 @@ fn ask(j: &mut Journal, first: usize, last: usize, guarded: bool) -> Option<u64>
     }
     j.asked += 1;
     let now = j.asked;
-    j.mark_pages(
-        j.found[..count]
-            .iter()
-            .map(|&at| at / PAGE)
-            .chain(guarded.iter().copied()),
-        now,
-    );
+    // The kernel's answer by its 4 KiB parts; a guarded block is the whole
+    // page, as the guard gave it all back at its first write.
+    j.stamps
+        .mark_found(&j.found[..count], granularity as usize, now);
+    j.mark_pages(guarded.iter().copied(), now);
     // What the guards made clean of it is noted: from now on the bits tell
     // of it (the journal's lock is still held, no other asking of it came
     // between).
@@ -963,7 +964,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, taken: &Taken) -> bool {
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     (known || j.ahead.iter().any(|&(a, b)| a <= first && last <= b))
         && j.stamps
-            .stale_words(first, last, taken, |_| std::ops::ControlFlow::Break(()))
+            .stale_words(first, last, taken, |_, _| std::ops::ControlFlow::Break(()))
             .is_continue()
 }
 
@@ -2625,7 +2626,7 @@ mod tests {
     fn take(start: usize, end: usize, guarded: bool, copied: &mut Taken) {
         let now = writes_now(start, end, guarded).expect("watched or a view");
         let mut stale = Vec::new();
-        let _ = stale_words(start / PAGE, end.div_ceil(PAGE), copied, |page| {
+        let _ = stale_words(start / PAGE, end.div_ceil(PAGE), copied, |page, _| {
             stale.push(page);
             std::ops::ControlFlow::Continue(())
         });
@@ -3433,9 +3434,9 @@ mod journal_tests {
                 .unwrap_or(0)
         }
 
-        /// `Shadow::copy_stale`: copies the pages of `[from, to)` (inside
-        /// the copy) that `stale_words` finds after asking `now`, and notes
-        /// the whole ones taken at `now`. Given the pages `written` that
+        /// `Shadow::copy_stale`: copies the parts `stale_words` names of
+        /// the pages of `[from, to)` (inside the copy) after asking `now`,
+        /// and notes the whole pages taken at `now`. Given the pages `written` that
         /// the asking answered (`writes_in`), the pages the old rule took
         /// from that list (never taken, or written after their take) are
         /// among them, and are all of them when `exact` (no other asker).
@@ -3449,9 +3450,10 @@ mod journal_tests {
         ) {
             let (start, end) = (self.start, self.start + self.len);
             let (first, last) = (from / PAGE, to.div_ceil(PAGE));
-            let mut stale = Vec::new();
-            let flow = stale_words_in(journal, first, last, &self.taken, |page| {
+            let (mut stale, mut parts) = (Vec::new(), Vec::new());
+            let flow = stale_words_in(journal, first, last, &self.taken, |page, part| {
                 stale.push(page);
+                parts.push(part);
                 ControlFlow::Continue(())
             });
             assert!(flow.is_continue());
@@ -3471,14 +3473,19 @@ mod journal_tests {
                     assert!(old.iter().all(|p| stale.binary_search(p).is_ok()));
                 }
             }
-            for page in stale {
+            for (page, part) in stale.into_iter().zip(parts) {
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     self.taken.take(page, page + 1, now);
                 }
-                let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
-                // SAFETY: inside the caller's committed region.
-                let title = unsafe { std::slice::from_raw_parts(lo as *const u8, hi - lo) };
-                self.data[lo - start..hi - start].copy_from_slice(title);
+                for (a, b) in super::part_runs(part) {
+                    let (lo, hi) = ((page * PAGE + a).max(from), (page * PAGE + b).min(to));
+                    if lo >= hi {
+                        continue;
+                    }
+                    // SAFETY: inside the caller's committed region.
+                    let title = unsafe { std::slice::from_raw_parts(lo as *const u8, hi - lo) };
+                    self.data[lo - start..hi - start].copy_from_slice(title);
+                }
             }
         }
 

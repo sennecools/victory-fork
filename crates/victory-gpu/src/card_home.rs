@@ -1253,8 +1253,8 @@ mod tests {
         let lo = (page - start) as usize;
         assert_eq!(
             written,
-            [(lo, lo + K64 as usize)],
-            "only the page the title wrote"
+            [(lo, lo + crate::watch::KERNEL_PAGE)],
+            "only the 4 KiB part of the page the title wrote"
         );
         upload(&mut rig, &copy, &written);
         let card = rig.fetch(&copy.buffer, 0, len as usize).unwrap();
@@ -2029,8 +2029,8 @@ mod tests {
         let now = flow_now();
         let up = now[flow::UPLOADED] - was[flow::UPLOADED];
         assert!(
-            (2 * K64..size / 4).contains(&up),
-            "the merged piece and the title's page went up, not the copy: {up}"
+            (K64 + crate::watch::KERNEL_PAGE as u64..size / 4).contains(&up),
+            "the merged piece and the title's part went up, not the copy: {up}"
         );
         assert_eq!(
             now[flow::KEPT] - was[flow::KEPT],
