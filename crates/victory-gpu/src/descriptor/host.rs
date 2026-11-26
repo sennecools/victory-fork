@@ -31,7 +31,8 @@ pub(crate) struct HostHeap {
     /// [`CLAIMED`] while one thread changes the slot ([`HostHeap::claim`]).
     made: Box<[std::sync::atomic::AtomicU64]>,
     /// Whether `made` is changed a slot at a time, with no lock over the
-    /// heap ([`made_atomic`]); otherwise under `made_lock`, as before.
+    /// heap (every heap but the tests' references: see [`HostHeap::new`]);
+    /// otherwise under `made_lock`.
     atomic: bool,
     /// The heap-wide lock over `made` when it is not changed a slot at a
     /// time: held across every look at and change of a slot, as the lock
@@ -1383,7 +1384,7 @@ impl HostHeap {
             return Self::with_made(sampler, count, true)
                 .map(|heap| heap.with_stripes(MADE_STRIPES));
         }
-        Self::with_made(sampler, count, made_atomic())
+        Self::with_made(sampler, count, true)
     }
 
     /// This heap, changed a slot at a time, with its claims under `n`
@@ -1398,7 +1399,7 @@ impl HostHeap {
     }
 
     /// [`HostHeap::new`]; `atomic`: `made` is changed a slot at a time
-    /// ([`made_atomic`]). The rest as the environment says.
+    /// ([`HostHeap::atomic`]). The rest as the environment says.
     fn with_made(sampler: bool, count: u32, atomic: bool) -> Option<Self> {
         Self::with_ways(sampler, count, atomic, slot_bits(), quick_mirror())
     }
@@ -5027,31 +5028,17 @@ const KEPT_SHARD: u32 = 1 << 12;
 /// it in the spans; the bits above it count the slot's writes.
 const IN_SPANS: u32 = 1;
 
-/// Whether [`HostHeap::made`] is changed a slot at a time, each slot
-/// claimed by the thread that changes it, with no lock over the heap; the
-/// host descriptor is made outside any such lock, what a write changes
-/// in the queue of textures and the sets of buffer views is logged and
-/// applied by whatever reads them next ([`NoteLog`]), and a write of a
-/// slot that holds no placed texture view leaves the spans' lock alone
-/// ([`HostHeap::spanned`]).
-/// `VICTORY_MADE_ATOMIC=1`; otherwise one lock over the heap's `made` is
-/// held across all of it, as before.
-fn made_atomic() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MADE_ATOMIC").is_some_and(|v| v == "1"))
-}
-
 /// Whether a heap's claims of its slots are taken under [`MADE_STRIPES`]
 /// striped locks ([`HostHeap::stripes`]), each slot under the lock of its
-/// stripe, with `made` changed a slot at a time as with [`made_atomic`]
-/// (implied: the queue and set changes are logged in order, [`NoteLog`]).
-/// `VICTORY_MADE_STRIPES=1`; off by default: as [`made_atomic`] says.
+/// stripe, with `made` changed a slot at a time as on every heap
+/// ([`HostHeap::atomic`]). `VICTORY_MADE_STRIPES=1`; off by default: each
+/// claim spins on its slot alone.
 ///
 /// Ported from cool_fox 6c17ce9's `Made`, 512 locks in place of the lock
 /// over the heap's `made` (cool_fox measured that one lock as what
 /// everything of a frame waited for once the lists were translated on
 /// threads: half of what those did). Ours already claims each slot alone
-/// with `VICTORY_MADE_ATOMIC=1`; the stripes add a lock a thread sleeps on
+/// (once `VICTORY_MADE_ATOMIC=1`, now every heap); the stripes add a lock a thread sleeps on
 /// in place of the claim's spin, at the cost of slots of one stripe
 /// waiting for each other.
 fn made_stripes() -> bool {
@@ -5064,8 +5051,8 @@ const MADE_STRIPES: usize = 512;
 
 /// Whether a heap's sets of buffer views (the slots holding one, and those
 /// changed since the heap buffer pass took them) are bits of atomic words
-/// ([`BufferBits`]), changed by the writer of a slot with no lock and, with
-/// [`made_atomic`], no log (`VICTORY_SLOT_BITS=1`, off by default: a
+/// ([`BufferBits`]), changed by the writer of a slot with no lock and no
+/// log (`VICTORY_SLOT_BITS=1`, off by default: a
 /// `BTreeSet` and a `HashSet` under locks of their own, as before). Either
 /// way the sets hold the same slots; the slots come out in slot order.
 ///
@@ -5237,7 +5224,8 @@ impl BufferNote {
 }
 
 /// Logs of the changes writes of slots make to a heap's queue of textures
-/// and sets of buffer views, with `VICTORY_MADE_ATOMIC` ([`made_atomic`]):
+/// and sets of buffer views, on a heap changed a slot at a time
+/// ([`HostHeap::atomic`]):
 /// each thread appends to a log of its own (one of [`LOG_STRIPES`]), so
 /// threads that write different slots wait for no lock in common, and
 /// whatever reads the queue or the sets applies the changes logged until
@@ -6819,8 +6807,7 @@ mod tests {
 #[cfg(test)]
 mod sync_tests;
 
-/// `made` changed a slot at a time (`VICTORY_MADE_ATOMIC=1`) against the
-/// heap-wide lock.
+/// `made` changed a slot at a time against the heap-wide lock.
 #[cfg(test)]
 mod made_tests {
     use super::*;
