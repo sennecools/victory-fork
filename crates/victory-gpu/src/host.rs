@@ -3829,6 +3829,32 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
     ranges.truncate(kept);
 }
 
+/// The ranges the flights declared their shaders write, for each copy
+/// once, in the order the flights first name it, joined ([`join_ranges`]:
+/// in order, apart, none empty). Each copy is found by its address, where a
+/// search of the list for each made a landing of many copies quadratic.
+fn gather_back<'a, T: 'a>(
+    backs: impl IntoIterator<Item = &'a (std::sync::Arc<T>, Vec<(usize, usize)>)>,
+) -> Vec<(std::sync::Arc<T>, Vec<(usize, usize)>)> {
+    use std::collections::hash_map::Entry;
+    let mut back: Vec<(std::sync::Arc<T>, Vec<(usize, usize)>)> = Vec::new();
+    let mut found: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (shadow, ranges) in backs {
+        match found.entry(std::sync::Arc::as_ptr(shadow) as *const () as usize) {
+            Entry::Occupied(at) => back[*at.get()].1.extend_from_slice(ranges),
+            Entry::Vacant(at) => {
+                at.insert(back.len());
+                back.push((shadow.clone(), ranges.clone()));
+            }
+        }
+    }
+    for (_, ranges) in &mut back {
+        let declared = std::mem::take(ranges);
+        join_ranges(ranges, declared);
+    }
+    back
+}
+
 /// Whether anything is in the air.
 fn flying() -> bool {
     if !late() {
@@ -5344,7 +5370,7 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{continues, gather_back, join_ranges, touches};
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -5363,6 +5389,64 @@ mod late_tests {
         // They touch without overlapping.
         assert!(continues((1000, 1032, 16), (1016, 1048, 16)));
         assert!(!continues((usize::MAX - 8, 0, 8), (0, 8, 8)));
+    }
+
+    /// The landing's gathering of what the flights declared, by the copy's
+    /// address, gives what the search of the list for each copy gave once
+    /// joined: the same copies in the same order, the same ranges.
+    #[test]
+    fn gathering_by_address_gives_what_the_search_did() {
+        use std::sync::Arc;
+        type Back = (Arc<u32>, Vec<(usize, usize)>);
+        // As the landing gathered before: each copy looked for in the list,
+        // each range not in it yet added.
+        fn searched(backs: &[Back]) -> Vec<Back> {
+            let mut back: Vec<Back> = Vec::new();
+            for (shadow, ranges) in backs {
+                match back.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                    Some((_, all)) => {
+                        for range in ranges {
+                            if !all.contains(range) {
+                                all.push(*range);
+                            }
+                        }
+                    }
+                    None => back.push((shadow.clone(), ranges.clone())),
+                }
+            }
+            back
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below) as usize
+        };
+        for round in 0..500 {
+            let copies: Vec<Arc<u32>> = (0..1 + next(12)).map(|n| Arc::new(n as u32)).collect();
+            let backs: Vec<Back> = (0..next(40))
+                .map(|_| {
+                    let shadow = copies[next(copies.len() as u64)].clone();
+                    let ranges = (0..next(6))
+                        .map(|_| {
+                            let from = next(4096);
+                            (from, from + next(300))
+                        })
+                        .collect();
+                    (shadow, ranges)
+                })
+                .collect();
+            let old = searched(&backs);
+            let new = gather_back(&backs);
+            assert_eq!(old.len(), new.len(), "round {round}");
+            for ((old, old_ranges), (new, new_ranges)) in old.iter().zip(&new) {
+                assert!(Arc::ptr_eq(old, new), "round {round}: the same copies in order");
+                let mut joined = Vec::new();
+                join_ranges(&mut joined, old_ranges.iter().copied());
+                assert_eq!(&joined, new_ranges, "round {round}");
+            }
+        }
     }
 
     /// Ranges are found by what they hold, not by where they start, and a
@@ -6867,21 +6951,7 @@ impl Host {
                     self.relay_card_back(&plans, fetch);
                 }
                 let hand_back = crate::profile::span("relay: hand back");
-                let mut back: Vec<Declared> = Vec::new();
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
-                        }
-                    }
-                }
+                let back = gather_back(flights.iter().flat_map(|flight| &flight.back));
                 relay_hand_back(&back);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
