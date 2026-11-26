@@ -208,11 +208,93 @@ pub(crate) struct Staging {
     waiting: std::sync::atomic::AtomicU64,
 }
 
+/// What tells a texture's memory changed (see [`content_hash`]). Kept in
+/// memory only: no hash of it is stored anywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hash {
+    Blake3(blake3::Hash),
+    Digest(Digest),
+}
+
+/// Whether textures' memory is told changed by [`digest`] instead of
+/// blake3 (`VICTORY_TEXTURE_DIGEST=1`; off by default: blake3, as before).
+/// cool_fox measured blake3 at 0.2 to 0.27 ms a megabyte, four times the
+/// detiling it is to spare, and the digest at 0.035. Also for
+/// [`fingerprint`].
+fn cheap_hash() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_DIGEST").is_some_and(|v| v == "1"))
+}
+
+/// The hash of a texture's memory: [`digest`] with [`cheap_hash`], else
+/// blake3.
+fn content_hash(bytes: &[u8]) -> Hash {
+    if cheap_hash() {
+        Hash::Digest(digest(bytes))
+    } else {
+        Hash::Blake3(blake3::hash(bytes))
+    }
+}
+
+/// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
+/// lanes of folded multiplications over 64 bytes at a time. Not a
+/// cryptographic one: nobody makes up textures to collide.
+pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    const K: [u64; 8] = [
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+        0x8ebc_6af0_9c88_c6e3,
+        0x5899_65cc_7537_4cc3,
+        0x1d8e_4e27_c47d_124f,
+        0xeb44_acca_b455_d165,
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+    ];
+    let fold = |a: u64, b: u64| {
+        let p = u128::from(a) * u128::from(b);
+        p as u64 ^ (p >> 64) as u64
+    };
+    let word = |b: &[u8]| {
+        let mut w = [0; 8];
+        w[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(w)
+    };
+    let mut lanes = [K[0], K[1], K[2], K[3]];
+    let mut step = |block: &[u8; 64]| {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let a = word(&block[16 * i..16 * i + 8]);
+            let b = word(&block[16 * i + 8..16 * i + 16]);
+            // (What went in is added again: a product with a factor of zero
+            // forgets neither the lane nor the block.)
+            *lane = fold(a ^ K[4 + i], b ^ *lane)
+                .wrapping_add(a.rotate_left(23) ^ lane.rotate_left(41))
+                ^ b;
+        }
+    };
+    let mut blocks = bytes.chunks_exact(64);
+    for block in &mut blocks {
+        step(block.try_into().unwrap_or(&[0; 64]));
+    }
+    let rest = blocks.remainder();
+    let mut last = [0u8; 64];
+    last[..rest.len()].copy_from_slice(rest);
+    step(&last);
+    let len = bytes.len() as u64;
+    let low = fold(lanes[0] ^ K[1], lanes[1] ^ len) ^ fold(lanes[2] ^ K[3], lanes[3] ^ K[5]);
+    let high = fold(lanes[0].rotate_left(32) ^ K[6], lanes[2] ^ len)
+        ^ fold(lanes[1].rotate_left(32) ^ K[7], lanes[3] ^ K[2]);
+    Digest(u128::from(low) << 64 | u128::from(high))
+}
+
+/// See [`digest`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Digest(u128);
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<Hash>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -224,7 +306,7 @@ struct Last {
 impl Last {
     /// Takes `hash` as the hash of the texture's memory; true when it
     /// differs from the last one, and then the frame is noted.
-    fn rehash(&mut self, hash: blake3::Hash) -> bool {
+    fn rehash(&mut self, hash: Hash) -> bool {
         if self.hash == Some(hash) {
             return false;
         }
@@ -269,7 +351,7 @@ impl Last {
         if bytes.iter().all(|&b| b == 0) {
             return false;
         }
-        self.rehash(blake3::hash(bytes))
+        self.rehash(content_hash(bytes))
     }
 }
 
@@ -1674,7 +1756,7 @@ impl Staging {
         last.partial = None;
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = content_hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if !last.rehash(hash) {
@@ -1689,7 +1771,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if !last.rehash(hash) {
@@ -1713,7 +1795,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            if last.rehash(blake3::hash(read)) {
+            if last.rehash(content_hash(read)) {
                 self.detile(read);
             }
             true
@@ -1858,10 +1940,17 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         let mut read = read.borrow_mut();
         read.resize(PIECES * PIECE, 0);
         let mut hasher = blake3::Hasher::new();
+        // With [`cheap_hash`] the pieces' digests folded instead.
+        let cheap = cheap_hash();
+        let mut print = 0u128;
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
-            hasher.update(&read[..bytes]);
+            if cheap {
+                print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+            } else {
+                hasher.update(&read[..bytes]);
+            }
         };
         if len <= PIECES * PIECE {
             take(0, len);
@@ -1870,6 +1959,9 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
                 take(((len - PIECE) / (PIECES - 1) * n) & !0xfff, PIECE);
             }
             take(len - PIECE, PIECE);
+        }
+        if cheap {
+            return (print as u64 ^ (print >> 64) as u64) | 1;
         }
         let hash = hasher.finalize();
         let mut first = [0u8; 8];
@@ -2272,6 +2364,40 @@ mod guard_tests {
 }
 
 #[cfg(test)]
+mod digest_tests {
+    use super::{Digest, digest};
+
+    /// The digest tells every length and every changed byte apart, zeros
+    /// among them.
+    #[test]
+    fn a_digest_tells_bytes_apart() {
+        let zeros = [0u8; 400];
+        let mut seen: Vec<Digest> = (0..400).map(|n| digest(&zeros[..n])).collect();
+        for at in 0..400 {
+            for value in [1u8, 0x80, 0xff] {
+                let mut bytes = zeros;
+                bytes[at] = value;
+                seen.push(digest(&bytes));
+            }
+        }
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
+        for at in 0..399 {
+            let mut bytes = text.clone();
+            bytes.swap(at, at + 1);
+            if bytes != text {
+                seen.push(digest(&bytes));
+            }
+        }
+        seen.push(digest(&text));
+        let n = seen.len();
+        seen.sort_unstable_by_key(|d| d.0);
+        seen.dedup();
+        assert_eq!(seen.len(), n);
+        assert_eq!(digest(&text), digest(&text.clone()));
+    }
+}
+
+#[cfg(test)]
 mod title_memory_tests {
     use super::{Last, with_title};
 
@@ -2303,12 +2429,12 @@ mod title_memory_tests {
         assert!(!last.accept_partial(&zero));
         assert_eq!(last.hash, None);
         assert!(last.accept_partial(&data));
-        assert_eq!(last.hash, Some(blake3::hash(&data)));
+        assert_eq!(last.hash, Some(super::content_hash(&data)));
         assert!(!last.accept_partial(&zero));
-        assert_eq!(last.hash, Some(blake3::hash(&data)));
+        assert_eq!(last.hash, Some(super::content_hash(&data)));
         // A later fully mapped zero texture must not be skipped as equal
         // to the nonzero contents still in staging.
-        assert_ne!(last.hash, Some(blake3::hash(&zero)));
+        assert_ne!(last.hash, Some(super::content_hash(&zero)));
         assert!(!last.accept_partial(&data));
         assert!(last.accept_partial(&[0xa2; 64]));
     }
