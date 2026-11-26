@@ -1296,14 +1296,53 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        // With `VICTORY_SAME_RECORDS=1` (`same_records`), records copied onto
+        // the same bytes are not written: their page stays unwritten for the
+        // write watch, and the heap sync does not read it for them. They are
+        // mirrored as before.
+        // SAFETY: both ranges are descriptor slots the title owns (they may
+        // overlap: only read here).
+        let same = same_records()
+            && len > 0
+            && unsafe {
+                std::slice::from_raw_parts(dst as *const u8, len as usize)
+                    == std::slice::from_raw_parts(src as *const u8, len as usize)
+            };
+        if !same {
+            // SAFETY: as above.
+            unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step, list_site::COPY);
         }
     }
 }
+
+/// Whether [`copy_simple`] (and so [`copy`]) leaves records that are copied
+/// onto the same bytes unwritten (`VICTORY_SAME_RECORDS=1`, off by default:
+/// written, as before). The title copies its tables' records into its heaps
+/// each frame, many of them onto what is there already; a write of the same
+/// bytes still marks the page written, and the heap sync then reads and
+/// compares it (`sync_heaps`). What the title reads back is the same either
+/// way.
+///
+/// Ported from the `VICTORY_SAME_RECORDS` check of cool_fox e8d3d91, by
+/// local (there in its own write of the title's bytes, which this port
+/// leaves out).
+fn same_records() -> bool {
+    #[cfg(test)]
+    if SAME_RECORDS_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_some_and(|v| v == "1"))
+}
+
+/// Tests: [`same_records`] on, whatever the environment says.
+#[cfg(test)]
+pub(crate) static SAME_RECORDS_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Device method: ranges of descriptors (start and count each) gathered
 /// from the sources and scattered to the destinations, in order.

@@ -950,3 +950,79 @@ fn passes_of_its_own_run_between_requests_and_answer_none() {
     std::thread::sleep(Duration::from_millis(60));
     assert_eq!(passes.load(Relaxed), after);
 }
+
+/// With `VICTORY_SAME_RECORDS`, records copied onto the same bytes leave
+/// their page unwritten for the write watch, and records that differ are
+/// copied and mark it, as without the switch (which writes the same bytes
+/// too). In write-watched memory that is no heap: no pass of another test
+/// takes its pages.
+#[test]
+fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch,
+        VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    let page = crate::watch::PAGE;
+    // SAFETY: new memory.
+    let memory = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            2 * page,
+            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+        )
+    };
+    assert!(!memory.is_null());
+    let (src, dst) = (memory as u64, memory as u64 + page as u64);
+    // The kernel pages of `dst`'s page written since the last look.
+    let written = || {
+        let mut found = vec![std::ptr::null_mut::<std::ffi::c_void>(); page / 4096 + 1];
+        let (mut count, mut granularity) = (found.len(), 0u32);
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                1,
+                dst as *const _,
+                page,
+                found.as_mut_ptr(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        assert_eq!(failed, 0);
+        count
+    };
+    // Records 0..8 of both alike, as the title left them.
+    for k in 0..8u64 {
+        // SAFETY: records of the allocation.
+        unsafe {
+            (dst as *mut [u32; 8])
+                .add(k as usize)
+                .write([k as u32 + 1; 8]);
+            (src as *mut [u32; 8])
+                .add(k as usize)
+                .write([k as u32 + 1; 8]);
+        }
+    }
+    // SAFETY: the allocation's own.
+    assert_eq!(unsafe { ResetWriteWatch(memory, 2 * page) }, 0);
+    let _ = written();
+    let on = descriptor::SAME_RECORDS_FOR_TESTS.swap(true, Relaxed);
+    descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
+    assert_eq!(written(), 0, "the same records: the page is not written");
+    // One record differs: all eight are copied.
+    // SAFETY: a record of the allocation.
+    unsafe { (src as *mut [u32; 8]).add(5).write([99; 8]) };
+    descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
+    assert!(written() > 0, "a record that differs is written");
+    // SAFETY: as above.
+    assert_eq!(unsafe { (dst as *const [u32; 8]).add(5).read() }, [99; 8]);
+    descriptor::SAME_RECORDS_FOR_TESTS.store(on, Relaxed);
+    // Without the switch the same bytes are written, and mark the page.
+    let _ = written();
+    descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
+    assert!(written() > 0, "without the switch the page is written");
+    // SAFETY: this allocation belongs to the test.
+    unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+}
