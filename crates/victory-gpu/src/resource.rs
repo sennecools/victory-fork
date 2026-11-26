@@ -2291,6 +2291,37 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // A texture the title fills, whose every subresource is uploaded from
+    // its staging buffer before anything reads it: cut from a block of
+    // `crate::texture_pool` (`VICTORY_TEXTURE_POOL`; what the piece held
+    // before shows in no texel). One plane only: the upload writes plane 0.
+    if !reserved
+        && crate::texture_pool::textures_on()
+        && fills(desc)
+        && d.sample_count <= 1
+        && clear_value.is_none()
+        && texture_layout(desc)
+            .is_some_and(|t| t.planes.len() == 1 && !t.planes[0].layout.desc.swizzle.xor())
+        // SAFETY: the description has the host layout, as below.
+        && let Some(t) = unsafe {
+            crate::texture_pool::texture(
+                &host.device,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                ),
+            )
+        }
+    {
+        crate::host::label_texture(&t, "host texture (in a block)");
+        crate::host::name(&t, || {
+            format!(
+                "texture {}x{} f{} flags {:#x} (in a block)",
+                d.width, d.height, d.format, d.flags
+            )
+        });
+        return Ok(t);
+    }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture

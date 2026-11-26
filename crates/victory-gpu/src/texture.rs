@@ -35,9 +35,18 @@ macro_rules! once {
 /// retired when it goes (`crate::host::retire`): dropped only once every
 /// submission running then has finished, whoever lets go of it last.
 pub(crate) struct Buf {
-    /// Some until it is dropped.
+    /// Some until it is dropped. With [`Buf::piece`], the block the piece
+    /// lies in.
     buffer: Option<ID3D12Resource>,
+    /// Its mapping (with a piece, where the piece starts in the block's).
     data: *mut u8,
+    /// Where in `buffer` it starts: 0, or with a piece where that lies
+    /// (copies from it add this to the footprints' offsets).
+    base: u64,
+    /// Cut from a block of `crate::texture_pool` (`VICTORY_TEXTURE_POOL`):
+    /// retired with the buffer when it goes, back in the pool once the
+    /// submissions running then have finished.
+    piece: Option<crate::texture_pool::StagingPiece>,
     /// Its bytes as made: the texture's, or with [`transient`] a size class
     /// ([`class_of`]).
     bytes: u64,
@@ -63,6 +72,30 @@ impl Buf {
         Some(Buf {
             buffer: Some(buffer),
             data,
+            base: 0,
+            piece: None,
+            bytes,
+            fence: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// [`Buf::new`], cut from a block of `crate::texture_pool` if its
+    /// staging half is on (all zeros, as a new buffer); a buffer of its own
+    /// otherwise. Not for [`transient`] buffers, whose pool asks whether a
+    /// list holds a buffer by its references, which a block's buffer has
+    /// for all its pieces.
+    fn pooled(bytes: u64) -> Option<Buf> {
+        let host = host()?;
+        let Some((piece, buffer, base, data)) = crate::texture_pool::staging(host, bytes) else {
+            return Buf::new(bytes);
+        };
+        STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        Some(Buf {
+            buffer: Some(buffer),
+            data,
+            base,
+            piece: Some(piece),
             bytes,
             fence: std::sync::atomic::AtomicU64::new(0),
         })
@@ -104,6 +137,10 @@ impl Drop for Buf {
         // submission running.
         if let Some(buffer) = self.buffer.take() {
             crate::host::retire(buffer);
+        }
+        // A piece of a block waits the same way, and then rests.
+        if let Some(piece) = self.piece.take() {
+            crate::host::retire(piece);
         }
     }
 }
@@ -1074,6 +1111,24 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
+    // A texture cut from a block (`crate::texture_pool`) may lie where
+    // another did: what the card holds of that one is done with before the
+    // first upload into this one.
+    if !staging.uploaded.load(Relaxed) && crate::texture_pool::in_block(texture) {
+        let aliasing = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: std::mem::ManuallyDrop::new(None),
+                    // SAFETY: a borrowed pointer the barrier never releases.
+                    pResourceAfter: unsafe { std::mem::transmute_copy(texture) },
+                }),
+            },
+        };
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[aliasing]) };
+    }
     match staging.record_copies(list, texture, resource) {
         Recorded::Copies => staging.later.store(false, Relaxed),
         Recorded::Later => {
@@ -1313,7 +1368,7 @@ impl Staging {
                             f.RowPitch
                         )
                     },
-                    (gpu + footprint.Offset, len),
+                    (gpu + buf.base + footprint.Offset, len),
                 );
             }
             let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -1329,7 +1384,10 @@ impl Staging {
                 pResource: unsafe { std::mem::transmute_copy(buf.buffer()) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: *footprint,
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: buf.base + footprint.Offset,
+                        ..*footprint
+                    },
                 },
             };
             // SAFETY: an open list; both locations name live resources.
@@ -2128,10 +2186,20 @@ fn make_staging(
     let buf = if transient {
         None
     } else {
-        let buf = Buf::new(total)?;
-        crate::host::name(buf.buffer(), || {
-            format!("{} {}x{}x{} f{}", name(), d.Width, d.Height, d.DepthOrArraySize, d.Format.0)
-        });
+        let buf = Buf::pooled(total)?;
+        // (A block's buffer has its own name.)
+        if buf.piece.is_none() {
+            crate::host::name(buf.buffer(), || {
+                format!(
+                    "{} {}x{}x{} f{}",
+                    name(),
+                    d.Width,
+                    d.Height,
+                    d.DepthOrArraySize,
+                    d.Format.0
+                )
+            });
+        }
         Some(Arc::new(buf))
     };
     Some(Staging {

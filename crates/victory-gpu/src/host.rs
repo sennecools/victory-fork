@@ -242,6 +242,9 @@ fn sweep(whole: bool) {
         {
             return;
         }
+        // The blocks of textures and staging kept empty, by the card's
+        // room (nothing without `VICTORY_TEXTURE_POOL`).
+        crate::texture_pool::room();
         // Without slices nothing is held: what a pass lets go of is retired
         // or dropped at once, where it is let go, as before slices.
         *pass = Some(Sweep {
@@ -484,6 +487,12 @@ pub(crate) fn sweep_walk<K: Copy, V>(
         }
     }
     None
+}
+
+/// The number of the newest submission begun, and of the newest of which
+/// all before it have finished too.
+pub(crate) fn submissions() -> (u64, u64) {
+    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
 /// Drops `object` once every submission running now has finished: at once
