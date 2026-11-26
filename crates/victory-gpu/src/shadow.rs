@@ -3652,8 +3652,7 @@ impl Shadow {
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
-    /// (`crate::watch::nothing_new`; for `VICTORY_NOTHING_NEW=1`,
-    /// `crate::watch::skip_unchanged`). `false` if it would have to ask.
+    /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     /// Ported from cool_fox 2aa8134.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
         if self.place.is_some() {

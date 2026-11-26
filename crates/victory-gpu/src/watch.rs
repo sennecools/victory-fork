@@ -850,25 +850,15 @@ fn protected_bits(start: usize, end: usize) -> bool {
     PROTECTED.any(start / BLOCK, end.div_ceil(BLOCK))
 }
 
-/// Whether a flush of host copies leaves out those that it knows have
-/// nothing new, before any thread is woken and anything asked for them
-/// (`VICTORY_NOTHING_NEW=1`; off by default, as before;
-/// `crate::shadow::Shadow::nothing_new`, [`nothing_new`]). What it knows is
-/// the submission's asking ahead (write-watched memory) and the bits of view
-/// memory ([`PUBLISHED`]).
-///
-/// Ported from cool_fox 2aa8134, where it is part of `VICTORY_LIGHT_REFRESH`.
-pub(crate) fn skip_unchanged() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_NOTHING_NEW").is_some_and(|v| v == "1"))
-}
-
 /// Whether nothing of `[start, end)` was written that a copy with the notes
 /// `copied` (the asking after which each page from page `base` on was taken)
 /// does not hold, as [`writes`] would answer with nothing asked: the
 /// submission's asking covers the range, or its blocks are known by their
 /// bits ([`PUBLISHED`]). `false` if something would have to be asked, or a
-/// page was never taken.
+/// page was never taken. A flush of host copies leaves out those that have
+/// nothing new so, before any thread is woken and anything asked for them
+/// (`crate::shadow::Shadow::nothing_new`; ported from cool_fox 2aa8134, its
+/// `VICTORY_NOTHING_NEW`).
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64]) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let Some(taken) = first
