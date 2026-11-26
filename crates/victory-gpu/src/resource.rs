@@ -1163,6 +1163,9 @@ pub(crate) struct HostTexture {
     /// With `VICTORY_TEXTURE_SAME=1`: the hash of the title memory its last
     /// upload was detiled from (`crate::texture::unchanged`).
     pub(crate) holds: std::sync::Mutex<Option<crate::texture::Hash>>,
+    /// With `VICTORY_TEXTURE_SAME=1`: its last upload was left out as it
+    /// held those bytes (`crate::texture::left_out_memory`).
+    pub(crate) left_out: std::sync::atomic::AtomicBool,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -2158,6 +2161,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             holds: std::sync::Mutex::new(None),
+            left_out: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2176,6 +2180,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             holds: std::sync::Mutex::new(None),
+            left_out: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

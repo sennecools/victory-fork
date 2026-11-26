@@ -1184,6 +1184,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // The pass over textures picked by index, for a texture without a
     // staging state: nothing to upload if its host copy holds these bytes.
     if PICKING.get() && same() && !is_staged(resource) && unchanged(resource) {
+        if let Some(copy) = crate::resource::host_copy(resource) {
+            copy.left_out
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let n = SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n == 1 || n.is_multiple_of(10_000) {
             tracing::info!(
@@ -1737,6 +1741,8 @@ impl Staging {
     fn note_held(&self, copy: &crate::resource::HostTexture) {
         let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).held;
         *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash;
+        copy.left_out
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -2122,11 +2128,16 @@ pub(crate) fn unchanged(resource: This) -> bool {
     })
 }
 
-/// With [`same`]: where a title texture's memory is, address and bytes, as
-/// [`staged_memory`] says it of a staged one (for the look again at a
-/// texture whose upload was left out). `None` with the switch off.
+/// With [`same`]: where a title texture whose last upload [`same`] left out
+/// has its memory, address and bytes, as [`staged_memory`] says it of a
+/// staged one (for the look again at it). `None` with the switch off, and
+/// for a texture not uploaded for another reason (written by the host, no
+/// console layout), which a look again would not upload either.
 pub(crate) fn left_out_memory(resource: This) -> Option<(u64, u64)> {
-    if !same() {
+    if !same()
+        || !crate::resource::host_copy(resource)
+            .is_some_and(|copy| copy.left_out.load(std::sync::atomic::Ordering::Relaxed))
+    {
         return None;
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
