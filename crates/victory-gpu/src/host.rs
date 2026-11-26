@@ -519,6 +519,30 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// Tests: a submission counted as started and not finished, as one sent
+/// ahead is while it is on the card; it finishes (and what waited for it is
+/// dropped) when this goes. Counted in the process's own `STARTED` and
+/// `FINISHED`: only with `--test-threads=1` (as the WARP tests run), since
+/// a real submission of a test beside it that finishes stores a higher
+/// `FINISHED` and buries what waits for this one early.
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) struct Running(u64);
+
+#[cfg(all(test, feature = "diagnostics"))]
+impl Running {
+    pub(crate) fn start() -> Self {
+        Self(STARTED.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+impl Drop for Running {
+    fn drop(&mut self) {
+        FINISHED.fetch_max(self.0, Ordering::AcqRel);
+        bury(FINISHED.load(Ordering::Acquire));
+    }
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -10269,12 +10293,14 @@ impl Meter {
         let [own, asking, still, texture_refresh_ms] =
             [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let staging = STAGING_WAIT_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
-        if texture_refresh_ms >= 1.0 {
+        // With `VICTORY_TEXTURE_STAGING_TRANSIENT=1`: the staging buffers.
+        let buffers = crate::texture::staging_note();
+        if texture_refresh_ms >= 1.0 || !buffers.is_empty() {
             tracing::info!(
                 "texture refreshes per frame, all threads: {texture_refresh_ms:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                  is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                  hold still (the runtime remapping it), {staging:.1} ms waiting for the staging upload; \
-                 the rest is reading, hashing and detiling"
+                 the rest is reading, hashing and detiling{buffers}"
             );
         }
         #[cfg(feature = "diagnostics")]

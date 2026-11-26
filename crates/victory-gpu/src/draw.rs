@@ -2403,8 +2403,11 @@ impl State {
                 // again, `upload_again`), so nothing is counted or spent,
                 // and the staging buffer stays: taking it away made the
                 // next draw that reads the texture through a table stage,
-                // detile and upload all of it once more.
+                // detile and upload all of it once more. With transient
+                // staging buffers the copy may be left to the next list
+                // (`texture::copy_pending`): the slot stays due for it.
                 HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
+                let again = again.or_else(|| crate::texture::copy_pending(resource).then_some((frame + 1, 0)));
                 host.texture_slot_done(index, write, again);
                 continue;
             }
