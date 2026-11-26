@@ -218,10 +218,7 @@ fn a_page_at_once_with_the_early_skip_makes_what_one_by_one_makes() {
 
 /// The two tests above: the early skip on for the page at once if `skip`.
 fn page_against_one_by_one(skip: bool) {
-    let (Some(one), Some(page)) = (
-        HostHeap::with_made(false, SLOTS),
-        HostHeap::with_made(false, SLOTS),
-    ) else {
+    let (Some(one), Some(page)) = (HostHeap::new(false, SLOTS), HostHeap::new(false, SLOTS)) else {
         return; // no host GPU
     };
     let views = views(memory());
@@ -299,7 +296,7 @@ fn page_against_one_by_one(skip: bool) {
 /// null, as without the skip.
 #[test]
 fn the_early_skip_takes_no_claim_and_still_nulls_a_released_view() {
-    let Some(heap) = HostHeap::with_made(false, SLOTS) else {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
         return; // no host GPU
     };
     let _fast = Fast::on();
@@ -692,10 +689,8 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
 /// the same records last seen. With prints or bytes (`bytes`), and with or
 /// without `shows_none`.
 fn sorted_against_one_by_one(bytes: bool, shows_none: bool) {
-    let (Some(one), Some(sorted)) = (
-        HostHeap::with_made(false, SLOTS),
-        HostHeap::with_made(false, SLOTS),
-    ) else {
+    let (Some(one), Some(sorted)) = (HostHeap::new(false, SLOTS), HostHeap::new(false, SLOTS))
+    else {
         return; // no host GPU
     };
     let views = views(memory());

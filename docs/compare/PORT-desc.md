@@ -32,9 +32,11 @@ Notes on adaptation:
   Ours reads `made` itself, which a claim stores last with Release, after
   the descriptor, stride word and kept resource. There is no second record
   to go stale, so the fix is built in.
-- Stripes: ours has no heap-wide key array to stripe. The per-slot claim of
-  `VICTORY_MADE_ATOMIC` already replaces the heap-wide lock, so
-  `VICTORY_MADE_STRIPES` builds a slot-at-a-time heap (NoteLog and
+- Stripes (history: `VICTORY_MADE_ATOMIC` and `VICTORY_MADE_STRIPES` were
+  removed in change 1f, 26 Nov 2026; the per-slot claim is now the only
+  design and the stripes measured slower). Ours has no heap-wide key array
+  to stripe. The per-slot claim of `VICTORY_MADE_ATOMIC` already replaced
+  the heap-wide lock, so `VICTORY_MADE_STRIPES` built a slot-at-a-time heap (NoteLog and
   `spanned` ordering kept) and each claim takes its stripe lock
   (`index % 512`) before the CAS. cb9245a first left the stripes out; the
   review flagged that as an unapproved scope change and 2c86826 ports them.
@@ -54,10 +56,9 @@ Notes on adaptation:
 
 | Switch | Default | Values | What it does when on | Depends on | Read in |
 | --- | --- | --- | --- | --- | --- |
-| `VICTORY_QUICK_MIRROR` | off | `1` on | Every mirror (table binds, pass walk, texture pass, title writes, sync) of a slot whose `made` already holds the record's key, view still there, returns before the `made` lock or the claim. `texture_slot_made_from` answers "no" early for a settled slot on another key (not for a claimed one). Skips counted in `QUICK_MIRRORED`. | - | `descriptor/host.rs` `quick_mirror` |
-| `VICTORY_SLOT_BITS` | off | `1` on | Buffer-view set and changed set become atomic u64 bit sets, changed under the slot's claim with no lock. | With `VICTORY_MADE_ATOMIC=1` the buffer half of NoteLog is bypassed too | `descriptor/host.rs` `slot_bits` |
-| `VICTORY_MADE_STRIPES` | off | `1` on | 512 stripe locks per view and sampler heap; a claim holds its stripe until the claim drops. Waits: `made stripe wait`. | Implies the `VICTORY_MADE_ATOMIC=1` machinery | `descriptor/host.rs` `made_stripes` |
-| `VICTORY_HEAP_PASS_THREADS` | unset (1) | `0`/`1` one thread; `2`..`16` (clamped) | Pass walk in jobs of 256 slots on N scoped threads, the binding one among them. A walk of 256 slots or fewer stays on one thread. | Gains need `MADE_ATOMIC` or `MADE_STRIPES`, plus `QUICK_MIRROR` (else the jobs meet on the heap-wide lock) | `draw.rs` `heap_pass_threads` |
+| `VICTORY_QUICK_MIRROR` | off | `1` on | Every mirror (table binds, pass walk, texture pass, title writes, sync) of a slot whose `made` already holds the record's key, view still there, returns before the claim. `texture_slot_made_from` answers "no" early for a settled slot on another key (not for a claimed one). Skips counted in `QUICK_MIRRORED`. | - | `descriptor/host.rs` `quick_mirror` |
+| `VICTORY_SLOT_BITS` | off | `1` on | Buffer-view set and changed set become atomic u64 bit sets, changed under the slot's claim with no lock. | The buffer half of NoteLog is bypassed too | `descriptor/host.rs` `slot_bits` |
+| `VICTORY_HEAP_PASS_THREADS` | unset (1) | `0`/`1` one thread; `2`..`16` (clamped) | Pass walk in jobs of 256 slots on N scoped threads, the binding one among them. A walk of 256 slots or fewer stays on one thread. | Gains need `QUICK_MIRROR` (per-slot claims are always on since 1f) | `draw.rs` `heap_pass_threads` |
 | `VICTORY_HEAP_SPREAD` | off | `1` on | Each pass looks at the changed slots plus one of 16 parts of the rest; first pass looks at all. Replaces the every-16th full pass. | - | `draw.rs` `heap_spread` |
 | `VICTORY_HEAP_PASS_TABLED` | off | `1` on | Draws mark their tables' buffer slots (`table_entry`; a fresh table's slots if it has 64 or fewer, else the named ones) in `buffer_tabled`; the pass skips slots marked in the last 8 frames. Skips in `HEAP_PASS_PARTS[2]`, logged per frame when nonzero. The sync and texture queue do not read these marks. | - | `draw.rs` `heap_pass_tabled` |
 | `VICTORY_HEAP_SWEEP_OWN` | off | `1` on | Pass state on the HostHeap under its own lock, dropped with the heap, not in the global `HEAP_RANGES` mutex. | - | `draw.rs` `heap_sweep_own` |
@@ -69,7 +70,7 @@ Notes on adaptation:
 
 Any of SYNC_BYTES, SYNC_THREADS or SHOWS_NONE takes the new sync path
 (`sort_copied_page` for all pages, then `mirror_synced`). Existing switches
-these work with: `VICTORY_MADE_ATOMIC`, `VICTORY_HEAP_SYNC_AHEAD`,
+these work with: `VICTORY_HEAP_SYNC_AHEAD`,
 `VICTORY_HEAP_SYNC_FAST`.
 
 ## Built here
@@ -112,10 +113,11 @@ New, `descriptor::host::tests`:
 - `a_table_s_buffer_slot_is_left_to_its_draws_for_some_frames`
 
 New, `descriptor::host::made_tests`:
-- `bits_and_quick_mirrors_make_what_the_sets_and_the_lock_make` (four heaps,
+- `bits_and_quick_mirrors_make_what_the_sets_and_the_claims_make` (four heaps,
   each a whole 2^21-slot view heap, about 64 MB of descriptors each)
 - `many_threads_leave_each_slot_with_its_own_word_with_bits_and_quick_mirrors`
-- `many_threads_leave_each_slot_with_its_own_word_under_stripes`
+- (`many_threads_leave_each_slot_with_its_own_word_under_stripes`: removed in
+  1f with the stripes.)
 - `a_quick_look_at_a_claimed_slot_waits_for_the_claim`
 
 New, `descriptor::host::sync_tests`:
@@ -135,7 +137,8 @@ New, `draw::tests`:
   against 1; tabled slot 700 skipped on both; fresh-table slot 701 left,
   then made after 9 frames)
 
-Existing, re-run (touched paths): `made_tests::a_slot_at_a_time_makes_what_the_heap_wide_lock_makes`,
+Existing, re-run (touched paths): (`made_tests::a_slot_at_a_time_makes_what_the_heap_wide_lock_makes`:
+removed in 1f with the heap-wide lock; its checks are in `bits_and_quick_mirrors_*`),
 `made_tests::many_threads_leave_each_slot_with_its_own_word` (now through
 `many_threads_on`), `sync_tests::a_page_at_once_*`, `sync_tests::the_early_skip_*`,
 and the ahead tests (`Ahead::start` now goes through `start_with`).
@@ -151,11 +154,9 @@ off. Then one set at a time against baseline, then combined.
 | Run | Switches | Measure |
 | --- | --- | --- |
 | A0 | none | all buckets below, for the baseline |
-| A1 | `MADE_ATOMIC=1` | `made lock wait`, `made claim wait` |
-| A2 | `MADE_STRIPES=1` | `made lock wait`, `made stripe wait` (against A1) |
-| A3 | `QUICK_MIRROR=1` | `made lock wait`, `heap walk`, texture pass time, refusal count with a full card |
-| A4 | `SLOT_BITS=1` (alone, then with A1) | `heap walk`, `heap pass lock wait` |
-| A5 | `HEAP_PASS_THREADS=4` (alone, then with A1+A3+A4) | `heap walk`, `heap walk job` (per thread), `heap walk wait` |
+| A3 | `QUICK_MIRROR=1` | `made claim wait`, `heap walk`, texture pass time, refusal count with a full card |
+| A4 | `SLOT_BITS=1` | `heap walk`, `heap pass lock wait` |
+| A5 | `HEAP_PASS_THREADS=4` (alone, then with A3+A4) | `heap walk`, `heap walk job` (per thread), `heap walk wait` |
 | A6 | `HEAP_SPREAD=1` | frame-time spikes against the old every-16th-pass spikes; `heap walk` max |
 | A7 | `HEAP_PASS_TABLED=1` | `heap walk`, per-frame tabled skip count, picture checks |
 | A8 | `HEAP_SWEEP_OWN=1` | `heap pass lock wait` |
@@ -164,7 +165,7 @@ off. Then one set at a time against baseline, then combined.
 | A11 | `SHOWS_NONE=1` | `sync heaps`, `shows_none` count |
 | A12 | `HEAP_SYNC_AHEAD=1 HEAP_SYNC_EARLY=4` (against `AHEAD=1` alone) | `sync heaps wait`, `sync heaps early`, `sync heaps ahead` |
 | A13 | `SAME_RECORDS=1` | heap sync page count, `sync heaps` |
-| C1 | A1 or A2, + A3 + A4 + A5 + A8 | pass buckets together |
+| C1 | A3 + A4 + A5 + A8 | pass buckets together |
 | C2 | C1 + A9 + A10 + A11 + `HEAP_SYNC_FAST=1` + `HEAP_SYNC_AHEAD=1` | sync buckets together |
 | C3 | C2 + A12 + A13, then + A6, then + A7 | whole frame; picture checks |
 
@@ -176,10 +177,11 @@ garbled geometry, and hangs.
 - Threads per heap per pass: PASS_THREADS and SYNC_THREADS spawn scoped
   threads each pass, for each heap, with no pool. Many small passes pay for
   the spawns. Compare against the time saved.
-- PASS_THREADS without MADE_ATOMIC or MADE_STRIPES: the jobs fight over the
-  heap-wide `made` lock; the gain may be small.
-- Parallel mirrors make host copies (`shadow::find` under BUFFERS) and views
-  from several threads at once. Watch for device removal and, in diagnostics
+- PASS_THREADS: (the heap-wide `made` lock the jobs once fought over is gone
+  since 1f: claims are per slot.)
+- Parallel mirrors make host copies (`shadow::find`, since 1f with no table
+  lock held, put in the tables by a compare: `RACE_LOST` counts the losers)
+  and views from several threads at once. Watch for device removal and, in diagnostics
   builds, `HEAP_VIEWS_ELSEWHERE`.
 - SYNC_BYTES: 32 B per title view slot, against 8 B per print (about 32 MB
   for a 1M-slot heap).
@@ -196,10 +198,9 @@ garbled geometry, and hangs.
 - SYNC_EARLY: a submission can wait for an own pass already running; the
   helper wakes every `<ms>` while the title submits. Check CPU cost on the
   slow PC.
-- MADE_STRIPES: a thread taking a second claim in the same stripe while
-  holding one would deadlock. No path does this now. If a run hangs with
-  the switch on, look there first.
-- QUICK_MIRROR: a claimed slot goes to the lock, as without the switch
+- MADE_STRIPES (removed in 1f, measured +35 ms): a thread taking a second
+  claim in the same stripe while holding one would have deadlocked.
+- QUICK_MIRROR: a claimed slot goes to the claim, as without the switch
   (ff15ef5). With a full card, compare the texture pass's refusal count on
   and off.
 - SLOT_BITS: `buffer_changes` scans count/64 words a call (about 32k at
@@ -218,8 +219,6 @@ garbled geometry, and hangs.
   pinned to fast cores; the picked-UAV handling.
 - `QUICK_MIRRORED` is counted but only tests read it; it is not on the frame
   line or the profile.
-- No single-thread equivalence test with a striped heap (the existing one
-  takes a whole view heap per heap).
 - `a_quick_look_at_a_claimed_slot_waits_for_the_claim` is weak if WARP makes
   no host texture for its BC7 view: the answer is then false both ways, and
   only the wait is checked.

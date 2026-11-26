@@ -35,13 +35,6 @@ pub(crate) struct HostHeap {
     /// write of a slot that holds no placed texture view leaves the spans'
     /// lock alone ([`HostHeap::spanned`]).
     made: Box<[std::sync::atomic::AtomicU64]>,
-    /// With `VICTORY_MADE_STRIPES=1` ([`made_stripes`]): a lock for every
-    /// few hundredth of the slots, slot `index` under lock `index % len`.
-    /// A claim ([`HostHeap::claim`]) takes its slot's lock first and holds
-    /// it until it is dropped, so threads that change slots of one stripe
-    /// sleep on it in turn instead of spinning on the slot. `None`: claims
-    /// spin on their slot alone.
-    stripes: Option<Box<[Mutex<()>]>>,
     /// The changes [`HostHeap::note_buffer`]
     /// makes to `textures`, `buffers` and `changed`, in the order they were
     /// made, until whatever reads those takes them ([`NoteLog`]).
@@ -1371,25 +1364,10 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
-        if made_stripes() {
-            return Self::with_made(sampler, count).map(|heap| heap.with_stripes(MADE_STRIPES));
-        }
-        Self::with_made(sampler, count)
-    }
-
-    /// This heap, changed a slot at a time, with its claims under `n`
-    /// striped locks ([`HostHeap::stripes`], [`made_stripes`]).
-    fn with_stripes(mut self, n: usize) -> Self {
-        self.stripes = Some((0..n.max(1)).map(|_| Mutex::new(())).collect());
-        self
-    }
-
-    /// [`HostHeap::new`] without stripes; the rest as the environment says.
-    fn with_made(sampler: bool, count: u32) -> Option<Self> {
         Self::with_ways(sampler, count, slot_bits(), quick_mirror())
     }
 
-    /// [`HostHeap::with_made`]; `bits`: the sets of buffer views are bits
+    /// [`HostHeap::new`]; `bits`: the sets of buffer views are bits
     /// ([`slot_bits`]); `quick`: a slot made from its record already is
     /// told so before any lock ([`quick_mirror`]).
     fn with_ways(sampler: bool, count: u32, bits: bool, quick: bool) -> Option<Self> {
@@ -1490,7 +1468,6 @@ impl HostHeap {
             made: (0..count)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
-            stripes: None,
             log: NoteLog::default(),
             copied: Mutex::new(Vec::new()),
             copied_bytes: Mutex::new(Vec::new()),
@@ -3613,32 +3590,12 @@ impl HostHeap {
     /// not wanted.
     ///
     /// A thread waits for a claim only while it holds none itself, so
-    /// claims cannot wait for each other in a ring. With
-    /// [`HostHeap::stripes`] it waits for the slot's stripe instead, on the
-    /// same terms: a thread that took a second claim while it held one
-    /// would wait for itself if both slots shared a stripe.
+    /// claims cannot wait for each other in a ring.
     fn claim(&self, index: u32, wanted: impl Fn(u64) -> bool) -> Result<Claimed<'_>, u64> {
         use std::sync::atomic::Ordering::{Acquire, Relaxed};
         let Some(slot) = self.made.get(index as usize) else {
             return Err(0);
         };
-        // The slot's stripe first ([`HostHeap::stripes`]): held by this
-        // claim, so no other claim of the stripe is held meanwhile and the
-        // slot is never found claimed below. (A thread holds one claim at
-        // a time on such a heap: see above.)
-        let stripe = self.stripes.as_ref().map(|stripes| {
-            let lock = &stripes[index as usize % stripes.len()];
-            match lock.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let waited = crate::profile::stamp();
-                    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    crate::profile::since("made stripe wait", waited, 50, &[("heap", self.id)]);
-                    guard
-                }
-            }
-        });
         let mut waited = 0;
         let mut spins = 0u32;
         let claimed = loop {
@@ -3666,7 +3623,6 @@ impl HostHeap {
                     slot,
                     old: now,
                     value: now,
-                    _stripe: stripe,
                 });
             }
         };
@@ -4907,26 +4863,6 @@ const KEPT_SHARD: u32 = 1 << 12;
 /// it in the spans; the bits above it count the slot's writes.
 const IN_SPANS: u32 = 1;
 
-/// Whether a heap's claims of its slots are taken under [`MADE_STRIPES`]
-/// striped locks ([`HostHeap::stripes`]), each slot under the lock of its
-/// stripe. `VICTORY_MADE_STRIPES=1`; off by default: each
-/// claim spins on its slot alone.
-///
-/// Ported from cool_fox 6c17ce9's `Made`, 512 locks in place of the lock
-/// over the heap's `made` (cool_fox measured that one lock as what
-/// everything of a frame waited for once the lists were translated on
-/// threads: half of what those did). Ours already claims each slot alone
-/// (once `VICTORY_MADE_ATOMIC=1`, now every heap); the stripes add a lock a thread sleeps on
-/// in place of the claim's spin, at the cost of slots of one stripe
-/// waiting for each other.
-fn made_stripes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MADE_STRIPES").is_some_and(|v| v == "1"))
-}
-
-/// Striped locks of a heap's claims ([`made_stripes`]), as cool_fox's.
-const MADE_STRIPES: usize = 512;
-
 /// Whether a heap's sets of buffer views (the slots holding one, and those
 /// changed since the heap buffer pass took them) are bits of atomic words
 /// ([`BufferBits`]), changed by the writer of a slot with no lock and no
@@ -5018,9 +4954,6 @@ struct Claimed<'a> {
     old: u64,
     /// What it holds once the claim is dropped.
     value: u64,
-    /// The slot's stripe ([`HostHeap::stripes`]), let go after `value` is
-    /// stored (fields drop after `drop`).
-    _stripe: Option<std::sync::MutexGuard<'a, ()>>,
 }
 
 impl Drop for Claimed<'_> {
@@ -6937,7 +6870,7 @@ mod made_tests {
     /// heap written the same way by one thread alone.
     #[test]
     fn many_threads_leave_each_slot_with_its_own_word() {
-        if let Some(heap) = HostHeap::with_made(false, SLOTS) {
+        if let Some(heap) = HostHeap::new(false, SLOTS) {
             many_threads_on(heap);
         }
     }
@@ -6948,19 +6881,6 @@ mod made_tests {
     fn many_threads_leave_each_slot_with_its_own_word_with_bits_and_quick_mirrors() {
         if let Some(heap) = HostHeap::with_ways(false, SLOTS, true, true) {
             many_threads_on(heap);
-        }
-    }
-
-    /// The same with the claims under striped locks
-    /// (`VICTORY_MADE_STRIPES=1`), four stripes over the sixteen slots so
-    /// that neighbours share them, alone and with bits and the quick
-    /// mirror.
-    #[test]
-    fn many_threads_leave_each_slot_with_its_own_word_under_stripes() {
-        for (bits, quick) in [(false, false), (true, true)] {
-            if let Some(heap) = HostHeap::with_ways(false, SLOTS, bits, quick) {
-                many_threads_on(heap.with_stripes(4));
-            }
         }
     }
 
@@ -7060,7 +6980,7 @@ mod made_tests {
         assert_eq!(spanned_but_not_queued(&heap), [], "slots in the spans");
         // Once more, a write per slot by one thread: constant buffer views
         // and the placed buffer, which leave nothing stale behind.
-        let Some(alone) = HostHeap::with_made(false, SLOTS) else {
+        let Some(alone) = HostHeap::new(false, SLOTS) else {
             return;
         };
         let mut records = vec![[0u32; 8]; SLOTS as usize];
@@ -7131,7 +7051,7 @@ mod made_tests {
     fn a_stale_slot_leaves_the_queue_only_before_its_newer_write() {
         const THREADS: u32 = 8;
         const STEPS: u32 = 2_000;
-        let Some(heap) = HostHeap::with_made(false, SLOTS) else {
+        let Some(heap) = HostHeap::new(false, SLOTS) else {
             return; // no host GPU
         };
         let heap = std::sync::Arc::new(heap);
@@ -7201,7 +7121,7 @@ mod made_tests {
     #[test]
     fn a_slot_shows_the_last_record_it_was_made_from() {
         const THREADS: u64 = 8;
-        let Some(heap) = HostHeap::with_made(false, SLOTS) else {
+        let Some(heap) = HostHeap::new(false, SLOTS) else {
             return; // no host GPU
         };
         let heap = std::sync::Arc::new(heap);
@@ -7242,7 +7162,7 @@ mod made_tests {
         const THREADS: u32 = 8;
         // Two slots of its own per thread.
         const _: () = assert!(THREADS * 2 == SLOTS);
-        let Some(heap) = HostHeap::with_made(false, SLOTS) else {
+        let Some(heap) = HostHeap::new(false, SLOTS) else {
             return; // no host GPU
         };
         let heap = std::sync::Arc::new(heap);
@@ -7310,7 +7230,7 @@ mod made_tests {
     /// writer that finds one long applies it.
     #[test]
     fn logs_no_pass_reads_stay_short() {
-        let Some(heap) = HostHeap::with_made(false, SLOTS) else {
+        let Some(heap) = HostHeap::new(false, SLOTS) else {
             return; // no host GPU
         };
         fn longest<T>(logs: &[Mutex<Vec<T>>]) -> usize {
