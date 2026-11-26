@@ -336,6 +336,13 @@ mod tests {
             if on {
                 assert_eq!(failed, 0, "no failed kernel asking");
                 assert!(left_out >= 1, "the view's span left out");
+            } else if crate::watch::light() {
+                // `VICTORY_LIGHT_REFRESH=1` leaves the span out by its own
+                // bits (a block of it is read-only by our hand), from the
+                // asking ahead and from `writes`: not asked either, though
+                // not counted as left out by the R5 flush.
+                assert_eq!(failed, 0, "with the light refresh the view's span is not asked");
+                assert_eq!(left_out, 0);
             } else {
                 assert!(
                     failed >= 1,
