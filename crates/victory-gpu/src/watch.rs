@@ -2007,6 +2007,17 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in aliased {
         g.aliased.remove(block);
     }
+    // What rested there was the old mapping's (`VICTORY_GUARD_REST`,
+    // [`rest`]): the new one is guarded at the next asking, as any other.
+    if !g.opened.is_empty() {
+        if range.len() < g.opened.len() {
+            for block in range {
+                g.opened.remove(&block);
+            }
+        } else {
+            g.opened.retain(|block, _| !range.contains(block));
+        }
+    }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -2101,6 +2112,18 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// For a test that checks how blocks are guarded again after a write
+    /// fault, not how they rest: no block written on this thread rests
+    /// ([`rest`]), whatever `VICTORY_GUARD_REST` says. With a rest, a block
+    /// the test has just written is told as written, and left open, at every
+    /// asking within the rest (at every view of its page); a test that
+    /// expects it clean at the next asking would hold only if the rest were
+    /// over by then. `a_block_just_written_rests` and
+    /// `no_write_to_resting_views_is_lost_between_askers` check the rest.
+    fn no_rest() {
+        set_rest_in_test(std::time::Duration::ZERO);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
@@ -2319,6 +2342,7 @@ mod tests {
             VirtualAlloc2,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        no_rest();
         // SAFETY: a fresh placeholder of three blocks and a pagefile
         // section of three; the middle block is mapped first.
         let (p, section) = unsafe {
@@ -2537,6 +2561,7 @@ mod tests {
     /// guarded view's next check reports the pages written.
     #[test]
     fn a_write_through_another_view_is_reported_at_the_guarded_one() {
+        no_rest();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -2556,6 +2581,7 @@ mod tests {
     /// guarded view checks its pages again (and guards the new view).
     #[test]
     fn a_view_mapped_beside_a_guarded_one_makes_it_check_again() {
+        no_rest();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -2572,6 +2598,7 @@ mod tests {
     /// (`writing`): the other views' next checks report the pages written.
     #[test]
     fn a_write_told_at_one_view_is_reported_at_the_others() {
+        no_rest();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -2594,6 +2621,7 @@ mod tests {
     /// keep the bytes from before the write.
     #[test]
     fn a_write_is_reported_at_every_checked_view() {
+        no_rest();
         const SIZE: usize = 2 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
@@ -2618,6 +2646,7 @@ mod tests {
     /// itself: the others stay writable, and nothing looks through them all.
     #[test]
     fn a_page_of_many_views_is_guarded_one_view_at_a_time() {
+        no_rest();
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
@@ -2661,6 +2690,9 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
         };
         const PAGES: usize = 6;
+        // (With a rest the written block is not known until a taking after
+        // the rest: `a_block_just_written_rests` checks it is not.)
+        no_rest();
         for view in [false, true] {
             // SAFETY: memory of the test's own, never given back (it stays
             // in the journal and the guards).
@@ -2878,7 +2910,29 @@ mod tests {
             }
         });
         if light() {
-            assert!(by_bits.into_inner() > 0, "the bits answered none");
+            // A block that rests after a write (`VICTORY_GUARD_REST`) is not
+            // clean, so not known by its bits, until an asking after its
+            // rest; here the title writes every page again within
+            // milliseconds, and with three views a page is clean only once
+            // none of its views rests: with a rest of milliseconds the bits
+            // may answer none of the askings above. Without a rest they
+            // must.
+            if super::rest().is_zero() {
+                assert!(by_bits.into_inner() > 0, "the bits answered none");
+            }
+            // Either way: once nothing has been written for longer than any
+            // rest, one asking at each view has every view known by its
+            // bits.
+            std::thread::sleep(super::rest().max(rest) + std::time::Duration::from_millis(1));
+            for &at in &all {
+                writes(at, at + PAGES * PAGE, true).expect("a view");
+            }
+            for &at in &all {
+                assert!(
+                    published(at, at + PAGES * PAGE),
+                    "nothing written since: the bits know the view at {at:x}"
+                );
+            }
         }
     }
 
@@ -2975,6 +3029,27 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
         assert!(!writable(two) && !writable(one));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// A block that rests and is then mapped anew (the runtime tells of it,
+    /// [`title_memory_remapped`]) rests no more: the new mapping is guarded
+    /// at the next asking, as any other. (A rest left over from an old
+    /// mapping was kept for the whole rest, here an hour.)
+    #[test]
+    fn a_block_mapped_anew_rests_no_more() {
+        set_rest_in_test(std::time::Duration::from_secs(3600));
+        let (section, one, two) = two_views(BLOCK);
+        let page = one / PAGE;
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
+        // SAFETY: a view, opened by the handler.
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
+        assert!(writable(one), "it rests");
+        title_memory_remapped(one, BLOCK);
+        crate::inplace::title_memory_view(one, BLOCK, section, 0);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]), "mapped anew");
+        assert!(!writable(one), "guarded again, not resting");
         drop_views(section, &[one, two], BLOCK);
     }
 
@@ -3078,6 +3153,7 @@ mod tests {
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
+        no_rest();
         let bits = light() && known_holes();
         // SAFETY (all): a placeholder and a section of our own, which stay.
         let (at, section) = unsafe {
