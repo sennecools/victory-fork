@@ -31,38 +31,27 @@
 //! A request names the heaps its submission's lists bind; a pass looks at
 //! the heaps of the requests it covers (`super::sync_heaps`).
 //!
-//! With `VICTORY_HEAP_SYNC_EARLY=<ms>` (off by default) the helper also
-//! runs passes of its own while submissions come ([`early`]), over the
-//! heaps of the requests the last pass covered; those answer no request.
+//! The helper also runs passes of its own while submissions come
+//! ([`EARLY`]), over the heaps of the requests the last pass covered; those
+//! answer no request.
 
 use std::sync::{Arc, Condvar, Mutex};
 
 /// How long the helper waits with no request before it runs a pass of its
-/// own, while submissions come (`VICTORY_HEAP_SYNC_EARLY=<ms>`; unset, the
-/// default: 4 ms, as the play set runs it; 0: none, it waits for a request,
-/// as before). The title copies its records into its heaps while
-/// it records, and the first submission of a frame found all of them for
-/// its pass to do (cool_fox measured 8 ms waited for); a pass of its own
-/// meanwhile leaves the requested one only what was written since. Such a
-/// pass answers no request: a request is answered by a pass begun after it,
-/// as without the switch, and one that comes during an own pass waits for
-/// that and then its own. Only within [`EARLY_WINDOW`] of the last request:
-/// a title that stops submitting is not looked at for ever.
+/// own, while submissions come. The title copies its records into its
+/// heaps while it records, and the first submission of a frame found all of
+/// them for its pass to do (cool_fox measured 8 ms waited for); a pass of
+/// its own meanwhile leaves the requested one only what was written since.
+/// Such a pass answers no request: a request is answered by a pass begun
+/// after it, and one that comes during an own pass waits for that and then
+/// its own. Only within [`EARLY_WINDOW`] of the last request: a title that
+/// stops submitting is not looked at for ever.
 ///
-/// Ported from cool_fox f6db479 (4 ms by default there), by local.
-fn early() -> Option<std::time::Duration> {
-    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(4);
-        (ms > 0).then(|| std::time::Duration::from_millis(ms))
-    })
-}
+/// Ported from cool_fox f6db479 (4 ms there too), by local.
+const EARLY: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// How long after the last request the helper still runs passes of its own
-/// ([`early`]).
+/// ([`EARLY`]).
 pub(super) const EARLY_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The helper of the process, started at the first request; `None` if no
@@ -75,7 +64,7 @@ static AHEAD: std::sync::OnceLock<Option<Ahead>> = std::sync::OnceLock::new();
 /// that wait.
 pub(crate) fn sync_ahead(heaps: &[usize]) -> Option<u64> {
     AHEAD
-        .get_or_init(|| Ahead::start_with(super::sync_heaps, early()))
+        .get_or_init(|| Ahead::start_with(super::sync_heaps, Some(EARLY)))
         .as_ref()?
         .request(heaps)
 }
@@ -127,12 +116,12 @@ struct State {
     stop: bool,
     /// A pass panicked: the helper is gone, and passes run in place.
     failed: bool,
-    /// When the last request was made ([`early`]).
+    /// When the last request was made ([`EARLY`]).
     asked_at: Option<std::time::Instant>,
     /// The heaps of the requests no pass has begun to cover, each once.
     heaps: Vec<usize>,
     /// The heaps the last pass that covered requests looked at: what a
-    /// pass of its own looks at ([`early`]).
+    /// pass of its own looks at ([`EARLY`]).
     recent: Vec<usize>,
 }
 
@@ -144,15 +133,15 @@ pub(super) struct Ahead {
 }
 
 impl Ahead {
-    /// Starts the helper, with `pass` as its pass. `None` if no thread
-    /// could be started.
+    /// Starts the helper, with `pass` as its pass and no passes of its own
+    /// (tests that hold a pass). `None` if no thread could be started.
     #[cfg(test)]
     pub(super) fn start(pass: impl Fn(&[usize]) + Send + 'static) -> Option<Self> {
         Self::start_with(pass, None)
     }
 
     /// [`Ahead::start`], with passes of its own every `early` while
-    /// requests come ([`early`]; `None`: none).
+    /// requests come ([`EARLY`]; `None`: none).
     pub(super) fn start_with(
         pass: impl Fn(&[usize]) + Send + 'static,
         early: Option<std::time::Duration>,
@@ -226,7 +215,7 @@ impl Drop for Ahead {
 }
 
 /// The helper's loop: a pass for the requests made before it, until told
-/// to stop with none left; with `early` ([`early`]), passes of its own
+/// to stop with none left; with `early` ([`EARLY`]), passes of its own
 /// between them, which cover none.
 fn run(
     shared: &(Mutex<State>, Condvar),

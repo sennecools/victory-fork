@@ -854,11 +854,10 @@ fn changed_records_are_those_that_differ_one_by_one() {
     }
 }
 
-/// With passes of its own (`VICTORY_HEAP_SYNC_EARLY`): none before the
-/// first request; some after it while requests are recent, none of which
-/// answers a request (one made during such a pass, held, waits for a pass
-/// of its own); none once requests have stopped. Without them, no pass
-/// past the requested ones.
+/// Passes of its own (`EARLY`): none before the first request; some after
+/// it while requests are recent, none of which answers a request (one made
+/// during such a pass, held, waits for a pass of its own); none once
+/// requests have stopped.
 #[test]
 fn passes_of_its_own_run_between_requests_and_answer_none() {
     use std::sync::atomic::AtomicU64;
@@ -920,22 +919,6 @@ fn passes_of_its_own_run_between_requests_and_answer_none() {
         stopped,
         "no passes long after a request"
     );
-    drop(ahead);
-
-    // Without passes of its own: the requested ones alone.
-    let passes = std::sync::Arc::new(AtomicU64::new(0));
-    let ahead = Ahead::start({
-        let passes = passes.clone();
-        move |_: &[usize]| {
-            passes.fetch_add(1, Relaxed);
-        }
-    })
-    .expect("a helper thread");
-    let first = ahead.request(&[]).expect("a request");
-    assert!(ahead.wait(first));
-    let after = passes.load(Relaxed);
-    std::thread::sleep(Duration::from_millis(60));
-    assert_eq!(passes.load(Relaxed), after);
 }
 
 /// A heap no submission binds is not looked at; when one binds it, its
