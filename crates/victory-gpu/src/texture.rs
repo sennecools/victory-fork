@@ -306,6 +306,12 @@ struct Last {
     /// The frame a hash last found the texture's memory changed in (see
     /// [`guard_skips`]).
     changed: Option<u64>,
+    /// The hash of what the staging buffer holds, if a hash was what it was
+    /// last detiled after (none once the write-watch path detiled it): what
+    /// [`Staging::note_held`] says the host copy holds. `hash` alone would
+    /// name bytes a detiling after the write-watch replaced, and memory that
+    /// went back to those bytes would be taken as uploaded.
+    held: Option<Hash>,
 }
 
 impl Last {
@@ -316,6 +322,7 @@ impl Last {
             return false;
         }
         self.hash = Some(hash);
+        self.held = Some(hash);
         self.changed = Some(crate::frame::current());
         true
     }
@@ -1728,7 +1735,7 @@ impl Staging {
     /// ([`unchanged`]): called after the check at a submission whose list
     /// copies the staging buffer into it.
     fn note_held(&self, copy: &crate::resource::HostTexture) {
-        let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
+        let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).held;
         *copy.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash;
     }
 
@@ -1835,6 +1842,8 @@ impl Staging {
                 return 0;
             }
             last.asked = now;
+            // What it holds now is known by no hash.
+            last.held = None;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -2637,6 +2646,25 @@ mod title_memory_tests {
         // A fully mapped path clears the partial polling state.
         last.partial = None;
         assert!(last.partial_due(191));
+    }
+
+    /// A detiling after the write-watch leaves no hash as what the staging
+    /// buffer holds, and memory back at the hashed bytes does not bring it
+    /// back (`VICTORY_TEXTURE_SAME`'s note of what the host copy holds).
+    #[test]
+    fn a_watched_detiling_forgets_what_the_staging_buffer_held() {
+        let mut last = Last::default();
+        let a = super::content_hash(&[0x11; 64]);
+        assert!(last.rehash(a));
+        assert_eq!(last.held, Some(a));
+        // The watch path detiled other bytes.
+        last.held = None;
+        // The memory is back at the first bytes: no detiling, nothing held.
+        assert!(!last.rehash(a));
+        assert_eq!(last.held, None);
+        let b = super::content_hash(&[0x22; 64]);
+        assert!(last.rehash(b));
+        assert_eq!(last.held, Some(b));
     }
 
     #[test]
