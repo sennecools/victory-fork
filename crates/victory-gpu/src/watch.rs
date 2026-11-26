@@ -36,6 +36,7 @@ mod stamps;
 
 use bits::{Bits, Blocks};
 use stamps::Stamps;
+pub(crate) use stamps::Taken;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -489,28 +490,23 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     true
 }
 
-/// What [`writes`] would say of `[start, end)` from the journal alone, if
-/// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
-/// pages last found written by an asking after `since` and that asking, with
-/// the number of the asking that stands (as [`writes`] gives it). `None` if
-/// the kernel would have to be asked.
-pub(crate) fn asked(start: usize, end: usize, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
-    asked_in(&JOURNAL, start, end, since)
+/// Whether [`writes_now`] could answer for `[start, end)` from the journal
+/// alone, the range lying in one asked ahead ([`ask_ahead`], [`ask_once`]):
+/// then the number of the asking that stands (as [`writes`] gives it), and
+/// [`stale_words`] tells what a copy must take. `None` if the kernel would
+/// have to be asked.
+pub(crate) fn asked_now(start: usize, end: usize) -> Option<u64> {
+    asked_now_in(&JOURNAL, start, end)
 }
 
-/// [`asked`] in `journal`.
-fn asked_in(
-    journal: &Mutex<Journal>,
-    start: usize,
-    end: usize,
-    since: u64,
-) -> Option<(u64, Vec<(usize, u64)>)> {
+/// [`asked_now`] in `journal`.
+fn asked_now_in(journal: &Mutex<Journal>, start: usize, end: usize) -> Option<u64> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.pages(first, last, since)))
+        .then_some(j.ahead_asked)
 }
 
 /// The pages of `[start, end)` (whole pages) last found written by an
@@ -536,20 +532,70 @@ fn writes_in(
     guarded: bool,
     since: u64,
 ) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let _journal = crate::profile::journal_timer();
     let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    let now = ask(&mut j, first, last, guarded)?;
+    Some((now, j.pages(first, last, since)))
+}
+
+/// What [`writes`] would answer of `[start, end)`, with the same asking,
+/// but only the asking's number: a host copy then finds what it must take
+/// with [`stale_words`], and no list of written pages is made.
+pub(crate) fn writes_now(start: usize, end: usize, guarded: bool) -> Option<u64> {
+    writes_now_in(&JOURNAL, start, end, guarded)
+}
+
+/// [`writes_now`] in `journal`.
+fn writes_now_in(journal: &Mutex<Journal>, start: usize, end: usize, guarded: bool) -> Option<u64> {
+    let _journal = crate::profile::journal_timer();
+    let mut j = journal.lock().unwrap_or_else(|e| e.into_inner());
+    ask(&mut j, start / PAGE, end.div_ceil(PAGE), guarded)
+}
+
+/// Calls `f` with each page of `[first, last)` that the copy whose notes
+/// are `taken` must take from title memory before it holds the title's
+/// bytes, in page order: the one rule for every host copy of title memory
+/// (`Stamps::stale_words`; texture staging asks [`writes`] with its own
+/// `since`).
+/// A caller asks first ([`writes_now`]) so the journal has the writes up to
+/// its asking; pages found written by later askings come too.
+pub(crate) fn stale_words(
+    first: usize,
+    last: usize,
+    taken: &Taken,
+    f: impl FnMut(usize) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
+    stale_words_in(&JOURNAL, first, last, taken, f)
+}
+
+/// [`stale_words`] in `journal`.
+fn stale_words_in(
+    journal: &Mutex<Journal>,
+    first: usize,
+    last: usize,
+    taken: &Taken,
+    f: impl FnMut(usize) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
+    let _journal = crate::profile::journal_timer();
+    let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+    j.stamps.stale_words(first, last, taken, f)
+}
+
+/// The asking of [`writes_in`] for pages `[first, last)`, with the
+/// journal's lock held: its number, after the pages it found written are
+/// marked. `None` as for [`writes`].
+fn ask(j: &mut Journal, first: usize, last: usize, guarded: bool) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((j.ahead_asked, j.pages(first, last, since)));
+        return Some(j.ahead_asked);
     }
     // Read-only since an asking noted it: the journal has every write of it.
     if guarded && published(first * PAGE, last * PAGE) {
         j.asked += 1;
-        return Some((j.asked, j.pages(first, last, since)));
+        return Some(j.asked);
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -628,7 +674,7 @@ fn writes_in(
     if failed {
         publish(&guarded);
     }
-    Some((now, j.pages(first, last, since)))
+    Some(now)
 }
 
 impl Tracked {
@@ -852,30 +898,26 @@ fn protected_bits(start: usize, end: usize) -> bool {
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes
-/// `copied` (the asking after which each page from page `base` on was taken)
-/// does not hold, as [`writes`] would answer with nothing asked: the
-/// submission's asking covers the range, or its blocks are known by their
-/// bits ([`PUBLISHED`]). `false` if something would have to be asked, or a
-/// page was never taken. A flush of host copies leaves out those that have
-/// nothing new so, before any thread is woken and anything asked for them
-/// (`crate::shadow::Shadow::nothing_new`; ported from cool_fox 2aa8134, its
-/// `VICTORY_NOTHING_NEW`).
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64]) -> bool {
+/// `taken` does not hold ([`stale_words`] finds no page), as [`writes`]
+/// would answer with nothing asked: the submission's asking covers the
+/// range, or its blocks are known by their bits ([`PUBLISHED`]). `false`
+/// if something would have to be asked, a page was never taken, or the
+/// range is not all the copy's. A flush of host copies leaves out those
+/// that have nothing new so, before any thread is woken and anything asked
+/// for them (`crate::shadow::Shadow::nothing_new`; ported from cool_fox
+/// 2aa8134, its `VICTORY_NOTHING_NEW`).
+pub(crate) fn nothing_new(start: usize, end: usize, taken: &Taken) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let Some(taken) = first
-        .checked_sub(base)
-        .and_then(|from| copied.get(from..last - base))
-    else {
-        return false;
-    };
-    if taken.contains(&0) {
+    if !taken.holds(first, last) {
         return false;
     }
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     (known || j.ahead.iter().any(|&(a, b)| a <= first && last <= b))
-        && j.stamps.none_above(first, last, taken)
+        && j.stamps
+            .stale_words(first, last, taken, |_| std::ops::ControlFlow::Break(()))
+            .is_continue()
 }
 
 /// Whether the block holding `start` is view memory the guards already
@@ -1900,14 +1942,17 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false, 0).expect("watched");
+        // The stamps are never freed, so an earlier test's marks may lie at
+        // these addresses: everything is asked since a first asking here.
+        let (base, _) = writes(start, end, false, u64::MAX).expect("watched");
+        let (_, before) = writes(start, end, false, base).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false, 0).expect("watched");
+        let (now, after) = writes(start, end, false, base).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false, 0).expect("watched");
+        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false, base).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
         // An asker that took the range after `now` (a texture's last
@@ -1922,7 +1967,7 @@ mod tests {
             [(p / PAGE + 3, newest)],
             "only the page written since"
         );
-        let (_, all) = writes(start, end, false, 0).expect("watched");
+        let (_, all) = writes(start, end, false, base).expect("watched");
         assert_eq!(all, [(p / PAGE + 1, now), (p / PAGE + 3, newest)]);
         assert!(
             writes(start, end, false, newest)
@@ -2531,17 +2576,15 @@ mod tests {
 
     /// What a copy of a range has taken: the asking after which it took
     /// each page, as `crate::shadow::Shadow::copy_stale` notes it.
-    fn take(start: usize, end: usize, guarded: bool, copied: &mut [u64]) {
-        let (now, written) = writes(start, end, guarded, 0).expect("watched or a view");
-        let base = start / PAGE;
-        for (page, at) in copied.iter_mut().enumerate() {
-            let write = written
-                .iter()
-                .find(|w| w.0 == base + page)
-                .map_or(0, |w| w.1);
-            if *at == 0 || write > *at {
-                *at = now;
-            }
+    fn take(start: usize, end: usize, guarded: bool, copied: &mut Taken) {
+        let now = writes_now(start, end, guarded).expect("watched or a view");
+        let mut stale = Vec::new();
+        let _ = stale_words(start / PAGE, end.div_ceil(PAGE), copied, |page| {
+            stale.push(page);
+            std::ops::ControlFlow::Continue(())
+        });
+        for page in stale {
+            copied.take(page, page + 1, now);
         }
     }
 
@@ -2585,14 +2628,14 @@ mod tests {
             };
             assert_ne!(at, 0);
             let (start, end) = (at, at + (PAGES - 1) * PAGE);
-            let mut copied = [0u64; PAGES - 1];
-            let known = |copied: &[u64]| {
+            let mut copied = Taken::new(start / PAGE, PAGES - 1);
+            let known = |copied: &Taken| {
                 // The submission's one asking, as a flush has it (again if
                 // another test's submission ended it).
                 let mut known = false;
                 for _ in 0..100 {
                     ask_once(&[(start, end), (at + (PAGES - 1) * PAGE, at + PAGES * PAGE)]);
-                    known = nothing_new(start, end, start / PAGE, copied);
+                    known = nothing_new(start, end, copied);
                     if known {
                         break;
                     }
@@ -2601,7 +2644,7 @@ mod tests {
                 known
             };
             assert!(
-                !nothing_new(start, end, start / PAGE, &copied),
+                !nothing_new(start, end, &copied),
                 "view {view}: never taken"
             );
             take(start, end, view, &mut copied);
@@ -2618,15 +2661,10 @@ mod tests {
             unsafe { ((at + (PAGES - 1) * PAGE + 8) as *mut u8).write_volatile(1) };
             assert!(known(&copied), "view {view}: written outside it");
             // A longer range was never taken whole.
-            assert!(!nothing_new(
-                start,
-                at + PAGES * PAGE,
-                start / PAGE,
-                &copied
-            ));
+            assert!(!nothing_new(start, at + PAGES * PAGE, &copied));
             if view {
                 title_memory_remapped(at, PAGES * PAGE);
-                assert!(!nothing_new(start, end, start / PAGE, &copied), "forgotten");
+                assert!(!nothing_new(start, end, &copied), "forgotten");
             }
         }
     }
@@ -3218,7 +3256,7 @@ mod mapping_tests {
 
 #[cfg(test)]
 mod wrote_tests {
-    use super::{PAGE, ask_once, ask_once_end, asked, writes, wrote};
+    use super::{PAGE, ask_once, ask_once_end, asked_now, writes, wrote};
 
     #[test]
     fn wrote_keeps_ahead_asked_at_or_above_written_timestamps() {
@@ -3241,19 +3279,18 @@ mod wrote_tests {
         wrote(p, PAGE);
 
         let (now, written) = writes(p, p + PAGE, false, 0).expect("write-watched page");
-        let (asked_now, asked_written) = asked(p, p + PAGE, 0).expect("in ask_once range");
+        let asked = asked_now(p, p + PAGE).expect("in ask_once range");
         ask_once_end();
 
         // SAFETY: freeing our private reservation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
 
-        assert_eq!(now, asked_now);
+        assert_eq!(now, asked);
         let page = p / PAGE;
         let &(_, w) = written
             .iter()
             .find(|&&(pg, _)| pg == page)
             .expect("page recorded by wrote()");
-        assert_eq!(asked_written, written);
         assert!(
             now >= w,
             "writes() returned now={now} < written timestamp w={w} after wrote()"
@@ -3267,9 +3304,11 @@ mod journal_tests {
     //! `crate::shadow::Shadow` keeps them. (The epoch tables' tests, which
     //! checked them against the journal of ordered maps the stamps replace.)
     use super::{
-        Journal, KERNEL_PAGE, PAGE, ask_ahead_done_in, ask_ahead_in, ask_once_end_in, ask_once_in,
-        asked_in, gpu_wrote_in, writes_in, wrote_in,
+        Journal, KERNEL_PAGE, PAGE, Taken, ask_ahead_done_in, ask_ahead_in, ask_once_end_in,
+        ask_once_in, asked_now_in, gpu_wrote_in, stale_words_in, writes_in, writes_now_in,
+        wrote_in,
     };
+    use std::ops::ControlFlow;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use windows_sys::Win32::System::Memory::{
@@ -3320,13 +3359,12 @@ mod journal_tests {
     }
 
     /// A host copy of `[start, start + len)` as `crate::shadow::Shadow`
-    /// keeps one: the bytes and, per 64 KiB page, the asking after which it
-    /// was last taken (0: never).
+    /// keeps one: the bytes and what it took ([`Taken`]).
     struct Copy {
         start: usize,
         len: usize,
         data: Vec<u8>,
-        copied: Vec<u64>,
+        taken: Taken,
     }
 
     impl Copy {
@@ -3336,56 +3374,66 @@ mod journal_tests {
                 start,
                 len,
                 data: vec![0; len],
-                copied: vec![0; pages],
+                taken: Taken::new(start / PAGE, pages),
             }
         }
 
         /// The lowest asking a page of `[from, to)` was taken at (0: one
         /// never was): what was written before it the copy holds.
         fn since(&self, from: usize, to: usize) -> u64 {
-            let base = self.start / PAGE;
-            self.copied[from / PAGE - base..=(to - 1) / PAGE - base]
-                .iter()
-                .copied()
+            (from / PAGE..to.div_ceil(PAGE))
+                .map(|page| self.taken.at(page))
                 .min()
                 .unwrap_or(0)
         }
 
         /// `Shadow::copy_stale`: copies the pages of `[from, to)` (inside
-        /// the copy) written after their last copy, notes the whole ones
-        /// taken at `now`; the pages copied, from the copy's first.
+        /// the copy) that `stale_words` finds after asking `now`, and notes
+        /// the whole ones taken at `now`. Given the pages `written` that
+        /// the asking answered (`writes_in`), the pages the old rule took
+        /// from that list (never taken, or written after their take) are
+        /// among them, and are all of them when `exact` (no other asker).
         fn refresh(
             &mut self,
+            journal: &Mutex<Journal>,
             from: usize,
             to: usize,
             now: u64,
-            written: &[(usize, u64)],
-        ) -> Vec<usize> {
+            written: Option<(&[(usize, u64)], bool)>,
+        ) {
             let (start, end) = (self.start, self.start + self.len);
-            let base = start / PAGE;
-            let mut writes = written.iter().peekable();
-            let mut taken = Vec::new();
-            for page in from / PAGE..=(to - 1) / PAGE {
-                let write = match writes.peek() {
-                    Some(&&(p, w)) if p == page => {
-                        writes.next();
-                        w
-                    }
-                    _ => 0,
-                };
-                let at = &mut self.copied[page - base];
-                if *at == 0 || write > *at {
-                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        *at = now;
-                    }
-                    let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
-                    // SAFETY: inside the caller's committed region.
-                    let title = unsafe { std::slice::from_raw_parts(lo as *const u8, hi - lo) };
-                    self.data[lo - start..hi - start].copy_from_slice(title);
-                    taken.push(page - base);
+            let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+            let mut stale = Vec::new();
+            let flow = stale_words_in(journal, first, last, &self.taken, |page| {
+                stale.push(page);
+                ControlFlow::Continue(())
+            });
+            assert!(flow.is_continue());
+            if let Some((written, exact)) = written {
+                let old: Vec<usize> = (first..last)
+                    .filter(|&page| {
+                        let at = self.taken.at(page);
+                        let write = written
+                            .binary_search_by_key(&page, |&(p, _)| p)
+                            .map_or(0, |i| written[i].1);
+                        at == 0 || write > at
+                    })
+                    .collect();
+                if exact {
+                    assert_eq!(stale, old, "one rule, one answer");
+                } else {
+                    assert!(old.iter().all(|p| stale.binary_search(p).is_ok()));
                 }
             }
-            taken
+            for page in stale {
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    self.taken.take(page, page + 1, now);
+                }
+                let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                // SAFETY: inside the caller's committed region.
+                let title = unsafe { std::slice::from_raw_parts(lo as *const u8, hi - lo) };
+                self.data[lo - start..hi - start].copy_from_slice(title);
+            }
         }
 
         /// Whether the copy holds the title's bytes of `[from, to)`.
@@ -3462,14 +3510,20 @@ mod journal_tests {
                     } else {
                         0
                     };
-                    from_stand += usize::from(asked_in(&journal, from, to, since).is_some());
-                    let (now, written) =
-                        writes_in(&journal, from, to, false, since).expect("watched");
-                    assert!(
-                        written.iter().all(|w| w.1 > since),
-                        "step {step}: since {since}"
-                    );
-                    copies[i].refresh(from, to, now, &written);
+                    from_stand += usize::from(asked_now_in(&journal, from, to).is_some());
+                    if step % 3 == 0 {
+                        // Only the asking's number, as a refresh asks.
+                        let now = writes_now_in(&journal, from, to, false).expect("watched");
+                        copies[i].refresh(&journal, from, to, now, None);
+                    } else {
+                        let (now, written) =
+                            writes_in(&journal, from, to, false, since).expect("watched");
+                        assert!(
+                            written.iter().all(|w| w.1 > since),
+                            "step {step}: since {since}"
+                        );
+                        copies[i].refresh(&journal, from, to, now, Some((&written, true)));
+                    }
                     assert!(copies[i].holds(from, to), "step {step}: copy {i}");
                 }
                 // A submission's one asking, over some of the copies.
@@ -3533,7 +3587,7 @@ mod journal_tests {
                         };
                         let (now, written) =
                             writes_in(&journal, from, to, false, since).expect("watched");
-                        copies[i].refresh(from, to, now, &written);
+                        copies[i].refresh(&journal, from, to, now, Some((&written, true)));
                         assert!(copies[i].holds(from, to), "step {step}: copy {i} ahead");
                     }
                     ask_ahead_done_in(&journal);
@@ -3584,19 +3638,22 @@ mod journal_tests {
                         if n == 0 {
                             ask_ahead_in(journal, &all);
                         }
-                        let since = copy.since(start, end);
-                        let (now, written) =
-                            writes_in(journal, start, end, false, since).expect("watched");
-                        copy.refresh(start, end, now, &written);
+                        if n % 2 == 0 {
+                            let since = copy.since(start, end);
+                            let (now, written) =
+                                writes_in(journal, start, end, false, since).expect("watched");
+                            copy.refresh(journal, start, end, now, Some((&written, false)));
+                        } else {
+                            let now = writes_now_in(journal, start, end, false).expect("watched");
+                            copy.refresh(journal, start, end, now, None);
+                        }
                         if n == 0 {
                             ask_ahead_done_in(journal);
                         }
                     }
                     still.wait();
-                    let since = copy.since(start, end);
-                    let (now, written) =
-                        writes_in(journal, start, end, false, since).expect("watched");
-                    copy.refresh(start, end, now, &written);
+                    let now = writes_now_in(journal, start, end, false).expect("watched");
+                    copy.refresh(journal, start, end, now, None);
                     assert!(copy.holds(start, end), "copy {n}");
                 })
             })

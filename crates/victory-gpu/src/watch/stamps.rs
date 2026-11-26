@@ -27,6 +27,7 @@
 //! the stamps under it.
 
 use super::PAGE;
+use std::ops::ControlFlow;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
@@ -177,23 +178,68 @@ impl Stamps {
         }
     }
 
-    /// Whether no page of `[first, last)` has a stamp above what a copy
-    /// took it at: `taken[k]` for page `first + k` (as many as the pages).
-    pub(super) fn none_above(&self, first: usize, last: usize, taken: &[u64]) -> bool {
-        debug_assert_eq!(taken.len(), last - first);
-        self.groups(first, last).all(|group| {
-            let taken = &taken[group.first - first..][..group.pages.len()];
-            let top = group.top.load(Ordering::Acquire);
-            if taken.iter().all(|&t| top <= t) {
-                return true;
+    /// Calls `f` with each page of `[first, last)` (cut to the copy) that
+    /// the copy whose notes are `taken` must take from title memory before
+    /// it holds the title's bytes, in page order: a page it never took
+    /// whole, and a page whose stamp is above the asking it was taken at.
+    /// This is the one rule every copy decides by. A group of the range
+    /// whose pages were all taken, and whose top is not above the group's
+    /// floor in `taken`, is skipped with one compare: the cost is a look
+    /// per group of the range and one per page of the groups written since
+    /// the copy took them. Stops when `f` breaks, and says so.
+    pub(super) fn stale_words(
+        &self,
+        first: usize,
+        last: usize,
+        taken: &Taken,
+        mut f: impl FnMut(usize) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let (first, last) = (
+            first.max(taken.first),
+            last.min(taken.first + taken.at.len()),
+        );
+        if first >= last {
+            return ControlFlow::Continue(());
+        }
+        // The table looked at last, by its index.
+        let mut table: Option<(usize, Option<&[AtomicU64]>)> = None;
+        for group in first / GROUP..=(last - 1) / GROUP {
+            let (a, b) = ((group * GROUP).max(first), ((group + 1) * GROUP).min(last));
+            let word = group - taken.first / GROUP;
+            let untaken = taken.untaken[word] & bits(a % GROUP, b - group * GROUP);
+            let page = group * GROUP;
+            let index = page / TABLE_PAGES;
+            let stamps = match table {
+                Some((at, stamps)) if at == index => stamps,
+                _ => {
+                    let stamps = self.table(index);
+                    table = Some((index, stamps));
+                    stamps
+                }
+            };
+            let in_table = (page - index * TABLE_PAGES) / GROUP;
+            let (top, floor) = stamps.map_or((0, 0), |t| {
+                let top = t[TABLE_PAGES + GROUPS + in_table].load(Ordering::Acquire);
+                (top, t[TABLE_PAGES + in_table].load(Ordering::Relaxed))
+            });
+            if untaken == 0 && top <= taken.floor[word] {
+                continue;
             }
-            let floor = group.floor.load(Ordering::Relaxed);
-            group
-                .pages
-                .iter()
-                .zip(taken)
-                .all(|(stamp, &t)| stamp.load(Ordering::Relaxed).max(floor) <= t)
-        })
+            for page in a..b {
+                let stale = untaken & (1 << (page % GROUP)) != 0 || {
+                    let stamp = stamps.map_or(0, |t| {
+                        t[page - index * TABLE_PAGES]
+                            .load(Ordering::Relaxed)
+                            .max(floor)
+                    });
+                    stamp > taken.at[page - taken.first]
+                };
+                if stale {
+                    f(page)?;
+                }
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     /// The tables made so far.
@@ -226,6 +272,114 @@ impl Drop for Stamps {
     }
 }
 
+/// What a host copy of title memory took of it (`crate::shadow::Shadow`):
+/// for each 64 KiB page, the asking after which the copy last took it
+/// whole, and for each group of [`GROUP`] pages (the stamps' own groups, at
+/// the same addresses) the pages never taken whole and the lowest asking a
+/// taken page was taken at, so [`Stamps::stale_words`] can pass over a
+/// group with one compare.
+///
+/// For every page of the copy, either it was never taken whole, or the
+/// copy holds the title's bytes as of the asking it was taken at and the
+/// group's floor is not above that asking. Stamps only rise.
+pub(crate) struct Taken {
+    /// The copy's first page.
+    first: usize,
+    /// For each page from `first` on: the asking after which it was last
+    /// taken whole (0: never).
+    at: Vec<u64>,
+    /// For each group from the one holding `first`: a bit per page, set
+    /// while the page was never taken whole; clear for pages outside the
+    /// copy (padding).
+    untaken: Vec<u64>,
+    /// For each such group: the lowest `at` of its pages that were taken
+    /// (`u64::MAX` if none was).
+    floor: Vec<u64>,
+}
+
+impl Taken {
+    /// The notes of a copy of pages `[first, first + pages)`, none taken.
+    pub(crate) fn new(first: usize, pages: usize) -> Self {
+        let last = first + pages;
+        let groups = if pages == 0 {
+            0
+        } else {
+            (last - 1) / GROUP - first / GROUP + 1
+        };
+        let untaken = (0..groups)
+            .map(|k| {
+                let group = first / GROUP + k;
+                let (a, b) = ((group * GROUP).max(first), ((group + 1) * GROUP).min(last));
+                bits(a % GROUP, b - group * GROUP)
+            })
+            .collect();
+        Self {
+            first,
+            at: vec![0; pages],
+            untaken,
+            floor: vec![u64::MAX; groups],
+        }
+    }
+
+    /// Notes pages `[first, last)` (cut to the copy) taken whole after
+    /// asking `now`, and brings the floors of their groups up to date.
+    pub(crate) fn take(&mut self, first: usize, last: usize, now: u64) {
+        let (first, last) = (first.max(self.first), last.min(self.first + self.at.len()));
+        if first >= last {
+            return;
+        }
+        for page in first..last {
+            let at = &mut self.at[page - self.first];
+            *at = (*at).max(now);
+            self.untaken[page / GROUP - self.first / GROUP] &= !(1 << (page % GROUP));
+        }
+        for group in first / GROUP..=(last - 1) / GROUP {
+            let word = group - self.first / GROUP;
+            let (a, b) = (
+                (group * GROUP).max(self.first),
+                ((group + 1) * GROUP).min(self.first + self.at.len()),
+            );
+            let untaken = self.untaken[word];
+            self.floor[word] = (a..b)
+                .filter(|&page| untaken & (1 << (page % GROUP)) == 0)
+                .map(|page| self.at[page - self.first])
+                .min()
+                .unwrap_or(u64::MAX);
+        }
+    }
+
+    /// Whether pages `[first, last)` are all pages of the copy.
+    pub(crate) fn holds(&self, first: usize, last: usize) -> bool {
+        self.first <= first && last <= self.first + self.at.len()
+    }
+
+    /// The pages of the copy taken whole at least once.
+    pub(crate) fn taken_pages(&self) -> usize {
+        self.at.len()
+            - self
+                .untaken
+                .iter()
+                .map(|w| w.count_ones() as usize)
+                .sum::<usize>()
+    }
+
+    /// The asking after which page `page` was last taken whole (0: never,
+    /// or not a page of the copy).
+    #[cfg(test)]
+    pub(crate) fn at(&self, page: usize) -> u64 {
+        page.checked_sub(self.first)
+            .and_then(|k| self.at.get(k))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// The bits of pages `[a, b)` of a group (`a < b <= GROUP`).
+fn bits(a: usize, b: usize) -> u64 {
+    debug_assert!(a < b && b <= GROUP);
+    (u64::MAX >> (GROUP - b)) & (u64::MAX << a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,7 +398,8 @@ mod tests {
 
     /// Random marks, small, over whole groups and straddling groups and
     /// tables, answer as a map of every page's highest mark (the journal's
-    /// map before the stamps): `since` for any stamp, and `none_above`.
+    /// map before the stamps): `since` for any stamp, and
+    /// `stale_words` for copies around the range.
     #[test]
     fn stamps_match_a_page_model() {
         let stamps = Stamps::new();
@@ -286,18 +441,67 @@ mod tests {
                 got, want,
                 "step {step}: pages {first}..{last} since {since}"
             );
-            let taken: Vec<u64> = (first..last)
-                .map(|p| match rng.next(3) {
-                    0 => model.get(&p).copied().unwrap_or(0),
-                    1 => since,
-                    _ => now,
+            // A copy around the range, pages taken at random askings
+            // (some never, some in runs), asked about at random edges in
+            // and around it: `stale_words` says what the page rule says.
+            let (cf, cl) = (first - rng.next(70), last + rng.next(70));
+            let mut taken = Taken::new(cf, cl - cf);
+            let mut page = cf;
+            while page < cl {
+                let most = if rng.next(4) == 0 { 90 } else { 3 };
+                let n = (1 + rng.next(most)).min(cl - page);
+                let at = match rng.next(6) {
+                    0 => None,
+                    1 => Some(model.get(&page).copied().unwrap_or(1)),
+                    2 => Some(since.max(1)),
+                    3 => Some(1 + rng.next(now as usize) as u64),
+                    _ => Some(now),
+                };
+                if let Some(at) = at {
+                    taken.take(page, page + n, at);
+                }
+                page += n;
+            }
+            let (qa, qb) = (
+                cf - 5 + rng.next(cl - cf + 10),
+                cf - 5 + rng.next(cl - cf + 10),
+            );
+            let (qa, qb) = (qa.min(qb), qa.max(qb) + 1);
+            let want: Vec<usize> = (qa.max(cf)..qb.min(cl))
+                .filter(|&p| {
+                    let at = taken.at(p);
+                    at == 0 || model.get(&p).is_some_and(|&w| w > at)
                 })
                 .collect();
-            let above = (first..last).any(|p| model.get(&p).is_some_and(|&w| w > taken[p - first]));
+            let mut got = Vec::new();
+            let flow = stamps.stale_words(qa, qb, &taken, |p| {
+                got.push(p);
+                ControlFlow::Continue(())
+            });
+            assert!(flow.is_continue());
+            assert_eq!(got, want, "step {step}: pages {qa}..{qb} of {cf}..{cl}");
+            let floors = (cf / GROUP..=(cl - 1) / GROUP).all(|group| {
+                let pages = (group * GROUP).max(cf)..((group + 1) * GROUP).min(cl);
+                let low = pages.map(|p| taken.at(p)).filter(|&at| at != 0).min();
+                taken.floor[group - cf / GROUP] == low.unwrap_or(u64::MAX)
+            });
+            assert!(
+                floors,
+                "step {step}: every floor is its group's lowest take"
+            );
+            // Stopped at the first.
+            let mut seen = 0;
+            let flow = stamps.stale_words(qa, qb, &taken, |_| {
+                seen += 1;
+                ControlFlow::Break(())
+            });
             assert_eq!(
-                stamps.none_above(first, last, &taken),
-                !above,
-                "step {step}"
+                (seen, flow.is_break()),
+                (usize::from(!want.is_empty()), !want.is_empty())
+            );
+            assert_eq!(
+                taken.taken_pages(),
+                (cf..cl).filter(|&p| taken.at(p) != 0).count()
             );
         }
         assert_eq!(stamps.tables_made(), 2, "the two tables marked, no more");
@@ -324,6 +528,36 @@ mod tests {
         assert!(out.is_empty());
         // No table, nothing to look at.
         assert_eq!(stamps.groups(0, base).count(), 0);
+    }
+
+    /// Where no page was ever marked (no table), a copy must take what it
+    /// never took and nothing else; a group taken whole whose top is not
+    /// above its floor is skipped, one written since is looked into.
+    #[test]
+    fn stale_words_without_tables_and_by_floor() {
+        let stamps = Stamps::new();
+        let base = 7 * TABLE_PAGES + 10;
+        let mut taken = Taken::new(base, 200);
+        let stale = |taken: &Taken, a: usize, b: usize| {
+            let mut out = Vec::new();
+            let _ = stamps.stale_words(a, b, taken, |p| {
+                out.push(p);
+                ControlFlow::Continue(())
+            });
+            out
+        };
+        assert_eq!(
+            stale(&taken, 0, usize::MAX / PAGE),
+            (base..base + 200).collect::<Vec<_>>()
+        );
+        taken.take(base, base + 200, 5);
+        assert!(stale(&taken, base, base + 200).is_empty());
+        assert_eq!(taken.taken_pages(), 200);
+        stamps.mark(base + 70, base + 71, 6);
+        stamps.mark(base + 150, base + 151, 4);
+        assert_eq!(stale(&taken, base, base + 200), [base + 70]);
+        taken.take(base + 70, base + 71, 6);
+        assert!(stale(&taken, base, base + 200).is_empty());
     }
 
     /// Marks over the same GiB again and again make one table.

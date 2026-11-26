@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
-use crate::watch::PAGE;
+use crate::watch::{PAGE, Taken};
+use std::ops::ControlFlow;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -32,9 +33,10 @@ pub(crate) struct Shadow {
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
-    /// Per page of title memory from `start`'s on: the write-watch asking
-    /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
+    /// What the copy took of title memory, per page from `start`'s on: the
+    /// write-watch asking after which it last took the page whole
+    /// ([`Taken`]; [`crate::watch::stale_words`] decides what it must take).
+    taken: Mutex<Taken>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -2484,30 +2486,26 @@ mod piece_tests {
     }
 }
 
-/// The pages of `[a, e)` (title addresses, `a < e`) that a copy whose
-/// first page is `base` must take from title memory before it holds the
-/// title's bytes: those it never took (`copied` 0), whether or not the
-/// title wrote them since tracking began, and those `written` (as
-/// `crate::watch::writes` gives it, by page in order) shows written after
-/// the copy took them. As [`Shadow::copy_stale`] decides it.
+/// The pages of `[a, e)` (title addresses, `a < e`) that the copy whose
+/// notes are `taken` must take from title memory before it holds the
+/// title's bytes, in order: those it never took whole, whether or not the
+/// title wrote them since tracking began, and those the journal shows
+/// written after the copy took them. The one rule of every copy
+/// ([`crate::watch::stale_words`]), as [`Shadow::copy_stale`] decides it.
 ///
-/// [`Shadow::stale_under_writes`] and [`Shadow::merge_under_writes`] looked
-/// at `written` alone, so a page of a range shaders may be writing that the
-/// copy never took, and the title had not written lately, was neither
-/// merged nor a reason to settle; the refresh leaves such ranges alone, and
-/// shaders read zeros there (fxceless/victory-fork#206: missing geometry
-/// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
-fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
-    (a / PAGE..e.div_ceil(PAGE))
-        .filter(|&page| page >= base)
-        .filter(|&page| match copied.get(page - base) {
-            None => false,
-            Some(0) => true,
-            Some(&at) => written
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .is_ok_and(|i| written[i].1 > at),
-        })
-        .collect()
+/// [`Shadow::stale_under_writes`] and [`Shadow::merge_under_writes`] once
+/// looked at the written pages alone, so a page of a range shaders may be
+/// writing that the copy never took, and the title had not written lately,
+/// was neither merged nor a reason to settle; the refresh leaves such
+/// ranges alone, and shaders read zeros there (fxceless/victory-fork#206:
+/// missing geometry with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
+fn stale_pages_in(taken: &Taken, a: usize, e: usize) -> Vec<usize> {
+    let mut pages = Vec::new();
+    let _ = crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), taken, |page| {
+        pages.push(page);
+        ControlFlow::Continue(())
+    });
+    pages
 }
 
 #[cfg(test)]
@@ -2516,16 +2514,163 @@ mod stale_tests {
 
     #[test]
     fn pages_never_taken_are_stale_written_or_not() {
-        let base = 0x100;
-        let copied = [5, 0, 5, 5];
-        let at = |page: usize| page * PAGE;
-        // Page 0x101 was never taken; page 0x102 was written after it was
-        // taken, page 0x103 before.
-        let written = [(0x102, 6), (0x103, 4)];
-        assert_eq!(stale_pages_in(base, &copied, at(0x100), at(0x104), &written), [0x101, 0x102]);
+        // Addresses nothing of ours uses: the GPU's writes there are told,
+        // nothing is asked.
+        let base = (0x7e00_0000_0000 + 77 * 64 * PAGE) / PAGE;
+        let mut taken = Taken::new(base, 4);
+        let at = |page: usize| (base + page) * PAGE;
+        // Page 1 was never taken; page 2 was written after it was taken
+        // (at the first asking: the second wrote it), page 3 before (no
+        // asking comes after its take).
+        taken.take(base, base + 1, 1);
+        taken.take(base + 2, base + 3, 1);
+        crate::watch::gpu_wrote(at(3) + 8, 1);
+        crate::watch::gpu_wrote(at(2) + 8, 1);
+        taken.take(base + 3, base + 4, u64::MAX / 2);
+        assert_eq!(stale_pages_in(&taken, at(0), at(4)), [base + 1, base + 2]);
         // Part of a page counts as the page; pages outside the copy do not.
-        assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
-        assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
+        assert_eq!(stale_pages_in(&taken, at(1) + 8, at(1) + 16), [base + 1]);
+        crate::watch::gpu_wrote(at(4), PAGE);
+        assert!(stale_pages_in(&taken, at(3), at(6)).is_empty());
+        assert_eq!(taken.taken_pages(), 3);
+    }
+}
+
+/// Refreshes of a host copy on the software adapter, of write-watched
+/// memory of the test's own: what each takes, by the bytes it returns.
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// `pages` pages of write-watched memory (64 KiB aligned), filled and
+    /// with nothing counted as written; never given back (an exact copy
+    /// stays in its table over it).
+    fn region(pages: usize) -> usize {
+        let len = pages * PAGE;
+        // SAFETY: a fresh allocation of the test's own.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        for i in 0..len {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + i) as *mut u8).write((i as u8).wrapping_mul(13).wrapping_add(7)) };
+        }
+        // SAFETY: our allocation.
+        assert_eq!(unsafe { ResetWriteWatch(at as *const _, len) }, 0);
+        at
+    }
+
+    fn holds(copy: &Shadow, from: usize, to: usize) -> bool {
+        let start = copy.start as usize;
+        // SAFETY: committed memory of the test's own.
+        let title = unsafe { std::slice::from_raw_parts(from as *const u8, to - from) };
+        copy_bytes(copy)[from - start..to - start] == *title
+    }
+
+    fn poke(at: usize, value: u8) {
+        // SAFETY: committed memory of the test's own.
+        unsafe { (at as *mut u8).write_volatile(value) };
+    }
+
+    /// The first refresh takes the whole range, once; a second with no
+    /// write takes nothing, and the copy is then known to have nothing new.
+    #[test]
+    fn warp_first_refresh_takes_the_whole_range_once() {
+        if host().is_none() {
+            return;
+        }
+        let at = region(8);
+        let len = 8 * PAGE;
+        let copy = exact(at as u64, len as u64).expect("a copy");
+        assert!(!copy.nothing_new(at, len), "never taken");
+        assert_eq!(copy.update(at, len), len);
+        assert!(holds(&copy, at, at + len));
+        assert_eq!(copy.update(at, len), 0);
+        crate::watch::ask_once(&[(at, at + len)]);
+        let same = copy.nothing_new(at, len);
+        crate::watch::ask_once_end();
+        assert!(same, "taken, nothing written");
+        assert_eq!(copy.taken.lock().unwrap().taken_pages(), 8);
+    }
+
+    /// Bytes written in two pages: those two pages are taken, no more.
+    #[test]
+    fn warp_refresh_copies_only_dirty_pages() {
+        if host().is_none() {
+            return;
+        }
+        let at = region(8);
+        let len = 8 * PAGE;
+        let copy = exact(at as u64, len as u64).expect("a copy");
+        assert_eq!(copy.update(at, len), len);
+        poke(at + 2 * PAGE + 100, 1);
+        poke(at + 5 * PAGE + 7, 2);
+        assert_eq!(copy.update(at, len), 2 * PAGE);
+        assert!(holds(&copy, at, at + len));
+        assert_eq!(copy.update(at, len), 0);
+    }
+
+    /// A first refresh of part of a page at each end copies those parts but
+    /// leaves the two pages untaken; a later refresh of all of them takes
+    /// them whole.
+    #[test]
+    fn warp_partial_first_refresh_leaves_edges_untaken() {
+        if host().is_none() {
+            return;
+        }
+        let at = region(4);
+        let len = 4 * PAGE;
+        let copy = exact(at as u64, len as u64).expect("a copy");
+        let (from, to) = (at + 0x100, at + 3 * PAGE - 0x100);
+        assert_eq!(copy.update(from, to - from), to - from);
+        assert!(holds(&copy, from, to));
+        assert_eq!(
+            copy.taken.lock().unwrap().taken_pages(),
+            1,
+            "the middle page only"
+        );
+        // Nothing written: the two edge pages, still untaken, again in part.
+        assert_eq!(copy.update(from, to - from), 2 * (PAGE - 0x100));
+        // The whole range: the edge pages whole, and the last page.
+        assert_eq!(copy.update(at, len), 3 * PAGE);
+        assert!(holds(&copy, at, at + len));
+        assert_eq!(copy.update(at, len), 0);
+    }
+
+    /// A range shaders may be writing is left alone: the pages around it
+    /// are refreshed, it is not, and no run spans it.
+    #[test]
+    fn warp_refresh_around_pending_range() {
+        if host().is_none() {
+            return;
+        }
+        let at = region(6);
+        let len = 6 * PAGE;
+        let copy = exact(at as u64, len as u64).expect("a copy");
+        assert_eq!(copy.update(at, len), len);
+        copy.writing(at + 3 * PAGE, PAGE);
+        let held = copy_bytes(&copy)[3 * PAGE..4 * PAGE].to_vec();
+        for page in 2..5 {
+            poke(at + page * PAGE + 9, 0xa0 + page as u8);
+        }
+        assert_eq!(copy.update(at, len), 2 * PAGE, "pages 2 and 4");
+        assert!(holds(&copy, at, at + 3 * PAGE));
+        assert!(holds(&copy, at + 4 * PAGE, at + len));
+        assert_eq!(
+            copy_bytes(&copy)[3 * PAGE..4 * PAGE],
+            held[..],
+            "page 3 untouched"
+        );
     }
 }
 
@@ -2565,8 +2710,8 @@ pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
-        let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let taken = s.taken.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = taken.taken_pages() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -2855,7 +3000,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
+            taken: Mutex::new(Taken::new((start / PAGE as u64) as usize, pages as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3438,7 +3583,7 @@ impl Shadow {
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the
     /// write-watch journal alone, as the submission's one asking left it
-    /// (`crate::watch::asked`); where the journal cannot say (memory not
+    /// (`crate::watch::asked_now`); where the journal cannot say (memory not
     /// write-watched, a range not asked about) it is yes. A page the copy
     /// never took whole counts as written if the title ever wrote it.
     ///
@@ -3465,13 +3610,14 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
-        let base = start / PAGE;
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        busy.into_iter()
-            .any(|(a, e)| match crate::watch::asked(a, e, 0) {
-                Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
-                None => true,
-            })
+        let taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        busy.into_iter().any(|(a, e)| {
+            crate::watch::asked_now(a, e).is_none()
+                || crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), &taken, |_| {
+                    ControlFlow::Break(())
+                })
+                .is_break()
+        })
     }
 
     /// Where [`Shadow::stale_under_writes`] says yes: puts the bytes the
@@ -3510,7 +3656,6 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
         }
-        let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
@@ -3519,13 +3664,10 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true, 0) else {
+            let Some(now) = crate::watch::writes_now(a, e, true) else {
                 return true;
             };
-            let stale: Vec<usize> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
-            };
+            let stale = stale_pages_in(&self.taken.lock().unwrap_or_else(|e| e.into_inner()), a, e);
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
@@ -3599,10 +3741,8 @@ impl Shadow {
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
+                    let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+                    taken.take(page, page + 1, now);
                 }
             }
         }
@@ -3673,8 +3813,8 @@ impl Shadow {
             return false;
         }
         drop(pending);
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied);
+        let taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        let same = crate::watch::nothing_new(from, to, &taken);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3688,9 +3828,9 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true, 0) {
+            if let Some(now) = crate::watch::writes_now(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3769,42 +3909,39 @@ impl Shadow {
         }
     }
 
-    /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    /// Copies the pages of `[from, to)` (inside the buffer) the copy must
+    /// take after asking `now` ([`crate::watch::stale_words`]), one copy per
+    /// run of them, and notes the pages it took whole. The walk costs a look
+    /// per 64 pages of the range and one per page of the groups written
+    /// since the copy took them; the first refresh of a range takes all of
+    /// it, as one run.
+    fn copy_stale(&self, from: usize, to: usize, now: u64) -> usize {
         // On the profile: the page stamps are the journal's work, the
         // copies are not (`crate::profile::journal_timer`).
         let _journal = crate::profile::journal_timer();
-        let base = self.start as usize / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
-        let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+        let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let _ = crate::watch::stale_words(from / PAGE, to.div_ceil(PAGE), &taken, |page| {
+            match runs.last_mut() {
+                Some((_, end)) if *end == page => *end += 1,
+                _ => runs.push((page, page + 1)),
             }
-        }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            ControlFlow::Continue(())
+        });
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let whole =
+            |page: usize| (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+        let mut bytes = 0;
+        for (a, b) in runs {
+            // Cut to the range: next to it shaders may be writing the copy.
+            bytes += self.copy((a * PAGE).max(from), (b * PAGE).min(to));
+            // A page only partly in the range is copied in part: it stays
+            // stale for the rest.
+            let first = if whole(a) { a } else { a + 1 };
+            let last = if whole(b - 1) { b } else { b - 1 };
+            if first < last {
+                taken.take(first, last, now);
+            }
         }
         bytes
     }
