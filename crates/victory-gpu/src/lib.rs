@@ -56,6 +56,8 @@ pub mod queue;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod safecopy;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -95,7 +97,7 @@ pub use pool::{
 pub use upscale::{hook as upscaler_dispatch, standin as upscaler_standin};
 #[cfg(windows)]
 pub use watch::{
-    Remapping, title_memory_reading, title_memory_reading_range, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_range, title_memory_written,
-    writing as kernel_will_write,
+    Remapping, title_memory_allocated, title_memory_reading, title_memory_reading_range,
+    title_memory_remapped, title_memory_remapping, title_memory_remapping_range,
+    title_memory_written, writing as kernel_will_write,
 };

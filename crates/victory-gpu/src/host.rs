@@ -28,6 +28,8 @@ pub(crate) use ending::{
 };
 #[cfg(test)]
 pub(crate) use ending::{refused_count, reset_for_test};
+/// R5 flush (`VICTORY_R5_FLUSH=1`): less work at submission, and its counters.
+pub(crate) mod r5_flush;
 
 #[cfg(test)]
 pub(crate) use late_homes::{flights, test_flights, test_relay_sees};
@@ -3433,6 +3435,9 @@ struct Deferred {
     /// CPU again since ([`HostList::unlift`]): held until the reset, as that
     /// submission's lift list reads and writes their buffers.
     spent: Vec<Lifted>,
+    /// Placed copies the list refreshed, held with no step
+    /// ([`r5_flush::on`]).
+    kept_homes: r5_flush::Kept,
 }
 
 /// What a list's submission-time steps asked for and did
@@ -9203,6 +9208,11 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        // A placed copy's refresh copies nothing: the list only holds it.
+        if shadow.is_placed() && r5_flush::on() {
+            deferred.kept_homes.keep(shadow);
+            return;
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
@@ -9704,6 +9714,7 @@ impl HostList {
             ..DeferredRun::default()
         };
         let batch_copied = batch.done.copied;
+        let counting = r5_flush::on();
         // For the submission's lift list ([`Step::Lifted`]).
         let mut lifted = Vec::new();
         for step in &deferred.copies {
@@ -9738,6 +9749,9 @@ impl HostList {
                     }
                     run.refreshes += 1;
                     run.asked += *len as u64;
+                    if counting && shadow.is_placed() {
+                        r5_flush::count(r5_flush::Count::PlacedSteps, 1);
+                    }
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -9782,6 +9796,10 @@ impl HostList {
                     if batch.texture_due(staging) {
                         run.textures += 1;
                         staging.refresh();
+                        if counting {
+                            let us = started.elapsed().as_micros() as u64;
+                            r5_flush::count(r5_flush::Count::TextureUs, us);
+                        }
                     }
                     continue;
                 }
@@ -9962,11 +9980,24 @@ impl Batch {
         }
         ranges.merge();
         self.done.refreshes += 1;
+        if crate::watch::skip_unchanged() && Self::nothing_new(&shadow, &ranges) {
+            return;
+        }
         let copied = Self::update(&shadow, &ranges);
         if crate::profile::on() {
             self.done.asked += Self::bytes(&ranges);
             self.done.copied += copied;
         }
+    }
+
+    /// Whether no range of a copy has anything new, as far as is known
+    /// without asking (`VICTORY_NOTHING_NEW=1`,
+    /// `crate::shadow::Shadow::nothing_new`).
+    fn nothing_new(shadow: &crate::shadow::Shadow, ranges: &RefreshRanges) -> bool {
+        ranges
+            .as_slice()
+            .iter()
+            .all(|&(from, to)| shadow.nothing_new(from, to - from))
     }
 
     /// The bytes of a copy's merged ranges.
@@ -10020,6 +10051,19 @@ impl Batch {
         for (_, ranges) in &mut self.refreshes {
             ranges.merge();
         }
+        // Copies known to have nothing new (`VICTORY_NOTHING_NEW=1`): left
+        // out before anything is asked and any thread woken for them, from
+        // what the submission's asking found and the guards' bits. A flush
+        // of thousands of copies (the heap's buffer views) is looked at on
+        // the threads instead, below. (cool_fox 2aa8134.)
+        const FEW: usize = 256;
+        let skip = crate::watch::skip_unchanged();
+        if skip && self.refreshes.len() <= FEW {
+            let started = std::time::Instant::now();
+            self.refreshes
+                .retain(|(shadow, ranges)| !Self::nothing_new(shadow, ranges));
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // One write-watch asking for ranges that lie close together.
         let ahead = self.refreshes.len() > 1
             || self.refreshes.first().is_some_and(|(_, ranges)| ranges.as_slice().len() > 1);
@@ -10038,6 +10082,10 @@ impl Batch {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         self.done.refreshes += self.refreshes.len() as u64;
+        let counting = r5_flush::on();
+        if counting {
+            r5_flush::flush_begins(&self.refreshes);
+        }
         // The bytes, for the profiler's spans only ([`BatchDone`]).
         let profiling = crate::profile::on();
         if profiling {
@@ -10056,12 +10104,18 @@ impl Batch {
             // The bytes copied, summed across the threads.
             let copied =
                 profiling.then(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+            // (Not looked at above.)
+            let many = self.refreshes.len() > FEW;
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
                 .map(|(shadow, ranges)| {
                     let copied = copied.clone();
+                    let look = skip && many;
                     Box::new(move || {
+                        if look && Self::nothing_new(&shadow, &ranges) {
+                            return;
+                        }
                         let bytes = Self::update(&shadow, &ranges);
                         if let Some(copied) = copied {
                             copied.fetch_add(bytes, Ordering::Relaxed);
@@ -10083,6 +10137,9 @@ impl Batch {
                 }
             }
         }
+        if counting {
+            r5_flush::flush_ends();
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -10098,6 +10155,9 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+/// `VICTORY_SAFE_COPY=1` copies with one `rep movsb` instead, whose faults
+/// the write watch's handler turns into the same failure
+/// (`crate::safecopy`).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -10222,6 +10282,13 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if crate::safecopy::on() {
+        // `VICTORY_SAFE_COPY=1`: one `rep movsb`, no kernel call.
+        // SAFETY: the destination is mapped writable memory of `len` bytes
+        // (or title memory whose guards the write watch's handler opens); a
+        // source page that is not there fails the copy.
+        return unsafe { crate::safecopy::copy(dst, src, len) };
+    }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
@@ -10261,6 +10328,14 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        if crate::safecopy::on() {
+            // `VICTORY_SAFE_COPY=1`: one `rep movsb`, no kernel call. A block
+            // guarded again since the caller opened it is opened by the write
+            // watch's handler and the copy goes on.
+            // SAFETY: the source is our mapped host copy; a destination page
+            // that is not there, or not writable, fails the copy.
+            return unsafe { crate::safecopy::copy(at as *mut u8, from, n) };
+        }
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and
@@ -10525,6 +10600,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        r5_flush::line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =

@@ -2821,6 +2821,12 @@ impl Shadow {
         self.core.is_some() || self.card_home().is_some()
     }
 
+    /// Whether the copy is title memory in place (a home of the memory core,
+    /// or a buffer in place, [`Shadow::placed`]): its refresh copies nothing.
+    pub(crate) fn is_placed(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The kind of home of the memory core this is, if it is one. `None`
     /// for a copy in the card's memory whose CPU side is one: it is not
     /// itself the title's memory (its home's kind is that home's).
@@ -3630,6 +3636,41 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// Whether [`Shadow::update`] of `[address, address + len)` would copy
+    /// nothing, and knows it without asking anything
+    /// (`crate::watch::nothing_new`; for `VICTORY_NOTHING_NEW=1`,
+    /// `crate::watch::skip_unchanged`). `false` if it would have to ask.
+    /// Ported from cool_fox 2aa8134.
+    pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        if self.place.is_some() {
+            return true;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return true;
+        }
+        // Known to be watched or guarded (an asking answered for it before).
+        if self.watched.load(Ordering::Relaxed) != 1 {
+            return false;
+        }
+        // Around ranges shaders are writing the refresh asks gap by gap.
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.iter().any(|&(a, e)| a < to && e > from) {
+            return false;
+        }
+        drop(pending);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied);
+        #[cfg(feature = "diagnostics")]
+        if same {
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from) as u64);
+        }
+        same
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
@@ -3769,6 +3810,7 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        crate::host::r5_flush::copied(from, to);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
