@@ -1233,11 +1233,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         list.defer_texture(staging, false);
         return;
     }
-    const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
     // A texture cut from a block (`crate::texture_pool`) may lie where
     // another did: what the card holds of that one is done with before the
-    // first upload into this one.
+    // first upload into this one, and before its transition below (a use).
     if !staging.uploaded.load(Relaxed) && crate::texture_pool::in_block(texture) {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
@@ -1253,6 +1251,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[aliasing]) };
     }
+    const COPY_DEST: u32 = 0x400;
+    crate::list::ensure_state(list, resource, COPY_DEST);
     match staging.record_copies(list, texture, resource) {
         Recorded::Copies => staging.later.store(false, Relaxed),
         Recorded::Later => {
