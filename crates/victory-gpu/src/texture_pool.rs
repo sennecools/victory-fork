@@ -55,12 +55,7 @@ fn now() -> u64 {
 fn halves() -> (bool, bool) {
     static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = match std::env::var("VICTORY_TEXTURE_POOL").as_deref() {
-            Ok("1") => (true, true),
-            Ok("texture") => (true, false),
-            Ok("staging") => (false, true),
-            _ => (false, false),
-        };
+        let on = switched();
         if on != (false, false) {
             tracing::info!(
                 textures = on.0,
@@ -71,6 +66,17 @@ fn halves() -> (bool, bool) {
         }
         on
     })
+}
+
+/// What `VICTORY_TEXTURE_POOL` says, read each time ([`halves`] keeps it;
+/// [`ahead`] reads it too, from inside [`halves`]'s first call).
+fn switched() -> (bool, bool) {
+    match std::env::var("VICTORY_TEXTURE_POOL").as_deref() {
+        Ok("1") => (true, true),
+        Ok("texture") => (true, false),
+        Ok("staging") => (false, true),
+        _ => (false, false),
+    }
 }
 
 /// Whether host copies of textures the title fills are cut from blocks.
@@ -108,8 +114,10 @@ fn spares(memory: Option<[u64; 4]>) -> usize {
 
 /// How many blocks of textures are made ahead, so that one has been there
 /// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, a
-/// count; unset or 0, the default: none, and a new block is used at once).
-/// cool_fox runs with 12.
+/// count; unset: 12 while the texture half of `VICTORY_TEXTURE_POOL` is
+/// on, as cool_fox runs, and with the pool off nothing is cut from blocks
+/// anyway; 0: none, and a new block is used at once, the setup in which
+/// cool_fox lost the device).
 ///
 /// cool_fox lost the device to page faults of lists already on the card,
 /// in a texture made the same tenth of a second as the first piece of a
@@ -124,7 +132,7 @@ fn ahead() -> usize {
         std::env::var("VICTORY_RIPE_BLOCKS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
+            .unwrap_or(if switched().0 { 12 } else { 0 })
     })
 }
 
