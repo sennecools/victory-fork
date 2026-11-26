@@ -1553,11 +1553,24 @@ pub(crate) fn room() -> bool {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        crate::host::host().and_then(|h| h.video_memory()).map(|[budget, used, a, b]| {
-            [budget, used + crate::shadow::card_room_kept() + targets_room_kept(), a, b]
-        })
+        // used; the empty blocks of `crate::texture_pool`, which new
+        // textures take first, do not ([`kept_used`]).
+        crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, used, a, b]| [budget, kept_used(used), a, b])
     })
+}
+
+/// The card's `used` bytes as the room tests count them: less the empty
+/// blocks of `crate::texture_pool` (0 with its texture half off), plus the
+/// room kept for card copies of title buffers not made yet
+/// (`crate::shadow::card_room_kept`) and for the first world frame's render
+/// targets ([`targets_room_kept`]). As cool_fox 8d79927 counts it.
+#[cfg(windows)]
+fn kept_used(used: u64) -> u64 {
+    used.saturating_sub(crate::texture_pool::texture_room())
+        + crate::shadow::card_room_kept()
+        + targets_room_kept()
 }
 
 #[cfg(any(windows, test))]
@@ -1910,11 +1923,17 @@ pub(crate) fn let_go_idle(
     // room, and past it the longest idle first, as many bytes as must go
     // (`crate::host::vram_keep`).
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if crate::host::texture_keep() => crate::host::vram_keep(
-            budget,
-            used.saturating_sub(crate::texture_pool::texture_room()),
-        ),
-        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+        Some([budget, used, ..]) if crate::host::texture_keep() => {
+            crate::host::vram_keep(budget, kept_used(used))
+        }
+        // The idle tiers do not count the pool's empty blocks either (0 with
+        // its texture half off: as before).
+        _ => {
+            let spare = crate::texture_pool::texture_room();
+            let memory =
+                memory.map(|[budget, used, a, b]| [budget, used.saturating_sub(spare), a, b]);
+            (crate::host::vram_idle_ms(memory), u64::MAX)
+        }
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.

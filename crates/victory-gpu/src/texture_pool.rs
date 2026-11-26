@@ -470,6 +470,9 @@ mod d3d {
     /// Bytes of the texture blocks no texture holds: memory of the card in
     /// use by us that new textures take first (0 with the pool off).
     pub(crate) fn texture_room() -> u64 {
+        if !super::textures_on() {
+            return 0;
+        }
         (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
     }
 
