@@ -20,6 +20,8 @@ use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 /// The card's clocks kept up between submissions (`VICTORY_CARD_AWAKE=1`).
 mod awake;
+/// The upload ring the copy queue carries from.
+pub(crate) mod ring;
 /// R5 (`VICTORY_R5=1`): what only the core's homes under the relay use.
 mod late_homes;
 /// The release at the title's end (`crate::release`): submissions refused
