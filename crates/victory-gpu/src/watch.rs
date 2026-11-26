@@ -2113,6 +2113,18 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// For a test that checks how blocks are guarded again after a write
+    /// fault, not how they rest: no block written on this thread rests
+    /// ([`rest`]), whatever `VICTORY_GUARD_REST` says. With a rest, a block
+    /// the test has just written is told as written, and left open, at every
+    /// asking within the rest (at every view of its page); a test that
+    /// expects it clean at the next asking would hold only if the rest were
+    /// over by then. `a_block_just_written_rests` and
+    /// `no_write_to_resting_views_is_lost_between_askers` check the rest.
+    fn no_rest() {
+        set_rest_in_test(std::time::Duration::ZERO);
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -2330,6 +2342,7 @@ mod tests {
             VirtualAlloc2,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        no_rest();
         // SAFETY: a fresh placeholder of three blocks and a pagefile
         // section of three; the middle block is mapped first.
         let (p, section) = unsafe {
@@ -2548,6 +2561,7 @@ mod tests {
     /// guarded view's next check reports the pages written.
     #[test]
     fn a_write_through_another_view_is_reported_at_the_guarded_one() {
+        no_rest();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -2567,6 +2581,7 @@ mod tests {
     /// guarded view checks its pages again (and guards the new view).
     #[test]
     fn a_view_mapped_beside_a_guarded_one_makes_it_check_again() {
+        no_rest();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -2583,6 +2598,7 @@ mod tests {
     /// (`writing`): the other views' next checks report the pages written.
     #[test]
     fn a_write_told_at_one_view_is_reported_at_the_others() {
+        no_rest();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -2605,6 +2621,7 @@ mod tests {
     /// keep the bytes from before the write.
     #[test]
     fn a_write_is_reported_at_every_checked_view() {
+        no_rest();
         const SIZE: usize = 2 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
@@ -2629,6 +2646,7 @@ mod tests {
     /// itself: the others stay writable, and nothing looks through them all.
     #[test]
     fn a_page_of_many_views_is_guarded_one_view_at_a_time() {
+        no_rest();
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
@@ -2672,6 +2690,9 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
         };
         const PAGES: usize = 6;
+        // (With a rest the written block is not known until a taking after
+        // the rest: `a_block_just_written_rests` checks it is not.)
+        no_rest();
         for view in [false, true] {
             // SAFETY: memory of the test's own, never given back (it stays
             // in the journal and the guards).
@@ -3110,6 +3131,7 @@ mod tests {
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCKS: usize = 8;
+        no_rest();
         let bits = light() && known_holes();
         // SAFETY (all): a placeholder and a section of our own, which stay.
         let (at, section) = unsafe {
