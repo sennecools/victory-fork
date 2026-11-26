@@ -21,6 +21,8 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+mod script;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -113,6 +115,10 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Axes the input script (`VICTORY_ROUTE`) sets on the stand-in pad.
+    fn scripted_axes(&mut self) -> script::Axes {
+        script::Axes::default()
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -408,12 +414,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, axes) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.scripted_axes())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, axes);
         self.deliver(events);
     }
 
@@ -458,6 +464,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        axes: script::Axes,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -465,7 +472,11 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| {
+            let mut pad = fallback(&keys);
+            axes.apply(&mut pad);
+            Value::Pad(pad)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1188,22 +1199,29 @@ mod host {
             }
             self.empty_until[slot] = None;
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
+            // The scripted keys (`VICTORY_KEYS`, `VICTORY_ROUTE`) also press
+            // the first pad's buttons, by the stand-in pad's table, and the
+            // route's axes move its sticks and triggers: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
-                for vk in scripted() {
+                let held = scripted();
+                for vk in held.keys {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
                 }
+                held.axes.apply(&mut pad);
             }
             Some(pad)
         }
 
+        fn scripted_axes(&mut self) -> script::Axes {
+            scripted().axes
+        }
+
         fn keys(&mut self) -> Vec<KeyState> {
-            let mut down = scripted();
+            let mut down = scripted().keys;
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1237,43 +1255,30 @@ mod host {
     }
 
     /// Test aid, in every build so that unattended runs of release builds
-    /// get past the title's start screen too: `VICTORY_KEYS=<seconds>:<key>,...`
-    /// holds each key for 0.2 s that long after input starts, with or without
-    /// focus. A key is a letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`,
-    /// `Up`, `Down`, `Left`, `Right` (the stand-in pad's table maps them to
-    /// buttons). Unset, it presses nothing.
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
+    /// get past the title's start screen and can move:
+    /// `VICTORY_KEYS=<seconds>:<key>[:<hold>],...` and the route file of
+    /// `VICTORY_ROUTE=<path>` (`script.rs` has both formats), timed from when
+    /// input starts, with or without focus. Unset, they press nothing; a
+    /// route that cannot be read or parsed is logged and adds nothing.
+    fn scripted() -> script::Held {
+        static SCRIPT: LazyLock<(Instant, Vec<script::Step>)> = LazyLock::new(|| {
+            let mut steps = script::parse_keys(&std::env::var("VICTORY_KEYS").unwrap_or_default());
+            if let Some(path) = std::env::var_os("VICTORY_ROUTE").filter(|p| !p.is_empty()) {
+                let route = std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| script::parse_route(&text));
+                match route {
+                    Ok(route) => {
+                        tracing::info!(steps = route.len(), "input route");
+                        steps.extend(route);
                     }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+                    Err(error) => tracing::error!(%error, "input route not used"),
+                }
+            }
+            (Instant::now(), steps)
         });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        let (start, steps) = &*SCRIPT;
+        script::held(steps, start.elapsed())
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1324,6 +1329,7 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         rumble: Vec<(usize, u16, u16)>,
+        route: Vec<script::Step>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1337,6 +1343,9 @@ mod tests {
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
+        }
+        fn scripted_axes(&mut self) -> script::Axes {
+            script::held(&self.0.lock().unwrap().route, Duration::ZERO).axes
         }
     }
 
@@ -1560,6 +1569,28 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn a_route_moves_the_stand_in_pads_sticks_over_its_keys() {
+        let (hub, host) = fake();
+        {
+            let mut host = host.lock().unwrap();
+            host.keys = vec![key(b'W'), key(b'D')];
+            host.route = script::parse_route("0 10 ly=0.5 rx=-0.25").unwrap();
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                left_x: 1.0,
+                left_y: 0.5,
+                right_x: -0.25,
+                ..Default::default()
+            }
+        );
+        release(r);
     }
 
     #[test]

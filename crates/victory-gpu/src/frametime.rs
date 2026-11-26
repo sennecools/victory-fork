@@ -10,6 +10,11 @@
 //! the first row.
 //! This is deliberately release-buildable (no `diagnostics` feature): the
 //! frames it is meant to explain are the slow ones.
+//!
+//! `VICTORY_FRAMETIME_FRAMES=1`, with the dump on, also writes every frame's
+//! time (`t_ms,frame_ms`, one row per present) to `<dump>.frames.csv`
+//! beside it, so percentiles and the share of slow frames are exact rather
+//! than read from interval means.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,6 +27,8 @@ static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Where `=1` writes; the app points this at Victory's cache folder.
 static DEFAULT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+/// The per-frame file (`VICTORY_FRAMETIME_FRAMES=1`); flushed with each row.
+static FRAMES: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
 static METADATA: OnceLock<String> = OnceLock::new();
 static BUILD_LABEL: OnceLock<String> = OnceLock::new();
 
@@ -91,6 +98,41 @@ fn file() -> Option<&'static Mutex<std::fs::File>> {
         }
     })
     .as_ref()
+}
+
+/// The dump's path with `.frames.csv` for its extension.
+fn frames_path(dump: &std::path::Path) -> PathBuf {
+    dump.with_extension("frames.csv")
+}
+
+fn frames_file() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
+    FRAMES
+        .get_or_init(|| {
+            if !enabled() || std::env::var_os("VICTORY_FRAMETIME_FRAMES").is_none_or(|v| v != "1") {
+                return None;
+            }
+            let path = frames_path(PATH.get().and_then(Option::as_ref)?);
+            match std::fs::File::create(&path) {
+                Ok(file) => {
+                    let mut file = std::io::BufWriter::new(file);
+                    let _ = file.write_all(b"t_ms,frame_ms\n");
+                    tracing::info!(path = %path.display(), "frametime dump per frame");
+                    Some(Mutex::new(file))
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "no per-frame frametime dump");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Unix time in milliseconds, the dump's clock.
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 const HEADER: &str = "t_ms,frame,frames,fps,ms_per_frame,frame_ms_max,frame_ms_avg,\
@@ -301,6 +343,10 @@ pub(crate) fn tick() {
         MAX_US.fetch_max(micros, Ordering::Relaxed);
         SUM_US.fetch_add(micros, Ordering::Relaxed);
         COUNT.fetch_add(1, Ordering::Relaxed);
+        if let Some(frames) = frames_file() {
+            let mut frames = frames.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(frames, "{},{:.3}", unix_ms(), micros as f64 / 1000.0);
+        }
     }
     *last = Some(now);
 }
@@ -366,9 +412,10 @@ pub(crate) fn record(r: &Row) {
     let Some(file) = file() else {
         return;
     };
-    let t_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
+    if let Some(frames) = frames_file() {
+        let _ = frames.lock().unwrap_or_else(|e| e.into_inner()).flush();
+    }
+    let t_ms = unix_ms();
     let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
     let _ = writeln!(
         file,
@@ -418,4 +465,21 @@ pub(crate) fn record(r: &Row) {
         cpu_pct = r.cpu_pct,
     );
     let _ = file.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_per_frame_file_sits_beside_the_dump() {
+        assert_eq!(
+            frames_path(std::path::Path::new(r"cache\frametime-a.csv")),
+            PathBuf::from(r"cache\frametime-a.frames.csv")
+        );
+        assert_eq!(
+            frames_path(std::path::Path::new("dump")),
+            PathBuf::from("dump.frames.csv")
+        );
+    }
 }
