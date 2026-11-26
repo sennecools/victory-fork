@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Interface, PCWSTR, w};
 
+/// The card's clocks kept up between submissions (`VICTORY_CARD_AWAKE=1`).
+mod awake;
 /// R5 (`VICTORY_R5=1`): what only the core's homes under the relay use.
 mod late_homes;
 /// R5's reads of homes on the card (`VICTORY_R5_LIFT=1`), and what its
@@ -8232,6 +8234,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            awake::sent(&self.device);
             self.card_sent();
             drop(execute);
             if let Err(e) = signalled {
