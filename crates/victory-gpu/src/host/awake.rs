@@ -17,10 +17,11 @@
 //! compare the two in one run (the log says when each turn starts).
 //!
 //! The counting thread is started at the first submission ([`sent`]) and
-//! is detached: its handle is forgotten, so it is never stopped and keeps
-//! its own reference to the device for the life of the process. Dropping
-//! an [`Awake`] stops the thread, waits for what it sent and closes its
-//! event, but only for callers of [`start`] that keep the handle.
+//! is detached: its handle is forgotten, and it keeps its own reference to
+//! the device for the life of the process. At the title's end [`end`]
+//! stops its sends for good (and it ends). Dropping an [`Awake`] stops the
+//! thread, waits for what it sent and closes its event, but only for
+//! callers of [`start`] that keep the handle.
 //!
 //! The sends may keep heaps the host let go from going: the software
 //! adapter lets such a heap go only once its queues at work ran on past it,
@@ -56,8 +57,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// Quiet this long after the last submission.
 const QUIET_MS: u64 = 250;
 
-/// How long [`hold`] waits at most for what was sent (about 2 ms a send on
-/// the card, two on the way; some 50 ms each on the software adapter).
+/// How long [`hold`] and [`end`] wait at most for what was sent (about
+/// 2 ms a send on the card, two on the way; some 50 ms each on the software
+/// adapter).
 const SETTLE_MS: u64 = 500;
 
 /// A counting thread's fence and the last value it signalled on it.
@@ -73,13 +75,16 @@ unsafe impl Send for OnTheWay {}
 /// The counting threads at work ([`run`]).
 static ON_THE_WAY: Mutex<Vec<OnTheWay>> = Mutex::new(Vec::new());
 
-/// Taken by a counting thread from its look at [`HOLDS`] to the signal
-/// behind its send, and by [`hold`] around its change of it and its look at
-/// [`ON_THE_WAY`]: no send follows it.
+/// Taken by a counting thread from its look at [`HOLDS`] and [`ENDED`] to
+/// the signal behind its send, and by [`hold`] and [`end`] around their
+/// change of them and their look at [`ON_THE_WAY`]: no send follows either.
 static GATE: Mutex<()> = Mutex::new(());
 
 /// The [`Held`]s alive: nothing is sent meanwhile.
 static HOLDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Set by [`end`]: nothing is sent from then on, and no thread started.
+static ENDED: AtomicBool = AtomicBool::new(false);
 
 fn gate() -> std::sync::MutexGuard<'static, ()> {
     GATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -153,6 +158,25 @@ pub(crate) fn hold() -> Held {
     Held { waited }
 }
 
+/// At the title's end (the release, after its last submission): no
+/// counting thread sends from now on and none is started, and what they
+/// sent has run (waited for [`SETTLE_MS`] at most); whether it did.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn end() -> bool {
+    let marks = {
+        let _gate = gate();
+        ENDED.store(true, Ordering::SeqCst);
+        on_the_way()
+    };
+    settle(marks)
+}
+
+/// Tests: sends may follow again.
+#[cfg(test)]
+pub(crate) fn reset_end_for_test() {
+    ENDED.store(false, Ordering::SeqCst);
+}
+
 /// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
 const TURN_MS: u64 = 20_000;
 
@@ -208,7 +232,7 @@ fn wanted() -> bool {
 /// [`QUIET_MS`] after the last.
 pub(super) fn sent(device: &ID3D12Device) {
     let mode = mode();
-    if mode == Mode::Off {
+    if mode == Mode::Off || ENDED.load(Ordering::SeqCst) {
         return;
     }
     let now = now_ms();
@@ -365,7 +389,7 @@ fn run(
             });
         let mut value = 0u64;
         let mut result = Ok(());
-        while !stop.load(Ordering::Relaxed) && result.is_ok() {
+        while !stop.load(Ordering::Relaxed) && !ENDED.load(Ordering::SeqCst) && result.is_ok() {
             if !wanted() || HOLDS.load(Ordering::SeqCst) != 0 {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
@@ -380,7 +404,7 @@ fn run(
                 continue;
             }
             let gate = gate();
-            if HOLDS.load(Ordering::SeqCst) != 0 {
+            if HOLDS.load(Ordering::SeqCst) != 0 || ENDED.load(Ordering::SeqCst) {
                 continue;
             }
             queue.ExecuteCommandLists(&lists[(value % 2) as usize..][..1]);
@@ -443,9 +467,10 @@ mod tests {
     }
 
     /// A hold stops the sends and waits for those on the way, and they go
-    /// on once it is let go.
+    /// on once it is let go; once ended nothing is sent, what was sent ran,
+    /// and the thread ends.
     #[test]
-    fn warp_nothing_is_sent_while_held() {
+    fn warp_nothing_is_sent_while_held_or_once_ended() {
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -459,6 +484,25 @@ mod tests {
         assert_eq!(awake.sends(), sends, "nothing sent while held");
         drop(held);
         sends_after(&awake, sends);
+        // Sends may follow again once the test is done, failed or not.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                reset_end_for_test();
+            }
+        }
+        let _reset = Reset;
+        assert!(end(), "what was sent ran");
+        assert!(on_the_way().is_empty());
+        let sends = awake.sends();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(awake.sends(), sends, "nothing sent once ended");
+        let since = Instant::now();
+        while !awake.thread.as_ref().is_some_and(|t| t.is_finished()) {
+            assert!(since.elapsed().as_secs() < 5, "the thread ends");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(awake);
     }
 
     #[test]
