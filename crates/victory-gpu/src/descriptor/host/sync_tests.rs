@@ -1776,3 +1776,79 @@ fn the_oracle_s_card_read_tells_two_heaps_apart() {
         "the first heap again"
     );
 }
+
+/// A record copied in as bytes while its slot is a table's is left to the
+/// draws; once the table mark ages, the next pass reads it again even with
+/// nothing else written on its page, and the slot shows it.
+#[test]
+fn a_record_left_to_a_table_is_read_again_once_its_mark_ages() {
+    let _census = crate::census::lock_tests();
+    let placed = Placed::new(descriptor::VIEWS_KIND);
+    let Some(host) = placed.host() else {
+        return; // no host GPU
+    };
+    let textures = [title_texture_of(16, 16), title_texture_of(32, 8)];
+    let _hosts = textures.map(|t| crate::resource::host_copy(t).expect("a host copy"));
+    let mut elsewhere = [0u64; 8];
+    let (x, y) = (
+        elsewhere.as_mut_ptr() as u64,
+        elsewhere.as_mut_ptr() as u64 + 32,
+    );
+    write(x, &Some(View::Shader(textures[0] as usize, None)));
+    write(y, &Some(View::Shader(textures[1] as usize, None)));
+    copy_record(x, placed.at(7), 32);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_eq!(key(host, 7), title_key(placed.at(7)), "made from X");
+    host.texture_slot_tabled(7, false);
+    copy_record(y, placed.at(7), 32);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_ne!(key(host, 7), title_key(placed.at(7)), "left to the draws");
+    // Still a table's: left again.
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_ne!(key(host, 7), title_key(placed.at(7)), "left while tabled");
+    host.tabled[7].store(0, Relaxed);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_eq!(
+        key(host, 7),
+        title_key(placed.at(7)),
+        "read again once the mark aged"
+    );
+    // And not again after that: the set holds it no more.
+    assert!(host.left_to_tables.lock().unwrap().is_empty());
+}
+
+/// The slots left to tables are kept up to a limit: a slot already there is
+/// not kept twice, and every slot past the limit is counted, not only the
+/// first.
+#[test]
+fn slots_left_to_tables_past_the_limit_are_counted() {
+    let _census = crate::census::lock_tests();
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    for s in 0..SLOTS {
+        // Tables hold every slot, so none of them is read again yet.
+        heap.texture_slot_tabled(s, false);
+    }
+    LEFT_MOST_HERE.set(Some(2));
+    let dropped = LEFT_DROPPED.load(Relaxed);
+    let mut part = SyncPart::default();
+    {
+        let copied = heap.copied_begin(32);
+        // SAFETY: this thread alone has the records.
+        unsafe { heap.retake_left(&copied, &[1, 2, 2, 1, 3, 4, 3], (base, 32), &mut part) };
+    }
+    LEFT_MOST_HERE.set(None);
+    assert_eq!(LEFT_DROPPED.load(Relaxed) - dropped, 3, "3, 4 and 3 again");
+    let kept: Vec<u32> = heap
+        .left_to_tables
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(kept, [1, 2]);
+    assert!(part.make.is_empty(), "nothing aged");
+}

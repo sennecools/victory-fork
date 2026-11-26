@@ -47,6 +47,15 @@ pub(crate) struct HostHeap {
     /// bytes last looked at it, `step` bytes a slot (zeros: never looked at,
     /// or nothing there; [`HostHeap::copied_begin`]). Made on first use.
     copied_bytes: Mutex<Vec<u8>>,
+    /// Title slots whose changed record the pass over records copied in as
+    /// bytes left to their draws, as tables held them lately
+    /// ([`HostHeap::sort_copied_page`]): once no table holds one for
+    /// [`TABLED_FRAMES`], the pass reads it again whether or not its page was
+    /// written since ([`HostHeap::retake_left`]). Without that, a record a
+    /// draw never made, in a slot no table reads any more, went on showing
+    /// the view from before for as long as nothing else on its page changed.
+    /// At most [`LEFT_MOST`] slots; taken by the pass alone, once a pass.
+    left_to_tables: Mutex<std::collections::BTreeSet<u32>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -1485,6 +1494,7 @@ impl HostHeap {
             writes: std::sync::atomic::AtomicU64::new(0),
             log: NoteLog::default(),
             copied_bytes: Mutex::new(Vec::new()),
+            left_to_tables: Mutex::default(),
             kept: (0..(count + extra).div_ceil(KEPT_SHARD))
                 .map(|shard| {
                     let slots = (count + extra - shard * KEPT_SHARD).min(KEPT_SHARD);
@@ -3159,6 +3169,7 @@ impl HostHeap {
             if !tables && self.tabled_lately(index, frame) {
                 COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 part.tabled += 1;
+                part.left.push(index);
                 continue;
             }
             // SAFETY: as above.
@@ -3186,6 +3197,76 @@ impl HostHeap {
                 .made
                 .get(index as usize)
                 .is_some_and(|made| made.load(std::sync::atomic::Ordering::Acquire) == 0)
+    }
+
+    /// For one pass over this heap (`super::sync_heaps`), after its pages are
+    /// sorted: the slots the pass left to tables (`left`, this pass's) are
+    /// noted ([`HostHeap::left_to_tables`]), and those noted before that no
+    /// table holds lately any more are read again from the title's heap at
+    /// `start` (records of `step` bytes), seen from here on and handed on
+    /// to be mirrored (`part.make`, kept sorted and without repeats). Costs
+    /// one lock of the set and a look at each slot in it, then a read of
+    /// `step` bytes per slot read again; nothing when the set is empty.
+    ///
+    /// # Safety
+    /// No other call with `copied` has any slot at the same time (the pass's
+    /// parts are done).
+    pub(crate) unsafe fn retake_left(
+        &self,
+        copied: &Copied<'_>,
+        left: &[u32],
+        (start, step): (u64, u64),
+        part: &mut SyncPart,
+    ) {
+        let frame = crate::frame::current();
+        let aged: Vec<u32> = {
+            let mut set = self
+                .left_to_tables
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if set.is_empty() && left.is_empty() {
+                return;
+            }
+            let aged: Vec<u32> = set
+                .iter()
+                .copied()
+                .filter(|&slot| !self.tabled_lately(slot, frame))
+                .collect();
+            for slot in &aged {
+                set.remove(slot);
+            }
+            let (most, mut refused) = (left_most(), 0u64);
+            for &slot in left {
+                if set.contains(&slot) {
+                    continue;
+                }
+                if set.len() >= most {
+                    refused += 1;
+                    continue;
+                }
+                set.insert(slot);
+            }
+            if refused > 0 {
+                LEFT_DROPPED.fetch_add(refused, std::sync::atomic::Ordering::Relaxed);
+            }
+            aged
+        };
+        if aged.is_empty() {
+            return;
+        }
+        let mut record = vec![0u8; step as usize];
+        for slot in aged {
+            let at = start + u64::from(slot) * step;
+            // (Read by the safe copy: the title may have unmapped the page.)
+            if !crate::host::read_into(at as *const u8, &mut record) {
+                continue;
+            }
+            // SAFETY: by the caller, the slot is this call's alone.
+            unsafe { copied.take(slot, &record) };
+            part.make.push(slot);
+        }
+        part.make.sort_unstable();
+        part.make.dedup();
     }
 
     /// [`HostHeap::mirror`] of a slot `super::sync_heaps` found a new
@@ -3987,6 +4068,9 @@ pub(crate) struct SyncPart {
     pub(crate) read_ticks: u64,
     /// The slots to mirror, in slot order.
     pub(crate) make: Vec<u32>,
+    /// The changed ones left to the draws of tables, for
+    /// [`HostHeap::retake_left`].
+    pub(crate) left: Vec<u32>,
     /// Room for the changed slots of a page.
     changed: Vec<u32>,
 }
@@ -4139,6 +4223,34 @@ pub(crate) fn claims_line(frames: f64) {
         again as f64 / frames
     );
 }
+
+/// Slots of a heap [`HostHeap::left_to_tables`] holds at most: a view
+/// heap's tables of a frame (some 16,000 tables of a few slots, run 45)
+/// fit many times over. Slots left past it are not read again unless their
+/// page is written (as before the set), and are counted in
+/// [`LEFT_DROPPED`]. A slot is a 4-byte key in a tree node holding up to 11
+/// of them: well under 1 MB at most per heap.
+const LEFT_MOST: usize = 1 << 16;
+
+/// [`LEFT_MOST`], or what a test on this thread set ([`LEFT_MOST_HERE`]).
+fn left_most() -> usize {
+    #[cfg(test)]
+    if let Some(most) = LEFT_MOST_HERE.get() {
+        return most;
+    }
+    LEFT_MOST
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`left_most`] on this thread.
+    pub(crate) static LEFT_MOST_HERE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Slots left to tables that [`HostHeap::left_to_tables`] had no room for.
+/// Only grows.
+pub(crate) static LEFT_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::sort_copied_page`] left to their draws (tables' slots).

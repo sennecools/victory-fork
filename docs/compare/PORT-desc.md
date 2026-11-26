@@ -250,3 +250,18 @@ garbled geometry, and hangs.
 - Review findings: all five were fixed (ea442e7, 2c86826, ff15ef5, 2d3eb68,
   and this file). None left open.
 - The base is not rustfmt-clean; see "Built here".
+
+## Wave 1 changes
+
+- **Slots left to tables are read again (26 Nov 2026).** A record copied in
+  as bytes while a table holds its slot is left to the draws, as before; the
+  pass now also notes the slot (`HostHeap::left_to_tables`, at most 65,536
+  slots a heap, each once) and reads it again once no table has held it for
+  240 frames, whether or not its page was written since
+  (`HostHeap::retake_left`). Before, such a slot kept the view from before
+  for as long as nothing else on its page changed. Cost per pass: one lock
+  of that set (the pass's alone) and a look at each slot in it, then one
+  record read per slot read again; nothing with the set empty. Slots refused
+  for want of room are counted in `LEFT_DROPPED`, on the frame line when not
+  zero. Tests: `a_record_left_to_a_table_is_read_again_once_its_mark_ages`,
+  `slots_left_to_tables_past_the_limit_are_counted`.

@@ -452,8 +452,8 @@ fn sync_parted_heap(
         }
         *found[n].lock().unwrap_or_else(|e| e.into_inner()) = part;
     });
-    drop(copied);
     let mut all = host::SyncPart::default();
+    let mut left = Vec::new();
     for part in found {
         let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
         all.pages += part.pages;
@@ -462,7 +462,13 @@ fn sync_parted_heap(
         all.nothing += part.nothing;
         all.read_ticks += part.read_ticks;
         all.make.append(&mut part.make);
+        left.append(&mut part.left);
     }
+    // The slots left to tables before whose marks have aged: read again,
+    // whether or not their pages were written since.
+    // SAFETY: the parts are done; this thread alone has the records now.
+    unsafe { host.retake_left(&copied, &left, (start, step), &mut all) };
+    drop(copied);
     let make = &all.make;
     crate::draw::each_on(
         threads,
@@ -550,6 +556,18 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    // (`LEFT_DROPPED` only grows: the line's part since the last line.)
+    static DROPPED_LINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dropped = host::LEFT_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+    let since =
+        dropped.wrapping_sub(DROPPED_LINED.swap(dropped, std::sync::atomic::Ordering::Relaxed));
+    if since > 0 {
+        tracing::info!(
+            "heap sync: per frame {:.1} slots left to tables found no room to be read again once \
+             their mark ages (read again only if their page is written)",
+            since as f64 / frames
+        );
+    }
 }
 
 /// For tests: a heap [`sync_heaps`] stops at, until the test lets it go
