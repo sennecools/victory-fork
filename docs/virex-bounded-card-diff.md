@@ -1,15 +1,17 @@
 # Bound fragmented card-write diff work
 
 In late-exact submission preparation, the card-backed path budgets a
-maximum of 4,096 changed runs across the submission (512 before every
-stale span was merged). Previously a page
+maximum of 4,096 changed runs a look at the stale spans (512 before every
+stale span was merged); each look after a narrowed wait has a budget of its
+own. Previously a page
 was fully scanned and all runs allocated even when the result exceeded
 the remaining budget and would be discarded. Stop on the first excess
 run instead, before allocating or scanning that run's remainder.
 
 The accepted run list is unchanged. If the budget is exceeded, no
-partial result is returned or applied, and the caller settles flights
-exactly as before. Preserve unequal-length common-prefix behavior,
+partial result is returned or applied, and the caller waits for flights as
+`settle_stale` says (with `VICTORY_RELAY=2` the narrowed wait first, then a
+settle). Preserve unequal-length common-prefix behavior,
 zero budget, and the unbounded CPU-side path.
 
 A synthetic 64 KiB alternating-byte page contains 32,768 runs.
