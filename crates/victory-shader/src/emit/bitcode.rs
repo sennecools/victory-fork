@@ -232,6 +232,12 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// The names of the functions the module declares or defines.
+    #[cfg(test)]
+    pub(crate) fn function_names(&self) -> Vec<String> {
+        self.funcs.iter().map(|f| f.name.clone()).collect()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

@@ -66,6 +66,9 @@ pub(crate) struct Lowered {
     /// The wave size the shader requires of the host, if any.
     #[cfg(test)]
     pub wave_size: Option<u32>,
+    /// The functions the module declares (`dx.op.*` by name).
+    #[cfg(test)]
+    pub functions: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1444,6 +1447,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             wave_size: self.s.wave_size,
+            #[cfg(test)]
+            functions: self.s.m.function_names(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3247,6 +3252,15 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Whether a quad-local read must reach helper lanes: in a pixel program
+    /// every quad a triangle edge crosses has some (the console's whole-quad
+    /// mode runs them; discarded pixels stay helpers too), and only quad
+    /// reads see them on the host (wave reads give 0 from them on AMD: wrong
+    /// derivatives of computed values along every triangle edge).
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel
+    }
+
     /// `x` in the first lane of the wave where `guard` holds: the console reads the first lane
     /// of EXEC, and a lane that got here with EXEC clear (a guard, not a branch) is not one.
     /// With no such lane, `x` of the wave's first lane here.
@@ -3367,7 +3381,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -5918,7 +5932,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -10825,6 +10839,78 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    /// Lowers a pixel program with PERSP_CENTER's barycentrics in v0 and v1,
+    /// no attributes and one float4 target.
+    fn lower_pixel(words: &[u32]) -> Lowered {
+        use super::super::container::SigElement;
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+    }
+
+    /// Quad-local reads in a pixel program (DPP `quad_perm`, `ds_swizzle`'s
+    /// quad mode) go through quad reads, which reach the helper lanes at
+    /// triangle edges; a wave read gives 0 from a helper on AMD (WARP hides
+    /// that, so the test pins the operation). Compute keeps wave reads.
+    #[test]
+    fn pixel_quad_reads_reach_helper_lanes() {
+        // exp mrt0, v2, v2, v2, v2 done vm
+        let exp = [0xF800_180F, 0x0202_0202];
+        // v_mov_b32 v2, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+        let dpp = [0x7E04_02FA, 0xFF00_B100];
+        // ds_swizzle_b32 v2, v0 offset:swizzle(QUAD_PERM,1,0,3,2)
+        let swizzle = [0xD8D4_80B1, 0x0200_0000];
+        let (quad, wave) = ("dx.op.quadReadLaneAt.i32", "dx.op.waveReadLaneAt.i32");
+        for (what, read) in [("quad_perm", dpp), ("ds_swizzle", swizzle)] {
+            let words = [read[0], read[1], exp[0], exp[1], S_ENDPGM];
+            let f = lower_pixel(&words).functions;
+            assert!(f.iter().any(|n| n == quad), "{what}: {f:?}");
+            assert!(!f.iter().any(|n| n == wave), "{what}: {f:?}");
+            let words = [read[0], read[1], S_ENDPGM];
+            let f = lower_with(&words, vec![], vec![]).unwrap().functions;
+            assert!(f.iter().any(|n| n == wave), "{what}: {f:?}");
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

@@ -159,7 +159,33 @@ const CASES: &[(&str, &str)] = &[
             return f ? c : -c;
         }"#,
     ),
+    // Derivatives and quad reads of values each pixel computes, on a
+    // triangle whose edge crosses quads: the neighbours outside it are
+    // helpers (`EDGE`).
+    (
+        "derivatives and quad reads across a triangle edge",
+        r#"[RootSignature(RS)] float4 ps(V i) : SV_Target {
+            uint2 p = uint2(i.pos.xy);
+            float v = p.x * 3.0 + p.y * 5.0 + 1;
+            v = v * v;
+            return float4(ddx_fine(v), ddy_fine(v), QuadReadAcrossDiagonal(v), QuadReadLaneAt(v, 0));
+        }"#,
+    ),
+    // The same with some neighbours discarded before the reads: helpers too.
+    (
+        "discard, then derivatives and quad reads across a triangle edge",
+        r#"[RootSignature(RS)] float4 ps(V i) : SV_Target {
+            uint2 p = uint2(i.pos.xy);
+            float v = p.x * 3.0 + p.y * 5.0 + 1;
+            v = v * v;
+            if (((p.x * 7 + p.y * 3) & 5) == 5) discard;
+            return float4(ddx_fine(v), ddy_fine(v), QuadReadAcrossDiagonal(v), QuadReadLaneAt(v, 0));
+        }"#,
+    ),
 ];
+
+/// Pixel cases named with this draw a triangle whose edge crosses quads.
+const EDGE: &str = "triangle edge";
 
 const CS_RS: &str = "RootConstants(num32BitConstants=4, b0), \
                      DescriptorTable(SRV(t0, numDescriptors=4)), DescriptorTable(Sampler(s0)), \
@@ -759,18 +785,24 @@ fn translated_shaders_draw_as_pc_ones() {
             D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         ),
     ];
-    // A full-screen triangle: POSITION (4 floats), TEXCOORD0 (2 floats).
+    // A full-screen triangle: POSITION (4 floats), TEXCOORD0 (2 floats),
+    // or for cases named with `EDGE` one whose diagonal crosses quads.
     let vertices = [
         -1.0, -1.0, 0.5, 1.0, 0.0, 1.0, //
         -1.0, 3.0, 0.5, 1.0, 0.0, -1.0, //
         3.0, -1.0, 0.5, 1.0, 2.0, 1.0,
     ];
+    let half = [
+        -1.0, -1.0, 0.5, 1.0, 0.0, 1.0, //
+        -1.0, 1.1, 0.5, 1.0, 0.0, -0.05, //
+        1.1, -1.0, 0.5, 1.0, 1.05, 1.0,
+    ];
     let textures: [(u32, u32, &[[f32; 4]]); 2] = [(1, 1, &dummy), (4, 4, &texels)];
-    let draw = |roots| Draw {
+    let draw = |roots, edge: bool| Draw {
         roots,
         textures: &textures,
         samplers: &samplers,
-        vertices: &vertices,
+        vertices: if edge { &half } else { &vertices },
         stride: 24,
         size: (16, 16),
         mesh_groups: 0,
@@ -813,10 +845,13 @@ fn translated_shaders_draw_as_pc_ones() {
             .draw(
                 &root_t,
                 &pso_t,
-                &draw(vec![
-                    (0, Root::Constants(user_data(&vs_c, &k))),
-                    (1, Root::Constants(user_data(&ps_c, &k))),
-                ]),
+                &draw(
+                    vec![
+                        (0, Root::Constants(user_data(&vs_c, &k))),
+                        (1, Root::Constants(user_data(&ps_c, &k))),
+                    ],
+                    name.contains(EDGE),
+                ),
             )
             .unwrap();
 
@@ -832,23 +867,26 @@ fn translated_shaders_draw_as_pc_ones() {
             .draw(
                 &root_p,
                 &pso_p,
-                &draw(vec![
-                    (0, Root::Constants(k.to_vec())),
-                    (
-                        1,
-                        Root::Table {
-                            sampler: false,
-                            index: 1,
-                        },
-                    ),
-                    (
-                        2,
-                        Root::Table {
-                            sampler: true,
-                            index: 1,
-                        },
-                    ),
-                ]),
+                &draw(
+                    vec![
+                        (0, Root::Constants(k.to_vec())),
+                        (
+                            1,
+                            Root::Table {
+                                sampler: false,
+                                index: 1,
+                            },
+                        ),
+                        (
+                            2,
+                            Root::Table {
+                                sampler: true,
+                                index: 1,
+                            },
+                        ),
+                    ],
+                    name.contains(EDGE),
+                ),
             )
             .unwrap();
 
