@@ -2,7 +2,7 @@
 //! threads, the early skip (`SKIPPED_MADE`), and the pass run ahead on its
 //! own thread (`super::super::ahead`).
 
-use super::made_tests::{alive, key, memory, next, record_key, texture, views, write};
+use super::made_tests::{alive, key, memory, next, texture, views, write};
 use super::*;
 use crate::descriptor::ahead::Ahead;
 use crate::descriptor::{self as descriptor, HeapDesc, Placement};
@@ -132,6 +132,11 @@ fn words_agree(heap: &HostHeap) {
 /// is made on first use (`crate::resource::host_waits` until then). Left
 /// to the process.
 fn title_texture() -> This {
+    title_texture_of(16, 16)
+}
+
+/// [`title_texture`] of `width` x `height` texels.
+fn title_texture_of(width: u64, height: u32) -> This {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC,
         D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE, D3D12_TEXTURE_LAYOUT_UNKNOWN,
@@ -144,8 +149,8 @@ fn title_texture() -> This {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         Alignment: 0,
-        Width: 16,
-        Height: 16,
+        Width: width,
+        Height: height,
         DepthOrArraySize: 1,
         MipLevels: 1,
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -668,20 +673,20 @@ fn many_writers_and_the_pass_ahead_leave_each_slot_with_its_own_word() {
 }
 
 /// The reference the sorted pass is held to, one record at a time: a
-/// record not the one last seen in its slot (`last`, zeros before the first
-/// look), of a slot no table's lately, is last seen from then on and its
-/// slot mirrored as the sync mirrors it. True if it was.
-fn mirror_one(
-    heap: &HostHeap,
-    last: &mut [Vec<u8>],
-    index: u32,
-    handle: u64,
-    record: &[u8],
-) -> bool {
-    if heap.tabled_lately(index, crate::frame::current()) || last[index as usize] == record {
+/// record whose key is not the one last seen in its slot (`last`, 0 before
+/// the first look), or whose slot is made from another record, of a slot no
+/// table's lately, is seen from then on and its slot mirrored as the sync
+/// mirrors it. True if it was.
+fn mirror_one(heap: &HostHeap, last: &mut [u64], index: u32, handle: u64) -> bool {
+    let record = record_key(handle);
+    let made = key(heap, index);
+    if record == last[index as usize] && (made == record || made == 0) {
         return false;
     }
-    last[index as usize] = record.to_vec();
+    if heap.tabled_lately(index, crate::frame::current()) {
+        return false;
+    }
+    last[index as usize] = record;
     heap.mirror_synced(index, handle);
     true
 }
@@ -692,20 +697,20 @@ fn mirror_one(
 /// page on four threads (`sort_copied_page`) and the slots found mirrored
 /// on four threads (`mirror_synced`): after every round the same slots
 /// made from the same records, with the same words and buffer sets, and
-/// the same records last seen. With or without `shows_none`.
-fn sorted_against_one_by_one(shows_none: bool) {
+/// the same keys last seen.
+#[test]
+fn pages_sorted_on_threads_make_what_one_by_one_makes() {
     let (Some(one), Some(sorted)) = (HostHeap::new(false, SLOTS), HostHeap::new(false, SLOTS))
     else {
         return; // no host GPU
     };
     let views = views(memory());
-    let none_before = SHOWED_NONE.load(Relaxed);
     let mut records = vec![[0u32; 8]; SLOTS as usize];
     let base = records.as_mut_ptr() as u64;
     let step = 32u64;
-    let mut rng = 0x0dd5_eed5_1f1a_4330u64 ^ 1 ^ u64::from(shows_none) << 1;
-    let mut mirrored = 0u64;
-    let mut last = vec![vec![0u8; step as usize]; SLOTS as usize];
+    let mut rng = 0x0dd5_eed5_1f1a_4330u64 ^ 1;
+    let (mut mirrored, mut left) = (0u64, 0u64);
+    let mut last = vec![0u64; SLOTS as usize];
     for round in 0..200 {
         for _ in 0..8 {
             let r = next(&mut rng);
@@ -725,6 +730,11 @@ fn sorted_against_one_by_one(shows_none: bool) {
             if r >> 44 & 3 == 0 {
                 one.mirror(s, handle, true);
                 sorted.mirror(s, handle, true);
+                // A mirror that finds no view notes what it read as seen.
+                let record = record_key(handle);
+                if record == 0 || view_at(record as u32, (record >> 32) as u32).is_none() {
+                    last[s as usize] = record;
+                }
             }
         }
         // SAFETY: `records` is `SLOTS` records of `step` bytes.
@@ -733,10 +743,8 @@ fn sorted_against_one_by_one(shows_none: bool) {
         }
         .to_vec();
         let mut one_by_one = 0;
-        for index in 0..u64::from(SLOTS) {
-            let at = (index * step) as usize;
-            let record = &page[at..at + step as usize];
-            if mirror_one(&one, &mut last, index as u32, base + index * step, record) {
+        for index in 0..SLOTS {
+            if mirror_one(&one, &mut last, index, base + u64::from(index) * step) {
                 one_by_one += 1;
             }
         }
@@ -746,34 +754,24 @@ fn sorted_against_one_by_one(shows_none: bool) {
             .collect();
         let found: Vec<std::sync::Mutex<SyncPart>> =
             parts.iter().map(|_| Default::default()).collect();
-        {
-            let copied = sorted.copied_begin(step as usize);
-            crate::draw::each_on(4, parts.len(), "test-sync", &|n| {
-                let (from, to) = parts[n];
-                let mut part = SyncPart::default();
-                let at = from - base as usize;
-                let slots = (at as u64 / step)..((to - base as usize) as u64).div_ceil(step);
-                // SAFETY: the parts are apart from one another.
-                unsafe {
-                    sorted.sort_copied_page(
-                        &copied,
-                        slots,
-                        (base, step),
-                        from,
-                        &page[at..to - base as usize],
-                        shows_none,
-                        &mut part,
-                    )
-                };
-                *found[n].lock().unwrap() = part;
-            });
-        }
+        crate::draw::each_on(4, parts.len(), "test-sync", &|n| {
+            let (from, to) = parts[n];
+            let mut part = SyncPart::default();
+            let at = from - base as usize;
+            let slots = (at as u64 / step)..((to - base as usize) as u64).div_ceil(step);
+            sorted.sort_copied_page(
+                slots,
+                (base, step),
+                from,
+                &page[at..to - base as usize],
+                &mut part,
+            );
+            *found[n].lock().unwrap() = part;
+        });
         let mut make = Vec::new();
-        let mut nothing = 0;
         for part in found {
             let mut part = part.into_inner().unwrap();
             assert_eq!(part.looked, 8, "round {round}");
-            nothing += part.nothing;
             make.append(&mut part.make);
         }
         assert!(make.is_sorted(), "round {round}");
@@ -782,70 +780,39 @@ fn sorted_against_one_by_one(shows_none: bool) {
                 sorted.mirror_synced(index, base + u64::from(index) * step);
             }
         });
-        if shows_none {
-            assert_eq!(make.len() as u64 + nothing, one_by_one, "round {round}");
-        } else {
-            assert_eq!(nothing, 0, "round {round}");
-            assert_eq!(make.len() as u64, one_by_one, "round {round}");
-        }
+        assert_eq!(make.len() as u64, one_by_one, "round {round}");
         mirrored += one_by_one;
+        left += u64::from(SLOTS) - one_by_one;
         for s in 0..SLOTS {
             assert_eq!(key(&one, s), key(&sorted, s), "round {round}, slot {s}");
             assert_eq!(one.word(s), sorted.word(s), "round {round}, slot {s}");
-            let seen = sorted.copied_record(s, step as usize).expect("bytes kept");
-            assert_eq!(seen, last[s as usize], "round {round}, slot {s}");
+            assert_eq!(
+                sorted.seen_key(s),
+                Some(last[s as usize]),
+                "round {round}, slot {s}"
+            );
         }
         assert_eq!(one.buffer_slots(), sorted.buffer_slots(), "round {round}");
         words_agree(&sorted);
     }
-    assert!(mirrored > 0);
-    if shows_none {
-        assert!(SHOWED_NONE.load(Relaxed) > none_before, "records left");
-    }
+    assert!(mirrored > 0 && left > 0);
     assert!(alive());
 }
 
-/// [`sorted_against_one_by_one`].
+/// The keys of records as the pass reads them from a page: the view index
+/// and generation of a record of ours, 0 for any other bytes.
 #[test]
-fn pages_sorted_on_threads_make_what_one_by_one_makes() {
-    sorted_against_one_by_one(false);
-}
-
-/// [`sorted_against_one_by_one`] with records of no view into slots made
-/// from none left before their mirror.
-#[test]
-fn records_of_no_view_left_before_their_mirror_make_what_one_by_one_makes() {
-    sorted_against_one_by_one(true);
-}
-
-/// The records [`changed_records`] gives are those that differ one by one,
-/// in order, and it changes nothing (from cool_fox 53c5256's test).
-#[test]
-fn changed_records_are_those_that_differ_one_by_one() {
-    for (step, count) in [(32usize, 128usize), (32, 2048), (16, 77), (32, 5), (32, 17)] {
-        let mut seed = 7u64;
-        let mut random = move || {
-            seed = seed
-                .wrapping_mul(0x5851_F42D_4C95_7F2D)
-                .wrapping_add(0x1405_7B7E_F767_814F);
-            (seed >> 33) as usize
-        };
-        let last: Vec<u8> = (0..step * count).map(|_| random() as u8).collect();
-        let mut now = last.clone();
-        let mut differ = Vec::new();
-        for slot in 0..count {
-            if random() % 9 == 0 {
-                now[slot * step + random() % step] ^= 1 + (random() % 255) as u8;
-                differ.push(1000 + slot as u32);
-            }
-        }
-        let mut out = Vec::new();
-        changed_records(&last, &now, step, 1000, &mut out);
-        assert_eq!(out, differ);
-        out.clear();
-        changed_records(&now, &now, step, 1000, &mut out);
-        assert!(out.is_empty());
-    }
+fn a_page_key_is_the_view_a_record_names() {
+    let mut record = [0u8; 32];
+    record[..4].copy_from_slice(&VIEW_TAG.to_le_bytes());
+    record[4..8].copy_from_slice(&7u32.to_le_bytes());
+    record[8..12].copy_from_slice(&3u32.to_le_bytes());
+    // Bytes past the first 12 name nothing.
+    record[12..].fill(0xa5);
+    assert_eq!(page_key(&record), 3 << 32 | 7);
+    record[0] ^= 1;
+    assert_eq!(page_key(&record), 0);
+    assert_eq!(page_key(&record[..8]), 0);
 }
 
 /// Passes of its own (`EARLY`): none before the first request; some after
@@ -998,11 +965,10 @@ fn a_pass_looks_at_the_heaps_of_the_requests_it_covers() {
     drop(go);
 }
 
-/// With `VICTORY_SAME_RECORDS`, records copied onto the same bytes leave
-/// their page unwritten for the write watch, and records that differ are
-/// copied and mark it, as without the switch (which writes the same bytes
-/// too). In write-watched memory that is no heap: no pass of another test
-/// takes its pages.
+/// Records copied onto the same bytes leave their page unwritten for the
+/// write watch, and records that differ are copied and mark it. In
+/// write-watched memory that is no heap: no pass of another test takes its
+/// pages.
 #[test]
 fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
     use windows_sys::Win32::System::Memory::{
@@ -1055,8 +1021,6 @@ fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
     // SAFETY: the allocation's own.
     assert_eq!(unsafe { ResetWriteWatch(memory, 2 * page) }, 0);
     let _ = written();
-    // (On this thread alone: other tests copy records meanwhile.)
-    descriptor::SAME_RECORDS_HERE.set(Some(true));
     descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
     assert_eq!(written(), 0, "the same records: the page is not written");
     // One record differs: all eight are copied.
@@ -1066,13 +1030,1056 @@ fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
     assert!(written() > 0, "a record that differs is written");
     // SAFETY: as above.
     assert_eq!(unsafe { (dst as *const [u32; 8]).add(5).read() }, [99; 8]);
-    // Without the switch (whatever the environment says) the same bytes
-    // are written, and mark the page.
-    descriptor::SAME_RECORDS_HERE.set(Some(false));
-    let _ = written();
-    descriptor::copy_simple(std::ptr::null(), 8, dst, src, descriptor::VIEWS_KIND);
-    descriptor::SAME_RECORDS_HERE.set(None);
-    assert!(written() > 0, "without the switch the page is written");
     // SAFETY: this allocation belongs to the test.
     unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+}
+
+/// The oracle the heap sync is held to (wave 1, step W1.8): random title
+/// work on a placed heap (views written by calls and mirrored at once, records
+/// copied in as bytes or by calls, draws that read slots through tables or
+/// make tables, table marks that age, bytes that are no view, released
+/// textures), and at every submission the pass ahead
+/// ([`crate::descriptor::ahead::wait_and_make`]) against a reference heap
+/// that is mirrored slowly: every slot no table had lately, made again from
+/// the record the title holds now. After each submission each slot of the
+/// two must agree on what it was made from (`made`), its word in the table of
+/// strides and the host resource it keeps, and what it was made from must be
+/// the record the title holds there (or nothing, for a view left for later).
+/// Every [`GPU_EVERY`] submissions a compute read through a table of the
+/// placed heap's host slots checks that the slots made from views of texture
+/// objects show those textures.
+///
+/// Left out of the comparison, as the pass leaves them by design:
+/// - slots a table had lately: their draws make them, and the pass looks at
+///   them again next time;
+/// - slots that went on showing an older view of the same placed texture
+///   (`keep_views`);
+/// - slots made from a record whose resource was released since, where the
+///   record did not change: nothing tells the pass of a release, and the
+///   slot keeps its host resource until it is written;
+/// - placed texture views made null in one heap alone as stale (`Spans`)
+///   while that heap holds a rival view of the same memory: which of the two
+///   is the newer depends on the order the writes were seen in;
+/// - views left for later (made only for draws) that one heap shows from a
+///   draw of the same record and the other made null at a write of another
+///   view it saw in between;
+/// - the word of a slot made from nothing (a view left for later, or none):
+///   it is the word of the last write the mirror saw, which differs.
+struct Oracle {
+    placed: Placed,
+    reference: HostHeap,
+    ahead: Ahead,
+    views: Vec<Option<View>>,
+    /// Texture objects with their host copies (held, so the sweep lets none
+    /// go) and their sizes; none in a sampler heap.
+    objects: Vec<(This, std::sync::Arc<crate::resource::HostTexture>, [u32; 2])>,
+    /// Records outside the heap to copy from.
+    scratch: Box<[[u32; 8]; 2]>,
+    gpu: Option<GpuCheck>,
+    /// Submissions, slots compared, slots left out (tables', kept, released),
+    /// GPU checks, placed texture views left out as stale in one heap alone,
+    /// views left for later in one heap alone.
+    counts: [u64; 6],
+}
+
+/// Slots of the heaps the oracle makes.
+const ORACLE_SLOTS: u32 = 64;
+
+/// Submissions between two GPU checks of the oracle.
+const GPU_EVERY: u64 = 8;
+
+impl Oracle {
+    /// An oracle over a heap of `kind`. `None` with no host GPU.
+    fn new(kind: u32) -> Option<Self> {
+        let placed = Placed::with_slots(kind, ORACLE_SLOTS);
+        placed.host()?;
+        let samplers = kind == descriptor::SAMPLERS;
+        let reference = HostHeap::new(samplers, ORACLE_SLOTS)?;
+        let (views, objects) = if samplers {
+            let sampler = |filter: u32, address: u32| {
+                let mut desc = [filter, address, address, address, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+                desc[11] = 0x7f7f_ffff;
+                Some(View::Sampler(desc))
+            };
+            (
+                vec![
+                    sampler(21, 3),
+                    sampler(0, 1),
+                    sampler(21, 1),
+                    sampler(1, 2),
+                    None,
+                ],
+                Vec::new(),
+            )
+        } else {
+            let objects: Vec<_> = [[16u32, 16u32], [32, 8], [8, 4]]
+                .into_iter()
+                .map(|[width, height]| {
+                    let texture = title_texture_of(u64::from(width), height);
+                    let host = crate::resource::host_copy(texture).expect("a host copy");
+                    (texture, host, [width, height])
+                })
+                .collect();
+            let mut views = views(memory());
+            views.extend(
+                objects
+                    .iter()
+                    .map(|&(t, _, _)| Some(View::Shader(t as usize, None))),
+            );
+            (views, objects)
+        };
+        Some(Self {
+            placed,
+            reference,
+            ahead: Ahead::start(descriptor::sync_heaps)?,
+            views,
+            objects,
+            scratch: Box::new([[0; 8]; 2]),
+            gpu: if samplers { None } else { GpuCheck::new() },
+            counts: [0; 6],
+        })
+    }
+
+    fn real(&self) -> &HostHeap {
+        self.placed.host().expect("the host heap")
+    }
+
+    /// The record's bytes of the heap's kind.
+    fn step(&self) -> usize {
+        if self.reference.sampler { 16 } else { 32 }
+    }
+
+    /// `view` written at `handle` by a call.
+    fn call(&mut self, s: u32, view: &Option<View>) {
+        let at = self.placed.at(s);
+        match view {
+            Some(view) => descriptor::record(at, view.clone()),
+            // No view: zeros copied in by a call.
+            None => {
+                self.scratch[0] = [0; 8];
+                let from = self.scratch.as_ptr() as u64;
+                descriptor::copy_simple(std::ptr::null(), 1, at, from, self.kind());
+            }
+        }
+    }
+
+    fn kind(&self) -> u32 {
+        if self.reference.sampler {
+            descriptor::SAMPLERS
+        } else {
+            descriptor::VIEWS_KIND
+        }
+    }
+
+    /// `view` copied into slot `s` from a record outside the heap: by a call
+    /// (mirrored at once), or as bytes.
+    fn copy(&mut self, s: u32, view: &Option<View>, by_call: bool) {
+        let from = self.scratch.as_ptr() as u64 + 32;
+        write(from, view);
+        if by_call {
+            descriptor::copy_simple(std::ptr::null(), 1, self.placed.at(s), from, self.kind());
+        } else {
+            copy_record(from, self.placed.at(s), self.step());
+        }
+    }
+
+    /// Bytes that are no view of ours written into slot `s`.
+    fn garbage(&mut self, s: u32, r: u64) {
+        let words = [
+            0x7e57_0000 | (r >> 20) as u32 & 0xffff,
+            (r >> 36) as u32,
+            1,
+            2,
+        ];
+        // SAFETY: a record of the heap, at least 16 bytes.
+        unsafe { (self.placed.at(s) as *mut [u32; 4]).write_unaligned(words) };
+    }
+
+    /// A draw reads slot `s` through a table (`tabled`: and marks it a
+    /// table's first), in both heaps.
+    fn draw(&mut self, s: u32, tabled: Option<bool>) {
+        let at = self.placed.at(s);
+        for heap in [self.real(), &self.reference] {
+            if let Some(read) = tabled {
+                heap.texture_slot_tabled(s, read);
+            }
+            heap.mirror(s, at, true);
+        }
+    }
+
+    /// Slot `s` no table's for long: its stamp aged out, in both heaps.
+    fn age(&self, s: u32) {
+        for heap in [self.real(), &self.reference] {
+            if let Some(stamp) = heap.tabled.get(s as usize) {
+                stamp.store(0, Relaxed);
+            }
+        }
+    }
+
+    /// One random step of title work.
+    fn step_once(&mut self, rng: &mut u64) {
+        let r = next(rng);
+        let s = (r % u64::from(ORACLE_SLOTS)) as u32;
+        let view = self.views[(r >> 16) as usize % self.views.len()].clone();
+        match r >> 8 & 15 {
+            0..=3 => self.call(s, &view),
+            4..=6 => self.copy(s, &view, false),
+            7 | 8 => self.copy(s, &view, true),
+            9 | 10 => self.draw(s, None),
+            11 => self.draw(s, Some(r >> 40 & 1 == 0)),
+            12 => self.age(s),
+            13 => self.garbage(s, r),
+            14 if r >> 40 & 7 == 0 && !self.objects.is_empty() => {
+                let (texture, _, _) = self.objects[(r >> 44) as usize % self.objects.len()];
+                descriptor::forget(texture as usize);
+            }
+            _ => self.submit(),
+        }
+    }
+
+    /// A submission: the pass ahead for the heap and its wait, the
+    /// reference's slow mirror, and the comparison.
+    fn submit(&mut self) {
+        let heaps = [self.placed.registered()];
+        let seq = self.ahead.request(&heaps).expect("a request");
+        crate::descriptor::ahead::wait_and_make(Some(&self.ahead), Some(seq), &heaps);
+        let frame = crate::frame::current();
+        for s in 0..ORACLE_SLOTS {
+            if !self.reference.tabled_lately(s, frame) {
+                self.reference.mirror_synced(s, self.placed.at(s));
+            }
+        }
+        self.counts[0] += 1;
+        self.compare(frame);
+        if self.counts[0].is_multiple_of(GPU_EVERY) {
+            self.gpu_check();
+        }
+    }
+
+    /// The comparison of every slot after a submission.
+    fn compare(&mut self, frame: u64) {
+        let n = self.counts[0];
+        for s in 0..ORACLE_SLOTS {
+            let real = self.placed.host().expect("the host heap");
+            if real.tabled_lately(s, frame) {
+                self.counts[2] += 1;
+                continue;
+            }
+            let record = record_key(self.placed.at(s));
+            let (made, slow) = (key(real, s), key(&self.reference, s));
+            let of = |k: u64| {
+                (k != 0)
+                    .then(|| view_at(k as u32, (k >> 32) as u32))
+                    .flatten()
+            };
+            // A record of a released view, unchanged since: the pass does
+            // not look at it.
+            let released = record != 0 && of(record).is_none() && made == record;
+            // An older view of the same placed texture, shown on.
+            let kept = matches!(
+                (of(made), of(slow)),
+                (Some(a), Some(b)) if a != b && same_placed_texture(&a, &b)
+            );
+            if released || kept {
+                self.counts[2] += 1;
+                continue;
+            }
+            // A placed texture view made null in one heap alone, as stale: a
+            // rival there, another slot made from a view of a texture placed
+            // at the same memory that is no view of the record's texture,
+            // made it stale (`Spans`). The spans see the writes in another
+            // order in each heap (the title's calls at once, the slow mirror
+            // at the submission, slot by slot), so which of the two is the
+            // newer differs. Both null is compared as any other slot.
+            if (made == 0) != (slow == 0)
+                && let Some(view) = of(record)
+                && self.rival_in(if made == 0 { real } else { &self.reference }, s, &view)
+            {
+                self.counts[4] += 1;
+                continue;
+            }
+            // A view left for later (of placed memory, or a buffer's: made
+            // only for a draw) shown in one heap, from a draw of the same
+            // record, and made null in the other by a mirror not for a draw:
+            // one heap saw a write of another view in between and the other
+            // did not (a table held the slot meanwhile, so the slow mirror
+            // left it). Neither heap's pass skipped a record it should have
+            // looked at.
+            if (made == 0) != (slow == 0)
+                && made.max(slow) == record
+                && of(record).is_some_and(|view| HostHeap::deferred(&view, false).1)
+            {
+                self.counts[5] += 1;
+                continue;
+            }
+            assert_eq!(
+                made,
+                slow,
+                "the oracle: slot {s} made from another record, submission {n} \
+                 (record {:?}, slow {:?})",
+                of(record),
+                of(slow)
+            );
+            assert!(
+                made == record || made == 0,
+                "the oracle: slot {s} made from {made:#x}, its record is {record:#x}, \
+                 submission {n}"
+            );
+            // A slot made from nothing holds the word of what was last
+            // written into it, a view left for later or none: the pass and
+            // the slow mirror see other last writes.
+            if made != 0 {
+                assert_eq!(
+                    real.word(s),
+                    self.reference.word(s),
+                    "the oracle: slot {s} word, submission {n}"
+                );
+            }
+            assert_eq!(
+                real.kept_raw(s),
+                self.reference.kept_raw(s),
+                "the oracle: slot {s} keeps another resource, submission {n}"
+            );
+            self.counts[1] += 1;
+        }
+    }
+
+    /// Whether `heap` has a slot other than `s` made from a view of a texture
+    /// placed at the memory of `view`'s, of another texture than `view`'s
+    /// (one that makes `view` stale in the spans). `view` must be a placed
+    /// texture view: not a placed buffer (`resource[0] != 1`, the dimension
+    /// word of the resource description, 1 for a buffer).
+    fn rival_in(&self, heap: &HostHeap, s: u32, view: &View) -> bool {
+        let View::Placed(false, resource, desc) = view else {
+            return false;
+        };
+        if resource[0] == 1 {
+            return false;
+        }
+        (0..ORACLE_SLOTS).filter(|&other| other != s).any(|other| {
+            let made = key(heap, other);
+            let rival = (made != 0)
+                .then(|| view_at(made as u32, (made >> 32) as u32))
+                .flatten();
+            matches!(
+                &rival,
+                Some(rival @ View::Placed(false, other_resource, other_desc))
+                    if other_resource[0] != 1
+                        && other_desc[10..12] == desc[10..12]
+                        && !same_placed_texture(rival, view)
+            )
+        })
+    }
+
+    /// The slots of the placed heap made from a view of a texture object, read
+    /// on the card through a table: each shows its texture's size.
+    fn gpu_check(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+        let mut slots = Vec::new();
+        let mut sizes = Vec::new();
+        for s in 0..ORACLE_SLOTS {
+            let made = key(self.real(), s);
+            if made == 0 || made != record_key(self.placed.at(s)) {
+                continue;
+            }
+            if let Some(View::Shader(t, None)) = view_at(made as u32, (made >> 32) as u32)
+                && let Some((_, host, size)) = self.objects.iter().find(|o| o.0 as usize == t)
+            {
+                assert_eq!(
+                    self.real().kept_raw(s),
+                    Some(windows::core::Interface::as_raw(&host.texture)),
+                    "the oracle: slot {s} keeps its texture"
+                );
+                slots.push(s);
+                sizes.push(*size);
+            }
+        }
+        if slots.is_empty() {
+            return;
+        }
+        let read = gpu
+            .sizes(self.real(), &slots)
+            .expect("the card ran every dispatch");
+        assert_eq!(read, sizes, "the oracle: the card reads slots {slots:?}");
+        self.counts[3] += 1;
+    }
+}
+
+/// A compute program that reads the size of the texture in a slot of a view
+/// heap through a table of that one slot.
+struct GpuCheck {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    out: ID3D12Resource,
+    data: *mut u8,
+}
+
+impl GpuCheck {
+    fn new() -> Option<Self> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0), RootConstants(num32BitConstants = 1, b0)"
+Texture2D<float4> t : register(t0);
+RWByteAddressBuffer o : register(u0);
+cbuffer Slot : register(b0) { uint at; };
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint w, h;
+    t.GetDimensions(w, h);
+    o.Store2(8 * at, uint2(w, h));
+}
+"#;
+        let host = crate::host::host()?;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names outlive the call; the out pointer is ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("oracle"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the oracle's shader compiles");
+        let code = code?;
+        // SAFETY: the blob's own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: the root signature is in the shader.
+        let root: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, bytes) }.ok()?;
+        // SAFETY: the bytecode and root signature live through the call.
+        let pso: ID3D12PipelineState = unsafe {
+            host.device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+        }
+        .ok()?;
+        let (out, data) = host.shared_buffer(2048)?;
+        Some(Self {
+            root,
+            pso,
+            out,
+            data,
+        })
+    }
+
+    /// The size the card reads for the texture in each of `slots` of `heap`,
+    /// on a queue of the check's own (the host's submissions are not
+    /// involved), waited for; `None` if the card left out a dispatch (it
+    /// leaves its mark, all ones, as it was).
+    fn sizes(&self, heap: &HostHeap, slots: &[u32]) -> Option<Vec<[u32; 2]>> {
+        let device = &crate::host::host().expect("the host GPU").device;
+        // SAFETY: the mapping of 2,048 bytes; nothing of ours runs now.
+        unsafe { std::ptr::write_bytes(self.data, 0xff, 8 * slots.len()) };
+        // SAFETY: plain D3D12 calls on objects of ours; the list's heap,
+        // root signature, pipeline and buffer live until it has run, which
+        // the fence waits for.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("an allocator");
+            let l: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .expect("a list");
+            l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.SetComputeRootSignature(&self.root);
+            l.SetPipelineState(&self.pso);
+            l.SetComputeRootUnorderedAccessView(1, self.out.GetGPUVirtualAddress());
+            // A slot a dispatch, as a table of one view.
+            for (k, &s) in slots.iter().enumerate() {
+                l.SetComputeRootDescriptorTable(0, heap.gpu_handle(s));
+                l.SetComputeRoot32BitConstant(2, k as u32, 0);
+                l.Dispatch(1, 1, 1);
+            }
+            l.Close().expect("the list closes");
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("a queue");
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&l).expect("a list"))]);
+            let fence: ID3D12Fence = device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("a fence");
+            queue.Signal(&fence, 1).expect("a signal");
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            while fence.GetCompletedValue() < 1 {
+                assert!(std::time::Instant::now() < until, "the card ran the list");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // SAFETY: the mapping; the list has run.
+        let read: Vec<[u32; 2]> = (0..slots.len())
+            .map(|k| unsafe { self.data.add(8 * k).cast::<[u32; 2]>().read_volatile() })
+            .collect();
+        (!read.contains(&[u32::MAX; 2])).then_some(read)
+    }
+}
+
+/// [`Oracle`] over `rounds` submissions of a heap of `kind` from `seed`.
+fn oracle_run(kind: u32, seed: u64, rounds: u64) {
+    let _census = crate::census::lock_tests();
+    let Some(mut oracle) = Oracle::new(kind) else {
+        return; // no host GPU
+    };
+    let mut rng = seed;
+    while oracle.counts[0] < rounds {
+        oracle.step_once(&mut rng);
+    }
+    let [submissions, compared, left, gpu, stale, later] = oracle.counts;
+    // Few slots are left out as stale or left for later: a rule that hid
+    // real faults would hide many.
+    assert!(stale * 20 < compared, "stale: {:?}", oracle.counts);
+    assert!(later * 20 < compared, "left for later: {:?}", oracle.counts);
+    assert!(
+        compared > submissions * u64::from(ORACLE_SLOTS) / 4,
+        "{:?}",
+        oracle.counts
+    );
+    if kind == descriptor::VIEWS_KIND {
+        assert!(left > 0, "slots left out: {:?}", oracle.counts);
+        assert!(gpu > 0, "GPU checks: {:?}", oracle.counts);
+    }
+    if kind == descriptor::VIEWS_KIND {
+        // Every made slot holds its view's word (a released view's slot
+        // keeps what it had).
+        let real = oracle.real();
+        for s in 0..ORACLE_SLOTS {
+            let made = key(real, s);
+            if let Some(view) = (made != 0)
+                .then(|| view_at(made as u32, (made >> 32) as u32))
+                .flatten()
+            {
+                assert_eq!(real.word(s), Some(slot_word(Some(&view))), "slot {s}");
+            }
+        }
+    }
+    assert!(alive());
+}
+
+/// [`Oracle`] on a view heap, from three seeds.
+#[test]
+fn the_heap_sync_makes_what_a_slow_mirror_makes_in_a_view_heap() {
+    for seed in [
+        0x9e37_79b9_7f4a_7c15,
+        0x2545_f491_4f6c_dd1d,
+        0x6a09_e667_f3bc_c908,
+    ] {
+        oracle_run(descriptor::VIEWS_KIND, seed, 160);
+    }
+}
+
+/// [`Oracle`] on a sampler heap.
+#[test]
+fn the_heap_sync_makes_what_a_slow_mirror_makes_in_a_sampler_heap() {
+    for seed in [0x9e37_79b9_7f4a_7c15, 0x0dd5_eed5_1f1a_4330] {
+        oracle_run(descriptor::SAMPLERS, seed, 160);
+    }
+}
+
+/// What comparing records with the ones the pass saw last missed: a slot no
+/// table reads, made by a call from a record Y over the record X the pass
+/// saw, then given X back as bytes before the next pass. The pass finds X as
+/// it saw it; the slot shows Y, so it is mirrored again all the same.
+#[test]
+fn a_record_written_back_under_a_call_is_made_again() {
+    let _census = crate::census::lock_tests();
+    let placed = Placed::new(descriptor::VIEWS_KIND);
+    let Some(host) = placed.host() else {
+        return; // no host GPU
+    };
+    let (x, y) = (title_texture_of(16, 16), title_texture_of(32, 8));
+    let _hosts = [x, y].map(|t| crate::resource::host_copy(t).expect("a host copy"));
+    let mut elsewhere = [0u64; 4];
+    let source = elsewhere.as_mut_ptr() as u64;
+    write(source, &Some(View::Shader(x as usize, None)));
+    copy_record(source, placed.at(5), 32);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_eq!(key(host, 5), record_key(placed.at(5)), "the pass makes X");
+    write(placed.at(5), &Some(View::Shader(y as usize, None)));
+    assert_eq!(key(host, 5), record_key(placed.at(5)), "the call makes Y");
+    copy_record(source, placed.at(5), 32);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_eq!(
+        key(host, 5),
+        record_key(placed.at(5)),
+        "slot 5 shows another record"
+    );
+}
+/// The oracle's GPU check reads what a slot was made from: slots made from
+/// views of three textures of other sizes, read through one-view tables.
+#[test]
+fn the_oracle_s_card_read_sees_each_slot_s_texture() {
+    let _census = crate::census::lock_tests();
+    let (Some(heap), Some(gpu)) = (HostHeap::new(false, 8), GpuCheck::new()) else {
+        return; // no host GPU
+    };
+    let sizes = [[16u32, 16u32], [32, 8], [8, 4]];
+    let mut records = vec![[0u32; 8]; 8];
+    let base = records.as_mut_ptr() as u64;
+    let mut hosts = Vec::new();
+    for (k, &[width, height]) in sizes.iter().enumerate() {
+        let texture = title_texture_of(u64::from(width), height);
+        hosts.push(crate::resource::host_copy(texture).expect("a host copy"));
+        let at = base + 32 * (2 - k as u64);
+        write(at, &Some(View::Shader(texture as usize, None)));
+        heap.mirror(2 - k as u32, at, true);
+    }
+    let read = gpu
+        .sizes(&heap, &[0, 1, 2])
+        .expect("the card runs the list");
+    assert_eq!(read, [sizes[2], sizes[1], sizes[0]]);
+}
+
+/// Two view heaps read on the card in one list after the other: each shows
+/// its own slots.
+#[test]
+fn the_oracle_s_card_read_tells_two_heaps_apart() {
+    let _census = crate::census::lock_tests();
+    let (Some(one), Some(two), Some(gpu)) = (
+        HostHeap::new(false, 8),
+        HostHeap::new(false, 8),
+        GpuCheck::new(),
+    ) else {
+        return; // no host GPU
+    };
+    let mut records = vec![[0u32; 8]; 8];
+    let base = records.as_mut_ptr() as u64;
+    let mut hosts = Vec::new();
+    let mut textures = Vec::new();
+    for &[width, height] in &[[16u32, 16u32], [32, 8]] {
+        let texture = title_texture_of(u64::from(width), height);
+        hosts.push(crate::resource::host_copy(texture).expect("a host copy"));
+        textures.push(texture);
+    }
+    for (heap, order) in [(&one, [0, 1]), (&two, [1, 0])] {
+        for (s, &k) in order.iter().enumerate() {
+            let at = base + 32 * s as u64;
+            write(at, &Some(View::Shader(textures[k] as usize, None)));
+            heap.mirror(s as u32, at, true);
+        }
+    }
+    assert_eq!(
+        gpu.sizes(&one, &[0, 1]),
+        Some(vec![[16, 16], [32, 8]]),
+        "the first heap"
+    );
+    assert_eq!(
+        gpu.sizes(&two, &[0, 1]),
+        Some(vec![[32, 8], [16, 16]]),
+        "the second heap"
+    );
+    assert_eq!(
+        gpu.sizes(&one, &[0, 1]),
+        Some(vec![[16, 16], [32, 8]]),
+        "the first heap again"
+    );
+}
+
+/// Views of two texture objects with host copies (held: no sweep lets them
+/// go), which a mirror not for a draw makes at once.
+fn object_views() -> (
+    Vec<Option<View>>,
+    Vec<std::sync::Arc<crate::resource::HostTexture>>,
+) {
+    let textures = [title_texture_of(16, 16), title_texture_of(32, 8)];
+    let hosts = textures
+        .iter()
+        .map(|&t| crate::resource::host_copy(t).expect("a host copy"))
+        .collect();
+    (
+        textures
+            .iter()
+            .map(|&t| Some(View::Shader(t as usize, None)))
+            .collect(),
+        hosts,
+    )
+}
+
+/// The slots a pass over `records` (`SLOTS` records of 32 bytes at `base`)
+/// of `heap` hands on to be mirrored, and mirrors them.
+fn pass_over(heap: &HostHeap, base: u64) -> Vec<u32> {
+    let len = SLOTS as usize * 32;
+    // SAFETY: the caller's records.
+    let page = unsafe { std::slice::from_raw_parts(base as *const u8, len) }.to_vec();
+    let mut part = SyncPart::default();
+    heap.sort_copied_page(
+        0..u64::from(SLOTS),
+        (base, 32),
+        base as usize,
+        &page,
+        &mut part,
+    );
+    for &s in &part.make {
+        heap.mirror_synced(s, base + u64::from(s) * 32);
+    }
+    part.make
+}
+
+/// A record a call wrote and mirrored is seen: the next pass leaves it.
+#[test]
+fn sync_skips_own_api_writes() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    assert_eq!(pass_over(&heap, base), [], "nothing there");
+    let at = base + 3 * 32;
+    write(at, &views[0]);
+    heap.mirror(3, at, false);
+    heap.saw_key(3, record_key(at));
+    assert_eq!(pass_over(&heap, base), [], "the call's record is seen");
+    assert_eq!(key(&heap, 3), record_key(at));
+    // Copied in as bytes: handed on.
+    write(at, &views[1]);
+    assert_eq!(pass_over(&heap, base), [3]);
+    assert_eq!(key(&heap, 3), record_key(at));
+}
+
+/// A changed record of a slot a table's lately is left to its draws and not
+/// taken as seen: once the slot ages out, the next pass hands it on.
+#[test]
+fn sync_tabled_slot_seen_not_taken() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let at = base + 5 * 32;
+    write(at, &views[0]);
+    assert_eq!(pass_over(&heap, base), [5]);
+    heap.texture_slot_tabled(5, false);
+    write(at, &views[1]);
+    assert_eq!(pass_over(&heap, base), [], "left to the draws");
+    assert_ne!(heap.seen_key(5), Some(record_key(at)), "not seen");
+    heap.tabled[5].store(0, Relaxed);
+    assert_eq!(pass_over(&heap, base), [5], "looked at again");
+    assert_eq!(key(&heap, 5), record_key(at));
+}
+
+/// A slot a draw made from a record while a table held it, given back the
+/// record the pass saw before, once no table holds it: made again from that
+/// record, though the pass saw it last.
+#[test]
+fn sync_remakes_after_table_mirror_then_writeback() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let at = base + 7 * 32;
+    write(at, &views[0]);
+    assert_eq!(pass_over(&heap, base), [7]);
+    let x = record_key(at);
+    heap.texture_slot_tabled(7, false);
+    write(at, &views[1]);
+    heap.mirror(7, at, true);
+    assert_eq!(pass_over(&heap, base), [], "left to the draws");
+    heap.tabled[7].store(0, Relaxed);
+    write(at, &views[0]);
+    assert_eq!(record_key(at), x, "the record the pass saw");
+    assert_eq!(pass_over(&heap, base), [7], "the slot shows another record");
+    assert_eq!(key(&heap, 7), x);
+}
+
+/// Bytes that are no view, into a slot made from none, are not handed on;
+/// into a slot made from a view, they are, and the slot is made null.
+#[test]
+fn shows_none_slot_not_mirrored() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    records[2] = [0x7e57_0001; 8];
+    assert_eq!(
+        pass_over(&heap, base),
+        [],
+        "no view into a slot made from none"
+    );
+    let at = base + 4 * 32;
+    write(at, &views[0]);
+    assert_eq!(pass_over(&heap, base), [4]);
+    assert_ne!(key(&heap, 4), 0);
+    records[4] = [0x7e57_0002; 8];
+    assert_eq!(pass_over(&heap, base), [4], "no view over a made slot");
+    assert_eq!(key(&heap, 4), 0, "made null");
+}
+
+/// A record copied in as bytes while its slot is a table's is left to the
+/// draws; once the table mark ages, the next pass reads it again even with
+/// nothing else written on its page, and the slot shows it.
+#[test]
+fn a_record_left_to_a_table_is_read_again_once_its_mark_ages() {
+    let _census = crate::census::lock_tests();
+    let placed = Placed::new(descriptor::VIEWS_KIND);
+    let Some(host) = placed.host() else {
+        return; // no host GPU
+    };
+    let textures = [title_texture_of(16, 16), title_texture_of(32, 8)];
+    let _hosts = textures.map(|t| crate::resource::host_copy(t).expect("a host copy"));
+    let mut elsewhere = [0u64; 8];
+    let (x, y) = (
+        elsewhere.as_mut_ptr() as u64,
+        elsewhere.as_mut_ptr() as u64 + 32,
+    );
+    write(x, &Some(View::Shader(textures[0] as usize, None)));
+    write(y, &Some(View::Shader(textures[1] as usize, None)));
+    copy_record(x, placed.at(7), 32);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_eq!(key(host, 7), record_key(placed.at(7)), "made from X");
+    host.texture_slot_tabled(7, false);
+    copy_record(y, placed.at(7), 32);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_ne!(key(host, 7), record_key(placed.at(7)), "left to the draws");
+    // Still a table's: left again.
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_ne!(key(host, 7), record_key(placed.at(7)), "left while tabled");
+    host.tabled[7].store(0, Relaxed);
+    descriptor::sync_heaps(&[placed.registered()]);
+    assert_eq!(
+        key(host, 7),
+        record_key(placed.at(7)),
+        "read again once the mark aged"
+    );
+    // And not again after that: the set holds it no more.
+    assert!(host.left_to_tables.lock().unwrap().is_empty());
+}
+
+/// The slots left to tables are kept up to a limit: a slot already there is
+/// not kept twice, and every slot past the limit is counted, not only the
+/// first.
+#[test]
+fn slots_left_to_tables_past_the_limit_are_counted() {
+    let _census = crate::census::lock_tests();
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    for s in 0..SLOTS {
+        // Tables hold every slot, so none of them is read again yet.
+        heap.texture_slot_tabled(s, false);
+    }
+    LEFT_MOST_HERE.set(Some(2));
+    let dropped = LEFT_DROPPED.load(Relaxed);
+    let mut part = SyncPart::default();
+    heap.retake_left(&[1, 2, 2, 1, 3, 4, 3], (base, 32), &mut part);
+    LEFT_MOST_HERE.set(None);
+    assert_eq!(LEFT_DROPPED.load(Relaxed) - dropped, 3, "3, 4 and 3 again");
+    let kept: Vec<u32> = heap
+        .left_to_tables
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(kept, [1, 2]);
+    assert!(part.make.is_empty(), "nothing aged");
+}
+
+/// A slot a draw made null from bytes of no view, then given back the live
+/// record the pass saw last: the pass mirrors it again, though the key is
+/// the one it saw, and the slot shows the record.
+#[test]
+fn a_null_slot_whose_record_names_a_live_view_is_made_again() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let at = base + 6 * 32;
+    write(at, &views[0]);
+    assert_eq!(pass_over(&heap, base), [6]);
+    let x = record_key(at);
+    assert_eq!(key(&heap, 6), x);
+    // Bytes of no view, which a draw reads through a table: made null.
+    let bytes = records[6];
+    records[6] = [0x7e57_0003; 8];
+    heap.mirror(6, at, true);
+    assert_eq!(key(&heap, 6), 0, "made null by the draw");
+    // The live record back, as the pass saw it; the draw's mirror noted the
+    // bytes it read as seen.
+    records[6] = bytes;
+    assert_eq!(heap.seen_key(6), Some(0));
+    assert_eq!(pass_over(&heap, base), [6], "mirrored again");
+    assert_eq!(key(&heap, 6), x);
+    // Bytes of no view over a slot made from none are still left.
+    records[9] = [0x7e57_0004; 8];
+    assert_eq!(pass_over(&heap, base), [], "left");
+}
+
+/// Records of a constant buffer view, a placed buffer view and a placed
+/// texture view, which a mirror outside a draw leaves for later, made null
+/// by a draw from bytes of no view and then copied back as they were: the
+/// next pass mirrors them again, and each slot is back in the set of buffer
+/// views or the spans, with its word, as before the draw.
+#[test]
+fn a_view_left_for_later_and_nulled_by_a_draw_comes_back() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let views = views(memory());
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let slots = [(10u32, 0usize), (11, 2), (12, 3)];
+    let (buffer, texture) = (11u32, 12u32);
+    for (slot, view) in slots {
+        write(base + u64::from(slot) * 32, &views[view]);
+    }
+    assert_eq!(pass_over(&heap, base), [10, 11, 12]);
+    let state = |heap: &HostHeap| {
+        (
+            heap.buffer_slots(),
+            slots.map(|(slot, _)| heap.word(slot)),
+            heap.placed.lock().unwrap().by_slot.contains_key(&texture),
+        )
+    };
+    let before = state(&heap);
+    assert!(
+        before.0.contains(&buffer),
+        "the placed buffer view in the set"
+    );
+    // (A texture view's word is 0: no buffer.)
+    assert!(
+        before.1[..2].iter().all(|&word| word != Some(0)),
+        "words: {:?}",
+        before.1
+    );
+    assert!(before.2, "the placed texture in the spans");
+    for (slot, _) in slots {
+        let at = base + u64::from(slot) * 32;
+        let bytes = records[slot as usize];
+        records[slot as usize] = [0x7e57_0005; 8];
+        heap.mirror(slot, at, true);
+        records[slot as usize] = bytes;
+    }
+    let nulled = state(&heap);
+    assert!(!nulled.0.contains(&buffer), "out of the set after the draw");
+    assert_eq!(nulled.1, [Some(0); 3], "no words after the draw");
+    assert!(!nulled.2, "out of the spans after the draw");
+    assert_eq!(pass_over(&heap, base), [10, 11, 12], "mirrored again");
+    assert_eq!(state(&heap), before);
+}
+
+thread_local! {
+    /// [`a_pass_between_a_viewless_draw_s_read_and_its_claim_is_undone`]:
+    /// the records' base, the slot, and the live record to copy back.
+    static RACE: std::cell::Cell<(u64, u32, [u32; 8])> =
+        const { std::cell::Cell::new((0, 0, [0; 8])) };
+}
+
+/// For [`BEFORE_NULL`]: the title copies the live record back, and a pass
+/// makes the slot from it.
+fn copy_back_and_pass(heap: &HostHeap) {
+    let (base, slot, record) = RACE.get();
+    // SAFETY: a record of the test's records.
+    unsafe { ((base + u64::from(slot) * 32) as *mut [u32; 8]).write_unaligned(record) };
+    assert_eq!(
+        pass_over(heap, base),
+        [slot],
+        "the pass makes the live record"
+    );
+}
+
+/// A draw reads bytes of no view in a slot; before it claims the slot, the
+/// title copies a live record over them and a pass makes the slot from it;
+/// the draw then makes the slot null. The next pass must make it from the
+/// live record again: what the draw read is noted as seen under its claim,
+/// after the pass's own note.
+#[test]
+fn a_pass_between_a_viewless_draw_s_read_and_its_claim_is_undone() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let slot = 6u32;
+    let at = base + u64::from(slot) * 32;
+    write(at, &views[0]);
+    let live = records[slot as usize];
+    let live_key = record_key(at);
+    records[slot as usize] = [0x7e57_0006; 8];
+    assert_eq!(pass_over(&heap, base), [], "bytes of no view, left");
+    RACE.set((base, slot, live));
+    BEFORE_NULL.set(Some(copy_back_and_pass));
+    heap.mirror(slot, at, true);
+    assert!(BEFORE_NULL.take().is_none(), "the hook ran");
+    assert_eq!(record_key(at), live_key, "the live record is there");
+    assert_eq!(key(&heap, slot), 0, "the draw made the slot null");
+    assert_eq!(
+        pass_over(&heap, base),
+        [slot],
+        "the next pass makes it again"
+    );
+    assert_eq!(key(&heap, slot), live_key);
+}
+
+/// A pass finds a live record in a slot made from nothing and notes it as
+/// seen; before it mirrors the slot, the title writes bytes of no view
+/// there, so the mirror, no draw's, is refused its claim; then the title
+/// copies the record back. The refused mirror noted what it read, so the
+/// next pass hands the slot on and makes it.
+#[test]
+fn a_refused_viewless_mirror_notes_what_it_read() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let slot = 8u32;
+    let at = base + u64::from(slot) * 32;
+    assert_eq!(pass_over(&heap, base), [], "nothing there");
+    write(at, &views[0]);
+    let live = records[slot as usize];
+    let live_key = record_key(at);
+    // The pass's sort: the live record seen, the slot handed on.
+    let len = SLOTS as usize * 32;
+    // SAFETY: the test's records.
+    let page = unsafe { std::slice::from_raw_parts(base as *const u8, len) }.to_vec();
+    let mut part = SyncPart::default();
+    heap.sort_copied_page(
+        0..u64::from(SLOTS),
+        (base, 32),
+        base as usize,
+        &page,
+        &mut part,
+    );
+    assert_eq!(part.make, [slot]);
+    assert_eq!(heap.seen_key(slot), Some(live_key));
+    // Bytes of no view before the pass's mirror, which is refused.
+    records[slot as usize] = [0x7e57_0008; 8];
+    heap.mirror_synced(slot, at);
+    assert_eq!(key(&heap, slot), 0, "left null");
+    // The record back: the next pass makes the slot from it.
+    records[slot as usize] = live;
+    assert_eq!(pass_over(&heap, base), [slot]);
+    assert_eq!(key(&heap, slot), live_key);
 }

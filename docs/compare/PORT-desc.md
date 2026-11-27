@@ -64,27 +64,35 @@ is now the only path, as the play set ran it: the sync runs on its helper
 thread (`descriptor/ahead.rs`) and the submission waits on its request's
 number before its lists go to the card (in place, at that wait, only if the
 helper cannot run); the helper runs passes of its own 4 ms after the last
-(`EARLY`); the records are kept as bytes and compared 16 at a time
-(`HostHeap::copied_begin`); a heap's changed pages are sorted and its slots
-mirrored on 4 threads (`SYNC_THREADS` in `descriptor.rs`); and a record
-whose slot is made from it already is left before the slot's claim
-(`SKIPPED_MADE`). The sync also looks only at the heaps a submission's
-lists bind. Their rows below are kept as the record of the port.
-`VICTORY_SHOWS_NONE` is still a switch.
+(`EARLY`); a heap's changed pages are sorted and its slots mirrored on 4
+threads (`SYNC_THREADS` in `descriptor.rs`). The sync also looks only at the
+heaps a submission's lists bind. Their rows below are kept as the record of
+the port.
+
+Since W1.9 of wave 1 (26 Nov 2026) the records are no longer kept as bytes:
+the sync keeps an 8-byte key per slot (`HostHeap::seen`: the view index and
+generation of the record last looked at, 0 for no view; set by the pass and
+by the calls that write and mirror a record) and leaves a record only if its
+key is the one last seen and the slot is made from it or from nothing
+(`HostHeap::sort_copied_page`). `VICTORY_QUICK_MIRROR`,
+`VICTORY_SHOWS_NONE` and `VICTORY_SAME_RECORDS` are removed in W1.9 too:
+their `1` sides always run. `SKIPPED_MADE` counts every mirror that is done
+with before its slot's claim, at every site (table binds, the pass walk, the
+texture pass, the title's writes and the sync).
 
 | Switch | Default | Values | What it does when on | Depends on | Read in |
 | --- | --- | --- | --- | --- | --- |
-| `VICTORY_QUICK_MIRROR` | off | `1` on | Every mirror (table binds, pass walk, texture pass, title writes, sync) of a slot whose `made` already holds the record's key, view still there, returns before the claim. `texture_slot_made_from` answers "no" early for a settled slot on another key (not for a claimed one). Skips counted in `QUICK_MIRRORED`. | - | `descriptor/host.rs` `quick_mirror` |
+| `VICTORY_QUICK_MIRROR` (removed in W1.9: always) | off | `1` on | Every mirror (table binds, pass walk, texture pass, title writes, sync) of a slot whose `made` already holds the record's key, view still there, returns before the claim. `texture_slot_made_from` answers "no" early for a settled slot on another key (not for a claimed one). Skips counted in `SKIPPED_MADE`. | - | (was `descriptor/host.rs` `quick_mirror`) |
 | `VICTORY_SLOT_BITS` | off | `1` on | Buffer-view set and changed set become atomic u64 bit sets, changed under the slot's claim with no lock. | The buffer half of NoteLog is bypassed too | `descriptor/host.rs` `slot_bits` |
-| `VICTORY_HEAP_PASS_THREADS` | unset (1) | `0`/`1` one thread; `2`..`16` (clamped) | Pass walk in jobs of 256 slots on N scoped threads, the binding one among them. A walk of 256 slots or fewer stays on one thread. | Gains need `QUICK_MIRROR` (per-slot claims are always on since 1f) | `draw.rs` `heap_pass_threads` |
+| `VICTORY_HEAP_PASS_THREADS` | unset (1) | `0`/`1` one thread; `2`..`16` (clamped) | Pass walk in jobs of 256 slots on N scoped threads, the binding one among them. A walk of 256 slots or fewer stays on one thread. | Gains need `QUICK_MIRROR` (always since W1.9; per-slot claims are always on since 1f) | `draw.rs` `heap_pass_threads` |
 | `VICTORY_HEAP_SPREAD` | off | `1` on | Each pass looks at the changed slots plus one of 16 parts of the rest; first pass looks at all. Replaces the every-16th full pass. | - | `draw.rs` `heap_spread` |
 | `VICTORY_HEAP_PASS_TABLED` | off | `1` on | Draws mark their tables' buffer slots (`table_entry`; a fresh table's slots if it has 64 or fewer, else the named ones) in `buffer_tabled`; the pass skips slots marked in the last 8 frames. Skips in `HEAP_PASS_PARTS[2]`, logged per frame when nonzero. The sync and texture queue do not read these marks. | - | `draw.rs` `heap_pass_tabled` |
 | `VICTORY_HEAP_SWEEP_OWN` | off | `1` on | Pass state on the HostHeap under its own lock, dropped with the heap, not in the global `HEAP_RANGES` mutex. | - | `draw.rs` `heap_sweep_own` |
-| `VICTORY_HEAP_SYNC_BYTES` (removed in S9: always) | off | `1` on | Sync keeps the records' bytes (32 B per view slot, made on first use) instead of an 8 B print, and compares 16 records (512 B) at a time. | - | (was `descriptor/host.rs` `sync_bytes`) |
+| `VICTORY_HEAP_SYNC_BYTES` (removed in S9: always; the bytes replaced in W1.9 by an 8 B key per slot) | off | `1` on | Sync keeps the records' bytes (32 B per view slot, made on first use) instead of an 8 B print, and compares 16 records (512 B) at a time. | - | (was `descriptor/host.rs` `sync_bytes`) |
 | `VICTORY_HEAP_SYNC_THREADS` (removed in S9: always 4) | unset (1) | `0`/`1` one thread; `2`..`16` (clamped) | Sync reads, compares and sorts a heap's changed pages 8 a job, then mirrors the slots 256 a job, on N scoped threads (`each_on`). Slots are mirrored out of slot order, each ordered by its claim. | Keeps `VICTORY_HEAP_SYNC_FAST`'s early skip | (was `descriptor/host.rs` `sync_threads`) |
-| `VICTORY_SHOWS_NONE` | off | `1` on | A changed record that is no view of ours, into a slot with `made` 0 and not claimed, is not mirrored. Counted in `SHOWED_NONE` (frame line, `shows_none` arg on `sync heaps`). | - | `descriptor/host.rs` `shows_none` |
+| `VICTORY_SHOWS_NONE` (removed in W1.9: always) | off | `1` on | A changed record that is no view of ours, into a slot with `made` 0 and not claimed, is not mirrored. (Was counted in `SHOWED_NONE`; since W1.9 such a record has key 0 and is left by the key compare, uncounted.) | - | (was `descriptor/host.rs` `shows_none`) |
 | `VICTORY_HEAP_SYNC_EARLY` (removed in S9: always 4 ms) | unset (0: none) | `<ms>` > 0 | The sync helper runs passes of its own after `<ms>` with no request, while the last request is under 500 ms old. They answer no request. Profile: `sync heaps early`. | `VICTORY_HEAP_SYNC_AHEAD=1`, else no effect | (was `descriptor/ahead.rs` `early`) |
-| `VICTORY_SAME_RECORDS` | off | `1` on | `copy_simple` (and `copy`) skip the write when the destination already holds the source's bytes; records are still mirrored. | - | `descriptor.rs` `same_records` |
+| `VICTORY_SAME_RECORDS` (removed in W1.9: always) | off | `1` on | `copy_simple` (and `copy`) skip the write when the destination already holds the source's bytes; records are still mirrored. | - | (was `descriptor.rs` `same_records`) |
 
 Any of SYNC_BYTES, SYNC_THREADS or SHOWS_NONE took the new sync path
 (`sort_copied_page` for all pages, then `mirror_synced`). Existing switches
@@ -132,20 +140,27 @@ New, `descriptor::host::tests`:
 - `a_table_s_buffer_slot_is_left_to_its_draws_for_some_frames`
 
 New, `descriptor::host::made_tests`:
-- `bits_and_quick_mirrors_make_what_the_sets_and_the_claims_make` (four heaps,
-  each a whole 2^21-slot view heap, about 64 MB of descriptors each)
-- `many_threads_leave_each_slot_with_its_own_word_with_bits_and_quick_mirrors`
+- `bits_make_what_the_sets_make` (was `bits_and_quick_mirrors_*`, four heaps;
+  two since W1.9, as the quick mirror is always on; each heap a whole
+  2^21-slot view heap, about 64 MB of descriptors)
+- `many_threads_leave_each_slot_with_its_own_word_with_bits` (was
+  `..._with_bits_and_quick_mirrors`, renamed in W1.9)
 - (`many_threads_leave_each_slot_with_its_own_word_under_stripes`: removed in
   1f with the stripes.)
 - `a_quick_look_at_a_claimed_slot_waits_for_the_claim`
 
 New, `descriptor::host::sync_tests`:
-- `pages_sorted_on_threads_make_what_one_by_one_makes`
+- `pages_sorted_on_threads_make_what_one_by_one_makes` (since W1.9 against the
+  key compare: the one-by-one model `mirror_one` keeps the keys last seen)
 - `pages_sorted_with_bytes_make_what_one_by_one_makes` (removed in S9: the
   bytes are the only compare, so `pages_sorted_on_threads_*` checks them;
   the one-by-one reference is now a model in the test, `mirror_one`)
-- `records_of_no_view_left_before_their_mirror_make_what_one_by_one_makes`
-- `changed_records_are_those_that_differ_one_by_one` (from cool_fox 53c5256)
+- (`records_of_no_view_left_before_their_mirror_make_what_one_by_one_makes`:
+  removed in W1.9 with `SHOWS_NONE`; `shows_none_slot_not_mirrored` checks
+  the key-0 rule)
+- (`changed_records_are_those_that_differ_one_by_one`, from cool_fox 53c5256:
+  removed in W1.9 with the byte compare; `a_page_key_is_the_view_a_record_names`
+  checks the key a record is read as)
 - `passes_of_its_own_run_between_requests_and_answer_none` (about 1.2 s of
   real-time sleeps)
 - `records_copied_onto_the_same_bytes_leave_the_page_unwritten`
@@ -159,7 +174,7 @@ New, `draw::tests`:
   then made after 9 frames)
 
 Existing, re-run (touched paths): (`made_tests::a_slot_at_a_time_makes_what_the_heap_wide_lock_makes`:
-removed in 1f with the heap-wide lock; its checks are in `bits_and_quick_mirrors_*`),
+removed in 1f with the heap-wide lock; its checks are in `bits_make_what_the_sets_make`),
 `made_tests::many_threads_leave_each_slot_with_its_own_word` (now through
 `many_threads_on`), (`sync_tests::a_page_at_once_*`: removed in S9 with the
 page-by-page sync), `sync_tests::the_early_skip_*`,
@@ -172,13 +187,13 @@ above set in the environment. Tests that pick their own way must still pass.
 
 Same scene, same length, `VICTORY_PROFILE_SAMPLES` as usual. Baseline: all
 off. Then one set at a time against baseline, then combined. (History: A9,
-A10 and A12, and the sync switches of C2, cannot be set since S9: what they
-turned on always runs.)
+A10 and A12, and the sync switches of C2, cannot be set since S9; A3, A11
+and A13 cannot be set since W1.9: what they turned on always runs.)
 
 | Run | Switches | Measure |
 | --- | --- | --- |
 | A0 | none | all buckets below, for the baseline |
-| A3 | `QUICK_MIRROR=1` | `made claim wait`, `heap walk`, texture pass time, refusal count with a full card |
+| A3 (not settable since W1.9) | `QUICK_MIRROR=1` | `made claim wait`, `heap walk`, texture pass time, refusal count with a full card |
 | A4 | `SLOT_BITS=1` | `heap walk`, `heap pass lock wait` |
 | A5 | `HEAP_PASS_THREADS=4` (alone, then with A3+A4) | `heap walk`, `heap walk job` (per thread), `heap walk wait` |
 | A6 | `HEAP_SPREAD=1` | frame-time spikes against the old every-16th-pass spikes; `heap walk` max |
@@ -186,9 +201,9 @@ turned on always runs.)
 | A8 | `HEAP_SWEEP_OWN=1` | `heap pass lock wait` |
 | A9 | `HEAP_SYNC_BYTES=1` | `sync heaps` (`read_us`, `mirror_us`), memory |
 | A10 | `HEAP_SYNC_THREADS=4` (alone, then with A9) | `sync heaps` time against spawn cost |
-| A11 | `SHOWS_NONE=1` | `sync heaps`, `shows_none` count |
+| A11 (not settable since W1.9) | `SHOWS_NONE=1` | `sync heaps`, `shows_none` count |
 | A12 | `HEAP_SYNC_AHEAD=1 HEAP_SYNC_EARLY=4` (against `AHEAD=1` alone) | `sync heaps wait`, `sync heaps early`, `sync heaps ahead` |
-| A13 | `SAME_RECORDS=1` | heap sync page count, `sync heaps` |
+| A13 (not settable since W1.9) | `SAME_RECORDS=1` | heap sync page count, `sync heaps` |
 | C1 | A3 + A4 + A5 + A8 | pass buckets together |
 | C2 | C1 + A9 + A10 + A11 + `HEAP_SYNC_FAST=1` + `HEAP_SYNC_AHEAD=1` | sync buckets together |
 | C3 | C2 + A12 + A13, then + A6, then + A7 | whole frame; picture checks |
@@ -208,8 +223,9 @@ garbled geometry, and hangs.
   lock held, put in the tables by a compare: `RACE_LOST` counts the losers)
   and views from several threads at once. Watch for device removal and, in diagnostics
   builds, `HEAP_VIEWS_ELSEWHERE`.
-- SYNC_BYTES (always since S9): 32 B per title view slot, against 8 B per print (about 32 MB
-  for a 1M-slot heap).
+- SYNC_BYTES (always since S9, replaced in W1.9): 32 B per title view slot
+  (about 32 MB for a 1M-slot heap). Since W1.9 the sync keeps an 8 B key per
+  slot instead (about 8 MB for a 1M-slot heap, made on the first pass).
 - PASS_TABLED: a slot a table held, read by index within 8 frames, may be
   stale. After 8 frames it is walked again only on a full or spread pass or
   after a new write. Look for flicker or missing geometry that goes away
@@ -218,20 +234,19 @@ garbled geometry, and hangs.
   a part at a time.
 - SWEEP_OWN: state goes with the HostHeap, not `forget_heap`. Check a heap
   re-created in the same frame still gets its pass.
-- SHOWS_NONE: a draw that makes a slot from an older view at the same moment
-  keeps that view until the slot is written again.
+- SHOWS_NONE (always since W1.9): a draw that makes a slot from an older view
+  at the same moment keeps that view until the slot is written again.
 - SYNC_EARLY (always, 4 ms, since S9): a submission can wait for an own pass already running; the
   helper wakes every `<ms>` while the title submits. Check CPU cost on the
   slow PC.
 - MADE_STRIPES (removed in 1f, measured +35 ms): a thread taking a second
   claim in the same stripe while holding one would have deadlocked.
-- QUICK_MIRROR: a claimed slot goes to the claim, as without the switch
-  (ff15ef5). With a full card, compare the texture pass's refusal count on
-  and off.
+- QUICK_MIRROR (always since W1.9): a claimed slot goes to the claim
+  (ff15ef5). With a full card, watch the texture pass's refusal count.
 - SLOT_BITS: `buffer_changes` scans count/64 words a call (about 32k at
   2^21 slots).
-- SAME_RECORDS: one extra read of the destination per copy. Check what the
-  title reads back is the same.
+- SAME_RECORDS (always since W1.9): one extra read of the destination per
+  copy. Check what the title reads back is the same.
 
 ## Known gaps
 
@@ -242,11 +257,40 @@ garbled geometry, and hangs.
   VICTORY_VIEW_THREADS; 53c5256's HEAP_SYNC_ASIDE; 44629de's card-steps,
   land parts and kind counters; e8d3d91's titlewrite.rs; helper threads
   pinned to fast cores; the picked-UAV handling.
-- `QUICK_MIRRORED` is counted but only tests read it; it is not on the frame
-  line or the profile.
+- (`QUICK_MIRRORED`: removed in W1.9, folded into `SKIPPED_MADE`, which is on
+  the frame line and the `sync heaps` profile span.)
 - `a_quick_look_at_a_claimed_slot_waits_for_the_claim` is weak if WARP makes
   no host texture for its BC7 view: the answer is then false both ways, and
   only the wait is checked.
 - Review findings: all five were fixed (ea442e7, 2c86826, ff15ef5, 2d3eb68,
   and this file). None left open.
 - The base is not rustfmt-clean; see "Built here".
+
+## Wave 1 changes
+
+- **Slots left to tables are read again (26 Nov 2026).** A record copied in
+  as bytes while a table holds its slot is left to the draws, as before; the
+  pass now also notes the slot (`HostHeap::left_to_tables`, at most 65,536
+  slots a heap, each once) and reads it again once no table has held it for
+  240 frames, whether or not its page was written since
+  (`HostHeap::retake_left`). Before, such a slot kept the view from before
+  for as long as nothing else on its page changed. Cost per pass: one lock
+  of that set (the pass's alone) and a look at each slot in it, then one
+  record read per slot read again; nothing with the set empty. Slots refused
+  for want of room are counted in `LEFT_DROPPED`, on the frame line when not
+  zero. Tests: `a_record_left_to_a_table_is_read_again_once_its_mark_ages`,
+  `slots_left_to_tables_past_the_limit_are_counted`.
+- **Views read without a lock (W1.10, 26 Nov 2026).** `view_at` reads table
+  entries from a copy of `Views::list` in fixed chunks of 4,096 entries that
+  are made as the table grows and never moved or freed (the `table` module in
+  `descriptor.rs`, 4,194,304 entries; an entry past them is read under the
+  lock as before). Each entry is a seqlock: a write counter, odd while a
+  writer (under the write lock, as before) changes it, is read before and
+  after the entry's generation and words. Shapes of placed views have a
+  table of their own. In a release build one thread reads a view in about
+  20 ns against 14 ns under an uncontended lock, and four threads at once in
+  about 19 ns each against 99 ns. Tests: `a_view_comes_back_from_its_words`,
+  `view_table_seqlock_no_torn_reads`, `view_table_busy_reads_retry`,
+  `stale_generation_reads_none`,
+  `an_entry_past_the_reader_table_is_read_under_the_lock`,
+  `view_at_microbench` (not gated).
