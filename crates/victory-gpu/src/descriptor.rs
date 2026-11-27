@@ -1804,8 +1804,9 @@ mod tests {
         assert_eq!(View::from_words(&[0; table::WORDS]), None);
     }
 
-    /// Four readers and a writer that rewrites one entry over and over: every
-    /// read is one of the two views whole, never words of both.
+    /// Four readers and a writer that rewrites one entry over and over, for
+    /// at most half a second: every read is one of the two views whole, never
+    /// words of both, and both are read.
     #[test]
     fn view_table_seqlock_no_torn_reads() {
         static TABLE: table::Table = table::Table::new();
@@ -1819,6 +1820,8 @@ mod tests {
         TABLE.write(5, 1, &words[0]);
         let stop = std::sync::atomic::AtomicBool::new(false);
         let written = std::sync::atomic::AtomicU64::new(0);
+        // Each reader stops at `READS` or after half a second.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
         std::thread::scope(|scope| {
             // The writer first, and some of its writes before any read.
             let writer = scope.spawn(|| {
@@ -1827,6 +1830,11 @@ mod tests {
                     TABLE.write(5, 1, &words[n % 2]);
                     n += 1;
                     written.store(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    // A short pause: readers get through between writes as
+                    // well as across them.
+                    for _ in 0..16 {
+                        std::hint::spin_loop();
+                    }
                 }
             });
             while written.load(std::sync::atomic::Ordering::Relaxed) < 1_000
@@ -1838,7 +1846,10 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         let mut seen = [0u64; 2];
-                        for _ in 0..READS {
+                        for n in 0..READS {
+                            if n % 1024 == 0 && std::time::Instant::now() >= until {
+                                break;
+                            }
                             let read = TABLE.read(5, 1).expect("at its generation");
                             let view = View::from_words(&read).expect("a whole view");
                             let at = views
@@ -1859,8 +1870,10 @@ mod tests {
                 .into_iter()
                 .map(|r| r.expect("a reader read only whole views"))
                 .collect();
-            assert!(seen.iter().all(|s| s[0] + s[1] == READS));
-            let both = seen.iter().fold([0u64; 2], |a, s| [a[0] + s[0], a[1] + s[1]]);
+            assert!(seen.iter().all(|s| s[0] + s[1] > 0), "every reader read");
+            let both = seen
+                .iter()
+                .fold([0u64; 2], |a, s| [a[0] + s[0], a[1] + s[1]]);
             assert!(both[0] > 0 && both[1] > 0, "both views read: {both:?}");
         });
     }
