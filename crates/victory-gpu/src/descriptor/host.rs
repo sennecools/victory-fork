@@ -3152,7 +3152,7 @@ impl HostHeap {
             let key = page_key(record);
             if key == last.load(Relaxed) && {
                 let shown = made.load(Acquire);
-                shown == key || shown == 0
+                shown == key || shown == 0 && !makes_a_slot(key)
             } {
                 continue;
             }
@@ -4008,6 +4008,17 @@ fn page_key(record: &[u8]) -> u64 {
     } else {
         0
     }
+}
+
+/// Whether a mirror of a record of key `key` that is not a draw's would make
+/// its slot from it: a live view that is not left for later. A slot made
+/// from nothing whose record is such a view is mirrored again by the pass,
+/// though the record is the one it saw last: a draw may have made the slot
+/// null from bytes of no view the title copied back over since.
+fn makes_a_slot(key: u64) -> bool {
+    key != 0
+        && view_at(key as u32, (key >> 32) as u32)
+            .is_some_and(|view| !HostHeap::deferred(&view, false).1)
 }
 
 /// [`page_key`] of the record the title has at `handle`.
@@ -7162,8 +7173,9 @@ mod made_tests {
         missing
     }
 
-    /// The key of the record at `handle` ([`HostHeap::mirror`]).
-    pub(super) fn record_key(handle: u64) -> u64 {
+    /// The key of the record at `handle` ([`HostHeap::mirror`]), its tag
+    /// not looked at.
+    pub(super) fn raw_key(handle: u64) -> u64 {
         // SAFETY: the caller's record.
         let [_, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         u64::from(generation) << 32 | u64::from(i)
@@ -7276,7 +7288,7 @@ mod made_tests {
                         write(at, &views[(next(&mut rng) % 3) as usize]);
                         heap.mirror(0, at, true);
                     }
-                    record_key(at)
+                    raw_key(at)
                 })
             })
             .collect::<Vec<_>>()
@@ -7318,7 +7330,7 @@ mod made_tests {
             }
         });
         assert_eq!(heap.writes.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(key(&heap, 0), record_key(at));
+        assert_eq!(key(&heap, 0), raw_key(at));
         let copy = crate::shadow::find(address, u64::from(size)).expect("its host copy");
         assert_eq!(
             heap.kept_raw(0),
@@ -7348,7 +7360,7 @@ mod made_tests {
         let at = record.as_mut_ptr() as u64;
         write(at, &views[0]);
         heap.mirror(0, at, true);
-        assert_eq!(key(&heap, 0), record_key(at));
+        assert_eq!(key(&heap, 0), raw_key(at));
         let again = RESOLVED_AGAIN.load(std::sync::atomic::Ordering::Relaxed);
         // Past the first look (a slot that shows its record is done with
         // there): the slot shows another record at it, this one at the next
@@ -7365,7 +7377,7 @@ mod made_tests {
         heap.mirror(0, at, true);
         assert!(RESOLVED_AGAIN.load(std::sync::atomic::Ordering::Relaxed) > again);
         assert_eq!(heap.writes.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(key(&heap, 0), record_key(at));
+        assert_eq!(key(&heap, 0), raw_key(at));
         assert_eq!(heap.word(0), Some(slot_word(views[0].as_ref())));
         assert_eq!(claims_held(), 0);
         assert!(alive());
@@ -7392,7 +7404,7 @@ mod made_tests {
         assert!(heap.kept_raw(3).is_some(), "a host texture for the view");
         assert!(RESOLVED_AGAIN.load(std::sync::atomic::Ordering::Relaxed) > again);
         assert_eq!(heap.writes.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(key(&heap, 3), record_key(handle));
+        assert_eq!(key(&heap, 3), raw_key(handle));
         assert!(alive());
     }
 
@@ -7415,10 +7427,10 @@ mod made_tests {
         assert!(BEFORE_NOTE.take().is_none(), "the hook ran");
         assert!(heap.kept_raw(3).is_some(), "a host texture for the view");
         assert!(RESHOWN_AGAIN.load(std::sync::atomic::Ordering::Relaxed) > reshown);
-        assert_eq!(key(&heap, 3), record_key(handle));
+        assert_eq!(key(&heap, 3), raw_key(handle));
         // The next pass finds the slot in the spans and makes it again.
         assert_eq!(heap.texture_views_remade(), 1);
-        assert_eq!(key(&heap, 3), record_key(handle));
+        assert_eq!(key(&heap, 3), raw_key(handle));
         assert!(alive());
     }
 
@@ -7469,7 +7481,7 @@ mod made_tests {
             write(handle, &Some(view.clone()));
             heap.mirror(slot, handle, false);
             heap.mirror_marking(slot, handle, true, false, hold::WALK);
-            assert_eq!(key(&heap, slot), record_key(handle), "slot {slot} made");
+            assert_eq!(key(&heap, slot), raw_key(handle), "slot {slot} made");
         }
         assert!(heap.kept_raw(3).is_some(), "a host texture for the view");
         // Slot 4 written with a constant buffer view meanwhile.
@@ -7478,13 +7490,9 @@ mod made_tests {
         super::levels_changed(at);
         let remade = heap.texture_views_remade();
         assert_eq!(remade, 1, "slot 3 made again");
-        assert_eq!(key(&heap, 3), record_key(one));
+        assert_eq!(key(&heap, 3), raw_key(one));
         assert!(heap.kept_raw(3).is_some());
-        assert_eq!(
-            key(&heap, 4),
-            record_key(two),
-            "slot 4 keeps its new record"
-        );
+        assert_eq!(key(&heap, 4), raw_key(two), "slot 4 keeps its new record");
         assert!(alive());
     }
 

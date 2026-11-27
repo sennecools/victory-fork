@@ -1896,3 +1896,34 @@ fn slots_left_to_tables_past_the_limit_are_counted() {
     assert_eq!(kept, [1, 2]);
     assert!(part.make.is_empty(), "nothing aged");
 }
+
+/// A slot a draw made null from bytes of no view, then given back the live
+/// record the pass saw last: the pass mirrors it again, though the key is
+/// the one it saw, and the slot shows the record.
+#[test]
+fn a_null_slot_whose_record_names_a_live_view_is_made_again() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let at = base + 6 * 32;
+    write(at, &views[0]);
+    assert_eq!(pass_over(&heap, base), [6]);
+    let x = record_key(at);
+    assert_eq!(key(&heap, 6), x);
+    // Bytes of no view, which a draw reads through a table: made null.
+    let bytes = records[6];
+    records[6] = [0x7e57_0003; 8];
+    heap.mirror(6, at, true);
+    assert_eq!(key(&heap, 6), 0, "made null by the draw");
+    // The live record back, as the pass saw it.
+    records[6] = bytes;
+    assert_eq!(heap.seen_key(6), Some(x));
+    assert_eq!(pass_over(&heap, base), [6], "mirrored again");
+    assert_eq!(key(&heap, 6), x);
+    // Bytes of no view over a slot made from none are still left.
+    records[9] = [0x7e57_0004; 8];
+    assert_eq!(pass_over(&heap, base), [], "left");
+}
