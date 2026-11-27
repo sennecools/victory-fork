@@ -1986,3 +1986,57 @@ fn a_view_left_for_later_and_nulled_by_a_draw_comes_back() {
     assert_eq!(pass_over(&heap, base), [10, 11, 12], "mirrored again");
     assert_eq!(state(&heap), before);
 }
+
+thread_local! {
+    /// [`a_pass_between_a_viewless_draw_s_read_and_its_claim_is_undone`]:
+    /// the records' base, the slot, and the live record to copy back.
+    static RACE: std::cell::Cell<(u64, u32, [u32; 8])> =
+        const { std::cell::Cell::new((0, 0, [0; 8])) };
+}
+
+/// For [`BEFORE_NULL`]: the title copies the live record back, and a pass
+/// makes the slot from it.
+fn copy_back_and_pass(heap: &HostHeap) {
+    let (base, slot, record) = RACE.get();
+    // SAFETY: a record of the test's records.
+    unsafe { ((base + u64::from(slot) * 32) as *mut [u32; 8]).write_unaligned(record) };
+    assert_eq!(
+        pass_over(heap, base),
+        [slot],
+        "the pass makes the live record"
+    );
+}
+
+/// A draw reads bytes of no view in a slot; before it claims the slot, the
+/// title copies a live record over them and a pass makes the slot from it;
+/// the draw then makes the slot null. The next pass must make it from the
+/// live record again: what the draw read is noted as seen under its claim,
+/// after the pass's own note.
+#[test]
+fn a_pass_between_a_viewless_draw_s_read_and_its_claim_is_undone() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let slot = 6u32;
+    let at = base + u64::from(slot) * 32;
+    write(at, &views[0]);
+    let live = records[slot as usize];
+    let live_key = record_key(at);
+    records[slot as usize] = [0x7e57_0006; 8];
+    assert_eq!(pass_over(&heap, base), [], "bytes of no view, left");
+    RACE.set((base, slot, live));
+    BEFORE_NULL.set(Some(copy_back_and_pass));
+    heap.mirror(slot, at, true);
+    assert!(BEFORE_NULL.take().is_none(), "the hook ran");
+    assert_eq!(record_key(at), live_key, "the live record is there");
+    assert_eq!(key(&heap, slot), 0, "the draw made the slot null");
+    assert_eq!(
+        pass_over(&heap, base),
+        [slot],
+        "the next pass makes it again"
+    );
+    assert_eq!(key(&heap, slot), live_key);
+}

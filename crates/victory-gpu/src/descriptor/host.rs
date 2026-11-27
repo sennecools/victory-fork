@@ -3090,8 +3090,13 @@ impl HostHeap {
     /// leaves the slot if it still holds that record and the slot shows it
     /// ([`HostHeap::sort_copied_page`]). Nothing before the first pass.
     pub(crate) fn saw_key(&self, index: u32, key: u64) {
-        if let Some(seen) = self.seen.get().and_then(|seen| seen.get(index as usize)) {
-            seen.store(key, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(seen) = self.seen.get().and_then(|seen| seen.get(index as usize))
+            // (Most mirrors of a draw find the key there already: the cache
+            // line is left clean.)
+            && seen.load(Relaxed) != key
+        {
+            seen.store(key, Relaxed);
         }
     }
 
@@ -3430,17 +3435,25 @@ impl HostHeap {
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             let _hold = self.hold(site);
-            // What was read is seen (0 for bytes of no view, the dead key for
-            // a released view): a draw that makes the slot null here changes
-            // what the slot shows without the pass, and a live record copied
-            // back over it must then not look like the one the pass saw last
-            // ([`HostHeap::sort_copied_page`]).
-            self.saw_key(index, if tag == VIEW_TAG { key } else { 0 });
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_NULL.take() {
+                hook(self);
+            }
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             let Ok(mut claim) = self.claim(index, |made| made != 0 || for_draw) else {
                 return None;
             };
+            // What was read is seen (0 for bytes of no view, the dead key for
+            // a released view): a draw that makes the slot null here changes
+            // what the slot shows without the pass, and a live record copied
+            // back over it must then not look like the one the pass saw last
+            // ([`HostHeap::sort_copied_page`]). Noted under the claim: a pass
+            // that made the slot from a live record between this read and
+            // the claim noted that record as seen, and this null must not
+            // leave it so. With the claim refused, the slot is left as it is,
+            // and so is what was seen.
+            self.saw_key(index, if tag == VIEW_TAG { key } else { 0 });
             if claim.old != 0 {
                 claim.value = 0;
                 self.write_word(index, 0);
@@ -5094,6 +5107,11 @@ thread_local! {
     /// not show its record at the first look, with the slot's
     /// [`HostHeap::made`], before the look that asks whether to resolve.
     static BEFORE_LOOK: std::cell::Cell<Option<fn(&std::sync::atomic::AtomicU64)>> =
+        const { std::cell::Cell::new(None) };
+    /// Tests: called once, by this thread's next mirror that finds no view
+    /// in a slot, with the heap, after the record is read and before the
+    /// slot is claimed.
+    pub(crate) static BEFORE_NULL: std::cell::Cell<Option<fn(&HostHeap)>> =
         const { std::cell::Cell::new(None) };
     /// Tests: called once, by this thread's next mirror that changes a
     /// slot, under the claim, before the write is noted in the spans.
