@@ -3088,7 +3088,10 @@ impl HostHeap {
     /// its mirror) into title slot `index` and mirrored it (`super::record`,
     /// `super::copy_simple`): the key is the one last seen, so the next pass
     /// leaves the slot if it still holds that record and the slot shows it
-    /// ([`HostHeap::sort_copied_page`]). Nothing before the first pass.
+    /// ([`HostHeap::sort_copied_page`]). A mirror that finds no view in a
+    /// slot notes what it read too (0, or a released view's dead key),
+    /// whether or not it changes the slot ([`HostHeap::mirror_marking`]).
+    /// Nothing before the first pass.
     pub(crate) fn saw_key(&self, index: u32, key: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         if let Some(seen) = self.seen.get().and_then(|seen| seen.get(index as usize))
@@ -3111,7 +3114,8 @@ impl HostHeap {
     /// did not see (a call's, a draw's, a record copied back as bytes over
     /// one a call made) leaves it showing that other record. A mirror that
     /// finds no view in a slot notes the key it read as seen, so a live
-    /// record copied back over a slot a draw made null that way differs
+    /// record copied back over bytes a mirror found no view in (a draw's
+    /// that made the slot null, or a refused one that left it null) differs
     /// from the one last seen and is mirrored again. Of the others,
     /// one of a slot a table's lately is left to its draws, its key not taken
     /// as seen, so it is looked at again next time; the rest are seen from
