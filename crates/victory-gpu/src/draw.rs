@@ -3254,7 +3254,8 @@ impl State {
             // With `VICTORY_HEAP_PASS_TABLED=1` a small table's slots are its
             // own, named or not (below), and the heap buffer pass leaves them
             // to the draw: the buffer views among them the shader does not
-            // name are brought up to date here too, as the pass would have.
+            // name are brought up to date here too, as the pass would have
+            // (`pass_refresh`: a refresh only, no state and no write).
             let unnamed_tabled = heap_pass_tabled() && n <= 64 && title_first.is_some();
             let named = |k: u32| entries.iter().any(|u| u.table_offset_dwords / 8 == k);
             if let Some(&first) = self.fresh_tables.get(&key) {
@@ -3269,11 +3270,12 @@ impl State {
                     if named(k) || !(picked || unnamed_tabled) {
                         continue;
                     }
-                    let handle = table + u64::from(k) * 32;
-                    if let Some(view) = crate::descriptor::view(handle)
-                        && (picked || !crate::descriptor::host::is_texture_view(&view))
-                        && let Some(kind) = view_kind(&view)
-                    {
+                    let Some(view) = crate::descriptor::view(table + u64::from(k) * 32) else {
+                        continue;
+                    };
+                    if !picked {
+                        pass_refresh(list, &view);
+                    } else if let Some(kind) = view_kind(&view) {
                         readable(list, kind, &view);
                     }
                 }
@@ -3324,15 +3326,12 @@ impl State {
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
-                        // An unnamed buffer view of a small table, which the
-                        // heap buffer pass leaves to the draw (above).
-                        let read = kind.or_else(|| {
-                            (unnamed_tabled && !crate::descriptor::host::is_texture_view(&view))
-                                .then(|| view_kind(&view))
-                                .flatten()
-                        });
-                        if let Some(read) = read {
-                            readable(list, read, &view);
+                        if let Some(kind) = kind {
+                            readable(list, kind, &view);
+                        } else if unnamed_tabled {
+                            // An unnamed slot of a small table, which the
+                            // heap buffer pass leaves to the draw (above).
+                            pass_refresh(list, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3983,6 +3982,18 @@ fn view_kind(view: &View) -> Option<ResourceType> {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
         View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
         _ => None,
+    }
+}
+
+/// What the heap buffer pass does for a buffer view it makes, done by a
+/// draw for a slot the pass leaves to it (`VICTORY_HEAP_PASS_TABLED=1`): the
+/// view's range of its host copy brought up to date, nothing else. Not
+/// [`readable`]: for an unordered access view that would change the
+/// buffer's state and declare the shaders' writes (a snapshot and a
+/// copy-back), for a slot the shader may never touch.
+fn pass_refresh(list: &HostList, view: &View) {
+    if let Some((shadow, _, address, len)) = crate::descriptor::host::buffer_copy(view) {
+        shadow.refresh_from(list, address, len, Source::HeapPass);
     }
 }
 
@@ -4753,6 +4764,19 @@ pub(crate) mod test_heap {
             let width = self.size as u32;
             View::Placed(
                 false,
+                [1, 0, 0, 0, width, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+                desc,
+            )
+        }
+
+        /// [`ViewHeap::view`] for unordered access.
+        pub(crate) fn uav(&self, first: u32) -> View {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[0, 1, first, 0, 64, 12, 0, 0, 0, 0]);
+            (desc[10], desc[11]) = (self.memory as u32, (self.memory as u64 >> 32) as u32);
+            let width = self.size as u32;
+            View::Placed(
+                true,
                 [1, 0, 0, 0, width, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
                 desc,
             )
@@ -5814,27 +5838,30 @@ void main() {
         list.reset();
     }
 
-    /// With `VICTORY_HEAP_PASS_TABLED=1`: a small table made afresh (it holds
-    /// a constant view) whose first slot, which the shader does not name,
-    /// holds a buffer view between two of the pass's views, 4 KiB and more
-    /// from each. The slot is the table's, so the pass leaves it to the
-    /// draw, and the draw refreshes its exact range; again when the same
-    /// table is bound once more in the list.
-    #[test]
-    fn warp_heap_pass_unnamed_slot_of_a_tabled_table_gets_exact_refresh() {
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU
-        };
+    /// Refresh steps: title address, bytes, source.
+    type Steps = Vec<(usize, usize, Source)>;
+
+    /// A small table made afresh (it holds a constant view) whose first slot,
+    /// which the shader does not name, holds a buffer view (`uav`: for
+    /// unordered access) between two of the heap buffer pass's views, 4 KiB
+    /// and more from each; the table is bound, the pass runs, and the table
+    /// is bound again after a title copy. The refresh steps of the copy over
+    /// the slot's bytes after the first bind and at the end, and the list's
+    /// declared writes.
+    fn unnamed_slot(tabled: bool, uav: bool) -> Option<([Steps; 2], usize)> {
+        let host = crate::host::host()?;
         struct Tabled;
         impl Drop for Tabled {
             fn drop(&mut self) {
                 TABLED_HERE.with(|on| on.set(false));
             }
         }
-        TABLED_HERE.with(|on| on.set(true));
+        TABLED_HERE.with(|on| on.set(tabled));
         let _tabled = Tabled;
         let heap = ViewHeap::new(true);
-        heap.put(0, 1000);
+        let gap = heap.memory + 12000;
+        let view = if uav { heap.uav(1000) } else { heap.view(1000) };
+        crate::descriptor::record(crate::descriptor::heap(heap.h).handle(0).unwrap(), view);
         let constant = crate::descriptor::heap(heap.h).handle(1).unwrap();
         crate::descriptor::record(constant, View::Constant(heap.memory as u64, 256));
         heap.put(2, 0);
@@ -5854,40 +5881,60 @@ void main() {
         let mut state = State::default();
         state.heaps[0] = heap.h as usize;
         set(&mut state.compute, 0, Root::Table(table));
-        let gap = (heap.memory + 12000, 768, Source::Table);
         let copy = heap.copy();
+        let over = |list: &HostList| -> Steps {
+            steps_of(list, &copy)
+                .into_iter()
+                .filter(|&(at, len, _)| at < gap + 768 && gap < at + len)
+                .collect()
+        };
         assert_eq!(
             state.tables(&list, &used, &[], true).len(),
             1,
             "made afresh"
         );
-        assert!(steps_of(&list, &copy).contains(&gap), "the unnamed slot");
+        let bound = over(&list);
         heap.pass(&list, crate::frame::current());
-        let steps = steps_of(&list, &copy);
-        assert!(
-            steps
-                .iter()
-                .filter(|s| s.2 == Source::HeapPass)
-                .all(|&(at, len, _)| at + len <= gap.0 || gap.0 + gap.1 <= at),
-            "the pass leaves the slot to the draw: {steps:?}"
-        );
         // A title copy in between: the next bind of the same table, found
-        // made in the list, refreshes the slot again.
+        // made in the list, refreshes again what it refreshed.
         list.defer_copy(
             heap.memory as *mut u8,
             (heap.memory + 0x1_0000) as *const u8,
             4,
         );
         assert_eq!(state.tables(&list, &used, &[], true).len(), 1);
-        let again = steps_of(&list, &copy);
-        assert_eq!(
-            again.iter().filter(|&&s| s == gap).count(),
-            2,
-            "refreshed again: {again:?}"
-        );
+        let end = over(&list);
+        let writes = list.gpu_writes_for_test();
         state.tables_done();
         list.close();
         list.reset();
+        Some(([bound, end], writes))
+    }
+
+    /// With `VICTORY_HEAP_PASS_TABLED=1` the unnamed slot is the table's, so
+    /// the pass leaves it to the draw, and the draw refreshes its exact
+    /// range as the pass would have (nothing else: for an unordered access
+    /// view no state change and no declared write), at both binds. With the
+    /// switch off the pass makes the slot, and the draw does nothing for it.
+    #[test]
+    fn warp_heap_pass_unnamed_slot_of_a_tabled_table_gets_exact_refresh() {
+        for uav in [false, true] {
+            let Some(([bound, end], writes)) = unnamed_slot(true, uav) else {
+                return; // no host GPU
+            };
+            let refreshed = |steps: &[(usize, usize, Source)]| {
+                steps
+                    .iter()
+                    .all(|&(_, len, source)| len == 768 && source == Source::HeapPass)
+            };
+            assert_eq!(bound.len(), 1, "uav {uav}: at the bind: {bound:?}");
+            assert_eq!(end.len(), 2, "uav {uav}: and again: {end:?}");
+            assert!(refreshed(&end), "uav {uav}: as the pass refreshes: {end:?}");
+            assert_eq!(writes, 0, "uav {uav}: no declared write");
+        }
+        let ([bound, _], writes) = unnamed_slot(false, false).expect("a host GPU");
+        assert!(bound.is_empty(), "no step of the draw's: {bound:?}");
+        assert_eq!(writes, 0);
     }
 
     /// A range asked for twice in a list is one step, with the tag it got

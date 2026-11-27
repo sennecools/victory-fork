@@ -9182,6 +9182,16 @@ impl HostList {
         }
     }
 
+    /// The list's declared shader writes (tests).
+    #[cfg(test)]
+    pub(crate) fn gpu_writes_for_test(&self) -> usize {
+        self.deferred()
+            .copies
+            .iter()
+            .filter(|step| matches!(step, Step::GpuWrite(..)))
+            .count()
+    }
+
     /// The list's refresh steps (copy's id, title address, bytes, source),
     /// in order (tests).
     #[cfg(test)]
