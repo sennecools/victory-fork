@@ -50,6 +50,10 @@ pub(crate) struct HostHeap {
     /// heap's slots.
     #[cfg(test)]
     writes: std::sync::atomic::AtomicU64,
+    /// Tests: mirrors done with as left for a draw again
+    /// ([`HostHeap::left`]).
+    #[cfg(test)]
+    left_skips: std::sync::atomic::AtomicU64,
     /// The changes [`HostHeap::note_buffer`]
     /// makes to `textures`, `buffers` and `changed`, in the order they were
     /// made, until whatever reads those takes them ([`NoteLog`]).
@@ -1541,6 +1545,8 @@ impl HostHeap {
                 .collect(),
             #[cfg(test)]
             writes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            left_skips: std::sync::atomic::AtomicU64::new(0),
             log: NoteLog::default(),
             seen: std::sync::OnceLock::new(),
             left_to_tables: Mutex::default(),
@@ -2746,6 +2752,19 @@ impl HostHeap {
         std::mem::take(&mut *changed).into_iter().collect()
     }
 
+    /// Title slot `index`, which holds a buffer view, goes into the set of
+    /// changes the next heap buffer pass walks ([`HostHeap::buffer_changes`]).
+    fn mark_changed(&self, index: u32) {
+        if let Some(bits) = &self.bits {
+            bits.changed.put(index);
+        } else {
+            self.changed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(index);
+        }
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: whether it is a buffer view at all (the
     /// caller writes the table of strides, [`HostHeap::write_word`]).
@@ -3506,6 +3525,45 @@ impl HostHeap {
             SKIPPED_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Some(view);
         }
+        // A buffer view left for a draw again, of the record the slot was
+        // last left for a draw from ([`HostHeap::left`]), in a slot made
+        // from nothing: the deferral below would write the same null view
+        // and word, keep nothing and note the same sets, so it is done with
+        // before the claim, as a made slot is above, noting only the set of
+        // changes.
+        //
+        // `made` first: a claim writes the record before `made`, with
+        // release. A record whose view was released since goes on to the
+        // claim, as above. A change of the slot just after these loads is
+        // the race the look above takes too. With slots made by the heap
+        // buffer pass, this is a deferral between a deferral and the pass,
+        // of a slot the pass leaves to its tables, or in a heap whose pass
+        // does not run.
+        if !for_draw
+            && mark
+            && tag == VIEW_TAG
+            && let Some(left) = self.left.get(index as usize)
+            && self
+                .made
+                .get(index as usize)
+                .is_some_and(|made| made.load(std::sync::atomic::Ordering::Acquire) == 0)
+            && let Some(again @ crate::frame_budget::LeftAgain::Same) =
+                left_again(left.load(std::sync::atomic::Ordering::Acquire), key)
+            && let Some(view) = view_at(i, generation)
+        {
+            // The set of changes as the deferral notes it: a buffer view the
+            // heap buffer pass picks goes in again, as the walk may have
+            // taken it since and left it to its tables (a constant view goes
+            // into no set). It is in the set of buffer views already.
+            if view_stride(&view).is_some() {
+                self.mark_changed(index);
+            }
+            crate::frame_budget::left_again(again);
+            #[cfg(test)]
+            self.left_skips
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(view);
+        }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             let _hold = self.hold(site);
@@ -3728,8 +3786,10 @@ impl HostHeap {
                 && kind == crate::frame_budget::Mirror::BufferDeferred
                 && claim.left_at.is_some()
             {
+                // (The same record again is done with before the claim.)
                 if claim.old == 0
-                    && let Some(again) = left_again(claim.left_before(), key)
+                    && let Some(again @ crate::frame_budget::LeftAgain::Constant) =
+                        left_again(claim.left_before(), key)
                 {
                     crate::frame_budget::left_again(again);
                 }
@@ -6575,10 +6635,10 @@ mod made_tests {
     /// only the sampler (a table entry needing no host copy) is eligible
     /// for a pre-made descriptor. A mirror of what a slot shows already
     /// counts nothing. A buffer view left for a draw again counts as left
-    /// again, of the same record, and so does a constant buffer view left
-    /// where another one was, at another address; a placed texture view
-    /// left again does not. With the sets of buffer views as sets and as
-    /// bits.
+    /// again (and, done with before the claim, as no mirror), of the same
+    /// record, and so does a constant buffer view left where another one
+    /// was, at another address; a placed texture view left again does not.
+    /// With the sets of buffer views as sets and as bits.
     #[test]
     fn sync_counts_kinds() {
         use crate::frame_budget::{LeftAgain, Mirror, Seen, take_seen};
@@ -6630,7 +6690,6 @@ mod made_tests {
                     mirror(Mirror::Null),
                     mirror(Mirror::PlacedTexture),
                     mirror(Mirror::PlacedTexture),
-                    mirror(Mirror::BufferDeferred),
                     mirror(Mirror::BufferDeferred),
                     Seen::LeftAgain(LeftAgain::Same),
                     mirror(Mirror::BufferDeferred),
@@ -6758,6 +6817,375 @@ mod made_tests {
         assert!(alive());
     }
 
+    /// What a slot shows ([`shown`]).
+    type Shown = (u64, Option<u32>, bool);
+
+    /// A heap that keeps the records slots were left for a draw from
+    /// ([`HostHeap::left`]), and one that does not and makes every such
+    /// mirror in full, for each way of the sets of buffer views (as bits:
+    /// the play set's). `None` with no host GPU.
+    fn left_and_full() -> Option<Vec<(HostHeap, HostHeap, bool)>> {
+        [false, true]
+            .into_iter()
+            .map(|bits| {
+                Some((
+                    HostHeap::with_ways(false, SLOTS, bits, true)?,
+                    HostHeap::with_ways(false, SLOTS, bits, false)?,
+                    bits,
+                ))
+            })
+            .collect()
+    }
+
+    /// The mirrors `heap` did with as left for a draw again.
+    fn skips(heap: &HostHeap) -> u64 {
+        heap.left_skips.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What each of `slots` of `heap` shows: what it was made from, its
+    /// word and the host resource it keeps; and the slots holding buffer
+    /// views.
+    fn shown(heap: &HostHeap, slots: std::ops::Range<u32>) -> (Vec<Shown>, Vec<u32>) {
+        let each = slots
+            .map(|s| (key(heap, s), heap.word(s), heap.kept_raw(s).is_some()))
+            .collect();
+        (each, heap.buffer_slots())
+    }
+
+    /// The same buffer record left for a draw again is done with before
+    /// the claim (no claim asked for, nothing written, counted as left
+    /// again and not as a mirror), and leaves the slot as a full deferral
+    /// leaves it: a null view of its kind, its word, nothing kept, and in
+    /// the sets once.
+    #[test]
+    fn left_again_same_record_is_skipped() {
+        use crate::frame_budget::{LeftAgain, Seen, take_seen};
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; 2];
+            let at = records.as_mut_ptr() as u64 + 32;
+            write(at, &views[2]);
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+            }
+            assert_eq!(heap.left_key(1), record_key(at), "bits {bits}");
+            assert_eq!(full.left_key(1), 0, "bits {bits}: kept by no claim");
+            let writes = heap.writes.load(std::sync::atomic::Ordering::Relaxed);
+            let _ = take_seen();
+            BEFORE_CLAIM.set(Some(|_| panic!("a claim asked for")));
+            assert_eq!(heap.mirror(1, at, false), views[2], "bits {bits}");
+            assert!(BEFORE_CLAIM.take().is_some(), "bits {bits}: claimed");
+            assert_eq!(
+                take_seen(),
+                [Seen::LeftAgain(LeftAgain::Same)],
+                "bits {bits}"
+            );
+            assert_eq!(skips(heap), 1);
+            assert_eq!(
+                heap.writes.load(std::sync::atomic::Ordering::Relaxed),
+                writes
+            );
+            full.mirror(1, at, false);
+            assert_eq!(skips(full), 0);
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
+            assert_eq!(heap.buffer_changes(), full.buffer_changes(), "bits {bits}");
+            assert_eq!(heap.left_key(1), record_key(at), "bits {bits}");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// A draw that makes a slot left for a draw forgets its record, and so
+    /// does a slot made null again (its memory gone): the same record left
+    /// for a draw then is a deferral in full.
+    #[test]
+    fn left_cleared_by_draw_make() {
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; 2];
+            let at = records.as_mut_ptr() as u64 + 32;
+            write(at, &views[2]);
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+                heap.mirror(1, at, true);
+            }
+            assert_eq!(
+                key(heap, 1),
+                record_key(at),
+                "bits {bits}: made by the draw"
+            );
+            assert_eq!(heap.left_key(1), 0, "bits {bits}");
+            for heap in [heap, full] {
+                // Shows the record: nothing to change.
+                heap.mirror(1, at, false);
+                assert!(heap.texture_slot_gone(1), "bits {bits}");
+            }
+            assert_eq!(heap.left_key(1), 0, "bits {bits}");
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+            }
+            assert_eq!(skips(heap), 0);
+            assert_eq!(heap.left_key(1), record_key(at), "bits {bits}");
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// A slot made on a C-pool home whose pages a let-go let go counts as
+    /// made from no record, but was last made, not left for a draw: the
+    /// same buffer record left for a draw then is a deferral in full, which
+    /// makes it null, where a skip would have left the let-go's descriptor
+    /// shown.
+    #[test]
+    fn pool_let_go_then_left_for_a_draw_is_deferred_in_full() {
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (n, (heap, full, bits)) in heaps.iter().enumerate() {
+            let mut records = vec![[0u32; 8]; 2];
+            let at = records.as_mut_ptr() as u64 + 32;
+            write(at, &views[2]);
+            let start = 0x7fee_0000_0000u64 + n as u64 * 0x10_0000;
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+                heap.mirror(1, at, true);
+                let mut pool = heap.pool_slots.lock().unwrap();
+                pool.set(1, Some((start, start + 0x1000)));
+                heap.pool_noted
+                    .store(pool.by_slot.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            pool_let_go(start, start + 1);
+            for heap in [heap, full] {
+                heap.pool_slots_let_go();
+                assert!(!heap.made(1), "bits {bits}: made from no record");
+            }
+            assert_eq!(heap.left_key(1), 0, "bits {bits}");
+            let _ = crate::frame_budget::take_seen();
+            heap.mirror(1, at, false);
+            assert!(
+                crate::frame_budget::take_seen().iter().any(|s| matches!(
+                    s,
+                    crate::frame_budget::Seen::Mirror {
+                        kind: crate::frame_budget::Mirror::BufferDeferred,
+                        ..
+                    }
+                )),
+                "bits {bits}: left for a draw in full"
+            );
+            full.mirror(1, at, false);
+            assert_eq!(skips(heap), 0);
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// A slot whose deferral was skipped is made by the next draw that
+    /// reads it, as one deferred in full, and forgets its record.
+    #[test]
+    fn left_skip_then_draw_makes() {
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; 2];
+            let at = records.as_mut_ptr() as u64 + 32;
+            write(at, &views[2]);
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+                heap.mirror(1, at, false);
+            }
+            assert_eq!(skips(heap), 1);
+            for heap in [heap, full] {
+                heap.mirror(1, at, true);
+            }
+            assert_eq!(key(heap, 1), record_key(at), "bits {bits}");
+            assert_eq!(heap.left_key(1), 0, "bits {bits}");
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// A slot the walk of the heap buffer pass takes as changed, and leaves
+    /// to its tables without making it: the same record left for a draw
+    /// again, done with before the claim, goes into the set of changes
+    /// again, as a full deferral puts it, for a later pass.
+    #[test]
+    fn left_again_goes_into_changes_again() {
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; 2];
+            let at = records.as_mut_ptr() as u64 + 32;
+            write(at, &views[2]);
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+                assert_eq!(heap.buffer_changes(), [1], "bits {bits}");
+                // The title writes the same record again.
+                write(at, &views[2]);
+                heap.mirror(1, at, false);
+                assert_eq!(heap.buffer_changes(), [1], "bits {bits}: changed again");
+            }
+            assert_eq!(skips(heap), 1);
+            assert_eq!(heap.left_key(1), record_key(at), "bits {bits}");
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// A placed texture view left for later keeps no record: its deferral
+    /// changes the queue of textures and the spans, and is made in full
+    /// each time.
+    #[test]
+    fn left_not_set_for_placed_texture_deferral() {
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; 2];
+            let at = records.as_mut_ptr() as u64 + 32;
+            write(at, &views[3]);
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+                heap.mirror(1, at, false);
+            }
+            assert_eq!(heap.left_key(1), 0, "bits {bits}");
+            assert_eq!(skips(heap), 0);
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
+            assert_eq!(queued(heap), queued(full), "bits {bits}");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// One thread's writes, mirrors not for a draw of what a slot holds
+    /// (left for a draw again), draws, walks of the heap buffer pass (which
+    /// make what they take as changed, or leave it to its tables) and
+    /// slots made null leave a heap that skips what was left for a draw
+    /// again like one that makes every such mirror in full: what each slot
+    /// is made from, its word, what it keeps, the sets of buffer views and
+    /// the queue of textures. With the sets as sets and as bits.
+    #[test]
+    fn left_skips_leave_what_full_deferrals_leave() {
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; SLOTS as usize];
+            let base = records.as_mut_ptr() as u64;
+            let mut rng = 0xbb67_ae85_84ca_a73bu64 ^ u64::from(*bits);
+            for step in 0..3_000 {
+                let r = next(&mut rng);
+                let slot = (r % u64::from(SLOTS)) as u32;
+                let at = base + u64::from(slot) * 32;
+                match r >> 8 & 7 {
+                    // Left for a draw again (or mirrored again).
+                    0..=2 => {
+                        for heap in [heap, full] {
+                            heap.mirror(slot, at, false);
+                        }
+                    }
+                    3 => {
+                        for heap in [heap, full] {
+                            heap.mirror(slot, at, true);
+                        }
+                    }
+                    // A pass: what it took as changed, made or left to tables.
+                    4 => {
+                        let changed: Vec<Vec<u32>> = [heap, full]
+                            .iter()
+                            .map(|heap| {
+                                let mut changed = heap.buffer_changes();
+                                changed.sort_unstable();
+                                changed
+                            })
+                            .collect();
+                        assert_eq!(changed[0], changed[1], "step {step}, bits {bits}");
+                        for &s in &changed[0] {
+                            let at = base + u64::from(s) * 32;
+                            // (Left to tables: nothing done.)
+                            if r >> 16 & 1 == 0 {
+                                for heap in [heap, full] {
+                                    heap.mirror_walked(s, at);
+                                }
+                            }
+                        }
+                    }
+                    5 => {
+                        for heap in [heap, full] {
+                            heap.texture_slot_gone(slot);
+                        }
+                    }
+                    _ => {
+                        write(at, &views[(r >> 16) as usize % views.len()]);
+                        for heap in [heap, full] {
+                            heap.mirror(slot, at, r >> 24 & 3 == 0);
+                        }
+                    }
+                }
+                let (a, b) = (shown(heap, 0..SLOTS), shown(full, 0..SLOTS));
+                assert_eq!(a, b, "step {step}, bits {bits}");
+                assert_eq!(queued(heap), queued(full), "step {step}, bits {bits}");
+            }
+            assert!(skips(heap) > 0, "bits {bits}: skips");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// The time a buffer view left for a draw again takes per mirror, done
+    /// with before the claim and made in full (a heap that keeps no
+    /// record), over slots that each hold one: printed, not gated (run with
+    /// `--ignored`). On WARP a null view costs what WARP's does.
+    #[test]
+    #[ignore]
+    fn left_again_microbench() {
+        const ROUNDS: u32 = 2_000;
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; SLOTS as usize];
+            let base = records.as_mut_ptr() as u64;
+            let at = |s: u32| base + u64::from(s) * 32;
+            for s in 0..SLOTS {
+                write(at(s), &views[2]);
+            }
+            let per_mirror = |heap: &HostHeap| {
+                for s in 0..SLOTS {
+                    heap.mirror(s, at(s), false);
+                }
+                let start = std::time::Instant::now();
+                for _ in 0..ROUNDS {
+                    for s in 0..SLOTS {
+                        heap.mirror(s, at(s), false);
+                    }
+                }
+                start.elapsed().as_nanos() as f64 / f64::from(ROUNDS * SLOTS)
+            };
+            let (again, in_full) = (per_mirror(heap), per_mirror(full));
+            eprintln!("bits {bits}: left again {again:.0} ns, in full {in_full:.0} ns a mirror");
+            assert_eq!(skips(heap), u64::from(ROUNDS * SLOTS));
+            drop(records);
+        }
+    }
+
     /// Whether the host device is still there.
     pub(super) fn alive() -> bool {
         // SAFETY: a plain device query.
@@ -6848,6 +7276,11 @@ mod made_tests {
                         3 => {
                             heap.buffer_changes();
                             heap.texture_slots_due(u64::MAX, 4);
+                        }
+                        // The record there mirrored again, not for a draw
+                        // (a buffer view's left for a draw again).
+                        4 => {
+                            heap.mirror(slot, at, false);
                         }
                         op => {
                             write(at, &views[(r >> 16) as usize % views.len()]);

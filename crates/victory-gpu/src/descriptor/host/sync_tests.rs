@@ -455,6 +455,39 @@ fn slots_left_waiting_are_made_by_the_next_wait() {
     assert!(alive());
 }
 
+/// A view of a texture object with no host copy yet, mirrored not for a
+/// draw, waits for its texture and keeps no record of a buffer left for a
+/// draw ([`HostHeap::left`]): mirrored again, it is looked at under the
+/// claim each time, so its wait and the queue of textures are told again.
+/// With the sets of buffer views as sets and as bits.
+#[test]
+fn left_not_set_for_waiting_texture_deferral() {
+    let _census = crate::census::lock_tests();
+    for bits in [false, true] {
+        let Some(heap) = HostHeap::with_ways(false, SLOTS, bits, true) else {
+            return; // no host GPU
+        };
+        let title = title_texture();
+        let view = Some(View::Shader(title as usize, None));
+        // Left to the process: the texture's wait holds the handle.
+        let records = Box::leak(Box::new([[0u32; 8]; 2]));
+        let at = records.as_mut_ptr() as u64 + 32;
+        write(at, &view);
+        heap.mirror(1, at, false);
+        assert!(!heap.made(1), "bits {bits}: waits for its texture");
+        assert_eq!(heap.left_key(1), 0, "bits {bits}");
+        BEFORE_CLAIM.set(Some(|_| {}));
+        heap.mirror(1, at, false);
+        assert!(BEFORE_CLAIM.take().is_none(), "bits {bits}: claimed again");
+        assert_eq!(heap.left_key(1), 0, "bits {bits}");
+        assert_eq!(heap.left_skips.load(Relaxed), 0, "bits {bits}");
+        // Made by a draw, with its texture.
+        heap.mirror(1, at, true);
+        assert!(heap.made(1), "bits {bits}");
+    }
+    assert!(alive());
+}
+
 /// The black census counts the slots left unmade for a texture that waits
 /// for its host copy (`wait_for`), the slots made late once it is there
 /// (`make_waiting`), and shows both waiting gauges. A slot made null for a
@@ -1045,6 +1078,10 @@ fn records_copied_onto_the_same_bytes_leave_the_page_unwritten() {
 /// two must agree on what it was made from (`made`), its word in the table of
 /// strides and the host resource it keeps, and what it was made from must be
 /// the record the title holds there (or nothing, for a view left for later).
+/// The reference keeps no record of what its slots were left for a draw
+/// from ([`HostHeap::left`]), so it makes every such mirror in full: the
+/// heap's skips of buffer views left for a draw again are checked against
+/// it. Calls write the record a slot holds again now and then.
 /// Every [`GPU_EVERY`] submissions a compute read through a table of the
 /// placed heap's host slots checks that the slots made from views of texture
 /// objects show those textures.
@@ -1094,7 +1131,7 @@ impl Oracle {
         let placed = Placed::with_slots(kind, ORACLE_SLOTS);
         placed.host()?;
         let samplers = kind == descriptor::SAMPLERS;
-        let reference = HostHeap::new(samplers, ORACLE_SLOTS)?;
+        let reference = HostHeap::with_ways(samplers, ORACLE_SLOTS, slot_bits(), false)?;
         let (views, objects) = if samplers {
             let sampler = |filter: u32, address: u32| {
                 let mut desc = [filter, address, address, address, 0, 1, 0, 0, 0, 0, 0, 0, 0];
@@ -1222,6 +1259,11 @@ impl Oracle {
         let s = (r % u64::from(ORACLE_SLOTS)) as u32;
         let view = self.views[(r >> 16) as usize % self.views.len()].clone();
         match r >> 8 & 15 {
+            // The record the slot holds, written again.
+            0 if r >> 40 & 1 == 0 => {
+                let again = descriptor::view(self.placed.at(s));
+                self.call(s, &again);
+            }
             0..=3 => self.call(s, &view),
             4..=6 => self.copy(s, &view, false),
             7 | 8 => self.copy(s, &view, true),
@@ -1558,6 +1600,11 @@ fn oracle_run(kind: u32, seed: u64, rounds: u64) {
     if kind == descriptor::VIEWS_KIND {
         assert!(left > 0, "slots left out: {:?}", oracle.counts);
         assert!(gpu > 0, "GPU checks: {:?}", oracle.counts);
+        assert!(
+            oracle.real().left_skips.load(Relaxed) > 0,
+            "buffer views left for a draw again: {:?}",
+            oracle.counts
+        );
     }
     if kind == descriptor::VIEWS_KIND {
         // Every made slot holds its view's word (a released view's slot
