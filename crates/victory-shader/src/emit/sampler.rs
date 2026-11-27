@@ -34,6 +34,11 @@ pub struct StaticSampler {
 impl Eq for StaticSampler {}
 
 impl StaticSampler {
+    /// Replace the filter reduction with comparison, keeping the tap modes.
+    pub(crate) fn make_comparison(&mut self) {
+        self.filter = (self.filter & !0x180) | 0x80;
+    }
+
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -76,6 +81,16 @@ impl StaticSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_replaces_previous_reduction() {
+        for (filter, expected) in [(0x14, 0x94), (0x115, 0x95), (0x1d5, 0xd5)] {
+            let mut sampler = StaticSampler::from_words([0; 4]);
+            sampler.filter = filter;
+            sampler.make_comparison();
+            assert_eq!(sampler.filter, expected);
+        }
+    }
 
     #[test]
     fn console_compiled_samplers_decode() {
