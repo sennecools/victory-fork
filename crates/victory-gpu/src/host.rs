@@ -3317,6 +3317,23 @@ struct DeferredRun {
 }
 
 impl Deferred {
+    /// A refresh step of `len` bytes of `shadow` at `address`, unless the
+    /// range was asked for since the last title copy
+    /// ([`HostList::defer_refresh_from`]).
+    fn refresh(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        source: crate::frame_budget::Source,
+    ) {
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if self.refreshed.insert(key) {
+            self.copies
+                .push(Step::Refresh(shadow.clone(), address, len, source));
+        }
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -3325,6 +3342,13 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: locks of lists' steps taken on this thread
+    /// (`HostList::deferred`).
+    pub(crate) static DEFERRED_LOCKS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Drop for Deferred {
@@ -9158,6 +9182,8 @@ impl HostList {
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
+        #[cfg(test)]
+        DEFERRED_LOCKS_HERE.set(DEFERRED_LOCKS_HERE.get() + 1);
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -9220,11 +9246,29 @@ impl HostList {
             deferred.kept_homes.keep(shadow);
             return;
         }
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
-            deferred
-                .copies
-                .push(Step::Refresh(shadow.clone(), address, len, source));
+        deferred.refresh(shadow, address, len, source);
+    }
+
+    /// [`HostList::defer_refresh_from`] of each of `ranges` (title
+    /// addresses from and to, in order) of one copy, under one lock of the
+    /// list's steps (the heap buffer pass's, which asks for many ranges of
+    /// a copy); each is cut at the copy's end, as
+    /// [`crate::shadow::Shadow::refresh_from`] cuts it.
+    pub(crate) fn defer_refreshes_from(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        ranges: &[(u64, u64)],
+        source: crate::frame_budget::Source,
+    ) {
+        let mut deferred = self.deferred();
+        if shadow.is_placed() && r5_flush::on() {
+            deferred.kept_homes.keep(shadow);
+            return;
+        }
+        let (start, len) = shadow.span();
+        for &(from, to) in ranges {
+            let bytes = (to - from).min(start + len - from);
+            deferred.refresh(shadow, from as usize, bytes as usize, source);
         }
     }
 
