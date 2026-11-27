@@ -4608,17 +4608,17 @@ fn asked_spans(refreshed: &Refreshed) -> Vec<(usize, usize)> {
 /// title write between two of them is no refresh's, and the next
 /// submission that refreshes it takes it.
 ///
-/// The spans found so (copy, from, to): the first only, or with
-/// [`lift_stale`] all of them. Each refusal is counted
-/// (`crate::frame_budget::stale_refused`); `first`: this is the
+/// The spans found so (copy, from, to): with the relay's second stage
+/// ([`relay_exact`]) every one of them, else the first. Each refusal is
+/// counted (`crate::frame_budget::stale_refused`); `first`: this is the
 /// submission's first look.
 fn stale_under_flights(
     refreshed: &Refreshed,
     first: bool,
 ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-    // (Only with the relay's second stage, as the switch says: with
-    // `VICTORY_LATE_WAIT=2` alone the first span and 512 runs, as before.)
-    let all = lift_stale() && relay_exact();
+    // (With `VICTORY_LATE_WAIT=2` alone the first span and 512 runs, as
+    // before.)
+    let all = relay_exact();
     // On the profile: host copies looked at, runs merged (`late_exact`),
     // and whether a settle is due.
     let mut span = crate::profile::span("stale under flights");
@@ -4643,11 +4643,13 @@ fn stale_under_flights(
         crate::frame_budget::stale_bytes(hull, exact);
     }
     if late_exact() {
-        // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there (with `VICTORY_LIFT_STALE=1` more, and every
-        // span is merged).
+        // The title's bytes are put in beside the flights' writes; a wait
+        // is still due where that could not be done. At most this many
+        // changed runs go up to copies in the card's memory, each a copy of
+        // its own there (with the relay's second stage more, and every span
+        // is merged): cool_fox measured hundreds of short changed runs a
+        // page once lifted fills bring the pages of constants the title
+        // rewrites each frame here, at about 1.5 us a run.
         let budget = if all { 4096 } else { 512 };
         let mut runs_left = budget;
         let mut refused = Vec::new();
@@ -4694,27 +4696,6 @@ fn stale_under_flights(
         span.arg("stale", stale.len() as u64);
     }
     stale
-}
-
-/// Whether a submission that refreshes title memory the title wrote under
-/// flights' shader writes ([`stale_under_flights`]) waits only for the
-/// flights that may write those ranges, instead of settling every flight
-/// (`VICTORY_LIFT_STALE=1`; off by default, and only with [`relay_exact`]).
-///
-/// With it: every stale span is looked at, not only the first, with 4,096
-/// changed runs a submission put in under the writes instead of 512; the
-/// submission waits until no flight's shaders may still write any stale
-/// span (`Shadow::writes_pending_over`), asks the write watch again (the
-/// landings wrote title memory) and looks again, up to three times; what
-/// is still stale then settles as before ([`Host::settle_stale`]).
-///
-/// Why: lifted fills bring the pages of constants the title rewrites each
-/// frame here, which waited before at the reads themselves: cool_fox
-/// measured hundreds of short changed runs a page, more than 512 a
-/// submission, at about 1.5 us a run, and settled every flight for them.
-fn lift_stale() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIFT_STALE").is_some_and(|v| v == "1"))
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -7500,10 +7481,11 @@ impl Host {
     /// watch is asked again for `ranges`, the submission's one asking (what
     /// they landed is title memory written).
     ///
-    /// With [`lift_stale`] (and the relay's second stage) only the flights
-    /// that may write the spans are waited for, and the spans looked at
-    /// again, up to three times; what is left then, or without the switch
-    /// everything, settles every flight as before.
+    /// With the relay's second stage ([`relay_exact`]) only the flights that
+    /// may write the spans are waited for (`Shadow::writes_pending_over`;
+    /// later flights stay in the air), the write watch asked again and the
+    /// spans looked at again, up to three times; what is left then, or
+    /// without that stage everything, settles every flight as before.
     fn settle_stale(
         &self,
         submitted: &mut u64,
@@ -7519,13 +7501,16 @@ impl Host {
             let _refresh = crate::profile::refresh_scope();
             crate::watch::ask_once(ranges);
         };
-        if lift_stale() && relay_exact() {
+        if relay_exact() {
             for _ in 0..3 {
                 budget::measured(budget::Wait::Stale, || {
-                    relay_wait(WHY_STALE, |_| {
-                        stale.iter().all(|(shadow, from, to)| {
-                            !shadow.writes_pending_over(*from, *to - *from)
-                        })
+                    relay_wait(WHY_STALE, |line| {
+                        // (Or nothing is in the air: a range still pending
+                        // then is no flight's, and waiting would not end.)
+                        line.line.is_empty() && !line.settling
+                            || stale.iter().all(|(shadow, from, to)| {
+                                !shadow.writes_pending_over(*from, *to - *from)
+                            })
                     })
                 });
                 ask_again();

@@ -571,3 +571,143 @@ fn warp_send_own_memory_recycled_only_after_landing() {
     }
     unregister(0x57a1_e031, at as u64);
 }
+
+// ---- The targeted merge: every span merged, the narrowed wait ----
+
+#[test]
+fn warp_stale_600_runs_merge_without_settle() {
+    merge_does_not_reach_earlier_send(600);
+}
+
+#[test]
+fn warp_stale_merge_does_not_reach_earlier_queued_send_4096_runs() {
+    merge_does_not_reach_earlier_send(4096);
+}
+
+/// Three copies flights may write, each refreshed over what the title wrote
+/// there; the second's memory is not watched, so it refuses. Every other
+/// span is merged all the same, and only the refusing one is stale.
+#[test]
+fn warp_stale_all_spans_merged() {
+    let Some(host) = host() else { return };
+    let _flights = flights::TestFlights::on(false, false);
+    let mut copies = Vec::new();
+    for (i, watched) in [true, false, true].into_iter().enumerate() {
+        let at = title_memory(K64, watched);
+        let copy = copy_of(0x57a1_e041 + i, at, K64);
+        copy.update(at, K64);
+        copy.writing(at + 0x400, 0x400);
+        put(at + 0x500, &[0x60 + i as u8; 8]);
+        copies.push((at, copy));
+    }
+    let list = host.new_list().unwrap();
+    for (at, copy) in &copies {
+        copy.refresh(&list, *at as u64, K64 as u64);
+    }
+    list.close();
+    let refreshed = refreshed_ranges(&[&list]);
+    let _ = stale_seen();
+    let stale = stale_under_flights(&refreshed, true);
+    assert_eq!(stale.len(), 1);
+    assert!(
+        Arc::ptr_eq(&stale[0].0, &copies[1].1),
+        "the unwatched copy alone"
+    );
+    assert_eq!(stale_seen().1, 1, "one refusal");
+    for (i, (_, copy)) in copies.iter().enumerate() {
+        if i != 1 {
+            assert_eq!(
+                &crate::shadow::copy_bytes(copy)[0x500..0x508],
+                &[0x60 + i as u8; 8],
+                "merged beside the flights' writes"
+            );
+        }
+    }
+    for (i, (at, copy)) in copies.iter().enumerate() {
+        copy.copy_back_done(&[(at + 0x400, at + 0x800)]);
+        unregister(0x57a1_e041 + i, *at as u64);
+    }
+    list.reset();
+}
+
+/// Two flights, a hold on the queue in front of each: the first may write a
+/// copy whose memory is not watched, the second another copy. A submission
+/// refreshing the first's range refuses and waits, but only until the first
+/// flight has landed (its hold goes after a while); the second stays in the
+/// air, and the look after the wait finds nothing stale.
+#[test]
+fn warp_stale_narrowed_wait_leaves_other_flight_in_air() {
+    let Some(host) = host() else { return };
+    let flights = flights::TestFlights::on(false, false);
+    let (x, y) = (title_memory(K64, false), title_memory(K64, false));
+    let one_copy = copy_of(0x57a1_e051, x, K64);
+    let two_copy = copy_of(0x57a1_e052, y, K64);
+    one_copy.update(x, K64);
+    two_copy.update(y, K64);
+    let (first_hold, one) = held_flight(host, &one_copy, x + 0x400, 0x400);
+    let (second_hold, two) = held_flight(host, &two_copy, y + 0x400, 0x400);
+    assert_eq!(flights::in_air(), 2);
+    put(x + 0x500, &[0x42; 8]);
+    let three = refresher(host, &one_copy, &[(x, x + K64)]);
+    let first = first_hold.released().after(200);
+    // Were it to wait for everything, the second goes after a while.
+    let second = second_hold.released().after(3000);
+    let _ = stale_seen();
+    host.send_for_test(&three);
+    let left_in_air = flights::in_air();
+    let (waited, refused) = stale_seen();
+    second_hold.release();
+    flights.land_all();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(waited, "a wait for stale spans");
+    assert_eq!(refused, 1, "refused once, nothing stale after the wait");
+    assert_eq!(
+        left_in_air, 2,
+        "the second flight and the submission are in the air"
+    );
+    assert_eq!(
+        &crate::shadow::copy_bytes(&one_copy)[0x500..0x508],
+        &[0x42; 8],
+        "refreshed after the first flight landed"
+    );
+    drop(first_hold);
+    for list in [one, two, three] {
+        list.reset();
+    }
+    unregister(0x57a1_e051, x as u64);
+    unregister(0x57a1_e052, y as u64);
+}
+
+/// A span that stays stale after each narrowed wait (here a range declared
+/// with no flight to free it, while a flight is in the air): looked at again
+/// three times, then every flight settles and the submission goes on.
+#[test]
+fn warp_stale_third_failure_full_settle() {
+    let Some(host) = host() else { return };
+    let flights = flights::TestFlights::on(false, false);
+    let (x, y) = (title_memory(K64, false), title_memory(K64, false));
+    let stuck = copy_of(0x57a1_e061, x, K64);
+    let other = copy_of(0x57a1_e062, y, K64);
+    stuck.update(x, K64);
+    other.update(y, K64);
+    let (hold, one) = held_flight(host, &other, y + 0x400, 0x400);
+    stuck.writing(x + 0x400, 0x400);
+    let two = refresher(host, &stuck, &[(x, x + K64)]);
+    let released = hold.released().after(200);
+    let _ = stale_seen();
+    host.send_for_test(&two);
+    let (waited, refused) = stale_seen();
+    flights.land_all();
+    released.join().unwrap();
+    assert!(waited, "waited");
+    assert_eq!(refused, 4, "the first look and three after waits");
+    assert_eq!(flights::in_air(), 0);
+    stuck.copy_back_done(&[(x + 0x400, x + 0x800)]);
+    drop(hold);
+    for list in [one, two] {
+        list.reset();
+    }
+    unregister(0x57a1_e061, x as u64);
+    unregister(0x57a1_e062, y as u64);
+}
