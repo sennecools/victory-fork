@@ -1820,8 +1820,8 @@ mod tests {
         TABLE.write(5, 1, &words[0]);
         let stop = std::sync::atomic::AtomicBool::new(false);
         let written = std::sync::atomic::AtomicU64::new(0);
-        // Each reader stops at `READS` or after half a second.
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        // Each reader stops at `READS` or half a second after the warm-up.
+        let until = std::sync::OnceLock::new();
         std::thread::scope(|scope| {
             // The writer first, and some of its writes before any read.
             let writer = scope.spawn(|| {
@@ -1842,12 +1842,17 @@ mod tests {
             {
                 std::hint::spin_loop();
             }
+            until.get_or_init(|| std::time::Instant::now() + std::time::Duration::from_millis(500));
             let readers: Vec<_> = (0..4)
                 .map(|_| {
                     scope.spawn(|| {
                         let mut seen = [0u64; 2];
                         for n in 0..READS {
-                            if n % 1024 == 0 && std::time::Instant::now() >= until {
+                            if n % 1024 == 1023
+                                && until
+                                    .get()
+                                    .is_some_and(|&until| std::time::Instant::now() >= until)
+                            {
                                 break;
                             }
                             let read = TABLE.read(5, 1).expect("at its generation");
