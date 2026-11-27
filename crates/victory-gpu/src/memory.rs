@@ -972,7 +972,12 @@ pub(crate) fn ready(
             match numbered {
                 Some(Numbered::Copy(shadow)) => {
                     let (start, len) = shadow.span();
-                    shadow.gpu_writes(list, start, len);
+                    shadow.gpu_writes_from(
+                        list,
+                        start,
+                        len,
+                        crate::frame_budget::Declarer::Directory,
+                    );
                 }
                 // Told after the wait ([`after_wait`]).
                 Some(Numbered::Chunk { .. }) => {

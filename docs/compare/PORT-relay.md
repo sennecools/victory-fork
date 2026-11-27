@@ -41,7 +41,7 @@ test cannot toggle them; set them on the test process.
 |---|---|---|---|---|
 | `VICTORY_LIFT_CLOSURE` | off | `1` on; anything else off | Copies that write what a lifted step reads or writes, or read what a lifted copy writes, and liftable fills that read what a lifted copy writes, are lifted too, round by round, ahead or behind, instead of the plan aborting with "a CPU copy writes it". Recorded in step order, each step between its own barriers. Aborts: a texture behind a lifted copy over its memory, a step of ours, an unliftable fill over flights' writes or behind a taken copy, more than 12,288 steps ("too many steps taken along") | Lifts made: `VICTORY_LIFT_READS=1`/`2` or `VICTORY_R5_LIFT=1`, which need `VICTORY_RELAY=2`. With `VICTORY_LIFT_READS=count` it plans and counts only |
 | `VICTORY_LIFT_JOIN` | off | `1` on | The closure joins its ranges once a round and looks each place's host copy up once a plan. Same plan; only planning time differs | `VICTORY_LIFT_CLOSURE=1` |
-| `VICTORY_LIFT_STALE` | off | `1` on | Every stale span under flights' writes is kept (4,096 runs, not 512); `settle_stale` waits only for the flights that may write them, re-asks the write watch, looks again, up to 3 times, then settles everything as before | `VICTORY_RELAY=2` (`relay_exact`); without it nothing changes |
+| `VICTORY_LIFT_STALE` | removed | | Its on side is the design: with `VICTORY_LATE_WAIT` at 2 or more every stale span is merged (4,096 changed runs a submission); with `VICTORY_RELAY=2` (`relay_exact`) what still refuses waits only for the flights that may write it, up to three times, before everything settles | Merge: `VICTORY_LATE_WAIT>=2`; narrowed wait: `VICTORY_RELAY=2` |
 | `VICTORY_LIFT_UPLOADS` | off | `1` on | Texture upload buffers lie in shared memory (custom heap, write-back, L0) and their fills can be lifted like scratch-chunk fills, instead of aborting with "a fill into upload memory". The zeros of new texture levels stay in upload memory | Fills lifted: `VICTORY_LIFT_READS=2` or `VICTORY_R5_LIFT=1` (checked on every call) |
 | `VICTORY_CARD_AWAKE` | off | `1` on; `turns` 20 s on / 20 s off, logged at each turn; anything else off | While a late-path submission went out in the last 250 ms, one group of 64 threads counts (400,000 multiply-adds, about 2 ms at full clocks per cool_fox) on its own compute queue, so the card does not drop its clocks between submissions | The late path (`VICTORY_LATE_WAIT`, the relay); with every submission waited for it does nothing |
 
@@ -94,7 +94,6 @@ Run on the lane's final code (before this docs commit):
    base), then once per line:
    - `VICTORY_LIFT_CLOSURE=1`
    - `VICTORY_LIFT_CLOSURE=1 VICTORY_LIFT_JOIN=1`
-   - `VICTORY_LIFT_STALE=1`
    - `VICTORY_LIFT_UPLOADS=1`, then with `VICTORY_LIFT_CLOSURE=1`
    - `VICTORY_CARD_AWAKE=1`, then `turns` (no "the card is not kept
      awake" warning; clean exit)
@@ -106,10 +105,9 @@ Run on the lane's final code (before this docs commit):
    1. `VICTORY_LIFT_CLOSURE=1`
    2. `+ VICTORY_LIFT_JOIN=1`
    3. `VICTORY_LIFT_UPLOADS=1` (alone, then with the closure)
-   4. `VICTORY_LIFT_STALE=1`
-   5. `VICTORY_CARD_AWAKE=1`; then `turns` in one run (compare the on and
+   4. `VICTORY_CARD_AWAKE=1`; then `turns` in one run (compare the on and
       off turns)
-   6. all of them
+   5. all of them
 
    Measure, from the frametime CSV: `ms_per_frame`, `frame_ms_max`,
    `frame_ms_avg`, `cpu_prepare_ms`, `gpu_ms`, `gpu_pct`, `copies_ms`,
@@ -120,8 +118,9 @@ Run on the lane's final code (before this docs commit):
    with the uploads, watch for "not one copy" and "too many steps taken
    along" growing; "steps taken beyond those over flights' writes"), the
    settles line (ms waiting in settles, flights each time) and its
-   by-reason line ("title memory changed under shader writes" should drop
-   with `LIFT_STALE`), and the title-bytes-under-writes line. For the
+   by-reason line ("title memory changed under shader writes": under
+   `VICTORY_RELAY=2` most of it is now the narrowed stale wait, not a
+   settle), and the title-bytes-under-writes line. For the
    closure and join, compare `cpu_prepare_ms` with and without the join.
 
 ## Risks to check on the PC
@@ -130,11 +129,13 @@ Run on the lane's final code (before this docs commit):
   kind on the card's side than upload memory, unmeasured on the RX 9070
   XT. Check textures fed through these buffers are right on WARP and the
   card, and that `textures_ms` does not grow.
-- **Waits in `settle_stale` under the submission lock**
-  (`VICTORY_LIFT_STALE`): the submitting thread waits for flights up to
-  three times. A waited span is assumed to clear once its flight lands;
-  if it does not, the three rounds pass and it settles anyway. Look for
-  longer submit times, stalls, and title memory a submission late.
+- **Waits in `settle_stale` under the submission lock** (the narrowed
+  stale wait under `VICTORY_RELAY=2`): the submitting thread waits for
+  flights up to three times. Each wait ends when no flight may still
+  write the stale spans, or when nothing is in the air (a span still
+  pending then is no flight's); after the third look what is left
+  settles everything. Look for longer submit times, stalls, and title
+  memory a submission late.
 - **Planning cost of R5_LIFT plus the closure**: up to 12,288 lifts a
   plan, planned on the submitting thread under the submission lock.
   Compare `cpu_prepare_ms` with and without `VICTORY_LIFT_JOIN=1`.
@@ -184,9 +185,10 @@ Run on the lane's final code (before this docs commit):
   until then the card-awake queue may send for up to 250 ms after the
   release (on its own buffer, nothing of the title's). Its `ENDED` is
   not read from `ending()`, which is per thread under test there.
-- No unit tests for `VICTORY_LIFT_STALE`, `VICTORY_LIFT_UPLOADS` (cool_fox
-  has none) or the `over_lifted_homes` index (needs real shadows): WARP
-  tests and game runs only.
+- The stale path has WARP tests in `host/tests/stale.rs`. No unit tests
+  for `VICTORY_LIFT_UPLOADS` (cool_fox has none) or the
+  `over_lifted_homes` index (needs real shadows): WARP tests and game
+  runs only.
 - Formatting: the base is not rustfmt-clean (`cargo fmt --all` rewrites
   about 60 files), so it was not run over the tree. New files pass
   `rustfmt --edition 2024 --check` with our `rustfmt.toml`; hunks in

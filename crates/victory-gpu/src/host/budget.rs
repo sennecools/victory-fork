@@ -132,4 +132,5 @@ pub(super) fn line(frames: f64) {
     );
     crate::frame_budget::wave1_line(frames, crate::descriptor::host::levels_seen());
     crate::frame_budget::h2_line(frames);
+    crate::frame_budget::stale_line(frames);
 }

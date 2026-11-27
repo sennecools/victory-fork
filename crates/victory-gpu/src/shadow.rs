@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::frame_budget::{Declarer, Refused, StaleRefusal};
 use crate::host::{HostList, host};
 use crate::watch::{PAGE, Taken};
 use std::ops::ControlFlow;
@@ -862,7 +863,7 @@ pub(crate) fn relay() -> bool {
 }
 
 /// The submission being prepared (its number among those started): what
-/// [`Shadow::writing`] counts a declared range for ([`Flights`]).
+/// [`Shadow::writing_by`] counts a declared range for ([`Flights`]).
 static PREPARED: AtomicU64 = AtomicU64::new(0);
 
 /// A submission's preparing begins (`crate::host`, under the submission
@@ -884,28 +885,40 @@ pub(crate) fn relay_fetched(number: u64) {
 
 /// With [`relay`]: how many submissions that are not copied back yet
 /// declared each range shaders may be writing (range, count, the last
-/// submission that declared it).
+/// submission that declared it, and where that one declared it).
 ///
 /// Without it a range declared by two flights was one entry, and the end
 /// of the first flight's copy-back removed it while the second was still
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
 #[derive(Default)]
-struct Flights(Vec<((usize, usize), u32, u64)>);
+struct Flights(Vec<((usize, usize), u32, u64, Declarer)>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
     /// often it declares it.
+    #[cfg(test)]
     fn declare(&mut self, range: (usize, usize), number: u64) {
+        self.declare_by(range, number, Declarer::Other);
+    }
+
+    /// [`Flights::declare`], declared by `by`.
+    fn declare_by(&mut self, range: (usize, usize), number: u64, by: Declarer) {
         match self.0.iter_mut().find(|f| f.0 == range) {
             Some(f) => {
                 if f.2 != number {
                     f.1 += 1;
                     f.2 = number;
+                    f.3 = by;
                 }
             }
-            None => self.0.push((range, 1, number)),
+            None => self.0.push((range, 1, number, by)),
         }
+    }
+
+    /// The last submission that declared `range`, and where.
+    fn last(&self, range: (usize, usize)) -> Option<(u64, Declarer)> {
+        self.0.iter().find(|f| f.0 == range).map(|f| (f.2, f.3))
     }
 
     /// One submission that declared `ranges` (each once) is copied back:
@@ -1620,7 +1633,7 @@ const WIDE_JOB: usize = 1 << 20;
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 
 /// With [`wide_back`], when a submission's refreshes are done and before
-/// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
+/// its lists go to the card: takes the snapshots [`Shadow::writing_by`] noted.
 /// Nothing to do without the switch.
 pub(crate) fn take_snapshots() {
     let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
@@ -3021,7 +3034,7 @@ impl crate::home::Home for Shadow {
         if self.place.is_some() && self.core.is_none() {
             return;
         }
-        // A home of the memory core is declared as a copy is, and `writing`,
+        // A home of the memory core is declared as a copy is, and `writing_by`,
         // `copy_back_with` and `copy_back_done` do nothing for it: after the
         // wait the submission tells the copies over the same bytes
         // (`crate::home::after_wait`).
@@ -3297,6 +3310,18 @@ impl Shadow {
         crate::home::Home::gpu_may_write(self, list, address, len);
     }
 
+    /// [`Shadow::gpu_writes`], declared at `by` (the frame budget's stale
+    /// refusals count who declared the ranges they met).
+    pub(crate) fn gpu_writes_from(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        by: Declarer,
+    ) {
+        crate::frame_budget::declaring(by, || self.gpu_writes(list, address, len));
+    }
+
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
     /// one snapshot per copy and submission, each byte taken once, when the
@@ -3304,8 +3329,9 @@ impl Shadow {
     /// views of its 174 MB heap dozens of times, from different offsets: a
     /// snapshot grown to cover each was copied whole every time), in reused
     /// memory (fresh snapshots cost ~2.3 million page faults per world
-    /// frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// frame). `by` is where the range was declared, kept with the relay's
+    /// per-flight record for the stale refusals' counts.
+    pub(crate) fn writing_by(&self, address: usize, len: usize, by: Declarer) {
         if self.place.is_some() {
             return;
         }
@@ -3314,7 +3340,11 @@ impl Shadow {
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
         if relay() {
-            self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
+            self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare_by(
+                range,
+                PREPARED.load(Ordering::Relaxed),
+                by,
+            );
         }
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
@@ -3414,7 +3444,7 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written. The range must lie in ranges declared with
-    /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
+    /// [`Shadow::writing_by`] and not yet done: `Host::execute` passes the
     /// union of a submission's ranges, each byte once, then calls
     /// [`Shadow::copy_back_done`].
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
@@ -3435,7 +3465,7 @@ impl Shadow {
         if let Some(before) = &*snapshot
             && from < to
         {
-            // SAFETY: `writing` set the snapshot's bytes of every declared
+            // SAFETY: `writing_by` set the snapshot's bytes of every declared
             // range, at the copy's offsets.
             let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -3591,7 +3621,7 @@ impl Shadow {
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
-        // (`writing`), and these offsets are in a range declared and not
+        // (`writing_by`), and these offsets are in a range declared and not
         // done with, whose bytes it holds; nothing else touches them
         // without the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
@@ -3820,31 +3850,40 @@ impl Shadow {
     /// snapshot, so the compare after the card ran takes them for the
     /// title's and not the shaders').
     ///
-    /// Whether the caller must still settle the flights: the journal
-    /// cannot say what was written, a snapshot is missing, or `runs_left`
-    /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    /// `Err` where the caller must still wait for the flights, with why:
+    /// the journal cannot say what was written, a snapshot is missing, or
+    /// `runs_left` ran out. Pages done before that stay done.
+    pub(crate) fn merge_under_writes(
+        &self,
+        address: usize,
+        len: usize,
+        runs_left: &mut usize,
+    ) -> Result<(), Refused> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
-            return false;
+            return Ok(());
         }
-        let busy: Vec<(usize, usize)> = self
+        // Each with the declared range it is cut from.
+        let busy: Vec<((usize, usize), usize, usize)> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .map(|&(a, e)| ((a, e), a.max(from), e.min(to)))
             .collect();
-        if busy.is_empty() {
-            return false;
-        }
+        let Some(&(first, ..)) = busy.first() else {
+            return Ok(());
+        };
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            return Err(self.refused(StaleRefusal::NotWatched, first));
         }
         let mut title = vec![0u8; PAGE];
-        for (a, e) in busy {
+        // Whether a page was looked at before (a card copy's runs ran out
+        // on its first page, or a later one).
+        let mut looked = false;
+        for (declared, a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
@@ -3852,7 +3891,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some(now) = crate::watch::writes_now(a, e, true) else {
-                return true;
+                return Err(self.refused(StaleRefusal::JournalSilent, declared));
             };
             let stale = stale_pages_in(&self.taken.lock().unwrap_or_else(|e| e.into_inner()), a, e);
             for page in stale {
@@ -3885,7 +3924,7 @@ impl Shadow {
                     // queue behind the flights writing it, whose merges
                     // into the home are there by then.
                     if *runs_left == 0 {
-                        return true;
+                        return Err(self.refused(StaleRefusal::HomeRunsOut, declared));
                     }
                     *runs_left -= 1;
                     self.card_changed(at, at + n);
@@ -3896,7 +3935,12 @@ impl Shadow {
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let Some(runs) = changed_runs_limited(title, held, *runs_left) else {
-                        return true;
+                        let why = if looked {
+                            StaleRefusal::CardRunsOutLater
+                        } else {
+                            StaleRefusal::CardRunsOutFirst
+                        };
+                        return Err(self.refused(why, declared));
                     };
                     *runs_left -= runs.len();
                     for (r, m) in runs {
@@ -3907,10 +3951,10 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
-                        return true;
+                        return Err(self.refused(StaleRefusal::NoSnapshot, declared));
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
+                    // bytes at the copy's offsets (`writing_by`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
                     for (r, m) in changed_runs(title, held) {
@@ -3924,6 +3968,7 @@ impl Shadow {
                     }
                 }
                 drop(before);
+                looked = true;
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
@@ -3933,7 +3978,47 @@ impl Shadow {
                 }
             }
         }
-        false
+        Ok(())
+    }
+
+    /// A refusal of [`Shadow::merge_under_writes`] for `why`, at the
+    /// declared range `declared`: who declared it last, and whether that is
+    /// the submission sent just before the one being prepared.
+    fn refused(&self, why: StaleRefusal, declared: (usize, usize)) -> Refused {
+        let last = if relay() {
+            self.flights.lock().unwrap_or_else(|e| e.into_inner()).last(declared)
+        } else {
+            None
+        };
+        let prepared = PREPARED.load(Ordering::Relaxed);
+        Refused {
+            why,
+            by: last.map_or(Declarer::Other, |l| l.1),
+            newest: last.is_some_and(|l| l.0 + 1 >= prepared),
+        }
+    }
+
+    /// Bytes of title memory `[from, to)` that a flight's shaders may be
+    /// writing in the copy (each byte once).
+    pub(crate) fn pending_bytes(&self, from: usize, to: usize) -> u64 {
+        let mut over: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect();
+        over.sort_unstable();
+        let (mut bytes, mut at) = (0, from);
+        for (a, e) in over {
+            let a = a.max(at);
+            if e > a {
+                bytes += (e - a) as u64;
+                at = e;
+            }
+        }
+        bytes
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -4149,6 +4234,10 @@ impl Shadow {
             self.card_changed(from - start, to - start);
             return 0;
         }
+        crate::frame_budget::copied(
+            (to - from) as u64,
+            !from.is_multiple_of(PAGE) || !to.is_multiple_of(PAGE),
+        );
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -4212,6 +4301,27 @@ impl Shadow {
             crate::card_home::uploaded(bytes);
         }
         bytes
+    }
+
+    /// Of a copy in the card's memory with a CPU side of its own: its CPU
+    /// side's bytes at `runs` (offset in the copy, offset from `to`,
+    /// bytes) are copied to memory at `to`, as they are now
+    /// (`crate::host`'s send memory). Under the reference's lock: the relay's
+    /// landing writes the CPU side under it.
+    ///
+    /// # Safety
+    ///
+    /// `to` has room for every run; the runs lie in the copy.
+    pub(crate) unsafe fn card_take(&self, runs: &[(usize, u64, usize)], to: *mut u8) {
+        debug_assert!(self.card.is_some() && self.card_home().is_none());
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        for &(a, at, n) in runs {
+            // SAFETY: the caller's; the CPU side maps the copy's bytes, and
+            // only this thread and the landing (under the lock held) write it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data.add(a).cast_const(), to.add(at as usize), n)
+            };
+        }
     }
 
     /// For a copy in the card's memory whose CPU side is a home
@@ -4706,6 +4816,36 @@ pub(crate) fn table_placed_for_test(resource: usize, placed: crate::inplace::Pla
 #[cfg(test)]
 pub(crate) fn tabled_copy(start: u64) -> Option<Arc<Shadow>> {
     buffers().range((start, 0)..=(start, usize::MAX)).find_map(|(_, entry)| entry.shadow.clone())
+}
+
+/// Whether a title buffer or a window in the tables holds any of
+/// `[start, end)` (tests: memory an earlier test released may still have
+/// copies there).
+#[cfg(test)]
+pub(crate) fn tabled_over(start: u64, end: u64) -> bool {
+    buffers().iter().any(|(key, entry)| key.0 < end && entry.end > start)
+        || LOOSE.lock().unwrap_or_else(|e| e.into_inner()).keys().any(|&(a, len)| a < end && a + len > start)
+}
+
+#[cfg(test)]
+impl Shadow {
+    /// [`Shadow::writing_by`] from no site in particular (tests).
+    pub(crate) fn writing(&self, address: usize, len: usize) {
+        self.writing_by(address, len, Declarer::Other);
+    }
+
+    /// The copy's snapshot is let go, as if it were never taken (tests).
+    pub(crate) fn drop_snapshot_for_test(&self) {
+        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            give_back(bytes);
+        }
+    }
+
+    /// The last submission that declared `range` with the relay, and where
+    /// (tests).
+    pub(crate) fn declared_by_for_test(&self, range: (usize, usize)) -> Option<(u64, Declarer)> {
+        self.flights.lock().unwrap_or_else(|e| e.into_inner()).last(range)
+    }
 }
 
 /// A copy's bytes as the host copy holds them (tests).

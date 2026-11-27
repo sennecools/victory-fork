@@ -37,6 +37,9 @@ pub(crate) use ending::{
 };
 #[cfg(test)]
 pub(crate) use ending::{refused_count, reset_for_test};
+/// Each submission's sends to copies in the card's memory read memory of
+/// its own, not the copies' CPU sides.
+mod send;
 /// R5 flush (`VICTORY_R5_FLUSH=1`): less work at submission, and its counters.
 pub(crate) mod r5_flush;
 /// R5's refreshes over flights' homes done on the card, and what its waits
@@ -945,6 +948,9 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Title bytes under flights' shader writes.
+    mod stale;
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -3083,6 +3089,9 @@ struct CardPlan {
     /// With [`relay`], the number of this plan's send of changed ranges
     /// (`QUEUE_ORDER`); else 0.
     sent_as: u64,
+    /// With [`send::own`]: the memory its sends come from, given back by
+    /// `Host::card_done` (boxed: flights in the line hold plans).
+    sends: Option<Box<send::Memory>>,
     /// Whether the compare's list fetches the flagged pieces itself
     /// ([`inflight_fetch`]): every compared range has its [`CARD_FETCH`].
     inflight: bool,
@@ -3112,8 +3121,14 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy,
+    /// declared at a site of the frame budget's.
+    GpuWrite(
+        std::sync::Arc<crate::shadow::Shadow>,
+        usize,
+        usize,
+        crate::frame_budget::Declarer,
+    ),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture {
@@ -3201,7 +3216,7 @@ impl Step {
     /// declared writes, or a lifted copy's destination.
     fn card_writes(&self) -> Option<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
         match self {
-            Step::GpuWrite(shadow, address, len) => Some((shadow, *address, *len)),
+            Step::GpuWrite(shadow, address, len, _) => Some((shadow, *address, *len)),
             Step::Lifted(lift) => match &lift.to {
                 LiftedTo::Copy(dst, at, _) => Some((dst, *at, lift.len)),
                 LiftedTo::Fill(..) | LiftedTo::Refresh(_) => None,
@@ -4566,64 +4581,110 @@ unsafe fn record_lifts(list: &ID3D12GraphicsCommandList, lifts: &[LiftCopy]) {
     }
 }
 
-/// With flights in the air, after the submission's write-watch asking:
-/// whether `runs` refresh a range of a host copy that a flight's shaders
-/// may write and that the title wrote since it was last copied. The
-/// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
-/// the title's bytes there would reach the card a submission late.
-///
-/// The spans found so (copy, from, to): the first only, or with
-/// [`lift_stale`] all of them.
-fn stale_under_flights(
-    runs: &[&HostList],
-) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-    use std::sync::Arc;
-    // (Only with the relay's second stage, as the switch says: with
-    // `VICTORY_LATE_WAIT=2` alone the first span and 512 runs, as before.)
-    let all = lift_stale() && relay_exact();
-    // On the profile: host copies looked at, runs merged (`late_exact`),
-    // and whether a settle is due.
-    let mut span = crate::profile::span("stale under flights");
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+/// The host copies a submission refreshes, each found by its address: the
+/// copy and the ranges its steps refresh (a lifted read's too), in order and
+/// joined where they overlap or touch ([`join_ranges`]). One walk over the
+/// lists' steps serves the write-watch asking ([`asked_spans`]) and every
+/// look for stale spans ([`stale_under_flights`]); it is not filtered, so
+/// that each look sees the copies' pending writes as they are then.
+type Refreshed = std::collections::HashMap<
+    usize,
+    (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>),
+>;
+
+/// [`Refreshed`] of `runs`.
+fn refreshed_ranges(runs: &[&HostList]) -> Refreshed {
+    let mut refreshed = Refreshed::new();
     for list in runs {
         for step in &list.deferred().copies {
-            // (A lifted read's ranges are refreshed too.)
             for (shadow, address, len) in step.refreshes() {
-                if !shadow.writes_pending() {
-                    continue;
-                }
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(address), s.2.max(address + len)),
-                    None => spans.push((shadow.clone(), address, address + len)),
-                }
+                refreshed
+                    .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                    .or_insert_with(|| (shadow.clone(), Vec::new()))
+                    .1
+                    .push((address, address + len));
             }
         }
     }
+    for (_, ranges) in refreshed.values_mut() {
+        join_ranges(ranges, []);
+    }
+    refreshed
+}
+
+/// What the submission's one write-watch asking covers: per copy that is
+/// write-watched (or not known yet), the span of its refreshed ranges.
+/// Asking about more than is refreshed costs nothing that matters.
+fn asked_spans(refreshed: &Refreshed) -> Vec<(usize, usize)> {
+    refreshed
+        .values()
+        .filter(|(shadow, ranges)| !shadow.unwatched() && !ranges.is_empty())
+        .map(|(_, ranges)| (ranges[0].0, ranges[ranges.len() - 1].1))
+        .collect()
+}
+
+/// With flights in the air, after the submission's write-watch asking:
+/// whether the submission refreshes a range of a host copy that a flight's
+/// shaders may write and that the title wrote since it was last copied.
+/// The refresh leaves ranges shaders are writing alone (`Shadow::update`),
+/// so the title's bytes there would reach the card a submission late.
+/// Only the refreshed ranges count (`refreshed`, [`refreshed_ranges`]): a
+/// title write between two of them is no refresh's, and the next
+/// submission that refreshes it takes it.
+///
+/// The spans found so (copy, from, to), every one of them. Each refusal is
+/// counted (`crate::frame_budget::stale_refused`); `first`: this is the
+/// submission's first look.
+fn stale_under_flights(
+    refreshed: &Refreshed,
+    first: bool,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    // On the profile: host copies looked at, runs merged (`late_exact`),
+    // and whether a settle is due.
+    let mut span = crate::profile::span("stale under flights");
+    // Each refreshed range of a copy flights may be writing.
+    let (mut spans, mut copies) = (Vec::new(), 0u64);
+    let (mut hull, mut exact) = (0, 0);
+    for (shadow, ranges) in refreshed.values() {
+        if ranges.is_empty() || !shadow.writes_pending() {
+            continue;
+        }
+        copies += 1;
+        // On the first look: how much of what flights may write those
+        // ranges hold, and their copy's hull (the looks after a wait,
+        // under the submission lock, need not pay for it again).
+        if first {
+            hull += shadow.pending_bytes(ranges[0].0, ranges[ranges.len() - 1].1);
+            exact += ranges.iter().map(|&(a, e)| shadow.pending_bytes(a, e)).sum::<u64>();
+        }
+        spans.extend(ranges.iter().map(|&(a, e)| (shadow.clone(), a, e)));
+    }
+    if first {
+        crate::frame_budget::stale_bytes(hull, exact);
+    }
     if late_exact() {
-        // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there (with `VICTORY_LIFT_STALE=1` more, and every
-        // span is merged).
-        let budget = if all { 4096 } else { 512 };
+        // The title's bytes are put in beside the flights' writes, in every
+        // span; a wait is still due where that could not be done. At most
+        // this many changed runs go up to copies in the card's memory, each
+        // a copy of its own there: cool_fox measured hundreds of short
+        // changed runs a page once lifted fills bring the pages of
+        // constants the title rewrites each frame here, at about 1.5 us a
+        // run.
+        let budget = 4096;
         let mut runs_left = budget;
-        let copies = spans.len() as u64;
-        let stale: Vec<_> = if all {
-            spans.retain(|(shadow, from, to)| {
-                shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
-            });
-            spans
-        } else {
-            spans
-                .into_iter()
-                .find(|(shadow, from, to)| {
-                    shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
-                })
-                .into_iter()
-                .collect()
+        let mut refused = Vec::new();
+        let mut merge = |shadow: &crate::shadow::Shadow, from: usize, to: usize| {
+            match shadow.merge_under_writes(from, to - from, &mut runs_left) {
+                Ok(()) => false,
+                Err(why) => {
+                    refused.push(why);
+                    true
+                }
+            }
         };
+        let stale: Vec<_> =
+            spans.into_iter().filter(|(shadow, from, to)| merge(shadow, *from, *to)).collect();
+        crate::frame_budget::stale_refused(&refused, first);
         if let Some(span) = span.as_mut() {
             span.arg("copies", copies);
             span.arg("merged", budget.saturating_sub(runs_left) as u64);
@@ -4631,43 +4692,15 @@ fn stale_under_flights(
         }
         return stale;
     }
-    let copies = spans.len() as u64;
-    let stale: Vec<_> = if all {
-        spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
-        spans
-    } else {
-        spans
-            .into_iter()
-            .find(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
-            .into_iter()
-            .collect()
-    };
+    let stale: Vec<_> = spans
+        .into_iter()
+        .filter(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+        .collect();
     if let Some(span) = span.as_mut() {
         span.arg("copies", copies);
         span.arg("stale", stale.len() as u64);
     }
     stale
-}
-
-/// Whether a submission that refreshes title memory the title wrote under
-/// flights' shader writes ([`stale_under_flights`]) waits only for the
-/// flights that may write those ranges, instead of settling every flight
-/// (`VICTORY_LIFT_STALE=1`; off by default, and only with [`relay_exact`]).
-///
-/// With it: every stale span is looked at, not only the first, with 4,096
-/// changed runs a submission put in under the writes instead of 512; the
-/// submission waits until no flight's shaders may still write any stale
-/// span (`Shadow::writes_pending_over`), asks the write watch again (the
-/// landings wrote title memory) and looks again, up to three times; what
-/// is still stale then settles as before ([`Host::settle_stale`]).
-///
-/// Why: lifted fills bring the pages of constants the title rewrites each
-/// frame here, which waited before at the reads themselves: cool_fox
-/// measured hundreds of short changed runs a page, more than 512 a
-/// submission, at about 1.5 us a run, and settled every flight for them.
-fn lift_stale() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIFT_STALE").is_some_and(|v| v == "1"))
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -5410,6 +5443,7 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
+    send::line(frames);
 }
 
 #[cfg(test)]
@@ -6271,6 +6305,8 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // The bytes as they are now, whatever later submissions put there.
+        let own = if send::own() { send::take(self, &dirty) } else { None };
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -6283,11 +6319,17 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    // From the CPU side: the staging buffer, or the home
-                    // that is title memory itself (`crate::card_home`).
-                    let copies = |shadow: &crate::shadow::Shadow, ranges: &[(usize, usize)]| {
+                    // From the submission's own memory ([`send`]), or from
+                    // the CPU side: the staging buffer, or the home that is
+                    // title memory itself (`crate::card_home`).
+                    let copies = |i: usize,
+                                  shadow: &crate::shadow::Shadow,
+                                  ranges: &[(usize, usize)]| {
                         crate::spans::mark(list, crate::spans::Span::Upload);
-                        let bytes = shadow.card_upload(list, ranges);
+                        let bytes = match own.as_ref().and_then(|own| own.upload(list, i, shadow)) {
+                            Some(bytes) => bytes,
+                            None => shadow.card_upload(list, ranges),
+                        };
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                     };
@@ -6296,11 +6338,11 @@ impl Host {
                     let wide = work.wide;
                     if wide {
                         let mut barriers = Vec::new();
-                        for (shadow, ranges) in &dirty {
+                        for (i, (shadow, ranges)) in dirty.iter().enumerate() {
                             let Some((_, before, _)) = shadow.card_sides() else {
                                 continue;
                             };
-                            copies(shadow, ranges);
+                            copies(i, shadow, ranges);
                             if before.is_some() && !ranges.is_empty() {
                                 barriers.push(transition(
                                     &shadow.buffer,
@@ -6313,12 +6355,12 @@ impl Host {
                             list.ResourceBarrier(&barriers);
                         }
                     }
-                    for (shadow, ranges) in &dirty {
+                    for (i, (shadow, ranges)) in dirty.iter().enumerate() {
                         let Some((_, before, size)) = shadow.card_sides() else {
                             continue;
                         };
                         if !wide {
-                            copies(shadow, ranges);
+                            copies(i, shadow, ranges);
                         }
                         let Some(before) = before else {
                             continue;
@@ -6383,6 +6425,7 @@ impl Host {
             _synced: Vec::new(),
             lists: used,
             sent_as,
+            sends: own.map(|own| Box::new(own.memory())),
             inflight: false,
             inflight_landed: 0,
         };
@@ -6584,6 +6627,9 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
+        if let Some(memory) = plan.sends {
+            send::give_back(*memory);
+        }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -7434,20 +7480,21 @@ impl Host {
     /// signals behind them. `submitted` is the submission lock's value;
     /// `why` one of the `WHY_` places. Nothing happens if nothing flies.
     ///
-    /// For a submission of `runs` that refreshes the spans `stale` of host
-    /// copies, which flights may be writing and the title wrote too
-    /// ([`stale_under_flights`]): the flights land first, and the write
+    /// For a submission that refreshes `refreshed` ([`refreshed_ranges`]),
+    /// the spans `stale` of which flights may be writing and the title wrote
+    /// too ([`stale_under_flights`]): the flights land first, and the write
     /// watch is asked again for `ranges`, the submission's one asking (what
     /// they landed is title memory written).
     ///
-    /// With [`lift_stale`] (and the relay's second stage) only the flights
-    /// that may write the spans are waited for, and the spans looked at
-    /// again, up to three times; what is left then, or without the switch
-    /// everything, settles every flight as before.
+    /// With the relay's second stage ([`relay_exact`]) only the flights that
+    /// may write the spans are waited for (`Shadow::writes_pending_over`;
+    /// later flights stay in the air), the write watch asked again and the
+    /// spans looked at again, up to three times; what is left then, or
+    /// without that stage everything, settles every flight as before.
     fn settle_stale(
         &self,
         submitted: &mut u64,
-        runs: &[&HostList],
+        refreshed: &Refreshed,
         mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         ranges: &[(usize, usize)],
     ) {
@@ -7459,17 +7506,20 @@ impl Host {
             let _refresh = crate::profile::refresh_scope();
             crate::watch::ask_once(ranges);
         };
-        if lift_stale() && relay_exact() {
+        if relay_exact() {
             for _ in 0..3 {
                 budget::measured(budget::Wait::Stale, || {
-                    relay_wait(WHY_STALE, |_| {
-                        stale.iter().all(|(shadow, from, to)| {
-                            !shadow.writes_pending_over(*from, *to - *from)
-                        })
+                    relay_wait(WHY_STALE, |line| {
+                        // (Or nothing is in the air: a range still pending
+                        // then is no flight's, and waiting would not end.)
+                        line.line.is_empty() && !line.settling
+                            || stale.iter().all(|(shadow, from, to)| {
+                                !shadow.writes_pending_over(*from, *to - *from)
+                            })
                     })
                 });
                 ask_again();
-                stale = stale_under_flights(runs);
+                stale = stale_under_flights(refreshed, false);
                 if stale.is_empty() {
                     return;
                 }
@@ -7833,26 +7883,15 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // The copies the submission refreshes and their ranges, for the
+        // asking and the looks for stale spans.
+        let once = crate::watch::once();
+        let refreshed = if once || behind { refreshed_ranges(runs) } else { Refreshed::new() };
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        if crate::watch::once() {
+        if once {
             let mut asking = crate::profile::span("ask once");
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    // (A lifted read's ranges are refreshed too.)
-                    for (shadow, address, len) in step.refreshes() {
-                        if shadow.unwatched() {
-                            continue;
-                        }
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((address, address + len));
-                        *span = (span.0.min(address), span.1.max(address + len));
-                    }
-                }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges = asked_spans(&refreshed);
             let split = asking.as_ref().map(|_| crate::profile::refresh_split());
             {
                 let _refresh = crate::profile::refresh_scope();
@@ -7871,13 +7910,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = if behind { stale_under_flights(&refreshed, true) } else { Vec::new() };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle_stale(&mut submitted, runs, stale, &ranges);
+                self.settle_stale(&mut submitted, &refreshed, stale, &ranges);
                 settled += settling.elapsed();
             }
-        } else if behind && !stale_under_flights(runs).is_empty() {
+        } else if behind && !stale_under_flights(&refreshed, true).is_empty() {
             let settling = std::time::Instant::now();
             measured(Wait::Stale, || self.settle(&mut submitted, WHY_STALE));
             settled += settling.elapsed();
@@ -9299,16 +9338,18 @@ impl HostList {
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
-    /// host copy: copied back into title memory once the list has run.
+    /// host copy: copied back into title memory once the list has run. The
+    /// step keeps where it was declared (`crate::frame_budget::declaring`).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
+        let by = crate::frame_budget::declarer();
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, by));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -9899,7 +9940,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, by) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -9908,7 +9949,7 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
+                    shadow.writing_by(*address, *len, *by);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
@@ -9947,7 +9988,7 @@ impl HostList {
                             // the landing finds every byte the copy changed.
                             batch.add(dst, *at, lift.len);
                             batch.flush_one(dst);
-                            dst.writing(*at, lift.len);
+                            dst.writing_by(*at, lift.len, crate::frame_budget::Declarer::Lifted);
                             (dst.buffer.clone(), dst.offset(*at as u64), bounce.clone())
                         }
                         LiftedTo::Fill(buffer, offset, _) => (buffer.clone(), *offset, None),
