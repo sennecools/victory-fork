@@ -1208,11 +1208,14 @@ impl Oracle {
     }
 
     /// Slot `s` no table's for long: its stamp aged out, in both heaps.
+    /// Marks age by frames, so the next pass is of a later frame, and looks
+    /// for aged marks again ([`HostHeap::retake_left`]).
     fn age(&self, s: u32) {
         for heap in [self.real(), &self.reference] {
             if let Some(stamp) = heap.tabled.get(s as usize) {
                 stamp.store(0, Relaxed);
             }
+            heap.left_scanned.store(u64::MAX, Relaxed);
         }
     }
 
@@ -1860,6 +1863,9 @@ fn a_record_left_to_a_table_is_read_again_once_its_mark_ages() {
     descriptor::sync_heaps(&[placed.registered()]);
     assert_ne!(key(host, 7), record_key(placed.at(7)), "left while tabled");
     host.tabled[7].store(0, Relaxed);
+    // Marks age by frames, and the pass looks for aged ones once a frame:
+    // the next pass is of a later frame.
+    host.left_scanned.store(u64::MAX, Relaxed);
     descriptor::sync_heaps(&[placed.registered()]);
     assert_eq!(
         key(host, 7),
@@ -1900,6 +1906,169 @@ fn slots_left_to_tables_past_the_limit_are_counted() {
         .collect();
     assert_eq!(kept, [1, 2]);
     assert!(part.make.is_empty(), "nothing aged");
+}
+
+/// The slots of a heap's [`HostHeap::left_to_tables`] set, in order.
+fn left_set(heap: &HostHeap) -> Vec<u32> {
+    heap.left_to_tables
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect()
+}
+
+/// The set is looked at for aged marks in the first pass of a frame alone:
+/// a later pass of the frame does not look again, with slots left or not,
+/// and the first pass of the next frame does.
+#[test]
+fn warp_retake_scans_once_per_frame() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let at = (records.as_mut_ptr() as u64, 32);
+    let frame = 1_000;
+    heap.tabled_in(5, false, frame);
+    heap.tabled_in(6, false, frame);
+    let scans = LEFT_SCANS_HERE.get();
+    let mut part = SyncPart::default();
+    heap.retake_left_in(&[5], at, &mut part, frame);
+    assert_eq!(LEFT_SCANS_HERE.get() - scans, 1);
+    heap.retake_left_in(&[6], at, &mut part, frame);
+    heap.retake_left_in(&[], at, &mut part, frame);
+    assert_eq!(LEFT_SCANS_HERE.get() - scans, 1, "once in the frame");
+    assert_eq!(left_set(&heap), [5, 6], "slots still noted in a later pass");
+    heap.retake_left_in(&[], at, &mut part, frame + 1);
+    assert_eq!(LEFT_SCANS_HERE.get() - scans, 2, "again in the next frame");
+    assert!(part.make.is_empty(), "nothing aged");
+}
+
+/// A slot whose mark ages in a frame is read again by that frame's first
+/// pass, and not again by a later one.
+#[test]
+fn warp_retake_aged_slot_retaken_same_frame() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let at = (records.as_mut_ptr() as u64, 32);
+    let frame = 2_000;
+    heap.tabled_in(5, false, frame);
+    let mut part = SyncPart::default();
+    heap.retake_left_in(&[5], at, &mut part, frame);
+    heap.retake_left_in(&[], at, &mut part, frame + TABLED_FRAMES);
+    assert!(part.make.is_empty(), "still a table's slot lately");
+    let aged = frame + TABLED_FRAMES + 1;
+    heap.retake_left_in(&[], at, &mut part, aged);
+    assert_eq!(part.make, [5], "read again in the frame its mark aged");
+    assert!(left_set(&heap).is_empty());
+    let mut later = SyncPart::default();
+    heap.tabled_in(6, false, aged);
+    heap.retake_left_in(&[], at, &mut later, aged);
+    heap.retake_left_in(&[6], at, &mut later, aged);
+    assert!(later.make.is_empty(), "not read again in the frame");
+    assert_eq!(left_set(&heap), [6]);
+}
+
+/// With the set full, nothing more goes in, and every slot left that is not
+/// in it already is counted once per time it is left.
+#[test]
+fn warp_retake_full_set_skips_inserts_counts_left() {
+    let _census = crate::census::lock_tests();
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let at = (records.as_mut_ptr() as u64, 32);
+    let frame = 3_000;
+    for s in 0..SLOTS {
+        heap.tabled_in(s, false, frame);
+    }
+    LEFT_MOST_HERE.set(Some(3));
+    let mut part = SyncPart::default();
+    heap.retake_left_in(&[1, 2, 3], at, &mut part, frame);
+    let dropped = LEFT_DROPPED.load(Relaxed);
+    heap.retake_left_in(&[3, 4, 1, 5, 5], at, &mut part, frame);
+    heap.retake_left_in(&[2, 6], at, &mut part, frame + 1);
+    LEFT_MOST_HERE.set(None);
+    assert_eq!(LEFT_DROPPED.load(Relaxed) - dropped, 4, "4, 5, 5 and 6");
+    assert_eq!(left_set(&heap), [1, 2, 3]);
+    assert!(part.make.is_empty(), "nothing aged");
+}
+
+/// Against the pass as it was (every pass looked at every slot in the set,
+/// and refused each slot not in it once it was full), over frames that
+/// advance by none to many between passes: the same slots are read again
+/// in the same passes, the set holds the same slots, and the same number
+/// of slots are counted as finding no room.
+#[test]
+fn warp_retake_left_dropped_equals_old_refused_sum() {
+    let _census = crate::census::lock_tests();
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let at = (records.as_mut_ptr() as u64, 32);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    const MOST: usize = 12;
+    // The reference: each slot's last table frame, and the set.
+    let mut stamps = [None::<u64>; SLOTS as usize];
+    let mut set = std::collections::BTreeSet::new();
+    let lately = |stamps: &[Option<u64>], slot: u32, frame: u64| {
+        stamps[slot as usize].is_some_and(|stamp| frame - stamp <= TABLED_FRAMES)
+    };
+    LEFT_MOST_HERE.set(Some(MOST));
+    let (mut frame, mut refused_sum) = (10_000u64, 0u64);
+    let dropped = LEFT_DROPPED.load(Relaxed);
+    for _ in 0..3_000 {
+        frame += match next(10) {
+            0..=4 => 0,
+            5..=8 => 1 + next(3),
+            _ => 100 + next(200),
+        };
+        for _ in 0..next(6) {
+            let slot = next(u64::from(SLOTS)) as u32;
+            heap.tabled_in(slot, false, frame);
+            stamps[slot as usize] = Some(frame);
+        }
+        // As the pass leaves them: tables' slots lately, some twice.
+        let left: Vec<u32> = (0..next(8))
+            .map(|_| next(u64::from(SLOTS)) as u32)
+            .filter(|&slot| lately(&stamps, slot, frame))
+            .collect();
+        let aged: Vec<u32> = set
+            .iter()
+            .copied()
+            .filter(|&slot| !lately(&stamps, slot, frame))
+            .collect();
+        for slot in &aged {
+            set.remove(slot);
+        }
+        for &slot in &left {
+            if set.contains(&slot) {
+                continue;
+            }
+            if set.len() >= MOST {
+                refused_sum += 1;
+                continue;
+            }
+            set.insert(slot);
+        }
+        let mut part = SyncPart::default();
+        heap.retake_left_in(&left, at, &mut part, frame);
+        assert_eq!(part.make, aged, "frame {frame}");
+        assert_eq!(left_set(&heap), set.iter().copied().collect::<Vec<_>>());
+    }
+    LEFT_MOST_HERE.set(None);
+    assert!(refused_sum > 0, "the set was full at times");
+    assert_eq!(LEFT_DROPPED.load(Relaxed) - dropped, refused_sum);
 }
 
 /// A slot a draw made null from bytes of no view, then given back the live
