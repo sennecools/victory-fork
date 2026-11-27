@@ -3316,8 +3316,10 @@ pub(crate) mod tests {
     }
 
     /// An exact copy over a home's bytes is refreshed by a submission while
-    /// a flight's shaders write the home there: it waits for that flight, so
-    /// the refresh takes the card's bytes (nothing else would tell the copy
+    /// a flight's shaders write the home there, and the submission's shaders
+    /// write the copy too (so the card cannot take those bytes for it,
+    /// `late_lift::lift_refreshes`): it waits for that flight, so the
+    /// refresh takes the card's bytes (nothing else would tell the copy
     /// before its next refresh), and it is counted.
     #[test]
     fn warp_r5_x_refresh_over_flight_written_home_waits() {
@@ -3339,6 +3341,7 @@ pub(crate) mod tests {
         host.send_for_test(&one);
         let two = host.new_list().unwrap();
         copy.refresh(&two, view, bytes);
+        two.defer_gpu_write(&copy, view as usize, bytes as usize);
         two.close();
         assert_eq!(
             crate::host::flights::blocked(&[&two]),
@@ -3375,7 +3378,8 @@ pub(crate) mod tests {
         let _ = region;
     }
 
-    /// [`warp_r5_x_refresh_over_flight_written_home_waits`]'s submission
+    /// [`warp_r5_x_refresh_over_flight_written_home_waits`]'s submission (its
+    /// shaders write the copy too, so that it is not lifted)
     /// waits for H2 behind `flights_ahead` flights that write the home (each
     /// landed on its own while it waits), refreshing a buffer view's own copy
     /// whose buffer's copy is the home. What this thread counted
@@ -3405,6 +3409,7 @@ pub(crate) mod tests {
             .collect();
         let two = host.new_list().unwrap();
         copy.refresh(&two, view, bytes);
+        two.defer_gpu_write(&copy, view as usize, bytes as usize);
         two.close();
         assert!(crate::host::flights::refresh_waits(&[&two]));
         let _ = crate::frame_budget::take_seen();

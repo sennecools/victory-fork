@@ -18,9 +18,11 @@ use super::*;
 ///   (`crate::home::after_wait`, `crate::memory::after_wait`), as the
 ///   waited submission did after its wait;
 /// - a refresh of a copy that is no home, over bytes of a home a flight's
-///   shaders may write, waits until those flights have landed
-///   ([`refresh_over_flight_homes`]): what it would take may be half
-///   written, and nothing would tell it the rest; a card copy whose CPU side
+///   shaders may write ([`refresh_over_flight_homes`]), has those bytes
+///   copied from the home by the card, behind those flights on the queue
+///   (`late_lift::lift_refreshes`), or where that is refused waits until
+///   those flights have landed: taken on the CPU they may be half written,
+///   and nothing would tell it the rest; a card copy whose CPU side
 ///   is a home sends those bytes up from the home again, behind those
 ///   flights on the queue ([`retake_flight_homes`]);
 /// - the directory of raw-address shaders changes in queue order with each
@@ -66,12 +68,12 @@ pub(crate) fn r5() -> bool {
     })
 }
 
-/// R5's S2 (`VICTORY_R5_LIFT=1`, off by default; only with [`r5`]): reads of
-/// title memory that wait for flights are done on the card instead, behind
-/// the flights on the queue, also where the bytes are a home's (`lift_mode`
-/// in fills mode; the home's placed buffer is the source or destination), and
-/// a copy's refresh over a home a flight writes takes those bytes on the card
-/// (`late_lift::lift_refreshes`). Read once.
+/// R5's S2 (`VICTORY_R5_LIFT=1`, off by default; only with [`r5`]): fills and
+/// title buffer copies that wait for flights are done on the card instead,
+/// behind the flights on the queue, also where the bytes are a home's
+/// (`lift_mode` in fills mode; the home's placed buffer is the source or
+/// destination). Refreshes over flights' homes are done on the card with [`r5`]
+/// alone (`late_lift::lift_refreshes`). Read once.
 pub(crate) fn r5_lift() -> bool {
     #[cfg(test)]
     if test_flights() {
@@ -191,8 +193,10 @@ pub(super) fn join_writers(writers: &mut Vec<Writer>, back: &[Declared]) {
 /// partly in a home, a texture's buffer) takes the title's bytes from the
 /// home, which the card may be half way through writing; no copy-back comes
 /// for it (nothing was declared on the copy), and the telling at the landing
-/// marks the pages written only for its next refresh. So the submission
-/// waits like a read of that memory, until those flights have landed. A
+/// marks the pages written only for its next refresh. So the card takes
+/// those bytes for it behind those flights (`late_lift::lift_refreshes`), or
+/// the submission waits like a read of that memory, until those flights have
+/// landed. A
 /// card copy whose CPU side is a home does not wait: its refresh sends those
 /// bytes up from the home again ([`retake_flight_homes`]).
 pub(super) fn refresh_over_flight_homes(

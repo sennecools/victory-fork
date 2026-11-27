@@ -944,41 +944,46 @@ impl Adjacent {
     }
 }
 
-/// One submission refreshes two exact copies over home bytes flights
-/// write: one its shaders write too (refused: written), one across the
-/// border of two homes. The submission waits once; the refusal is counted
-/// once for the submission, under its first piece's reason, and per piece.
+/// One submission refreshes three exact copies over home bytes flights
+/// write: one its shaders write too (refused: written), one a flight in the
+/// air writes (refused: a pending write), and one across the border of two
+/// homes (split, not refused). The submission waits once; the refusal is
+/// counted once for the submission, under its first piece's reason, and
+/// per piece.
 #[test]
-fn warp_lift_dry_run_counts_refusal_per_submission() {
+fn warp_lift_counts_refusal_per_submission() {
     use crate::frame_budget::{Refusal, Seen, take_seen};
     let Some(host) = warp13() else { return };
     let (_core, flights) = r5_on();
     let adjacent = Adjacent::new();
     let border = adjacent.border;
-    let written = border - 0x8000;
-    let (one, two) = (
-        crate::shadow::exact(written, 0x200).expect("an exact copy"),
-        crate::shadow::exact(border - 0x100, 0x200).expect("an exact copy"),
-    );
-    one.update(written as usize, 0x200);
-    two.update((border - 0x100) as usize, 0x200);
+    let (written, pending) = (border - 0x8000, border - 0x4000);
+    let [one, two, three] = [written, pending, border - 0x100]
+        .map(|at| crate::shadow::exact(at, 0x200).expect("an exact copy"));
+    for (copy, at) in [(&one, written), (&two, pending), (&three, border - 0x100)] {
+        copy.update(at as usize, 0x200);
+    }
     let new = [0x5au8; 0x100];
     let from = source(host, &new);
     let hold = QueueHold::new(host);
-    let sides = adjacent.writers(host, &from, 0x100);
-    let first = writer(host, &adjacent.homes[0], written, &from, 0x100);
-    for list in sides.iter().chain([&first]) {
+    let mut sent: Vec<crate::host::HostList> = adjacent.writers(host, &from, 0x100).into();
+    sent.push(writer(host, &adjacent.homes[0], written, &from, 0x100));
+    sent.push(writer(host, &adjacent.homes[0], pending, &from, 0x100));
+    sent.push(copy_writer(host, &two, pending, &from, 0x100));
+    for list in &sent {
         host.send_for_test(list);
     }
-    let three = host.new_list().unwrap();
-    one.refresh(&three, written, 0x200);
-    three.defer_gpu_write(&one, written as usize, 0x200);
-    two.refresh(&three, border - 0x100, 0x200);
-    three.close();
-    assert!(refresh_waits(&[&three]));
+    let four = host.new_list().unwrap();
+    one.refresh(&four, written, 0x200);
+    four.defer_gpu_write(&one, written as usize, 0x200);
+    two.refresh(&four, pending, 0x200);
+    three.refresh(&four, border - 0x100, 0x200);
+    four.close();
+    assert!(refresh_waits(&[&four]));
     let _ = take_seen();
+    let before = r5_stats();
     let released = hold.released().after(200);
-    host.send_for_test(&three);
+    host.send_for_test(&four);
     released.join().unwrap();
     flights.land_all();
     let refused: Vec<(Refusal, [u32; Refusal::ALL.len()])> = take_seen()
@@ -990,15 +995,73 @@ fn warp_lift_dry_run_counts_refusal_per_submission() {
         .collect();
     let mut pieces = [0; Refusal::ALL.len()];
     pieces[Refusal::Written as usize] = 1;
-    pieces[Refusal::TwoHomes as usize] = 1;
+    pieces[Refusal::Pending as usize] = 1;
     assert_eq!(refused, [(Refusal::Written, pieces)], "once, first written");
-    for list in sides.iter().chain([&first, &three]) {
+    let after = r5_stats();
+    assert_eq!(
+        after[R5_REFRESHES_REFUSED],
+        before[R5_REFRESHES_REFUSED] + 1
+    );
+    assert_eq!(after[0], before[0] + 1, "one wait");
+    for list in sent.iter().chain([&four]) {
         list.reset();
     }
-    drop((sides, first, three, hold, one, two));
+    drop((sent, four, hold, one, two, three));
     adjacent.done();
 }
 
+/// An exact copy across the border of two homes side by side, which a
+/// flight writes on both sides: the one range of home bytes under the
+/// refresh is split by home and taken on the card, with no wait, and the
+/// copy then holds the flight's bytes on both sides.
+#[test]
+fn warp_r5_piece_over_two_adjacent_homes_is_split() {
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let adjacent = Adjacent::new();
+    let at = adjacent.border - 0x100;
+    let copy = crate::shadow::exact(at, 0x200).expect("an exact copy");
+    copy.update(at as usize, 0x200);
+    assert!(
+        crate::shadow::home_of(at, 0x200).is_none(),
+        "no one home holds it"
+    );
+    let new: Vec<u8> = (0..0x100u32).map(|i| (i * 11 + 5) as u8).collect();
+    let from = source(host, &new);
+    let hold = QueueHold::new(host);
+    let sides = adjacent.writers(host, &from, 0x100);
+    for list in &sides {
+        host.send_for_test(list);
+    }
+    let two = host.new_list().unwrap();
+    copy.refresh(&two, at, 0x200);
+    two.close();
+    assert!(refresh_waits(&[&two]));
+    assert!(
+        homes_written()
+            .iter()
+            .any(|&(a, b)| a as u64 <= at && at + 0x200 <= b as u64),
+        "one joined range over both homes"
+    );
+    let before = r5_stats();
+    let released = hold.released().after(5000);
+    host.send_for_test(&two);
+    assert_eq!(in_air(), 3, "sent behind the flights with no wait");
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    let after = r5_stats();
+    assert_eq!(after[0], before[0], "no wait");
+    assert_eq!(after[R5_REFRESHES_LIFTED], before[R5_REFRESHES_LIFTED] + 1);
+    let held = crate::shadow::copy_bytes(&copy);
+    assert_eq!(&held[..0x100], &new[..], "below the border, from the card");
+    assert_eq!(&held[0x100..0x200], &new[..], "above it");
+    for list in sides.iter().chain([&two]) {
+        list.reset();
+    }
+    drop((sides, two, hold, copy));
+    adjacent.done();
+}
 // ---- The heap buffer pass over a copy partly in a home ----
 
 /// A home, and a title buffer around it whose copy is no home (a home holds
@@ -1084,9 +1147,9 @@ fn warp_heap_pass_two_views_around_a_flight_home_do_not_wait() {
 }
 
 /// A view of the buffer over the home bytes the flight writes: the pass's
-/// refresh of it meets H2 (it waits, or the card takes those bytes).
+/// refresh of it meets H2, and the card takes those bytes, with no wait.
 #[test]
-fn warp_heap_pass_view_over_flight_home_still_waits() {
+fn warp_heap_pass_view_over_flight_home_is_lifted() {
     let Some(host) = warp13() else { return };
     let (_core, flights) = r5_on();
     let around = AroundHome::new();
@@ -1097,18 +1160,358 @@ fn warp_heap_pass_view_over_flight_home_still_waits() {
     let (one, two) = around.written_then_pass(host);
     assert!(refresh_waits(&[&two]), "a refresh over the home");
     let before = r5_stats();
-    let released = hold.released().after(200);
+    let released = hold.released().after(5000);
     host.send_for_test(&two);
-    released.join().unwrap();
+    assert_eq!(in_air(), 2, "sent behind the flight with no wait");
+    hold.release();
     flights.land_all();
+    released.join().unwrap();
     let after = r5_stats();
+    assert_eq!(after[0], before[0], "no H2 wait");
     assert_eq!(
-        after[0] + after[R5_REFRESHES_LIFTED],
-        before[0] + before[R5_REFRESHES_LIFTED] + 1,
-        "waited or lifted, once"
+        after[R5_REFRESHES_LIFTED],
+        before[R5_REFRESHES_LIFTED] + 1,
+        "lifted"
     );
     one.reset();
     two.reset();
     drop((one, two, hold));
     around.done();
+}
+
+// ---- The H2 lift under R5 alone ----
+
+/// A home, and a window over title memory that the home holds part of (a
+/// copy, made by an ask outside buffers that reaches into the home): the
+/// region, the home, the window and the home's start.
+struct WindowOverHome {
+    region: TestRegion,
+    home: Arc<Shadow>,
+    window: Arc<Shadow>,
+    start: u64,
+}
+
+impl WindowOverHome {
+    fn new(seed: u8) -> WindowOverHome {
+        let (region, cell) = window_region();
+        let start = cell + 2 * K64;
+        register(0xc0de_6101, start, K64);
+        let home = find(start, K64).expect("a home");
+        assert!(home.is_home());
+        let window = crate::shadow::find_any(start - 0x100, 0x200).expect("a window");
+        assert!(window.is_window() && !window.is_home());
+        let (from, bytes) = window.span();
+        assert!(
+            cell <= from && from + bytes <= cell + (4 << 20),
+            "in the region"
+        );
+        fill(cell, 8 * K64, seed);
+        window.update((start - 0x100) as usize, 0x200);
+        WindowOverHome {
+            region,
+            home,
+            window,
+            start,
+        }
+    }
+
+    /// The window's bytes at title address `at`, as its host copy holds them.
+    fn held(&self, at: u64, len: usize) -> Vec<u8> {
+        let from = (at - self.window.span().0) as usize;
+        crate::shadow::copy_bytes(&self.window)[from..from + len].to_vec()
+    }
+
+    fn done(self) {
+        unregister(0xc0de_6101, self.start);
+        drop((self.home, self.window));
+        // Not released: the window stays in its table, over this memory.
+        let _ = self.region;
+    }
+}
+
+/// A flight F0 reads a window's bytes over a home; a later flight F1 writes
+/// the home there; while both are held on the queue the title's memory
+/// there changes (as a card's write half way through would). The next
+/// submission's refresh of the window over those bytes is taken on the
+/// card: the CPU copies only around them, so F0, which runs before F1 on
+/// the queue, reads the bytes from before, and the window then holds F1's.
+#[test]
+fn warp_r5_window_cpu_refresh_skips_lifted_piece() {
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let over = WindowOverHome::new(2);
+    let start = over.start;
+    let before = bytes(start as *const u8, 0x100);
+    let (out, data) = host.shared_buffer(0x100).unwrap();
+    let hold = QueueHold::new(host);
+    let zero = host.new_list().unwrap();
+    // SAFETY: an open list of the host's; live buffers, the range in both.
+    unsafe {
+        zero.list.CopyBufferRegion(
+            &out,
+            0,
+            &over.window.buffer,
+            over.window.offset(start),
+            0x100,
+        )
+    };
+    zero.close();
+    host.send_for_test(&zero);
+    let new = [0xe1u8; 0x100];
+    let from = source(host, &new);
+    let one = writer(host, &over.home, start, &from, 0x100);
+    host.send_for_test(&one);
+    fill(start, 0x100, 0x77);
+    fill(start - 0x100, 0x100, 0x99);
+    let title_below = bytes((start - 0x100) as *const u8, 0x100);
+    let two = host.new_list().unwrap();
+    over.window.refresh(&two, start - 0x100, 0x200);
+    two.close();
+    assert!(refresh_waits(&[&two]));
+    let lifted = r5_stats()[R5_REFRESHES_LIFTED];
+    let released = hold.released().after(5000);
+    host.send_for_test(&two);
+    assert_eq!(in_air(), 3, "sent behind the flights with no wait");
+    assert_eq!(r5_stats()[R5_REFRESHES_LIFTED], lifted + 1, "lifted");
+    assert_eq!(over.held(start, 0x100), before, "the CPU left the piece");
+    assert_eq!(
+        over.held(start - 0x100, 0x100),
+        title_below,
+        "and took what lies around it"
+    );
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    assert_eq!(
+        bytes(data, 0x100),
+        before,
+        "the older flight read the bytes from before"
+    );
+    assert_eq!(
+        over.held(start, 0x100),
+        new,
+        "the card took the flight's bytes"
+    );
+    for list in [&zero, &one, &two] {
+        list.reset();
+    }
+    drop((zero, one, two, hold, out));
+    over.done();
+}
+
+/// A root shader resource view bound as a one-view table over a window
+/// whose bytes a flight writes in a home: its refresh is taken on the card
+/// (counted under its source), with no wait, and the window holds the
+/// flight's bytes.
+#[test]
+fn warp_r5_root_srv_window_over_flight_home_is_lifted() {
+    use crate::frame_budget::{H2Outcome, Seen, Source, take_seen};
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let over = WindowOverHome::new(3);
+    let heap = crate::draw::test_heap::ViewHeap::new(true);
+    let new = [0x2du8; 0x100];
+    let from = source(host, &new);
+    let hold = QueueHold::new(host);
+    let one = writer(host, &over.home, over.start, &from, 0x100);
+    host.send_for_test(&one);
+    let two = host.new_list().unwrap();
+    let at = over.start - 0x100;
+    let (mut state, root) = heap.root_srv(host, &two, at);
+    two.close();
+    assert!(refresh_waits(&[&two]));
+    let _ = take_seen();
+    let waits = r5_stats()[0];
+    let released = hold.released().after(5000);
+    host.send_for_test(&two);
+    assert_eq!(in_air(), 2, "sent behind the flight with no wait");
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    assert_eq!(r5_stats()[0], waits, "no wait");
+    let met: Vec<(Source, H2Outcome)> = take_seen()
+        .iter()
+        .filter_map(|s| match *s {
+            Seen::H2Source {
+                source, outcome, ..
+            } => Some((source, outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(met, [(Source::RootSrv, H2Outcome::Lifted)]);
+    assert_eq!(over.held(over.start, 0x100), new);
+    state.tables_done();
+    one.reset();
+    two.reset();
+    drop((one, two, hold, root, heap));
+    over.done();
+}
+
+/// An index buffer's refresh (a window a draw's ask finds) over home bytes
+/// a flight writes is taken on the card, with no wait.
+#[test]
+fn warp_r5_index_refresh_over_flight_home_is_lifted() {
+    use crate::frame_budget::{H2Outcome, Seen, Source, take_seen};
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let over = WindowOverHome::new(5);
+    let new = [0x4bu8; 0x100];
+    let from = source(host, &new);
+    let hold = QueueHold::new(host);
+    let one = writer(host, &over.home, over.start, &from, 0x100);
+    host.send_for_test(&one);
+    let two = host.new_list().unwrap();
+    let at = over.start - 0x80;
+    let index = crate::shadow::find_any(at, 0x100).expect("the window");
+    assert!(
+        Arc::ptr_eq(&index, &over.window),
+        "the window that is there"
+    );
+    index.refresh_from(&two, at, 0x100, Source::Index);
+    two.close();
+    let _ = take_seen();
+    let released = hold.released().after(5000);
+    host.send_for_test(&two);
+    assert_eq!(in_air(), 2, "sent behind the flight with no wait");
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    let met: Vec<(Source, H2Outcome)> = take_seen()
+        .iter()
+        .filter_map(|s| match *s {
+            Seen::H2Source {
+                source, outcome, ..
+            } => Some((source, outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(met, [(Source::Index, H2Outcome::Lifted)]);
+    assert_eq!(over.held(over.start, 0x80), new[..0x80]);
+    one.reset();
+    two.reset();
+    drop((one, two, hold, index));
+    over.done();
+}
+
+/// With R5 alone (no `VICTORY_R5_LIFT`, `VICTORY_LIFT_READS` off) a fill
+/// from a home a flight writes is not lifted: it waits for the flight
+/// (H8), and takes its bytes.
+#[test]
+fn warp_r5_lift_does_not_lift_fills_without_lift_reads() {
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let region = TestRegion::new(4 * K64 as usize);
+    let (start, len) = (region.base + K64, K64);
+    register(0xc0de_6201, start, len);
+    let home = find(start, len).expect("a home");
+    fill(start, len, 1);
+    let written = [0x93u8; 64];
+    let from = source(host, &written);
+    let hold = QueueHold::new(host);
+    let one = writer(host, &home, start + 0x100, &from, 64);
+    host.send_for_test(&one);
+    let two = host.new_list().unwrap();
+    let (_, out) = two.scratch(64).expect("scratch");
+    two.defer_fill(out, (start + 0x100) as *const u8, 64);
+    two.close();
+    assert_eq!(blocked(&[&two]), Some(READ));
+    let (left, waits) = (waits_left(), r5_stats()[R5_H8]);
+    let released = hold.released().after(200);
+    host.send_for_test(&two);
+    released.join().unwrap();
+    assert_eq!(waits_left(), left, "not lifted");
+    assert_eq!(r5_stats()[R5_H8], waits + 1, "it waited");
+    flights.land_all();
+    assert_eq!(bytes(out, 64), written, "the fill took the flight's bytes");
+    one.reset();
+    two.reset();
+    drop((one, two, hold));
+    unregister(0xc0de_6201, start);
+    drop(home);
+    region.release();
+}
+
+/// A refresh lifted in one submission leaves its piece stale on the CPU:
+/// once the flights landed, the next submission's refresh, with nothing in
+/// the air, takes the piece on the CPU, as the title wrote it since.
+#[test]
+fn warp_r5_lifted_refresh_then_cpu_refresh_next_submission() {
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let over = WindowOverHome::new(7);
+    let new = [0x18u8; 0x100];
+    let from = source(host, &new);
+    let hold = QueueHold::new(host);
+    let one = writer(host, &over.home, over.start, &from, 0x100);
+    host.send_for_test(&one);
+    let two = host.new_list().unwrap();
+    over.window.refresh(&two, over.start - 0x100, 0x200);
+    two.close();
+    let lifted = r5_stats()[R5_REFRESHES_LIFTED];
+    let released = hold.released().after(5000);
+    host.send_for_test(&two);
+    assert_eq!(r5_stats()[R5_REFRESHES_LIFTED], lifted + 1, "lifted");
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    assert_eq!(over.held(over.start, 0x100), new, "from the card");
+    // The title writes the piece since; nothing is in the air.
+    fill(over.start, 0x80, 0x61);
+    let three = host.new_list().unwrap();
+    over.window.refresh(&three, over.start - 0x100, 0x200);
+    three.close();
+    assert!(!refresh_waits(&[&three]));
+    host.send_for_test(&three);
+    flights.land_all();
+    assert_eq!(
+        over.held(over.start - 0x100, 0x200),
+        bytes((over.start - 0x100) as *const u8, 0x200),
+        "the next refresh took the piece on the CPU"
+    );
+    for list in [&one, &two, &three] {
+        list.reset();
+    }
+    drop((one, two, three, hold));
+    over.done();
+}
+
+/// A guard only (the software adapter may not fault as a card does): the
+/// title frees the region under a lifted piece while the submission that
+/// copies from its home is held on the queue. The free waits for the
+/// flights that hold the home; the device is still there after.
+#[test]
+fn warp_r5_lifted_piece_after_title_frees_region() {
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let region = TestRegion::new(8 * K64 as usize);
+    let start = region.base + 2 * K64;
+    register(0xc0de_6301, start, K64);
+    let home = find(start, K64).expect("a home");
+    let copy = crate::shadow::exact(start - 0x100, 0x200).expect("an exact copy");
+    fill(region.base, 8 * K64, 9);
+    copy.update((start - 0x100) as usize, 0x200);
+    let new = [0x0fu8; 0x100];
+    let from = source(host, &new);
+    let hold = QueueHold::new(host);
+    let one = writer(host, &home, start, &from, 0x100);
+    host.send_for_test(&one);
+    let two = host.new_list().unwrap();
+    copy.refresh(&two, start - 0x100, 0x200);
+    two.close();
+    let lifted = r5_stats()[R5_REFRESHES_LIFTED];
+    let released = hold.released().after(200);
+    host.send_for_test(&two);
+    assert_eq!(r5_stats()[R5_REFRESHES_LIFTED], lifted + 1, "lifted");
+    unregister(0xc0de_6301, start);
+    drop(home);
+    region.release();
+    released.join().unwrap();
+    flights.land_all();
+    assert!(
+        crate::descriptor::host::device_removed().is_none(),
+        "the device is still there"
+    );
+    one.reset();
+    two.reset();
+    drop((one, two, hold, copy));
 }

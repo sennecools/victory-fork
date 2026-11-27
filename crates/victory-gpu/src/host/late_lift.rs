@@ -1,31 +1,32 @@
-//! R5's S2 (`VICTORY_R5_LIFT=1`, [`r5_lift`]): reads of title memory that
-//! would wait for flights are done on the card instead, where the bytes are
-//! a home's too; and what the submitting thread's waits for flights say on
-//! the profile ([`wait_args`]).
+//! R5's reads of title memory that would wait for flights, done on the card
+//! instead where the bytes are a home's: refreshes over flights' homes with
+//! [`r5`], and fills and copies with `VICTORY_R5_LIFT=1` ([`r5_lift`]); and
+//! what the submitting thread's waits for flights say on the profile
+//! ([`wait_args`]).
 //!
 //! With R5 the submitting thread waits for flights before preparing for two
 //! reasons only, both "title memory read": a title buffer copy, a fill or a
 //! texture that reads (or a copy that writes) what a flight's shaders may
 //! write (H8, `blocked_by`), and a refresh of a copy that is no home over a
 //! home's bytes a flight's shaders may write (H2,
-//! [`refresh_over_flight_homes`]). With the switch:
+//! [`refresh_over_flight_homes`]).
 //!
-//! - H8 is lifted as `VICTORY_LIFT_READS=2` lifts it (`lift_reads`), and a
-//!   home that holds the whole range is a source or destination like a sole
-//!   copy (`crate::shadow::sole_or_home`): the copy reads or writes the
-//!   home's placed buffer at `Shadow::offset`, through a bounce buffer
-//!   within one buffer (two homes in one chunk of the pool share it). A
-//!   lifted copy into a home is declared as the list's shaders' writes are
-//!   (`Step::card_writes`): it is in the flight's `homes_written` until the
-//!   flight lands, and the landing tells the copies over those bytes, as for
-//!   a shader's write (`crate::home::after_wait`).
-//! - H2 is lifted by [`lift_refreshes`]: the refresh is done on the CPU as
-//!   before, and the card then copies the part over `homes_written` from the
-//!   home's placed buffer into the copy at the head of the submission, behind
-//!   the flights that write it.
+//! - H2 is lifted by [`lift_refreshes`]: the refresh is done on the CPU
+//!   around the part over `homes_written`, and the card copies that part
+//!   from the home's placed buffer into the copy at the head of the
+//!   submission, behind the flights that write it.
+//! - With the switch, H8 is lifted as `VICTORY_LIFT_READS=2` lifts it
+//!   (`lift_reads`), and a home that holds the whole range is a source or
+//!   destination like a sole copy (`crate::shadow::sole_or_home`): the copy
+//!   reads or writes the home's placed buffer at `Shadow::offset`, through a
+//!   bounce buffer within one buffer (two homes in one chunk of the pool
+//!   share it). A lifted copy into a home is declared as the list's shaders'
+//!   writes are (`Step::card_writes`): it is in the flight's `homes_written`
+//!   until the flight lands, and the landing tells the copies over those
+//!   bytes, as for a shader's write (`crate::home::after_wait`).
 //!
 //! What still waits is counted: `LiftAbort` for H8, [`R5_REFRESHES_REFUSED`]
-//! for H2.
+//! for H2 (with its reasons, `crate::frame_budget::h2_refused`).
 
 use super::*;
 
@@ -266,12 +267,6 @@ impl RefreshPlan {
     pub(super) fn first(&self) -> Option<&FirstRefresh> {
         self.first.as_ref()
     }
-
-    /// The first reason a piece was refused for, and the pieces refused per
-    /// [`Refusal`]; `None` if the card can take every piece.
-    pub(super) fn refusal(&self) -> Option<(Refusal, [u32; Refusal::ALL.len()])> {
-        self.refused.map(|first| (first, self.per_piece))
-    }
 }
 
 /// The pieces of the refreshes of `runs` over `homes_written` the card can
@@ -340,15 +335,10 @@ pub(super) fn plan_refresh_lifts(
             plan.refuse(Refusal::Pending);
             continue;
         }
-        let Some(home) = crate::shadow::home_of(from as u64, (to - from) as u64) else {
-            let two = crate::shadow::home_of(from as u64, 1)
-                .zip(crate::shadow::home_of(to as u64 - 1, 1))
-                .is_some_and(|(a, b)| !Arc::ptr_eq(&a, &b));
-            plan.refuse(if two {
-                Refusal::TwoHomes
-            } else {
-                Refusal::NoHome
-            });
+        // Split by home: what flights write in homes is joined where it
+        // touches, so one range can lie over two homes side by side.
+        let Some(homes) = homes_over(from, to) else {
+            plan.refuse(Refusal::NoHome);
             continue;
         };
         let ptr = Arc::as_ptr(&copy);
@@ -359,14 +349,16 @@ pub(super) fn plan_refresh_lifts(
             plan.refuse(Refusal::Written);
             continue;
         }
-        plan.pieces.push(Piece {
-            list,
-            step,
-            copy,
-            home,
-            at: from,
-            len: to - from,
-        });
+        for (home, at, end) in homes {
+            plan.pieces.push(Piece {
+                list,
+                step,
+                copy: copy.clone(),
+                home,
+                at,
+                len: end - at,
+            });
+        }
     }
     // (Never empty without a refusal: the caller found such a refresh.)
     if plan.pieces.is_empty() && plan.refused.is_none() {
@@ -375,29 +367,40 @@ pub(super) fn plan_refresh_lifts(
     plan
 }
 
-/// What [`lift_refreshes`] did with a submission's refreshes over flights'
-/// homes.
-pub(super) enum RefreshLift {
-    /// Not asked for (`VICTORY_R5_LIFT` off).
-    Off,
-    /// Taken on the card.
-    Lifted,
-    /// Refused (the reasons are counted): the submission waits.
-    Refused,
+/// The homes that hold `[from, to)` between them, in order, each with the
+/// part it holds; `None` if a byte of it lies in no home.
+fn homes_over(
+    from: usize,
+    to: usize,
+) -> Option<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> {
+    let mut homes = Vec::new();
+    let mut at = from;
+    while at < to {
+        let home = crate::shadow::home_of(at as u64, 1)?;
+        let (start, len) = home.span();
+        // The home holds byte `at`, so its end lies past it.
+        let end = ((start + len) as usize).min(to);
+        homes.push((home, at, end));
+        at = end;
+    }
+    Some(homes)
 }
 
-/// With [`r5_lift`] and flights in the air (`plan`: what [`plan_refresh_lifts`]
-/// found for `runs`): the refreshes of `runs` over
-/// homes' bytes flights' shaders may write (`homes_written`, as
+/// With [`r5`] and flights in the air (`plan`: what [`plan_refresh_lifts`]
+/// found for `runs`): the refreshes of `runs` over homes' bytes flights'
+/// shaders may write (`homes_written`, as
 /// [`refresh_over_flight_homes`] finds them) are done on the card instead of
-/// waiting for those flights. Each such refresh stays a refresh on the CPU,
-/// and the parts over `homes_written` become lifted copies
-/// (`LiftedTo::Refresh`) from the home's placed buffer into the copy, behind
-/// the refresh step: at the head of the submission, behind every flight on
-/// the queue. They write over what the CPU took there, and once the flights
-/// land the copy is told those bytes changed (`crate::home::after_wait`), so
-/// its next refresh takes them again. What it did: with
-/// [`RefreshLift::Lifted`] nothing is left to wait for.
+/// waiting for those flights. Each such refresh stays a refresh on the CPU
+/// around those bytes (the submission's batch leaves the pieces out,
+/// `Batch::around`), and the pieces over `homes_written`, split by home,
+/// become lifted copies (`LiftedTo::Refresh`) from the home's placed buffer
+/// into the copy, behind the refresh step: at the head of the submission,
+/// behind every flight on the queue. The CPU never writes a piece while a
+/// flight may still be writing its home, so a flight sent before that reads
+/// the copy sees no half-written bytes of a later one; once the flights land
+/// the copy is told those bytes changed (`crate::home::after_wait`), and its
+/// next refresh takes them on the CPU again (they were left stale). The
+/// copy and title range of each piece, or `None` if refused.
 ///
 /// Refused (counted; the submission waits as before) when the copy has a
 /// declared write of its own over such a part in this submission: its
@@ -410,15 +413,17 @@ pub(super) enum RefreshLift {
 /// copy's card side is in the card's memory (it goes up from the CPU side
 /// before the lists), no one home holds a part, or a list is named twice.
 /// Each refusal is counted with its reasons (`crate::frame_budget::h2_refused`).
-pub(super) fn lift_refreshes(plan: RefreshPlan, runs: &[&HostList]) -> RefreshLift {
-    if !r5_lift() {
-        return RefreshLift::Off;
-    }
+pub(super) fn lift_refreshes(plan: RefreshPlan, runs: &[&HostList]) -> Option<Vec<LiftedPiece>> {
     if let Some(first) = plan.refused {
         R5_STATS[R5_REFRESHES_REFUSED].fetch_add(1, Ordering::Relaxed);
         crate::frame_budget::h2_refused(first, plan.per_piece);
-        return RefreshLift::Refused;
+        return None;
     }
+    let lifted = plan
+        .pieces
+        .iter()
+        .map(|p| (p.copy.clone(), p.at, p.at + p.len))
+        .collect();
     // From the last, so that the places found hold; behind each refresh in
     // the order found.
     for piece in plan.pieces.into_iter().rev() {
@@ -434,8 +439,12 @@ pub(super) fn lift_refreshes(plan: RefreshPlan, runs: &[&HostList]) -> RefreshLi
             .insert(piece.step + 1, Step::Lifted(Box::new(lifted)));
     }
     R5_STATS[R5_REFRESHES_LIFTED].fetch_add(1, Ordering::Relaxed);
-    RefreshLift::Lifted
+    Some(lifted)
 }
+
+/// A piece of a refresh [`lift_refreshes`] gave the card: the copy, and the
+/// title range (start, end) the card writes into it.
+pub(super) type LiftedPiece = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
 
 #[cfg(test)]
 mod tests {

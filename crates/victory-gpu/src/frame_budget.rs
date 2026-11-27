@@ -684,22 +684,20 @@ pub(crate) enum Refusal {
     Carded,
     /// A flight in the air may write the copy over the piece.
     Pending,
-    /// No home holds the piece's bytes (or a part of them).
+    /// No home holds a part of the piece's bytes (a piece over two homes
+    /// side by side is split, one part per home).
     NoHome,
-    /// Two homes hold the piece's bytes between them.
-    TwoHomes,
     /// The submission's shaders write the copy over the piece.
     Written,
 }
 
 impl Refusal {
-    pub(crate) const ALL: [Refusal; 7] = [
+    pub(crate) const ALL: [Refusal; 6] = [
         Refusal::Twice,
         Refusal::NotRefresh,
         Refusal::Carded,
         Refusal::Pending,
         Refusal::NoHome,
-        Refusal::TwoHomes,
         Refusal::Written,
     ];
 
@@ -709,8 +707,7 @@ impl Refusal {
             Refusal::NotRefresh => "not a refresh",
             Refusal::Carded => "on the card",
             Refusal::Pending => "a pending write",
-            Refusal::NoHome => "no single home",
-            Refusal::TwoHomes => "two homes",
+            Refusal::NoHome => "no home",
             Refusal::Written => "written",
         }
     }

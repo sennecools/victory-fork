@@ -3142,10 +3142,10 @@ enum LiftedTo {
     /// `VICTORY_LIFT_READS=2`), the offset in it, and the fill's destination
     /// (the CPU address of those bytes, for [`Lifted::cpu_step`]).
     Fill(ID3D12Resource, u64, usize),
-    /// With `VICTORY_R5_LIFT=1`: the part of a copy's refresh over a home a
-    /// flight writes (the source), copied into this copy at the same title
-    /// address, behind the flights ([`late_lift::lift_refreshes`]). The
-    /// refresh step itself stays, and is done on the CPU first. Its
+    /// With [`r5`]: the part of a copy's refresh over a home a flight writes
+    /// (the source), copied into this copy at the same title address, behind
+    /// the flights ([`late_lift::lift_refreshes`]). The refresh step itself
+    /// stays, done on the CPU around that part ([`Batch`]'s `around`). Its
     /// [`LiftCopy`] has no bounce buffer: with the memory core no copy that
     /// is no home is placed, so the home and the copy are two buffers.
     Refresh(std::sync::Arc<crate::shadow::Shadow>),
@@ -7694,8 +7694,8 @@ impl Host {
         submitting(1, runs.len());
         // Steps an earlier submission of a list lifted: on the CPU again,
         // unless this submission's plan lifts them (only these switches
-        // lift steps).
-        if matches!(lift_mode(), LiftMode::Copies | LiftMode::Fills) {
+        // lift steps, and R5's refreshes over flights' homes).
+        if r5() || matches!(lift_mode(), LiftMode::Copies | LiftMode::Fills) {
             HostList::unlift(runs);
         }
         // Flights in the air ([`late`]): a submission that is waited for
@@ -7731,34 +7731,27 @@ impl Host {
                 measured(Wait::Settle, || self.settle(&mut submitted, why));
             }
         }
-        // With R5: a copy's refresh over a home a flight writes waits like
-        // a read, for those flights only (and after the waits above, which
-        // may have landed them); with `VICTORY_R5_LIFT=1` the card takes
-        // those bytes for it at the head of the submission, if it can.
+        // The pieces of refreshes the card takes in this submission: its
+        // batch copies around them.
+        let mut around = Vec::new();
+        // With R5: a copy's refresh over a home a flight writes (after the
+        // waits above, which may have landed those flights) has those bytes
+        // taken by the card at the head of the submission; where it cannot,
+        // the submission waits like a read, for those flights only.
         if late && r5() {
             let homes = line().homes_written.clone();
             if refresh_over_flight_homes(&homes, runs) {
                 use crate::frame_budget::H2Outcome;
-                use late_lift::RefreshLift;
-                // One walk over the lists: the pieces the card could take, and
+                // One walk over the lists: the pieces the card can take, and
                 // the first refresh that met H2, whose class (counted whatever
                 // comes of it) is looked up once their locks are let go.
                 let plan = late_lift::plan_refresh_lifts(&homes, runs);
                 let first = budget::h2_class(&homes, plan.first());
-                let refusal = plan.refusal();
-                let lift = late_lift::lift_refreshes(plan, runs);
-                match lift {
-                    RefreshLift::Lifted => budget::h2_outcome(first, H2Outcome::Lifted, 0),
-                    RefreshLift::Refused => budget::h2_outcome(first, H2Outcome::Refused, 0),
-                    RefreshLift::Off => {}
-                }
-                if !matches!(lift, RefreshLift::Lifted) {
-                    // Without the lifts: why they would have been refused,
-                    // looked at before the wait (the flights it waits for
-                    // change the answer), counted if it waited.
-                    let refused = matches!(lift, RefreshLift::Off)
-                        .then_some(refusal)
-                        .flatten();
+                if let Some(pieces) = late_lift::lift_refreshes(plan, runs) {
+                    budget::h2_outcome(first, H2Outcome::Lifted, 0);
+                    around = pieces;
+                } else {
+                    budget::h2_outcome(first, H2Outcome::Refused, 0);
                     let stamp = crate::profile::stamp();
                     let args = late_lift::wait_args(runs, true);
                     if let Some(us) = budget::h2_wait(&args, &homes, runs, first) {
@@ -7766,9 +7759,6 @@ impl Host {
                         R5_STATS[late_lift::R5_H2_US].fetch_add(us, Ordering::Relaxed);
                         if waiting == 0 {
                             waiting = stamp;
-                        }
-                        if let Some((why, pieces)) = refused {
-                            crate::frame_budget::h2_refused(why, pieces);
                         }
                     }
                 }
@@ -7823,7 +7813,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch::around(around);
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -9868,7 +9858,7 @@ impl HostList {
                     // source's host copy brought up to date (ranges flights
                     // write stay as they are), nothing read or written on
                     // the CPU. (A lifted refresh's copy is refreshed by its
-                    // own step, which stays: the card's copy goes over that.)
+                    // own step, which stays, around what the card copies.)
                     batch.add(&lift.src, lift.src_at, lift.len);
                     let (dst, dst_offset, bounce) = match &lift.to {
                         LiftedTo::Refresh(copy) => {
@@ -9975,6 +9965,13 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
     /// What the batch has refreshed so far, for the profiler's spans.
     done: BatchDone,
+    /// Per copy (by address), the title ranges (start, end; in order and
+    /// joined) the card writes into it at the head of the submission
+    /// ([`late_lift::lift_refreshes`]): its refreshes copy around them, as
+    /// [`crate::shadow::Shadow::update`] copies around what shaders write.
+    /// Copied on the CPU, a flight's half-written home bytes would reach the
+    /// copy's buffer while an older flight may still read it there.
+    around: std::collections::HashMap<usize, Vec<(usize, usize)>>,
 }
 
 /// What a submission's [`Batch`] has done so far, for the profiler's
@@ -10035,12 +10032,60 @@ impl RefreshRanges {
 }
 
 impl Batch {
+    /// A submission's batch whose refreshes leave out `pieces` (copy, start,
+    /// end): what the card takes for them.
+    fn around(pieces: Vec<late_lift::LiftedPiece>) -> Batch {
+        let mut batch = Batch::default();
+        for (copy, from, to) in pieces {
+            let ranges = batch
+                .around
+                .entry(std::sync::Arc::as_ptr(&copy) as usize)
+                .or_default();
+            join_ranges(ranges, [(from, to)]);
+        }
+        batch
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         if len == 0 {
             return;
         }
-        let range = (address, address + len);
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let Some(lifted) = self.around.get(&key) else {
+            self.add_range(shadow, key, (address, address + len));
+            return;
+        };
+        // Around what the card takes: the pieces stay stale, and a later
+        // submission's refresh takes them.
+        let (mut at, end) = (address, address + len);
+        let mut gaps = Vec::new();
+        for &(from, to) in lifted {
+            if to <= at {
+                continue;
+            }
+            if from >= end {
+                break;
+            }
+            if from > at {
+                gaps.push((at, from));
+            }
+            at = to;
+        }
+        if at < end {
+            gaps.push((at, end));
+        }
+        for gap in gaps {
+            self.add_range(shadow, key, gap);
+        }
+    }
+
+    /// [`Batch::add`] of one range, `key` the copy's address.
+    fn add_range(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        key: usize,
+        range: (usize, usize),
+    ) {
         match self.index.get(&key) {
             Some(&at) => self.refreshes[at].1.add(range),
             None => {
