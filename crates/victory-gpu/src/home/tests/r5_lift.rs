@@ -998,3 +998,117 @@ fn warp_lift_dry_run_counts_refusal_per_submission() {
     drop((sides, first, three, hold, one, two));
     adjacent.done();
 }
+
+// ---- The heap buffer pass over a copy partly in a home ----
+
+/// A home, and a title buffer around it whose copy is no home (a home holds
+/// part of it), with a view heap over the buffer: the region, the home, the
+/// buffer's start and the heap.
+struct AroundHome {
+    region: TestRegion,
+    home: Arc<Shadow>,
+    buffer: u64,
+    heap: crate::draw::test_heap::ViewHeap,
+}
+
+impl AroundHome {
+    fn new() -> AroundHome {
+        let region = TestRegion::new(8 * K64 as usize);
+        let (home_at, buffer) = (region.base + 2 * K64, region.base + K64);
+        register(0xc0de_6001, home_at, K64);
+        let home = find(home_at, K64).expect("a home");
+        assert!(home.is_home());
+        register(0xc0de_6002, buffer, 4 * K64);
+        let copy = find(buffer, 4 * K64).expect("a copy");
+        assert!(!copy.is_home(), "a home holds part of it");
+        fill(region.base, 8 * K64, 8);
+        let heap = crate::draw::test_heap::ViewHeap::over(buffer as usize, 4 * K64 as usize);
+        AroundHome {
+            region,
+            home,
+            buffer,
+            heap,
+        }
+    }
+
+    /// A flight's shaders write the home at its start plus 0x100; then a
+    /// list runs the heap buffer pass (closed). The flight and the list.
+    fn written_then_pass(
+        &self,
+        host: &crate::host::Host,
+    ) -> (crate::host::HostList, crate::host::HostList) {
+        let new = [0x6bu8; 0x100];
+        let from = source(host, &new);
+        let one = writer(host, &self.home, self.home.span().0 + 0x100, &from, 0x100);
+        host.send_for_test(&one);
+        let two = host.new_list().unwrap();
+        self.heap.pass(&two, crate::draw::test_heap::test_frame());
+        two.close();
+        (one, two)
+    }
+
+    fn done(self) {
+        unregister(0xc0de_6001, self.home.span().0);
+        unregister(0xc0de_6002, self.buffer);
+        drop((self.heap, self.home));
+        let _ = self.region;
+    }
+}
+
+/// Two views of the buffer, one below the home and one above it: the pass
+/// refreshes each view's range, not the span between, so its submission
+/// does not refresh the home's bytes the flight writes.
+#[test]
+fn warp_heap_pass_two_views_around_a_flight_home_do_not_wait() {
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let around = AroundHome::new();
+    // [buffer, +768) and [buffer + 3 * 64 KiB, +768).
+    around.heap.put(1, 0);
+    around.heap.put(2, (3 * K64 / 12) as u32);
+    let hold = QueueHold::new(host);
+    let (one, two) = around.written_then_pass(host);
+    assert!(!refresh_waits(&[&two]), "no refresh over the home");
+    let before = r5_stats();
+    let released = hold.released().after(5000);
+    host.send_for_test(&two);
+    assert_eq!(in_air(), 2, "sent behind the flight with no wait");
+    assert_eq!(r5_stats()[0], before[0], "no H2 wait");
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    one.reset();
+    two.reset();
+    drop((one, two, hold));
+    around.done();
+}
+
+/// A view of the buffer over the home bytes the flight writes: the pass's
+/// refresh of it meets H2 (it waits, or the card takes those bytes).
+#[test]
+fn warp_heap_pass_view_over_flight_home_still_waits() {
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let around = AroundHome::new();
+    around.heap.put(1, 0);
+    // From the home's start plus 4 bytes, over what the flight writes.
+    around.heap.put(2, (K64 / 12 + 1) as u32);
+    let hold = QueueHold::new(host);
+    let (one, two) = around.written_then_pass(host);
+    assert!(refresh_waits(&[&two]), "a refresh over the home");
+    let before = r5_stats();
+    let released = hold.released().after(200);
+    host.send_for_test(&two);
+    released.join().unwrap();
+    flights.land_all();
+    let after = r5_stats();
+    assert_eq!(
+        after[0] + after[R5_REFRESHES_LIFTED],
+        before[0] + before[R5_REFRESHES_LIFTED] + 1,
+        "waited or lifted, once"
+    );
+    one.reset();
+    two.reset();
+    drop((one, two, hold));
+    around.done();
+}

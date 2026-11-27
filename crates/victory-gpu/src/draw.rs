@@ -1964,20 +1964,40 @@ impl State {
         drop(walking);
         let views = ranges.len() as u32;
         let mut spanning = crate::profile::span_args("heap spans", &[("ranges", u64::from(views))]);
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+        // Per host copy, the ranges its picked views cover, in order, those
+        // less than 4 KiB apart joined (a refresh takes 4 KiB parts anyway).
+        // The bytes between views further apart are not refreshed here: a
+        // refresh of the copy's whole span took the home bytes a flight
+        // writes between two views, and the submission waited for that
+        // flight (H2). Every binding that reads such bytes has a refresh of
+        // its own: the views of tables (`readable`, also the unnamed views of
+        // a small table the pass leaves to the draw with
+        // `VICTORY_HEAP_PASS_TABLED=1`, `State::tables`), vertex and index
+        // buffers, and indirect arguments.
+        let mut spans: std::collections::HashMap<
+            usize,
+            (std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>),
+        > = std::collections::HashMap::new();
         for (shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+            spans
+                .entry(key)
+                .or_insert_with(|| (shadow.clone(), Vec::new()))
+                .1
+                .push((*from, *to));
+        }
+        for (_, joined) in spans.values_mut() {
+            join_near(joined, HEAP_PASS_JOIN);
         }
         drop(global);
         drop(own);
         // Its deferred steps are the pass's (the `run_deferred` span says so).
         list.ran_heap_pass();
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans
+            .values()
+            .flat_map(|(_, joined)| joined)
+            .map(|(from, to)| to - from)
+            .sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1988,7 +2008,9 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, joined) in spans.values() {
+            // Once per copy, then every range of it: a check per range would
+            // find the frame noted by the first and leave the others stale.
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -2008,7 +2030,9 @@ impl State {
                     }
                 }
             }
-            shadow.refresh_from(list, *from, to - from, Source::HeapPass);
+            for &(from, to) in joined {
+                shadow.refresh_from(list, from, to - from, Source::HeapPass);
+            }
         }
         if let Some(span) = spanning.as_mut() {
             span.arg("copies", spans.len() as u64);
@@ -3224,6 +3248,15 @@ impl State {
                 }
                 (table, n, h.finish())
             };
+            // The title's own slots of this table: what the draw reads of
+            // them it brings up to date here, in the dynamic slots.
+            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // With `VICTORY_HEAP_PASS_TABLED=1` a small table's slots are its
+            // own, named or not (below), and the heap buffer pass leaves them
+            // to the draw: the buffer views among them the shader does not
+            // name are brought up to date here too, as the pass would have.
+            let unnamed_tabled = heap_pass_tabled() && n <= 64 && title_first.is_some();
+            let named = |k: u32| entries.iter().any(|u| u.table_offset_dwords / 8 == k);
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -3231,12 +3264,14 @@ impl State {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                for k in 0..n {
+                    let picked = selected.binary_search(&k).is_ok();
+                    if named(k) || !(picked || unnamed_tabled) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
                     if let Some(view) = crate::descriptor::view(handle)
+                        && (picked || !crate::descriptor::host::is_texture_view(&view))
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
@@ -3254,9 +3289,6 @@ impl State {
             self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The title's own slots of this table: what the draw reads of
-            // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
             // With `VICTORY_HEAP_PASS_TABLED=1` they are such a table's,
             // whatever they hold: the heap buffer pass leaves them to the
             // draw. (Of a big one, which may lie over slots shaders pick by
@@ -3264,9 +3296,7 @@ impl State {
             if heap_pass_tabled()
                 && let Some(title) = title_first
             {
-                for k in (0..n)
-                    .filter(|&k| n <= 64 || entries.iter().any(|u| u.table_offset_dwords / 8 == k))
-                {
+                for k in (0..n).filter(|&k| n <= 64 || named(k)) {
                     host.buffer_slot_tabled(title + k);
                 }
             }
@@ -3294,8 +3324,15 @@ impl State {
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
-                        if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                        // An unnamed buffer view of a small table, which the
+                        // heap buffer pass leaves to the draw (above).
+                        let read = kind.or_else(|| {
+                            (unnamed_tabled && !crate::descriptor::host::is_texture_view(&view))
+                                .then(|| view_kind(&view))
+                                .flatten()
+                        });
+                        if let Some(read) = read {
+                            readable(list, read, &view);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -4324,8 +4361,18 @@ fn heap_pass_threads() -> usize {
 /// the slot for a few frames
 /// ([`crate::descriptor::host::HostHeap::buffer_slot_tabled`]).
 fn heap_pass_tabled() -> bool {
+    #[cfg(test)]
+    if TABLED_HERE.with(std::cell::Cell::get) {
+        return true;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_TABLED").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`heap_pass_tabled`] on for this thread.
+    static TABLED_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether what the heap buffer pass keeps of a heap lies on the heap
@@ -4377,6 +4424,23 @@ fn forget_part<T>(ranges: &mut std::collections::HashMap<u32, T>, part: u32, par
 /// What the walk of the heap buffer pass keeps of a slot: the host copy its
 /// buffer view shows, and the range of it the view reads.
 type HeapRange = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+/// Ranges of one copy the heap buffer pass refreshes apart only if this many
+/// bytes or more lie between them: the 4 KiB parts a refresh takes.
+const HEAP_PASS_JOIN: u64 = 4 << 10;
+
+/// `ranges` (start, end) sorted, and joined where they overlap or less than
+/// `gap` bytes lie between them.
+fn join_near(ranges: &mut Vec<(u64, u64)>, gap: u64) {
+    ranges.sort_unstable();
+    ranges.dedup_by(|next, previous| {
+        if next.0 >= previous.1.saturating_add(gap) {
+            return false;
+        }
+        previous.1 = previous.1.max(next.1);
+        true
+    });
+}
 
 /// The copy and range the view `view` of title slot `index` shows
 /// (`buffer_copy`, not the one the view's range alone would find), with
@@ -4594,6 +4658,205 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// A title view heap with buffer views for tests that run the heap buffer
+/// pass ([`State::heap_buffers`]).
+#[cfg(test)]
+pub(crate) mod test_heap {
+    use super::*;
+
+    /// The bytes of the title buffer [`ViewHeap::new`] makes.
+    pub(crate) const VIEW_MEMORY: usize = 1 << 17;
+
+    /// A title view heap of eight slots, and a title buffer whose views the
+    /// slots may hold. The heap is released on drop, also when an assertion
+    /// fails, and the buffer with it if the heap made it.
+    pub(crate) struct ViewHeap {
+        pub(crate) h: This,
+        /// The title buffer's start and bytes.
+        pub(crate) memory: usize,
+        size: usize,
+        /// Whether the heap made (and registered) the buffer.
+        own: bool,
+    }
+
+    impl ViewHeap {
+        /// The heap over a title buffer in memory of its own
+        /// ([`VIEW_MEMORY`] bytes, write-watched or not; the memory is left
+        /// to the process).
+        pub(crate) fn new(watched: bool) -> ViewHeap {
+            // SAFETY: new memory, left to the process.
+            let memory = unsafe {
+                use windows_sys::Win32::System::Memory::{
+                    MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+                };
+                const MEM_WRITE_WATCH: u32 = 0x20_0000;
+                let watch = if watched { MEM_WRITE_WATCH } else { 0 };
+                VirtualAlloc(
+                    std::ptr::null(),
+                    VIEW_MEMORY,
+                    MEM_RESERVE | MEM_COMMIT | watch,
+                    PAGE_READWRITE,
+                ) as usize
+            };
+            assert_ne!(memory, 0);
+            crate::shadow::register(memory, memory as u64, VIEW_MEMORY as u64);
+            let mut heap = ViewHeap::over(memory, VIEW_MEMORY);
+            heap.own = true;
+            heap
+        }
+
+        /// The heap over the title buffer `[memory, memory + size)`, which
+        /// the caller registered and unregisters.
+        pub(crate) fn over(memory: usize, size: usize) -> ViewHeap {
+            use crate::descriptor::{HeapDesc, create_heap};
+            use crate::object::{S_OK, guid};
+            #[repr(C)]
+            struct Extended(HeapDesc, [u64; 2]);
+            let desc = HeapDesc {
+                kind: 0,
+                count: 8,
+                flags: 1,
+                nodes: 1,
+            };
+            let iid = guid(
+                0x8efb471d,
+                0x616c,
+                0x4f49,
+                [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+            );
+            let extended = Extended(desc, [0; 2]);
+            let mut h: This = std::ptr::null();
+            assert_eq!(
+                create_heap(std::ptr::null(), &extended.0, &iid, &mut h),
+                S_OK
+            );
+            ViewHeap {
+                h,
+                memory,
+                size,
+                own: false,
+            }
+        }
+
+        pub(crate) fn host(&self) -> &'static crate::descriptor::host::HostHeap {
+            crate::descriptor::heap(self.h)
+                .host()
+                .expect("host view heap")
+        }
+
+        /// A view of 64 elements of 12 bytes of the buffer, from element
+        /// `first` (byte `12 * first`).
+        pub(crate) fn view(&self, first: u32) -> View {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[0, 1, 5768, 0, first, 0, 64, 12, 0, 0]);
+            (desc[10], desc[11]) = (self.memory as u32, (self.memory as u64 >> 32) as u32);
+            let width = self.size as u32;
+            View::Placed(
+                false,
+                [1, 0, 0, 0, width, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+                desc,
+            )
+        }
+
+        /// Slot `slot` holds [`ViewHeap::view`] of `first`.
+        pub(crate) fn put(&self, slot: u32, first: u32) {
+            let handle = crate::descriptor::heap(self.h).handle(slot).unwrap();
+            crate::descriptor::record(handle, self.view(first));
+        }
+
+        /// The buffer's host copy.
+        pub(crate) fn copy(&self) -> std::sync::Arc<crate::shadow::Shadow> {
+            crate::shadow::find(self.memory as u64, self.size as u64).expect("the buffer's copy")
+        }
+
+        /// A root shader resource view of title `address` bound in `list`
+        /// as a one-view table of the heap ([`State::root_srv_table`]), under
+        /// a root signature of one such table: the state, whose tables are
+        /// given back with `tables_done`, and the root signature, which must
+        /// live until the list is reset.
+        pub(crate) fn root_srv(
+            &self,
+            host: &crate::host::Host,
+            list: &HostList,
+            address: u64,
+        ) -> (State, ID3D12RootSignature) {
+            // A root signature of one table of one view, for the bind.
+            let range = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                ..Default::default()
+            };
+            let param = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: &param,
+                ..Default::default()
+            };
+            let mut blob = None;
+            // SAFETY: the description and what it points to live through the
+            // call; the out pointer is ours.
+            unsafe {
+                D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)
+            }
+            .expect("a root signature");
+            let blob = blob.unwrap();
+            // SAFETY: the blob's own bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+            };
+            // SAFETY: a serialized root signature.
+            let root: ID3D12RootSignature =
+                unsafe { host.device.CreateRootSignature(0, bytes) }.unwrap();
+            // SAFETY: an open list; our heap and root signature, which live
+            // until the list is reset.
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(self.host().heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+            }
+            let mut state = State::default();
+            state.heaps[0] = self.h as usize;
+            assert!(state.root_srv_table(list, Some(address), 0, true, false));
+            (state, root)
+        }
+
+        /// The heap buffer pass of a list that binds the heap, in `frame`.
+        pub(crate) fn pass(&self, list: &HostList, frame: u64) {
+            let mut state = State::default();
+            state.heaps[0] = self.h as usize;
+            assert!(state.heap_buffers_in(list, frame).is_some());
+        }
+    }
+
+    impl Drop for ViewHeap {
+        fn drop(&mut self) {
+            use crate::object::slot;
+            slot::<extern "system" fn(This) -> u32>(self.h, 0x10)(self.h);
+            if self.own {
+                crate::shadow::unregister(self.memory, self.memory as u64);
+            }
+        }
+    }
+
+    /// A frame of its own for a test's heap pass: the pass runs once per
+    /// frame per heap.
+    pub(crate) fn test_frame() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5350,114 +5613,7 @@ void main() {
 
     // ---- Where refreshes are asked for (`crate::frame_budget::Source`) ----
 
-    /// The bytes of a title buffer [`ViewHeap`] holds.
-    const VIEW_MEMORY: usize = 1 << 17;
-
-    /// A title view heap of eight slots, and a title buffer in memory of its
-    /// own ([`VIEW_MEMORY`] bytes; write-watched or not) whose views the
-    /// slots may hold. The heap and the buffer are released on drop, also
-    /// when an assertion fails; the memory is left to the process.
-    struct ViewHeap {
-        h: This,
-        memory: usize,
-    }
-
-    impl ViewHeap {
-        fn new(watched: bool) -> ViewHeap {
-            use crate::descriptor::{HeapDesc, create_heap};
-            use crate::object::{S_OK, guid};
-            #[repr(C)]
-            struct Extended(HeapDesc, [u64; 2]);
-            let desc = HeapDesc {
-                kind: 0,
-                count: 8,
-                flags: 1,
-                nodes: 1,
-            };
-            let iid = guid(
-                0x8efb471d,
-                0x616c,
-                0x4f49,
-                [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
-            );
-            let extended = Extended(desc, [0; 2]);
-            let mut h: This = std::ptr::null();
-            assert_eq!(
-                create_heap(std::ptr::null(), &extended.0, &iid, &mut h),
-                S_OK
-            );
-            // SAFETY: new memory, left to the process.
-            let memory = unsafe {
-                use windows_sys::Win32::System::Memory::{
-                    MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-                };
-                const MEM_WRITE_WATCH: u32 = 0x20_0000;
-                let watch = if watched { MEM_WRITE_WATCH } else { 0 };
-                VirtualAlloc(
-                    std::ptr::null(),
-                    VIEW_MEMORY,
-                    MEM_RESERVE | MEM_COMMIT | watch,
-                    PAGE_READWRITE,
-                ) as usize
-            };
-            assert_ne!(memory, 0);
-            crate::shadow::register(memory, memory as u64, VIEW_MEMORY as u64);
-            ViewHeap { h, memory }
-        }
-
-        fn host(&self) -> &'static crate::descriptor::host::HostHeap {
-            crate::descriptor::heap(self.h)
-                .host()
-                .expect("host view heap")
-        }
-
-        /// A view of 64 elements of 12 bytes of the buffer, from element
-        /// `first` (byte `12 * first`).
-        fn view(&self, first: u32) -> View {
-            let mut desc = [0u32; 16];
-            desc[..10].copy_from_slice(&[0, 1, 5768, 0, first, 0, 64, 12, 0, 0]);
-            (desc[10], desc[11]) = (self.memory as u32, (self.memory as u64 >> 32) as u32);
-            const WIDTH: u32 = VIEW_MEMORY as u32;
-            View::Placed(
-                false,
-                [1, 0, 0, 0, WIDTH, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
-                desc,
-            )
-        }
-
-        /// Slot `slot` holds [`ViewHeap::view`] of `first`.
-        fn put(&self, slot: u32, first: u32) {
-            let handle = crate::descriptor::heap(self.h).handle(slot).unwrap();
-            crate::descriptor::record(handle, self.view(first));
-        }
-
-        /// The buffer's host copy.
-        fn copy(&self) -> std::sync::Arc<crate::shadow::Shadow> {
-            crate::shadow::find(self.memory as u64, VIEW_MEMORY as u64).expect("the buffer's copy")
-        }
-
-        /// The heap buffer pass of a list that binds the heap, in `frame`.
-        fn pass(&self, list: &HostList, frame: u64) {
-            let mut state = State::default();
-            state.heaps[0] = self.h as usize;
-            assert!(state.heap_buffers_in(list, frame).is_some());
-        }
-    }
-
-    impl Drop for ViewHeap {
-        fn drop(&mut self) {
-            use crate::object::slot;
-            slot::<extern "system" fn(This) -> u32>(self.h, 0x10)(self.h);
-            crate::shadow::unregister(self.memory, self.memory as u64);
-        }
-    }
-
-    /// A frame of its own for a test's heap pass: the pass runs once per
-    /// frame per heap.
-    fn test_frame() -> u64 {
-        static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    }
+    use test_heap::{VIEW_MEMORY, ViewHeap, test_frame};
 
     /// The refresh steps of `list` for `copy` (title address, bytes, source).
     fn steps_of(list: &HostList, copy: &crate::shadow::Shadow) -> Vec<(usize, usize, Source)> {
@@ -5495,54 +5651,9 @@ void main() {
             return; // no host GPU
         };
         let heap = ViewHeap::new(true);
-        // A root signature of one table of one view, for the bind.
-        let range = D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            NumDescriptors: 1,
-            ..Default::default()
-        };
-        let param = D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                    NumDescriptorRanges: 1,
-                    pDescriptorRanges: &range,
-                },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        };
-        let desc = D3D12_ROOT_SIGNATURE_DESC {
-            NumParameters: 1,
-            pParameters: &param,
-            ..Default::default()
-        };
-        let mut blob = None;
-        // SAFETY: the description and what it points to live through the
-        // call; the out pointer is ours.
-        unsafe {
-            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)
-        }
-        .expect("a root signature");
-        let blob = blob.unwrap();
-        // SAFETY: the blob's own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-        };
-        // SAFETY: a serialized root signature.
-        let root: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, bytes) }.unwrap();
         let list = host.new_list().unwrap();
-        // SAFETY: an open list; our heap and root signature, which live
-        // until the list is reset.
-        unsafe {
-            list.list
-                .SetDescriptorHeaps(&[Some(heap.host().heap.clone())]);
-            list.list.SetComputeRootSignature(&root);
-        }
-        let mut state = State::default();
-        state.heaps[0] = heap.h as usize;
         let at = heap.memory + 0x100;
-        assert!(state.root_srv_table(&list, Some(at as u64), 0, true, false));
+        let (mut state, _root) = heap.root_srv(host, &list, at as u64);
         let copy = heap.copy();
         assert_eq!(
             steps_of(&list, &copy),
@@ -5568,6 +5679,213 @@ void main() {
             steps_of(&list, &copy),
             [(heap.memory + 48, 64 * 12, Source::Table)]
         );
+        list.close();
+        list.reset();
+    }
+
+    // ---- The heap buffer pass refreshes per joined range ----
+
+    /// [`join_near`] against a byte map: two bytes are in one range exactly
+    /// when every byte between them is covered or within the gap of a
+    /// covered byte below.
+    #[test]
+    fn join_near_matches_a_byte_map() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..500 {
+            let gap = 1 + next(16);
+            let ranges: Vec<(u64, u64)> = (0..1 + next(8))
+                .map(|_| {
+                    let from = next(200);
+                    (from, from + 1 + next(20))
+                })
+                .collect();
+            let mut joined = ranges.clone();
+            join_near(&mut joined, gap);
+            // The reference: covered bytes, then runs joined over gaps.
+            let mut covered = [false; 256];
+            for &(from, to) in &ranges {
+                covered[from as usize..to as usize].fill(true);
+            }
+            let mut reference: Vec<(u64, u64)> = Vec::new();
+            for byte in 0..256u64 {
+                if !covered[byte as usize] {
+                    continue;
+                }
+                match reference.last_mut() {
+                    Some(last) if byte < last.1 + gap => last.1 = byte + 1,
+                    _ => reference.push((byte, byte + 1)),
+                }
+            }
+            assert_eq!(joined, reference, "{ranges:?} gap {gap}");
+        }
+    }
+
+    /// Views of one copy that overlap or lie less than 4 KiB apart are one
+    /// refresh; one far from them is a refresh of its own, and the bytes
+    /// between are not refreshed by the pass.
+    #[test]
+    fn warp_heap_pass_joined_ranges_refresh_each_view() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let heap = ViewHeap::new(true);
+        // [0, 768), [120, 888), [1200, 1968), [32772, 33540).
+        for (slot, first) in [(1, 0), (2, 10), (3, 100), (4, 2731)] {
+            heap.put(slot, first);
+        }
+        let list = host.new_list().unwrap();
+        heap.pass(&list, test_frame());
+        let copy = heap.copy();
+        assert_eq!(
+            steps_of(&list, &copy),
+            [
+                (heap.memory, 1968, Source::HeapPass),
+                (heap.memory + 32772, 768, Source::HeapPass),
+            ]
+        );
+        list.close();
+        list.reset();
+    }
+
+    /// A copy of memory that is not write-watched (copied whole by every
+    /// refresh, at most once per `VICTORY_UNWATCHED_FRAMES` frames) has
+    /// every one of its ranges refreshed by the pass that takes it, not only
+    /// the first.
+    #[test]
+    fn warp_heap_pass_unwatched_copy_refreshes_every_range() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let heap = ViewHeap::new(false);
+        let copy = heap.copy();
+        copy.update(heap.memory, 0x100);
+        assert!(copy.unwatched());
+        heap.put(1, 0);
+        heap.put(2, 2731);
+        for frame in [test_frame(), test_frame()] {
+            let list = host.new_list().unwrap();
+            heap.pass(&list, frame);
+            assert_eq!(
+                steps_of(&list, &copy),
+                [
+                    (heap.memory, 768, Source::HeapPass),
+                    (heap.memory + 32772, 768, Source::HeapPass),
+                ]
+            );
+            list.close();
+            list.reset();
+        }
+    }
+
+    /// A table view whose bytes lie between two of the pass's views, which
+    /// the pass no longer refreshes, gets a refresh of its own exact range
+    /// in the same list.
+    #[test]
+    fn warp_heap_pass_gap_read_by_table_view_gets_exact_refresh() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let heap = ViewHeap::new(true);
+        heap.put(1, 0);
+        heap.put(2, 2731);
+        let list = host.new_list().unwrap();
+        heap.pass(&list, test_frame());
+        readable(&list, ResourceType::Srv, &heap.view(1000));
+        let copy = heap.copy();
+        let steps = steps_of(&list, &copy);
+        assert!(
+            steps.contains(&(heap.memory + 12000, 768, Source::Table)),
+            "{steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .filter(|s| s.2 == Source::HeapPass)
+                .all(|&(at, len, _)| at + len <= heap.memory + 12000 || heap.memory + 12768 <= at),
+            "the pass does not refresh the gap: {steps:?}"
+        );
+        list.close();
+        list.reset();
+    }
+
+    /// With `VICTORY_HEAP_PASS_TABLED=1`: a small table made afresh (it holds
+    /// a constant view) whose first slot, which the shader does not name,
+    /// holds a buffer view between two of the pass's views, 4 KiB and more
+    /// from each. The slot is the table's, so the pass leaves it to the
+    /// draw, and the draw refreshes its exact range; again when the same
+    /// table is bound once more in the list.
+    #[test]
+    fn warp_heap_pass_unnamed_slot_of_a_tabled_table_gets_exact_refresh() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        struct Tabled;
+        impl Drop for Tabled {
+            fn drop(&mut self) {
+                TABLED_HERE.with(|on| on.set(false));
+            }
+        }
+        TABLED_HERE.with(|on| on.set(true));
+        let _tabled = Tabled;
+        let heap = ViewHeap::new(true);
+        heap.put(0, 1000);
+        let constant = crate::descriptor::heap(heap.h).handle(1).unwrap();
+        crate::descriptor::record(constant, View::Constant(heap.memory as u64, 256));
+        heap.put(2, 0);
+        heap.put(3, 2731);
+        let table = crate::descriptor::heap(heap.h).handle(0).unwrap();
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.heaps[0] = heap.h as usize;
+        set(&mut state.compute, 0, Root::Table(table));
+        let gap = (heap.memory + 12000, 768, Source::Table);
+        let copy = heap.copy();
+        assert_eq!(
+            state.tables(&list, &used, &[], true).len(),
+            1,
+            "made afresh"
+        );
+        assert!(steps_of(&list, &copy).contains(&gap), "the unnamed slot");
+        heap.pass(&list, crate::frame::current());
+        let steps = steps_of(&list, &copy);
+        assert!(
+            steps
+                .iter()
+                .filter(|s| s.2 == Source::HeapPass)
+                .all(|&(at, len, _)| at + len <= gap.0 || gap.0 + gap.1 <= at),
+            "the pass leaves the slot to the draw: {steps:?}"
+        );
+        // A title copy in between: the next bind of the same table, found
+        // made in the list, refreshes the slot again.
+        list.defer_copy(
+            heap.memory as *mut u8,
+            (heap.memory + 0x1_0000) as *const u8,
+            4,
+        );
+        assert_eq!(state.tables(&list, &used, &[], true).len(), 1);
+        let again = steps_of(&list, &copy);
+        assert_eq!(
+            again.iter().filter(|&&s| s == gap).count(),
+            2,
+            "refreshed again: {again:?}"
+        );
+        state.tables_done();
         list.close();
         list.reset();
     }
