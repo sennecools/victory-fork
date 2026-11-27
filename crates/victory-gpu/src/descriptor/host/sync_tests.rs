@@ -730,6 +730,11 @@ fn pages_sorted_on_threads_make_what_one_by_one_makes() {
             if r >> 44 & 3 == 0 {
                 one.mirror(s, handle, true);
                 sorted.mirror(s, handle, true);
+                // A mirror that finds no view notes what it read as seen.
+                let record = record_key(handle);
+                if record == 0 || view_at(record as u32, (record >> 32) as u32).is_none() {
+                    last[s as usize] = record;
+                }
             }
         }
         // SAFETY: `records` is `SLOTS` records of `step` bytes.
@@ -1918,12 +1923,66 @@ fn a_null_slot_whose_record_names_a_live_view_is_made_again() {
     records[6] = [0x7e57_0003; 8];
     heap.mirror(6, at, true);
     assert_eq!(key(&heap, 6), 0, "made null by the draw");
-    // The live record back, as the pass saw it.
+    // The live record back, as the pass saw it; the draw's mirror noted the
+    // bytes it read as seen.
     records[6] = bytes;
-    assert_eq!(heap.seen_key(6), Some(x));
+    assert_eq!(heap.seen_key(6), Some(0));
     assert_eq!(pass_over(&heap, base), [6], "mirrored again");
     assert_eq!(key(&heap, 6), x);
     // Bytes of no view over a slot made from none are still left.
     records[9] = [0x7e57_0004; 8];
     assert_eq!(pass_over(&heap, base), [], "left");
+}
+
+/// Records of a constant buffer view, a placed buffer view and a placed
+/// texture view, which a mirror outside a draw leaves for later, made null
+/// by a draw from bytes of no view and then copied back as they were: the
+/// next pass mirrors them again, and each slot is back in the set of buffer
+/// views or the spans, with its word, as before the draw.
+#[test]
+fn a_view_left_for_later_and_nulled_by_a_draw_comes_back() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let views = views(memory());
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let slots = [(10u32, 0usize), (11, 2), (12, 3)];
+    let (buffer, texture) = (11u32, 12u32);
+    for (slot, view) in slots {
+        write(base + u64::from(slot) * 32, &views[view]);
+    }
+    assert_eq!(pass_over(&heap, base), [10, 11, 12]);
+    let state = |heap: &HostHeap| {
+        (
+            heap.buffer_slots(),
+            slots.map(|(slot, _)| heap.word(slot)),
+            heap.placed.lock().unwrap().by_slot.contains_key(&texture),
+        )
+    };
+    let before = state(&heap);
+    assert!(
+        before.0.contains(&buffer),
+        "the placed buffer view in the set"
+    );
+    // (A texture view's word is 0: no buffer.)
+    assert!(
+        before.1[..2].iter().all(|&word| word != Some(0)),
+        "words: {:?}",
+        before.1
+    );
+    assert!(before.2, "the placed texture in the spans");
+    for (slot, _) in slots {
+        let at = base + u64::from(slot) * 32;
+        let bytes = records[slot as usize];
+        records[slot as usize] = [0x7e57_0005; 8];
+        heap.mirror(slot, at, true);
+        records[slot as usize] = bytes;
+    }
+    let nulled = state(&heap);
+    assert!(!nulled.0.contains(&buffer), "out of the set after the draw");
+    assert_eq!(nulled.1, [Some(0); 3], "no words after the draw");
+    assert!(!nulled.2, "out of the spans after the draw");
+    assert_eq!(pass_over(&heap, base), [10, 11, 12], "mirrored again");
+    assert_eq!(state(&heap), before);
 }

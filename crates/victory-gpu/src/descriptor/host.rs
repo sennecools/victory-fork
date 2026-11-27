@@ -3104,7 +3104,10 @@ impl HostHeap {
     /// and the slot is made from it or from nothing; a slot made from another
     /// record is mirrored again whatever was seen, so no write that a pass
     /// did not see (a call's, a draw's, a record copied back as bytes over
-    /// one a call made) leaves it showing that other record. Of the others,
+    /// one a call made) leaves it showing that other record. A mirror that
+    /// finds no view in a slot notes the key it read as seen, so a live
+    /// record copied back over a slot a draw made null that way differs
+    /// from the one last seen and is mirrored again. Of the others,
     /// one of a slot a table's lately is left to its draws, its key not taken
     /// as seen, so it is looked at again next time; the rest are seen from
     /// here on and go into `part.make`, in slot order, for the caller to
@@ -3152,7 +3155,7 @@ impl HostHeap {
             let key = page_key(record);
             if key == last.load(Relaxed) && {
                 let shown = made.load(Acquire);
-                shown == key || shown == 0 && !makes_a_slot(key)
+                shown == key || shown == 0
             } {
                 continue;
             }
@@ -3427,6 +3430,12 @@ impl HostHeap {
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             let _hold = self.hold(site);
+            // What was read is seen (0 for bytes of no view, the dead key for
+            // a released view): a draw that makes the slot null here changes
+            // what the slot shows without the pass, and a live record copied
+            // back over it must then not look like the one the pass saw last
+            // ([`HostHeap::sort_copied_page`]).
+            self.saw_key(index, if tag == VIEW_TAG { key } else { 0 });
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             let Ok(mut claim) = self.claim(index, |made| made != 0 || for_draw) else {
@@ -4008,17 +4017,6 @@ fn page_key(record: &[u8]) -> u64 {
     } else {
         0
     }
-}
-
-/// Whether a mirror of a record of key `key` that is not a draw's would make
-/// its slot from it: a live view that is not left for later. A slot made
-/// from nothing whose record is such a view is mirrored again by the pass,
-/// though the record is the one it saw last: a draw may have made the slot
-/// null from bytes of no view the title copied back over since.
-fn makes_a_slot(key: u64) -> bool {
-    key != 0
-        && view_at(key as u32, (key >> 32) as u32)
-            .is_some_and(|view| !HostHeap::deferred(&view, false).1)
 }
 
 /// [`page_key`] of the record the title has at `handle`.
