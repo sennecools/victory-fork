@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
 use crate::census::Dropped;
+use crate::frame_budget::Source;
 use crate::host::{HostList, OpKind};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
@@ -512,7 +513,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .min(if srv { limit } else { ROOT_CBV_REACH });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
+        shadow.refresh_from(list, address, len, Source::RootView);
         list.buffer_read(&shadow.buffer);
         return Some(gpu);
     }
@@ -611,7 +612,7 @@ fn root_cbv_view(
     }
     if gpu.is_multiple_of(256) && gpu - base + bytes <= width {
         host.constant_view_at(index, &shadow.buffer, gpu, bytes as u32);
-        shadow.refresh(list, a, len);
+        shadow.refresh_from(list, a, len, Source::RootView);
         list.buffer_read(&shadow.buffer);
         return (Some(shadow), bytes);
     }
@@ -1111,7 +1112,7 @@ impl State {
                 continue;
             };
             shadow.handed(Hand::Vertex, v.address);
-            shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.refresh_from(list, v.address, u64::from(v.size), Source::Vertex);
             list.buffer_read(&shadow.buffer);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1132,7 +1133,7 @@ impl State {
                 return false;
             };
             shadow.handed(Hand::Index, v.address);
-            shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.refresh_from(list, v.address, u64::from(v.size), Source::Index);
             list.buffer_read(&shadow.buffer);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1493,7 +1494,7 @@ impl State {
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             s.handed(Hand::RootUav, a);
             let len = s.left(a).min(limit);
-            s.refresh(list, a, len);
+            s.refresh_from(list, a, len, Source::RootUav);
             list.buffer_uav(&s.buffer);
             if writes {
                 s.gpu_writes(list, a, len);
@@ -1641,7 +1642,7 @@ impl State {
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
             s.handed(Hand::RootSrv, *a);
-            s.refresh(list, *a, s.left(*a));
+            s.refresh_from(list, *a, s.left(*a), Source::RootSrv);
             list.buffer_read(&s.buffer);
         }
         let handle = host.gpu_handle(index);
@@ -1726,7 +1727,7 @@ impl State {
         if let Some((index, shadow, bytes)) = self.root_cbv_slots.get(&key) {
             if let (Some(shadow), Some(a)) = (shadow, address) {
                 shadow.handed(Hand::RootCbv, a);
-                shadow.refresh(list, a, shadow.left(a).min(ROOT_CBV_REACH));
+                shadow.refresh_from(list, a, shadow.left(a).min(ROOT_CBV_REACH), Source::RootCbv);
                 list.buffer_read(&shadow.buffer);
             }
             return Some((*index, *bytes));
@@ -2007,7 +2008,7 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            shadow.refresh_from(list, *from, to - from, Source::HeapPass);
         }
         if let Some(span) = spanning.as_mut() {
             span.arg("copies", spans.len() as u64);
@@ -3662,7 +3663,7 @@ impl State {
             s.handed(Hand::Count, *at);
         }
         let batched = if grouped {
-            args.refresh(list, arguments, len);
+            args.refresh_from(list, arguments, len, Source::Indirect);
             list.buffer_read(&args.buffer);
             crate::indirect::grouped_mesh(list, args.id(), &args.buffer, offset as u32)
         } else {
@@ -3718,10 +3719,15 @@ impl State {
                     }
                     _ => (stride, max),
                 };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                args.refresh_from(
+                    list,
+                    arguments,
+                    len.max(u64::from(step) * u64::from(records)),
+                    Source::Indirect,
+                );
                 list.buffer_read(&args.buffer);
                 if let Some((s, at)) = &counter {
-                    s.refresh(list, *at, 4);
+                    s.refresh_from(list, *at, 4, Source::Indirect);
                     list.buffer_read(&s.buffer);
                 }
                 // Bounded first: a clamp binds a compute pipeline of its own
@@ -3978,7 +3984,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, resource, address, len)) = crate::descriptor::host::buffer_copy(view) {
-        shadow.refresh(list, address, len);
+        shadow.refresh_from(list, address, len, Source::Table);
         // The resource the slot shows, whose state the view needs.
         let resource = resource.as_ref().unwrap_or(&shadow.buffer);
         if kind == ResourceType::Uav {
@@ -5342,6 +5348,255 @@ void main() {
         crate::shadow::unregister(memory, memory as u64);
     }
 
+    // ---- Where refreshes are asked for (`crate::frame_budget::Source`) ----
+
+    /// The bytes of a title buffer [`ViewHeap`] holds.
+    const VIEW_MEMORY: usize = 1 << 17;
+
+    /// A title view heap of eight slots, and a title buffer in memory of its
+    /// own ([`VIEW_MEMORY`] bytes; write-watched or not) whose views the
+    /// slots may hold. The heap and the buffer are released on drop, also
+    /// when an assertion fails; the memory is left to the process.
+    struct ViewHeap {
+        h: This,
+        memory: usize,
+    }
+
+    impl ViewHeap {
+        fn new(watched: bool) -> ViewHeap {
+            use crate::descriptor::{HeapDesc, create_heap};
+            use crate::object::{S_OK, guid};
+            #[repr(C)]
+            struct Extended(HeapDesc, [u64; 2]);
+            let desc = HeapDesc {
+                kind: 0,
+                count: 8,
+                flags: 1,
+                nodes: 1,
+            };
+            let iid = guid(
+                0x8efb471d,
+                0x616c,
+                0x4f49,
+                [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+            );
+            let extended = Extended(desc, [0; 2]);
+            let mut h: This = std::ptr::null();
+            assert_eq!(
+                create_heap(std::ptr::null(), &extended.0, &iid, &mut h),
+                S_OK
+            );
+            // SAFETY: new memory, left to the process.
+            let memory = unsafe {
+                use windows_sys::Win32::System::Memory::{
+                    MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+                };
+                const MEM_WRITE_WATCH: u32 = 0x20_0000;
+                let watch = if watched { MEM_WRITE_WATCH } else { 0 };
+                VirtualAlloc(
+                    std::ptr::null(),
+                    VIEW_MEMORY,
+                    MEM_RESERVE | MEM_COMMIT | watch,
+                    PAGE_READWRITE,
+                ) as usize
+            };
+            assert_ne!(memory, 0);
+            crate::shadow::register(memory, memory as u64, VIEW_MEMORY as u64);
+            ViewHeap { h, memory }
+        }
+
+        fn host(&self) -> &'static crate::descriptor::host::HostHeap {
+            crate::descriptor::heap(self.h)
+                .host()
+                .expect("host view heap")
+        }
+
+        /// A view of 64 elements of 12 bytes of the buffer, from element
+        /// `first` (byte `12 * first`).
+        fn view(&self, first: u32) -> View {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[0, 1, 5768, 0, first, 0, 64, 12, 0, 0]);
+            (desc[10], desc[11]) = (self.memory as u32, (self.memory as u64 >> 32) as u32);
+            const WIDTH: u32 = VIEW_MEMORY as u32;
+            View::Placed(
+                false,
+                [1, 0, 0, 0, WIDTH, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0],
+                desc,
+            )
+        }
+
+        /// Slot `slot` holds [`ViewHeap::view`] of `first`.
+        fn put(&self, slot: u32, first: u32) {
+            let handle = crate::descriptor::heap(self.h).handle(slot).unwrap();
+            crate::descriptor::record(handle, self.view(first));
+        }
+
+        /// The buffer's host copy.
+        fn copy(&self) -> std::sync::Arc<crate::shadow::Shadow> {
+            crate::shadow::find(self.memory as u64, VIEW_MEMORY as u64).expect("the buffer's copy")
+        }
+
+        /// The heap buffer pass of a list that binds the heap, in `frame`.
+        fn pass(&self, list: &HostList, frame: u64) {
+            let mut state = State::default();
+            state.heaps[0] = self.h as usize;
+            assert!(state.heap_buffers_in(list, frame).is_some());
+        }
+    }
+
+    impl Drop for ViewHeap {
+        fn drop(&mut self) {
+            use crate::object::slot;
+            slot::<extern "system" fn(This) -> u32>(self.h, 0x10)(self.h);
+            crate::shadow::unregister(self.memory, self.memory as u64);
+        }
+    }
+
+    /// A frame of its own for a test's heap pass: the pass runs once per
+    /// frame per heap.
+    fn test_frame() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1 << 40);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The refresh steps of `list` for `copy` (title address, bytes, source).
+    fn steps_of(list: &HostList, copy: &crate::shadow::Shadow) -> Vec<(usize, usize, Source)> {
+        list.refresh_steps_for_test()
+            .into_iter()
+            .filter(|&(id, ..)| id == copy.id())
+            .map(|(_, at, len, source)| (at, len, source))
+            .collect()
+    }
+
+    /// The heap buffer pass tags its refreshes as its own.
+    #[test]
+    fn warp_h2_source_tag_heap_pass() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let heap = ViewHeap::new(true);
+        heap.put(1, 0);
+        let list = host.new_list().unwrap();
+        heap.pass(&list, test_frame());
+        let copy = heap.copy();
+        assert_eq!(
+            steps_of(&list, &copy),
+            [(heap.memory, 64 * 12, Source::HeapPass)]
+        );
+        list.close();
+        list.reset();
+    }
+
+    /// A root shader resource view bound as a one-view table tags its
+    /// refresh as such.
+    #[test]
+    fn warp_h2_source_tag_root_srv() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let heap = ViewHeap::new(true);
+        // A root signature of one table of one view, for the bind.
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            ..Default::default()
+        };
+        let param = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: 1,
+            pParameters: &param,
+            ..Default::default()
+        };
+        let mut blob = None;
+        // SAFETY: the description and what it points to live through the
+        // call; the out pointer is ours.
+        unsafe {
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)
+        }
+        .expect("a root signature");
+        let blob = blob.unwrap();
+        // SAFETY: the blob's own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        // SAFETY: a serialized root signature.
+        let root: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, bytes) }.unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list; our heap and root signature, which live
+        // until the list is reset.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(heap.host().heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+        }
+        let mut state = State::default();
+        state.heaps[0] = heap.h as usize;
+        let at = heap.memory + 0x100;
+        assert!(state.root_srv_table(&list, Some(at as u64), 0, true, false));
+        let copy = heap.copy();
+        assert_eq!(
+            steps_of(&list, &copy),
+            [(at, VIEW_MEMORY - 0x100, Source::RootSrv)]
+        );
+        state.tables_done();
+        list.close();
+        list.reset();
+    }
+
+    /// A buffer view in a table a draw binds tags its refresh as the
+    /// table's.
+    #[test]
+    fn warp_h2_source_tag_table_readable() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let heap = ViewHeap::new(true);
+        let list = host.new_list().unwrap();
+        readable(&list, ResourceType::Srv, &heap.view(4));
+        let copy = heap.copy();
+        assert_eq!(
+            steps_of(&list, &copy),
+            [(heap.memory + 48, 64 * 12, Source::Table)]
+        );
+        list.close();
+        list.reset();
+    }
+
+    /// A range asked for twice in a list is one step, with the tag it got
+    /// first; another range of the same copy is a step of its own.
+    #[test]
+    fn warp_h2_source_tag_dedup_first_wins() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let heap = ViewHeap::new(true);
+        let copy = heap.copy();
+        let (at, len) = (heap.memory as u64 + 0x400, 0x200);
+        let list = host.new_list().unwrap();
+        copy.refresh_from(&list, at, len, Source::Vertex);
+        copy.refresh_from(&list, at, len, Source::Index);
+        copy.refresh(&list, at, len);
+        copy.refresh_from(&list, at, len / 2, Source::Index);
+        assert_eq!(
+            steps_of(&list, &copy),
+            [
+                (at as usize, len as usize, Source::Vertex),
+                (at as usize, len as usize / 2, Source::Index),
+            ]
+        );
+        list.close();
+        list.reset();
+    }
     #[test]
     fn rect_vertex_span_rejects_overflow_and_out_of_bounds() {
         let view = VertexView {

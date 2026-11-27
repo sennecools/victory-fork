@@ -818,3 +818,183 @@ fn warp_r5_matches_waited_submissions_with_lifts() {
         assert_eq!(got.0, waited.0, "{how}: the same title memory");
     }
 }
+
+// ---- The H2 split (`crate::frame_budget::h2_line`) ----
+
+/// Title memory for a window over a home: a region that holds a whole cell
+/// of windows (4 MiB, on its line), and the cell's start. The window an ask
+/// there makes lies inside the region, which is never released: the window
+/// stays in its table, and no later test's memory lies under it.
+fn window_region() -> (TestRegion, u64) {
+    const CELL: u64 = 4 << 20;
+    let region = TestRegion::new(3 * CELL as usize);
+    let cell = region.base.next_multiple_of(CELL);
+    (region, cell)
+}
+
+/// A window over title memory that a home holds part of is a copy, not a
+/// home, and keeps the core's reason (`Origin::Kept`): a refresh of it over
+/// the home bytes a flight writes, reaching past the home's pages, is
+/// counted as C2-cross under H2, with the refresh's source.
+#[test]
+fn warp_r5_window_over_home_is_c2_cross() {
+    use crate::frame_budget::{H2Class, Seen, Source, take_seen};
+    use crate::shadow::{Kept, Origin};
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let (region, cell) = window_region();
+    let (start, len) = (cell + 2 * K64, K64);
+    register(0xc0de_5f01, start, len);
+    let home = find(start, len).expect("a home");
+    assert!(home.is_home());
+    // An ask outside buffers that reaches into the home.
+    let window = find(start - 0x100, 0x200).expect("a window");
+    assert!(
+        window.is_window() && !window.is_home(),
+        "a copy, not a home"
+    );
+    let (from, bytes) = window.span();
+    assert!(
+        cell <= from && from + bytes <= cell + (4 << 20),
+        "in the region"
+    );
+    assert_eq!(window.origin(), Origin::Kept(Kept::Why(Why::Overlap)));
+    fill(cell, 8 * K64, 4);
+    let new = [0x3cu8; 0x100];
+    let from = source(host, &new);
+    let hold = QueueHold::new(host);
+    let one = writer(host, &home, start, &from, 0x100);
+    host.send_for_test(&one);
+    let two = host.new_list().unwrap();
+    window.refresh_from(&two, start - 0x100, 0x200, Source::Vertex);
+    two.close();
+    assert!(
+        refresh_waits(&[&two]),
+        "a refresh over a home a flight writes"
+    );
+    let _ = take_seen();
+    let released = hold.released().after(200);
+    host.send_for_test(&two);
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    let met: Vec<(Source, H2Class)> = take_seen()
+        .iter()
+        .filter_map(|s| match *s {
+            Seen::H2Source { source, class, .. } => Some((source, class)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(met, [(Source::Vertex, H2Class::C2Cross)]);
+    for list in [&one, &two] {
+        list.reset();
+    }
+    unregister(0xc0de_5f01, start);
+    drop((one, two, hold, home, window));
+    // Not released: the window stays in its table, over this memory.
+    let _ = region;
+}
+
+/// Two homes side by side, and a flight that writes both across their
+/// border: what flights write in homes is one joined range there.
+struct Adjacent {
+    region: TestRegion,
+    homes: [Arc<Shadow>; 2],
+    /// The border between the two homes.
+    border: u64,
+}
+
+impl Adjacent {
+    fn new() -> Adjacent {
+        let region = TestRegion::new(8 * K64 as usize);
+        let (a, b) = (region.base + K64, region.base + 2 * K64);
+        register(0xc0de_5f02, a, K64);
+        register(0xc0de_5f03, b, K64);
+        let homes = [find(a, K64).expect("a home"), find(b, K64).expect("a home")];
+        assert!(homes.iter().all(|h| h.is_home()));
+        assert!(!Arc::ptr_eq(&homes[0], &homes[1]), "two homes");
+        fill(region.base, 8 * K64, 6);
+        Adjacent {
+            region,
+            homes,
+            border: b,
+        }
+    }
+
+    /// Lists whose shaders write `bytes` (`len` of them) on each side of the
+    /// border, closed.
+    fn writers(
+        &self,
+        host: &crate::host::Host,
+        from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        len: u64,
+    ) -> [crate::host::HostList; 2] {
+        [
+            writer(host, &self.homes[0], self.border - len, from, len),
+            writer(host, &self.homes[1], self.border, from, len),
+        ]
+    }
+
+    fn done(self) {
+        unregister(0xc0de_5f02, self.region.base + K64);
+        unregister(0xc0de_5f03, self.border);
+        drop(self.homes);
+        // Not released: exact copies stay in their table, over this memory.
+        let _ = self.region;
+    }
+}
+
+/// One submission refreshes two exact copies over home bytes flights
+/// write: one its shaders write too (refused: written), one across the
+/// border of two homes. The submission waits once; the refusal is counted
+/// once for the submission, under its first piece's reason, and per piece.
+#[test]
+fn warp_lift_dry_run_counts_refusal_per_submission() {
+    use crate::frame_budget::{Refusal, Seen, take_seen};
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = r5_on();
+    let adjacent = Adjacent::new();
+    let border = adjacent.border;
+    let written = border - 0x8000;
+    let (one, two) = (
+        crate::shadow::exact(written, 0x200).expect("an exact copy"),
+        crate::shadow::exact(border - 0x100, 0x200).expect("an exact copy"),
+    );
+    one.update(written as usize, 0x200);
+    two.update((border - 0x100) as usize, 0x200);
+    let new = [0x5au8; 0x100];
+    let from = source(host, &new);
+    let hold = QueueHold::new(host);
+    let sides = adjacent.writers(host, &from, 0x100);
+    let first = writer(host, &adjacent.homes[0], written, &from, 0x100);
+    for list in sides.iter().chain([&first]) {
+        host.send_for_test(list);
+    }
+    let three = host.new_list().unwrap();
+    one.refresh(&three, written, 0x200);
+    three.defer_gpu_write(&one, written as usize, 0x200);
+    two.refresh(&three, border - 0x100, 0x200);
+    three.close();
+    assert!(refresh_waits(&[&three]));
+    let _ = take_seen();
+    let released = hold.released().after(200);
+    host.send_for_test(&three);
+    released.join().unwrap();
+    flights.land_all();
+    let refused: Vec<(Refusal, [u32; Refusal::ALL.len()])> = take_seen()
+        .iter()
+        .filter_map(|s| match *s {
+            Seen::H2Refused { first, pieces } => Some((first, pieces)),
+            _ => None,
+        })
+        .collect();
+    let mut pieces = [0; Refusal::ALL.len()];
+    pieces[Refusal::Written as usize] = 1;
+    pieces[Refusal::TwoHomes as usize] = 1;
+    assert_eq!(refused, [(Refusal::Written, pieces)], "once, first written");
+    for list in sides.iter().chain([&first, &three]) {
+        list.reset();
+    }
+    drop((sides, first, three, hold, one, two));
+    adjacent.done();
+}

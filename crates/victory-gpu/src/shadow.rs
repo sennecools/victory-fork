@@ -156,7 +156,7 @@ impl Hand {
 /// budget's H2 classes are told apart by. Nothing reads it to decide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
-    /// Made as copies are made: a home, a window, a buffer's copy with no
+    /// Made as copies are made: a home, a window or a buffer's copy with no
     /// reason of the memory core's noted.
     Made,
     /// A buffer view's copy of its own bytes ([`exact`]), and what the copy
@@ -166,8 +166,8 @@ pub(crate) enum Origin {
         base_is_home: bool,
         base_is_card: bool,
     },
-    /// A title buffer's copy (or a card copy's staging) made because the
-    /// memory core gave its bytes no home: why.
+    /// A title buffer's copy (or a card copy's staging), or a window, made
+    /// because the memory core gave its bytes no home: why.
     Kept(Kept),
 }
 
@@ -3008,10 +3008,7 @@ unsafe impl Sync for Shadow {}
 
 impl crate::home::Home for Shadow {
     fn visible(self: &Arc<Self>, list: &HostList, at: u64, len: u64) {
-        let len = len.min(self.start + self.len - at);
-        // For a placed one too: `update` copies nothing for it, but the list
-        // holds it until it is reset, so no list names a freed heap.
-        list.defer_refresh(self, at as usize, len as usize);
+        self.refresh_from(list, at, len, crate::frame_budget::Source::Other);
     }
 
     fn gpu_may_write(self: &Arc<Self>, list: &HostList, at: u64, len: u64) {
@@ -3140,6 +3137,21 @@ impl Shadow {
     /// ([`crate::home::Home::visible`]).
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         crate::home::Home::visible(self, list, address, len);
+    }
+
+    /// [`Shadow::refresh`], the step tagged with where it was asked for
+    /// (the frame budget's H2 split, `crate::frame_budget::Source`).
+    pub(crate) fn refresh_from(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        source: crate::frame_budget::Source,
+    ) {
+        let len = len.min(self.start + self.len - address);
+        // For a placed one too: `update` copies nothing for it, but the list
+        // holds it until it is reset, so no list names a freed heap.
+        list.defer_refresh_from(self, address as usize, len as usize, source);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -5388,12 +5400,22 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // window let go by the sweep while a buffer inside it kept it), or a new
     // one. A window is never offered the card here. Found or made, and
     // tabled, under one hold of [`HOMING`].
+    // Why the window got no home, if the core said (the copy made below
+    // notes it, [`Origin::Kept`], for the frame budget's H2 classes only).
+    let mut kept = None;
     if crate::home::on() {
         let _homing = homing(true);
         let home = match crate::home::resolve(start, len, true, false, &mut || false) {
             crate::home::Found::Home(home) => Some(home),
             crate::home::Found::New(new) => Some(new.home(start, len, true)),
-            crate::home::Found::Card | crate::home::Found::Copy(_) => None,
+            crate::home::Found::Card => {
+                kept = Some(Kept::Why(crate::home::Why::Off));
+                None
+            }
+            crate::home::Found::Copy(why) => {
+                kept = Some(Kept::Why(why));
+                None
+            }
         };
         if let Some(home) = home {
             let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
@@ -5468,6 +5490,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    if let Some(kept) = kept {
+        shadow.origin = Origin::Kept(kept);
+    }
     Some(window_made(
         (start, len),
         Arc::new(shadow),

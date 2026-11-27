@@ -3096,8 +3096,14 @@ enum Step {
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
-    /// intervenes.
-    Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// intervenes. Tagged with where it was asked for, for the frame
+    /// budget's H2 split only.
+    Refresh(
+        std::sync::Arc<crate::shadow::Shadow>,
+        usize,
+        usize,
+        crate::frame_budget::Source,
+    ),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
@@ -3164,7 +3170,7 @@ impl Step {
     /// a lifted read's source and destination.
     fn refreshes(&self) -> impl Iterator<Item = (&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
         let (first, second) = match self {
-            Step::Refresh(shadow, address, len) => (Some((shadow, *address, *len)), None),
+            Step::Refresh(shadow, address, len, _) => (Some((shadow, *address, *len)), None),
             Step::Lifted(lift) => (
                 Some((&lift.src, lift.src_at, lift.len)),
                 match &lift.to {
@@ -3175,6 +3181,15 @@ impl Step {
             _ => (None, None),
         };
         first.into_iter().chain(second)
+    }
+
+    /// Where a refresh step was asked for (the frame budget's H2 split);
+    /// `Other` for every other step.
+    fn source(&self) -> crate::frame_budget::Source {
+        match self {
+            Step::Refresh(.., source) => *source,
+            _ => crate::frame_budget::Source::Other,
+        }
     }
 
     /// The range of a host copy (copy, title address, bytes) the card writes
@@ -7722,14 +7737,39 @@ impl Host {
         // those bytes for it at the head of the submission, if it can.
         if late && r5() {
             let homes = line().homes_written.clone();
-            if refresh_over_flight_homes(&homes, runs) && !late_lift::lift_refreshes(&homes, runs) {
-                let stamp = crate::profile::stamp();
-                let args = late_lift::wait_args(runs, true);
-                if let Some(us) = budget::h2_wait(&args, &homes, runs) {
-                    R5_STATS[0].fetch_add(1, Ordering::Relaxed);
-                    R5_STATS[late_lift::R5_H2_US].fetch_add(us, Ordering::Relaxed);
-                    if waiting == 0 {
-                        waiting = stamp;
+            if refresh_over_flight_homes(&homes, runs) {
+                use crate::frame_budget::H2Outcome;
+                use late_lift::RefreshLift;
+                // One walk over the lists: the pieces the card could take, and
+                // the first refresh that met H2, whose class (counted whatever
+                // comes of it) is looked up once their locks are let go.
+                let plan = late_lift::plan_refresh_lifts(&homes, runs);
+                let first = budget::h2_class(&homes, plan.first());
+                let refusal = plan.refusal();
+                let lift = late_lift::lift_refreshes(plan, runs);
+                match lift {
+                    RefreshLift::Lifted => budget::h2_outcome(first, H2Outcome::Lifted, 0),
+                    RefreshLift::Refused => budget::h2_outcome(first, H2Outcome::Refused, 0),
+                    RefreshLift::Off => {}
+                }
+                if !matches!(lift, RefreshLift::Lifted) {
+                    // Without the lifts: why they would have been refused,
+                    // looked at before the wait (the flights it waits for
+                    // change the answer), counted if it waited.
+                    let refused = matches!(lift, RefreshLift::Off)
+                        .then_some(refusal)
+                        .flatten();
+                    let stamp = crate::profile::stamp();
+                    let args = late_lift::wait_args(runs, true);
+                    if let Some(us) = budget::h2_wait(&args, &homes, runs, first) {
+                        R5_STATS[0].fetch_add(1, Ordering::Relaxed);
+                        R5_STATS[late_lift::R5_H2_US].fetch_add(us, Ordering::Relaxed);
+                        if waiting == 0 {
+                            waiting = stamp;
+                        }
+                        if let Some((why, pieces)) = refused {
+                            crate::frame_budget::h2_refused(why, pieces);
+                        }
                     }
                 }
             }
@@ -9147,11 +9187,25 @@ impl HostList {
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
+    #[cfg(test)]
     pub(crate) fn defer_refresh(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+    ) {
+        self.defer_refresh_from(shadow, address, len, crate::frame_budget::Source::Other);
+    }
+
+    /// [`HostList::defer_refresh`], the step tagged with where it was asked
+    /// for (`source`, for the frame budget's H2 split). A range asked for
+    /// again keeps the step, and so the tag, it got first.
+    pub(crate) fn defer_refresh_from(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        source: crate::frame_budget::Source,
     ) {
         let mut deferred = self.deferred();
         // A placed copy's refresh copies nothing: the list only holds it.
@@ -9163,8 +9217,24 @@ impl HostList {
         if deferred.refreshed.insert(key) {
             deferred
                 .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+                .push(Step::Refresh(shadow.clone(), address, len, source));
         }
+    }
+
+    /// The list's refresh steps (copy's id, title address, bytes, source),
+    /// in order (tests).
+    #[cfg(test)]
+    pub(crate) fn refresh_steps_for_test(
+        &self,
+    ) -> Vec<(u64, usize, usize, crate::frame_budget::Source)> {
+        self.deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Refresh(shadow, at, len, source) => Some((shadow.id(), *at, *len, *source)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -9731,7 +9801,7 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
-                Step::Refresh(shadow, address, len) => {
+                Step::Refresh(shadow, address, len, _) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Refreshes, 1);

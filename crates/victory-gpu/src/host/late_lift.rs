@@ -235,7 +235,159 @@ struct Piece {
     len: usize,
 }
 
-/// With [`r5_lift`] and flights in the air: the refreshes of `runs` over
+use crate::frame_budget::Refusal;
+
+/// The first refresh of a submission over home bytes flights write (H2):
+/// the copy, its title range (start, end) and where it was asked for.
+pub(super) type FirstRefresh = (
+    std::sync::Arc<crate::shadow::Shadow>,
+    usize,
+    usize,
+    crate::frame_budget::Source,
+);
+
+/// What [`plan_refresh_lifts`] found: the pieces, or the first reason a
+/// piece was refused for, and per [`Refusal`] the pieces it refused; and the
+/// first refresh that met H2, for the frame budget's class.
+pub(super) struct RefreshPlan {
+    pieces: Vec<Piece>,
+    refused: Option<Refusal>,
+    per_piece: [u32; Refusal::ALL.len()],
+    first: Option<FirstRefresh>,
+}
+
+impl RefreshPlan {
+    fn refuse(&mut self, why: Refusal) {
+        self.refused.get_or_insert(why);
+        self.per_piece[why as usize] += 1;
+    }
+
+    /// The first refresh that met H2.
+    pub(super) fn first(&self) -> Option<&FirstRefresh> {
+        self.first.as_ref()
+    }
+
+    /// The first reason a piece was refused for, and the pieces refused per
+    /// [`Refusal`]; `None` if the card can take every piece.
+    pub(super) fn refusal(&self) -> Option<(Refusal, [u32; Refusal::ALL.len()])> {
+        self.refused.map(|first| (first, self.per_piece))
+    }
+}
+
+/// The pieces of the refreshes of `runs` over `homes_written` the card can
+/// take ([`lift_refreshes`]), or why not: every piece is looked at, so that
+/// each reason is counted, and the first refused is the submission's reason.
+/// One walk over the lists, which also finds the first refresh that met H2
+/// ([`RefreshPlan::first`]); the copies' tables are looked at only after
+/// it, with no list's lock held. Inserts nothing.
+pub(super) fn plan_refresh_lifts(
+    homes_written: &[(usize, usize)],
+    runs: &[&HostList],
+) -> RefreshPlan {
+    use std::sync::Arc;
+    let mut plan = RefreshPlan {
+        pieces: Vec::new(),
+        refused: None,
+        per_piece: [0; Refusal::ALL.len()],
+        first: None,
+    };
+    let twice = runs
+        .iter()
+        .enumerate()
+        .any(|(i, a)| runs[..i].iter().any(|b| std::ptr::eq(*a, *b)));
+    if twice {
+        plan.refuse(Refusal::Twice);
+    }
+    // The pieces (list, step, copy, address, end), then their homes: the
+    // copies' tables are not looked at under a list's lock. With them, the
+    // card writes of the submission's steps (copy, address, end).
+    let mut found = Vec::new();
+    let mut writes = Vec::new();
+    for (l, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            if let Some((shadow, at, len)) = step.card_writes() {
+                writes.push((Arc::as_ptr(shadow), at, at.saturating_add(len)));
+            }
+            for (copy, at, len) in step.refreshes() {
+                let end = at.saturating_add(len);
+                if copy.is_home() || !touches(homes_written, at, end) {
+                    continue;
+                }
+                if plan.first.is_none() {
+                    plan.first = Some((copy.clone(), at, end, step.source()));
+                }
+                if twice {
+                    continue;
+                }
+                let why = if !matches!(step, Step::Refresh(..)) {
+                    Some(Refusal::NotRefresh)
+                } else if copy.carded() {
+                    Some(Refusal::Carded)
+                } else {
+                    None
+                };
+                for (from, to) in overlaps(homes_written, at, end) {
+                    match why {
+                        Some(why) => plan.refuse(why),
+                        None => found.push((l, i, copy.clone(), from, to)),
+                    }
+                }
+            }
+        }
+    }
+    for (list, step, copy, from, to) in found {
+        if copy.writes_pending_over(from, to - from) {
+            plan.refuse(Refusal::Pending);
+            continue;
+        }
+        let Some(home) = crate::shadow::home_of(from as u64, (to - from) as u64) else {
+            let two = crate::shadow::home_of(from as u64, 1)
+                .zip(crate::shadow::home_of(to as u64 - 1, 1))
+                .is_some_and(|(a, b)| !Arc::ptr_eq(&a, &b));
+            plan.refuse(if two {
+                Refusal::TwoHomes
+            } else {
+                Refusal::NoHome
+            });
+            continue;
+        };
+        let ptr = Arc::as_ptr(&copy);
+        if writes
+            .iter()
+            .any(|&(shadow, at, end)| shadow == ptr && from < end && at < to)
+        {
+            plan.refuse(Refusal::Written);
+            continue;
+        }
+        plan.pieces.push(Piece {
+            list,
+            step,
+            copy,
+            home,
+            at: from,
+            len: to - from,
+        });
+    }
+    // (Never empty without a refusal: the caller found such a refresh.)
+    if plan.pieces.is_empty() && plan.refused.is_none() {
+        plan.refuse(Refusal::NoHome);
+    }
+    plan
+}
+
+/// What [`lift_refreshes`] did with a submission's refreshes over flights'
+/// homes.
+pub(super) enum RefreshLift {
+    /// Not asked for (`VICTORY_R5_LIFT` off).
+    Off,
+    /// Taken on the card.
+    Lifted,
+    /// Refused (the reasons are counted): the submission waits.
+    Refused,
+}
+
+/// With [`r5_lift`] and flights in the air (`plan`: what [`plan_refresh_lifts`]
+/// found for `runs`): the refreshes of `runs` over
 /// homes' bytes flights' shaders may write (`homes_written`, as
 /// [`refresh_over_flight_homes`] finds them) are done on the card instead of
 /// waiting for those flights. Each such refresh stays a refresh on the CPU,
@@ -244,7 +396,8 @@ struct Piece {
 /// the refresh step: at the head of the submission, behind every flight on
 /// the queue. They write over what the CPU took there, and once the flights
 /// land the copy is told those bytes changed (`crate::home::after_wait`), so
-/// its next refresh takes them again. Whether nothing is left to wait for.
+/// its next refresh takes them again. What it did: with
+/// [`RefreshLift::Lifted`] nothing is left to wait for.
 ///
 /// Refused (counted; the submission waits as before) when the copy has a
 /// declared write of its own over such a part in this submission: its
@@ -256,78 +409,19 @@ struct Piece {
 /// the home's bytes for theirs. And when such a part is a lifted read's, the
 /// copy's card side is in the card's memory (it goes up from the CPU side
 /// before the lists), no one home holds a part, or a list is named twice.
-pub(super) fn lift_refreshes(homes_written: &[(usize, usize)], runs: &[&HostList]) -> bool {
-    use std::sync::Arc;
+/// Each refusal is counted with its reasons (`crate::frame_budget::h2_refused`).
+pub(super) fn lift_refreshes(plan: RefreshPlan, runs: &[&HostList]) -> RefreshLift {
     if !r5_lift() {
-        return false;
+        return RefreshLift::Off;
     }
-    let refuse = || {
+    if let Some(first) = plan.refused {
         R5_STATS[R5_REFRESHES_REFUSED].fetch_add(1, Ordering::Relaxed);
-        false
-    };
-    if runs
-        .iter()
-        .enumerate()
-        .any(|(i, a)| runs[..i].iter().any(|b| std::ptr::eq(*a, *b)))
-    {
-        return refuse();
-    }
-    // The pieces (list, step, copy, address, end), then their homes: the
-    // copies' tables are not looked at under a list's lock.
-    let mut found = Vec::new();
-    for (l, list) in runs.iter().enumerate() {
-        for (i, step) in list.deferred().copies.iter().enumerate() {
-            for (copy, at, len) in step.refreshes() {
-                let end = at.saturating_add(len);
-                if copy.is_home() || !touches(homes_written, at, end) {
-                    continue;
-                }
-                if !matches!(step, Step::Refresh(..)) || copy.carded() {
-                    return refuse();
-                }
-                for (from, to) in overlaps(homes_written, at, end) {
-                    found.push((l, i, copy.clone(), from, to));
-                }
-            }
-        }
-    }
-    // (Never empty: the caller found such a refresh. Counted all the same,
-    // so that the waits are.)
-    if found.is_empty() {
-        return refuse();
-    }
-    let mut pieces = Vec::with_capacity(found.len());
-    for (list, step, copy, from, to) in found {
-        if copy.writes_pending_over(from, to - from) {
-            return refuse();
-        }
-        let Some(home) = crate::shadow::home_of(from as u64, (to - from) as u64) else {
-            return refuse();
-        };
-        pieces.push(Piece {
-            list,
-            step,
-            copy,
-            home,
-            at: from,
-            len: to - from,
-        });
-    }
-    let written = runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| {
-            step.card_writes().is_some_and(|(shadow, at, len)| {
-                pieces
-                    .iter()
-                    .any(|p| Arc::ptr_eq(&p.copy, shadow) && p.at < at + len && at < p.at + p.len)
-            })
-        })
-    });
-    if written {
-        return refuse();
+        crate::frame_budget::h2_refused(first, plan.per_piece);
+        return RefreshLift::Refused;
     }
     // From the last, so that the places found hold; behind each refresh in
     // the order found.
-    for piece in pieces.into_iter().rev() {
+    for piece in plan.pieces.into_iter().rev() {
         let lifted = Lifted {
             src: piece.home,
             src_at: piece.at,
@@ -340,7 +434,7 @@ pub(super) fn lift_refreshes(homes_written: &[(usize, usize)], runs: &[&HostList
             .insert(piece.step + 1, Step::Lifted(Box::new(lifted)));
     }
     R5_STATS[R5_REFRESHES_LIFTED].fetch_add(1, Ordering::Relaxed);
-    true
+    RefreshLift::Lifted
 }
 
 #[cfg(test)]
