@@ -375,3 +375,199 @@ fn warp_ask_once_skips_unwatched_from_shared_walk() {
     unregister(0x57a1_e014, plain as u64);
     unregister(0x57a1_e015, watched as u64);
 }
+
+// ---- Each submission's sends read the bytes it was prepared with (`send`) ----
+
+/// A buffer of ours the CPU can read, `len` bytes: what a list copied there.
+fn readable(host: &Host, len: usize) -> (ID3D12Resource, *const u8) {
+    let (buffer, data) = host.shared_buffer(len as u64).expect("a shared buffer");
+    (buffer, data.cast_const())
+}
+
+/// A list that refreshes `[at, at + len)` of the card copy `copy` (title
+/// address `at`) and copies what its card side holds there into `out`, as a
+/// shader of the submission would read it; closed.
+fn reader(
+    host: &Host,
+    copy: &Arc<Shadow>,
+    at: usize,
+    len: usize,
+    out: &ID3D12Resource,
+) -> HostList {
+    let list = host.new_list().unwrap();
+    copy.refresh(&list, at as u64, len as u64);
+    // SAFETY: an open list of the host's; live buffers, the range in both.
+    unsafe {
+        list.list
+            .CopyBufferRegion(out, 0, &copy.buffer, copy.offset(at as u64), len as u64)
+    };
+    list.close();
+    list
+}
+
+/// A card copy of `len` bytes of title memory (write-watched if `watched`),
+/// or `None` where card copies are not made.
+fn card_copy(id: usize, len: usize, watched: bool) -> Option<(usize, Arc<Shadow>)> {
+    let host = host()?;
+    if !host.card_ready() {
+        return None;
+    }
+    let at = title_memory(len, watched);
+    let copy = copy_of(id, at, len);
+    if !copy.carded() {
+        unregister(id, at as u64);
+        return None;
+    }
+    copy.update(at, len);
+    Some((at, copy))
+}
+
+/// The debug layer's first error since the last look, if the host has it
+/// (`VICTORY_D3D12_DEBUG=1`, with `VICTORY_D3D12_GBV=1` for GPU-based
+/// validation, where the Graphics Tools are installed; else `None`).
+fn debug_error(host: &Host) -> Option<String> {
+    host.log_messages()
+}
+
+/// Three submissions, held on the queue, each put another value into the
+/// same bytes of a card copy and read them on the card: each reads its own
+/// value, not the last one's (cool_fox 18c0129's case: 12 of 12 wrong with
+/// sends out of the CPU side).
+#[test]
+fn warp_send_own_three_submissions_each_see_own_value() {
+    let Some(host) = host() else { return };
+    let flights = flights::TestFlights::on(false, false);
+    let Some((at, copy)) = card_copy(0x57a1_e021, 1 << 20, false) else {
+        return;
+    };
+    let _ = debug_error(host);
+    let hold = flights::QueueHold::new(host);
+    let mut lists = Vec::new();
+    let mut outs = Vec::new();
+    for value in [0x11u8, 0x22, 0x33] {
+        put(at + 0x100, &[value; 16]);
+        let (out, data) = readable(host, 256);
+        let list = reader(host, &copy, at + 0x100, 16, &out);
+        host.send_for_test(&list);
+        lists.push(list);
+        outs.push((out, data, value));
+    }
+    assert_eq!(flights::in_air(), 3, "all three held");
+    hold.release();
+    flights.land_all();
+    for (_, data, value) in &outs {
+        // SAFETY: the buffer's mapping holds 256 bytes; the card ran the copy.
+        let seen = unsafe { std::slice::from_raw_parts(*data, 16) };
+        assert_eq!(seen, &[*value; 16], "each submission's own value");
+    }
+    assert_eq!(debug_error(host), None, "the debug layer");
+    for list in lists {
+        list.reset();
+    }
+    unregister(0x57a1_e021, at as u64);
+}
+
+/// A flight may write a range of a card copy; two submissions behind it,
+/// held on the queue, each refresh the range after the title wrote another
+/// value there, and read it on the card. The second's merge under the
+/// flight's writes puts its value into the copy's CPU side before the card
+/// ran the first's sends: the first still reads its own value. `runs`: the
+/// changed runs each merge puts in.
+fn merge_does_not_reach_earlier_send(runs: usize) {
+    let Some(host) = host() else { return };
+    let flights = flights::TestFlights::on(false, false);
+    let Some((at, copy)) = card_copy(0x57a1_e022 + runs, 1 << 20, true) else {
+        return;
+    };
+    let _ = debug_error(host);
+    let (busy, len) = (at + 0x1000, 2 * runs);
+    let (hold, one) = held_flight(host, &copy, busy, len.next_multiple_of(0x1000));
+    let mut lists = vec![one];
+    let mut outs = Vec::new();
+    for value in [0x5au8, 0xa5] {
+        // Every other byte: `runs` runs.
+        for i in 0..runs {
+            put(busy + 2 * i, &[value]);
+        }
+        let (out, data) = readable(host, len.next_multiple_of(256));
+        let list = reader(host, &copy, busy, len, &out);
+        let _ = stale_seen();
+        host.send_for_test(&list);
+        let (waited, refused) = stale_seen();
+        assert!(!waited && refused == 0, "merged under the flight, no wait");
+        lists.push(list);
+        outs.push((out, data, value));
+    }
+    assert_eq!(flights::in_air(), 3, "the flight and both submissions held");
+    hold.release();
+    flights.land_all();
+    for (_, data, value) in &outs {
+        // SAFETY: the buffer's mapping holds `len` bytes; the card ran the copy.
+        let seen = unsafe { std::slice::from_raw_parts(*data, len) };
+        let wanted: Vec<u8> = (0..len)
+            .map(|i| if i % 2 == 0 { *value } else { 0 })
+            .collect();
+        assert!(
+            seen == &wanted[..],
+            "each submission reads the value it was prepared with"
+        );
+    }
+    assert_eq!(
+        get(busy, 2),
+        [0xa5, 0],
+        "title memory keeps the title's last bytes"
+    );
+    assert_eq!(debug_error(host), None, "the debug layer");
+    for list in lists {
+        list.reset();
+    }
+    unregister(0x57a1_e022 + runs, at as u64);
+}
+
+#[test]
+fn warp_stale_merge_does_not_reach_earlier_queued_send() {
+    merge_does_not_reach_earlier_send(16);
+}
+
+/// The memory a submission's sends come from is not used again while the
+/// submission is on the queue: a second submission behind it takes other
+/// memory, and neither is spare until they have landed.
+#[test]
+fn warp_send_own_memory_recycled_only_after_landing() {
+    let Some(host) = host() else { return };
+    let flights = flights::TestFlights::on(false, false);
+    let Some((at, copy)) = card_copy(0x57a1_e031, 1 << 20, false) else {
+        return;
+    };
+    let _ = debug_error(host);
+    let (out, _) = readable(host, 256);
+    let submit = |value: u8| {
+        put(at + 0x100, &[value; 16]);
+        let list = reader(host, &copy, at + 0x100, 16, &out);
+        host.send_for_test(&list);
+        (list, send::out_for_test())
+    };
+    let (out_before, _) = send::out_for_test();
+    let hold = flights::QueueHold::new(host);
+    let (one, (out_one, first)) = submit(1);
+    let (two, (out_two, second)) = submit(2);
+    assert_eq!(out_one, out_before + 1, "the first's memory is out");
+    assert_eq!(out_two, out_before + 2, "and the second's");
+    assert_ne!(first, second, "not the first's while it is on the queue");
+    assert!(
+        !send::spare_for_test(first) && !send::spare_for_test(second),
+        "neither is spare"
+    );
+    hold.release();
+    flights.land_all();
+    assert_eq!(send::out_for_test().0, out_before, "given back once landed");
+    assert!(
+        send::spare_for_test(first) && send::spare_for_test(second),
+        "both spare now"
+    );
+    assert_eq!(debug_error(host), None, "the debug layer");
+    for list in [one, two] {
+        list.reset();
+    }
+    unregister(0x57a1_e031, at as u64);
+}

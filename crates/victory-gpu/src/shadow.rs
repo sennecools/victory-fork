@@ -4303,6 +4303,27 @@ impl Shadow {
         bytes
     }
 
+    /// Of a copy in the card's memory with a CPU side of its own: its CPU
+    /// side's bytes at `runs` (offset in the copy, offset from `to`,
+    /// bytes) are copied to memory at `to`, as they are now
+    /// (`crate::host`'s send memory). Under the reference's lock: the relay's
+    /// landing writes the CPU side under it.
+    ///
+    /// # Safety
+    ///
+    /// `to` has room for every run; the runs lie in the copy.
+    pub(crate) unsafe fn card_take(&self, runs: &[(usize, u64, usize)], to: *mut u8) {
+        debug_assert!(self.card.is_some() && self.card_home().is_none());
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        for &(a, at, n) in runs {
+            // SAFETY: the caller's; the CPU side maps the copy's bytes, and
+            // only this thread and the landing (under the lock held) write it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data.add(a).cast_const(), to.add(at as usize), n)
+            };
+        }
+    }
+
     /// For a copy in the card's memory whose CPU side is a home
     /// (`crate::card_home`): its home, where the copy's first byte lies in
     /// the home's buffer, and its card side's bytes.

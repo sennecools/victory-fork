@@ -37,6 +37,9 @@ pub(crate) use ending::{
 };
 #[cfg(test)]
 pub(crate) use ending::{refused_count, reset_for_test};
+/// Each submission's sends to copies in the card's memory read memory of
+/// its own, not the copies' CPU sides.
+mod send;
 /// R5 flush (`VICTORY_R5_FLUSH=1`): less work at submission, and its counters.
 pub(crate) mod r5_flush;
 /// R5's refreshes over flights' homes done on the card, and what its waits
@@ -3086,6 +3089,9 @@ struct CardPlan {
     /// With [`relay`], the number of this plan's send of changed ranges
     /// (`QUEUE_ORDER`); else 0.
     sent_as: u64,
+    /// With [`send::own`]: the memory its sends come from, given back by
+    /// `Host::card_done` (boxed: flights in the line hold plans).
+    sends: Option<Box<send::Memory>>,
     /// Whether the compare's list fetches the flagged pieces itself
     /// ([`inflight_fetch`]): every compared range has its [`CARD_FETCH`].
     inflight: bool,
@@ -5451,6 +5457,7 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
+    send::line(frames);
 }
 
 #[cfg(test)]
@@ -6312,6 +6319,8 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // The bytes as they are now, whatever later submissions put there.
+        let own = if send::own() { send::take(self, &dirty) } else { None };
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -6324,11 +6333,17 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    // From the CPU side: the staging buffer, or the home
-                    // that is title memory itself (`crate::card_home`).
-                    let copies = |shadow: &crate::shadow::Shadow, ranges: &[(usize, usize)]| {
+                    // From the submission's own memory ([`send`]), or from
+                    // the CPU side: the staging buffer, or the home that is
+                    // title memory itself (`crate::card_home`).
+                    let copies = |i: usize,
+                                  shadow: &crate::shadow::Shadow,
+                                  ranges: &[(usize, usize)]| {
                         crate::spans::mark(list, crate::spans::Span::Upload);
-                        let bytes = shadow.card_upload(list, ranges);
+                        let bytes = match own.as_ref().and_then(|own| own.upload(list, i, shadow)) {
+                            Some(bytes) => bytes,
+                            None => shadow.card_upload(list, ranges),
+                        };
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                     };
@@ -6337,11 +6352,11 @@ impl Host {
                     let wide = work.wide;
                     if wide {
                         let mut barriers = Vec::new();
-                        for (shadow, ranges) in &dirty {
+                        for (i, (shadow, ranges)) in dirty.iter().enumerate() {
                             let Some((_, before, _)) = shadow.card_sides() else {
                                 continue;
                             };
-                            copies(shadow, ranges);
+                            copies(i, shadow, ranges);
                             if before.is_some() && !ranges.is_empty() {
                                 barriers.push(transition(
                                     &shadow.buffer,
@@ -6354,12 +6369,12 @@ impl Host {
                             list.ResourceBarrier(&barriers);
                         }
                     }
-                    for (shadow, ranges) in &dirty {
+                    for (i, (shadow, ranges)) in dirty.iter().enumerate() {
                         let Some((_, before, size)) = shadow.card_sides() else {
                             continue;
                         };
                         if !wide {
-                            copies(shadow, ranges);
+                            copies(i, shadow, ranges);
                         }
                         let Some(before) = before else {
                             continue;
@@ -6424,6 +6439,7 @@ impl Host {
             _synced: Vec::new(),
             lists: used,
             sent_as,
+            sends: own.map(|own| Box::new(own.memory())),
             inflight: false,
             inflight_landed: 0,
         };
@@ -6625,6 +6641,9 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
+        if let Some(memory) = plan.sends {
+            send::give_back(*memory);
+        }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
