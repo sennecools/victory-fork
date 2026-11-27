@@ -3675,7 +3675,9 @@ impl HostHeap {
         // The texture the slot waits for (`super::wait_for`, after the
         // claim: it takes a global lock and may make the texture).
         let mut wait = waiting;
+        // (A slot made from nothing shows no old view: no look up.)
         if later
+            && claim.old != 0
             && keep_views()
             && view_at(claim.old as u32, (claim.old >> 32) as u32)
                 .is_some_and(|old| same_placed_texture(&old, &view))
