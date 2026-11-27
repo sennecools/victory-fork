@@ -1,7 +1,8 @@
 # Bound fragmented card-write diff work
 
 In late-exact submission preparation, the card-backed path budgets a
-maximum of 512 changed runs across the submission. Previously a page
+maximum of 4,096 changed runs across the submission (512 before every
+stale span was merged). Previously a page
 was fully scanned and all runs allocated even when the result exceeded
 the remaining budget and would be discarded. Stop on the first excess
 run instead, before allocating or scanning that run's remainder.

@@ -4608,17 +4608,13 @@ fn asked_spans(refreshed: &Refreshed) -> Vec<(usize, usize)> {
 /// title write between two of them is no refresh's, and the next
 /// submission that refreshes it takes it.
 ///
-/// The spans found so (copy, from, to): with the relay's second stage
-/// ([`relay_exact`]) every one of them, else the first. Each refusal is
+/// The spans found so (copy, from, to), every one of them. Each refusal is
 /// counted (`crate::frame_budget::stale_refused`); `first`: this is the
 /// submission's first look.
 fn stale_under_flights(
     refreshed: &Refreshed,
     first: bool,
 ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-    // (With `VICTORY_LATE_WAIT=2` alone the first span and 512 runs, as
-    // before.)
-    let all = relay_exact();
     // On the profile: host copies looked at, runs merged (`late_exact`),
     // and whether a settle is due.
     let mut span = crate::profile::span("stale under flights");
@@ -4643,14 +4639,14 @@ fn stale_under_flights(
         crate::frame_budget::stale_bytes(hull, exact);
     }
     if late_exact() {
-        // The title's bytes are put in beside the flights' writes; a wait
-        // is still due where that could not be done. At most this many
-        // changed runs go up to copies in the card's memory, each a copy of
-        // its own there (with the relay's second stage more, and every span
-        // is merged): cool_fox measured hundreds of short changed runs a
-        // page once lifted fills bring the pages of constants the title
-        // rewrites each frame here, at about 1.5 us a run.
-        let budget = if all { 4096 } else { 512 };
+        // The title's bytes are put in beside the flights' writes, in every
+        // span; a wait is still due where that could not be done. At most
+        // this many changed runs go up to copies in the card's memory, each
+        // a copy of its own there: cool_fox measured hundreds of short
+        // changed runs a page once lifted fills bring the pages of
+        // constants the title rewrites each frame here, at about 1.5 us a
+        // run.
+        let budget = 4096;
         let mut runs_left = budget;
         let mut refused = Vec::new();
         let mut merge = |shadow: &crate::shadow::Shadow, from: usize, to: usize| {
@@ -4662,15 +4658,8 @@ fn stale_under_flights(
                 }
             }
         };
-        let stale: Vec<_> = if all {
-            spans.into_iter().filter(|(shadow, from, to)| merge(shadow, *from, *to)).collect()
-        } else {
-            spans
-                .into_iter()
-                .find(|(shadow, from, to)| merge(shadow, *from, *to))
-                .into_iter()
-                .collect()
-        };
+        let stale: Vec<_> =
+            spans.into_iter().filter(|(shadow, from, to)| merge(shadow, *from, *to)).collect();
         crate::frame_budget::stale_refused(&refused, first);
         if let Some(span) = span.as_mut() {
             span.arg("copies", copies);
@@ -4679,18 +4668,10 @@ fn stale_under_flights(
         }
         return stale;
     }
-    let stale: Vec<_> = if all {
-        spans
-            .into_iter()
-            .filter(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
-            .collect()
-    } else {
-        spans
-            .into_iter()
-            .find(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
-            .into_iter()
-            .collect()
-    };
+    let stale: Vec<_> = spans
+        .into_iter()
+        .filter(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+        .collect();
     if let Some(span) = span.as_mut() {
         span.arg("copies", copies);
         span.arg("stale", stale.len() as u64);
