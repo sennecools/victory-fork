@@ -3526,11 +3526,15 @@ impl HostHeap {
             return Some(view);
         }
         // A buffer view left for a draw again, of the record the slot was
-        // last left for a draw from ([`HostHeap::left`]), in a slot made
-        // from nothing: the deferral below would write the same null view
-        // and word, keep nothing and note the same sets, so it is done with
-        // before the claim, as a made slot is above, noting only the set of
-        // changes.
+        // last left for a draw from ([`HostHeap::left`]), or a constant
+        // buffer view where one was, in a slot made from nothing: the
+        // deferral below would write the same null view and word, keep
+        // nothing and note the same sets, so it is done with before the
+        // claim, as a made slot is above, noting only the set of changes.
+        // (Nothing makes a title slot of a constant view left for a draw
+        // later: tables made afresh make their own slots, and the heap
+        // buffer pass walks no constant views. A step that changes that
+        // changes this too.)
         //
         // `made` first: a claim writes the record before `made`, with
         // release. A record whose view was released since goes on to the
@@ -3547,8 +3551,7 @@ impl HostHeap {
                 .made
                 .get(index as usize)
                 .is_some_and(|made| made.load(std::sync::atomic::Ordering::Acquire) == 0)
-            && let Some(again @ crate::frame_budget::LeftAgain::Same) =
-                left_again(left.load(std::sync::atomic::Ordering::Acquire), key)
+            && let Some(again) = left_again(left.load(std::sync::atomic::Ordering::Acquire), key)
             && let Some(view) = view_at(i, generation)
         {
             // The set of changes as the deferral notes it: a buffer view the
@@ -3786,13 +3789,6 @@ impl HostHeap {
                 && kind == crate::frame_budget::Mirror::BufferDeferred
                 && claim.left_at.is_some()
             {
-                // (The same record again is done with before the claim.)
-                if claim.old == 0
-                    && let Some(again @ crate::frame_budget::LeftAgain::Constant) =
-                        left_again(claim.left_before(), key)
-                {
-                    crate::frame_budget::left_again(again);
-                }
                 claim.left = key;
             }
         }
@@ -4800,7 +4796,8 @@ struct Claimed<'a> {
 
 impl Claimed<'_> {
     /// The buffer record the slot was last left for a draw from when it was
-    /// claimed (0: none). Exact: only claims write it.
+    /// claimed (0: none). Exact: only claims write it. (Tests.)
+    #[cfg(test)]
     fn left_before(&self) -> u64 {
         self.left_at
             .map_or(0, |left| left.load(std::sync::atomic::Ordering::Relaxed))
@@ -6693,7 +6690,6 @@ mod made_tests {
                     mirror(Mirror::BufferDeferred),
                     Seen::LeftAgain(LeftAgain::Same),
                     mirror(Mirror::BufferDeferred),
-                    mirror(Mirror::BufferDeferred),
                     Seen::LeftAgain(LeftAgain::Constant),
                 ],
                 "bits {bits}"
@@ -6893,6 +6889,98 @@ mod made_tests {
             assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
             assert_eq!(heap.buffer_changes(), full.buffer_changes(), "bits {bits}");
             assert_eq!(heap.left_key(1), record_key(at), "bits {bits}");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// A constant buffer view left for a draw where another one was, at
+    /// another address, is done with before the claim, counted as left
+    /// again: the slot shows a null constant view and the constant word, in
+    /// no set of buffer views, as a full deferral leaves it, and keeps the
+    /// first record. A draw then makes it from the record there now.
+    #[test]
+    fn left_again_constant_any_address() {
+        use crate::frame_budget::{LeftAgain, Seen, take_seen};
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; 2];
+            let at = records.as_mut_ptr() as u64 + 32;
+            write(at, &views[0]);
+            let first = record_key(at);
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+            }
+            write(at, &views[1]);
+            assert_ne!(record_key(at), first);
+            let _ = take_seen();
+            BEFORE_CLAIM.set(Some(|_| panic!("a claim asked for")));
+            assert_eq!(heap.mirror(1, at, false), views[1], "bits {bits}");
+            assert!(BEFORE_CLAIM.take().is_some(), "bits {bits}: claimed");
+            assert_eq!(
+                take_seen(),
+                [Seen::LeftAgain(LeftAgain::Constant)],
+                "bits {bits}"
+            );
+            full.mirror(1, at, false);
+            assert_eq!(
+                heap.word(1),
+                Some(victory_shader::emit::SLOT_CONSTANT),
+                "bits {bits}"
+            );
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
+            assert_eq!(heap.buffer_changes(), full.buffer_changes(), "bits {bits}");
+            assert_eq!(heap.left_key(1), first, "bits {bits}");
+            for heap in [heap, full] {
+                heap.mirror(1, at, true);
+            }
+            assert_eq!(
+                key(heap, 1),
+                record_key(at),
+                "bits {bits}: made by the draw"
+            );
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
+            drop(records);
+        }
+        assert!(alive());
+    }
+
+    /// A buffer view that is no constant view, left for a draw where a
+    /// constant view was, is left in full: its null view, its word and the
+    /// set of buffer views it goes into differ.
+    #[test]
+    fn left_constant_then_srv_is_made() {
+        use crate::frame_budget::{Mirror, Seen, take_seen};
+        let Some(heaps) = left_and_full() else {
+            return; // no host GPU
+        };
+        let views = views(memory());
+        for (heap, full, bits) in &heaps {
+            let mut records = vec![[0u32; 8]; 2];
+            let at = records.as_mut_ptr() as u64 + 32;
+            write(at, &views[0]);
+            for heap in [heap, full] {
+                heap.mirror(1, at, false);
+            }
+            write(at, &views[2]);
+            let _ = take_seen();
+            heap.mirror(1, at, false);
+            assert_eq!(
+                take_seen(),
+                [Seen::Mirror {
+                    kind: Mirror::BufferDeferred,
+                    eligible: false
+                }],
+                "bits {bits}"
+            );
+            full.mirror(1, at, false);
+            assert_eq!(heap.left_key(1), record_key(at), "bits {bits}");
+            assert_ne!(heap.word(1), Some(victory_shader::emit::SLOT_CONSTANT));
+            assert_eq!(heap.buffer_slots(), [1], "bits {bits}");
+            assert_eq!(shown(heap, 0..2), shown(full, 0..2), "bits {bits}");
             drop(records);
         }
         assert!(alive());
