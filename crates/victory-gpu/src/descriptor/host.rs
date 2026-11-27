@@ -72,6 +72,10 @@ pub(crate) struct HostHeap {
     /// the view from before for as long as nothing else on its page changed.
     /// At most [`LEFT_MOST`] slots; taken by the pass alone, once a pass.
     left_to_tables: Mutex<std::collections::BTreeSet<u32>>,
+    /// The frame in which [`HostHeap::retake_left`] last looked for slots
+    /// of `left_to_tables` whose marks aged (`u64::MAX`: never). Marks age
+    /// by frames, so a later pass of that frame finds none.
+    left_scanned: std::sync::atomic::AtomicU64,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -1550,6 +1554,7 @@ impl HostHeap {
             log: NoteLog::default(),
             seen: std::sync::OnceLock::new(),
             left_to_tables: Mutex::default(),
+            left_scanned: std::sync::atomic::AtomicU64::new(u64::MAX),
             kept: (0..(count + extra).div_ceil(KEPT_SHARD))
                 .map(|shard| {
                     let slots = (count + extra - shard * KEPT_SHARD).min(KEPT_SHARD);
@@ -3274,40 +3279,70 @@ impl HostHeap {
     /// table holds lately any more are read again from the title's heap at
     /// `start` (records of `step` bytes): their keys are seen from here on
     /// and they are handed on to be mirrored (`part.make`, kept sorted and
-    /// without repeats). Costs one lock of the set (the pass's alone) and a
-    /// look at each slot in it, then a read of 12 bytes per slot read again;
-    /// nothing when the set is empty. No lock of the mirror path is taken.
-    pub(crate) fn retake_left(&self, left: &[u32], (start, step): (u64, u64), part: &mut SyncPart) {
-        let frame = crate::frame::current();
+    /// without repeats). Marks age by frames, so only the first pass of a
+    /// frame looks at the slots in the set ([`HostHeap::left_scanned`]); a
+    /// later pass of that frame with nothing left costs no lock. Otherwise
+    /// one lock of the set (the pass's alone), a look at each slot in it once
+    /// a frame, a look at each slot left, and a read of 12 bytes per slot
+    /// read again. No lock of the mirror path is taken.
+    pub(crate) fn retake_left(&self, left: &[u32], at: (u64, u64), part: &mut SyncPart) {
+        self.retake_left_in(left, at, part, crate::frame::current());
+    }
+
+    /// [`HostHeap::retake_left`] in frame `frame`.
+    ///
+    /// shortcut: a slot left by a pass that sorted its page in the frame
+    /// before is looked at from the next frame on, even if its mark aged in
+    /// this one (one frame late, of [`TABLED_FRAMES`]).
+    fn retake_left_in(
+        &self,
+        left: &[u32],
+        (start, step): (u64, u64),
+        part: &mut SyncPart,
+        frame: u64,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let scan = self.left_scanned.load(Relaxed) != frame;
+        if !scan && left.is_empty() {
+            return;
+        }
         let aged: Vec<u32> = {
             let mut set = self
                 .left_to_tables
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            // (An empty set counts as looked at: nothing in it ages.)
+            self.left_scanned.store(frame, Relaxed);
             if set.is_empty() && left.is_empty() {
                 return;
             }
-            let aged: Vec<u32> = set
-                .iter()
-                .copied()
-                .filter(|&slot| !self.tabled_lately(slot, frame))
-                .collect();
+            #[cfg(test)]
+            if scan {
+                LEFT_SCANS_HERE.set(LEFT_SCANS_HERE.get() + 1);
+            }
+            let aged: Vec<u32> = if scan {
+                set.iter()
+                    .copied()
+                    .filter(|&slot| !self.tabled_lately(slot, frame))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             for slot in &aged {
                 set.remove(slot);
             }
             let (most, mut refused) = (left_most(), 0u64);
-            for &slot in left {
-                if set.contains(&slot) {
-                    continue;
-                }
+            for (n, &slot) in left.iter().enumerate() {
                 if set.len() >= most {
-                    refused += 1;
-                    continue;
+                    // Full: no slot from here on finds room, and each one
+                    // not in the set already is refused.
+                    refused = left[n..].iter().filter(|s| !set.contains(s)).count() as u64;
+                    break;
                 }
                 set.insert(slot);
             }
             if refused > 0 {
-                LEFT_DROPPED.fetch_add(refused, std::sync::atomic::Ordering::Relaxed);
+                LEFT_DROPPED.fetch_add(refused, Relaxed);
             }
             aged
         };
@@ -4203,6 +4238,9 @@ thread_local! {
     /// Tests: [`left_most`] on this thread.
     pub(crate) static LEFT_MOST_HERE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// Tests: looks for aged marks over a [`HostHeap::left_to_tables`] set
+    /// on this thread ([`HostHeap::retake_left`]).
+    pub(crate) static LEFT_SCANS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Slots left to tables that [`HostHeap::left_to_tables`] had no room for.

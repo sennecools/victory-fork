@@ -2031,9 +2031,8 @@ impl State {
                     }
                 }
             }
-            for &(from, to) in joined {
-                shadow.refresh_from(list, from, to - from, Source::HeapPass);
-            }
+            // One lock of the list's steps for all of the copy's ranges.
+            list.defer_refreshes_from(shadow, joined, Source::HeapPass);
         }
         if let Some(span) = spanning.as_mut() {
             span.arg("copies", spans.len() as u64);
@@ -5790,6 +5789,42 @@ void main() {
         );
         list.close();
         list.reset();
+    }
+
+    /// The pass takes the list's steps' lock once for all ranges of a copy:
+    /// four views of a copy far apart take as many locks as four joined into
+    /// one range, and each far one is still a refresh of its own, in order.
+    #[test]
+    fn warp_heap_pass_one_lock_per_copy_same_steps() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        use crate::host::DEFERRED_LOCKS_HERE;
+        let locks_and_steps = |firsts: [u32; 4]| {
+            let heap = ViewHeap::new(true);
+            for (slot, first) in (1..).zip(firsts) {
+                heap.put(slot, first);
+            }
+            let list = host.new_list().unwrap();
+            let before = DEFERRED_LOCKS_HERE.get();
+            heap.pass(&list, test_frame());
+            let locks = DEFERRED_LOCKS_HERE.get() - before;
+            let steps: Vec<_> = steps_of(&list, &heap.copy())
+                .into_iter()
+                .map(|(at, len, source)| (at - heap.memory, len, source))
+                .collect();
+            list.close();
+            list.reset();
+            (locks, steps)
+        };
+        let (near, near_steps) = locks_and_steps([0, 10, 20, 30]);
+        let (far, far_steps) = locks_and_steps([0, 2731, 5462, 8193]);
+        assert_eq!(near_steps, [(0, 1128, Source::HeapPass)]);
+        assert_eq!(
+            far_steps,
+            [0, 32772, 65544, 98316].map(|at| (at, 768, Source::HeapPass))
+        );
+        assert_eq!(far, near, "one lock for the copy's four ranges");
     }
 
     /// A copy of memory that is not write-watched (copied whole by every
