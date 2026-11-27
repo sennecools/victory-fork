@@ -360,6 +360,67 @@ fn warp_r5_refresh_lift_refused_when_the_copy_is_written() {
     over.done();
 }
 
+/// The H2 wait of [`warp_r5_refresh_lift_refused_when_the_copy_is_written`]
+/// as this thread counted it (`crate::frame_budget::take_seen`): one H2
+/// wait, its fence and landing parts within its time and not both nothing
+/// (the card is held while the submission waits), and the exact copy's kind
+/// in the H2 table with one wait, one refresh, its bytes over the home as
+/// alias bytes, and the wait's whole time (it is the wait's only kind).
+#[test]
+fn warp_r5_h2_wait_is_attributed_to_the_exact_copy() {
+    use crate::frame_budget::{Culprit, Seen, Wait, take_seen};
+    let Some(host) = warp13() else { return };
+    let (_core, flights) = lifting();
+    let _ = take_seen();
+    let over = refresh_over_home(host, &flights, true);
+    let seen = take_seen();
+    assert!(!over.sent_with_no_wait, "it waited");
+    // A copy never handed to the card: no way noted.
+    let key = 3 << 8;
+    assert_eq!(over.copy.budget_key(), key, "a view's own copy");
+    assert_eq!(
+        crate::shadow::budget_name(key),
+        "view copy, last handed as no way noted"
+    );
+    let waits: Vec<[u64; 3]> = seen
+        .iter()
+        .filter_map(|s| match *s {
+            Seen::Wait {
+                kind: Wait::H2,
+                total,
+                fence,
+                land,
+            } => Some([total, fence, land]),
+            _ => None,
+        })
+        .collect();
+    let [[total, fence, land]] = waits[..] else {
+        panic!("one H2 wait: {seen:?}");
+    };
+    assert!(fence + land <= total, "{fence} + {land} within {total}");
+    // The relay waited for the held card and then landed meanwhile.
+    assert!(fence + land > 0, "the wait's parts were seen ({total} µs)");
+    let culprits: Vec<Culprit> = seen
+        .iter()
+        .filter_map(|s| match *s {
+            Seen::Culprit(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        culprits,
+        vec![Culprit {
+            key,
+            waits: 1,
+            refreshes: 1,
+            alias: PART,
+            us: total,
+        }],
+        "its bytes over the home, and the wait's whole time"
+    );
+    over.done();
+}
+
 /// A list whose "shader" writes `bytes` into `copy` at title address `at`
 /// (a copy on the card), declared as shaders' writes over `[at, at +
 /// bytes)`, with no refresh of its own first; closed.

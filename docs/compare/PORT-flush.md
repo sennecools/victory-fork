@@ -214,7 +214,9 @@ Plus frame-rate line `ms` / `prep` and the frame-time dump for every run.
   threads (inplace); the BESIDE bits (we have no COPY_BESIDE); writes past
   the guards in the many-askers test.
 - 7bc7c07's fault book (`VICTORY_FAULT_BOOK`); 74045e4's LAND_TAKEN;
-  3ead56e (PAGE_PARTS) not needed.
+  3ead56e (PAGE_PARTS) not needed. Since wave 1 lane C its parts logic
+  (with 673be0e's `Shard::note` and 0d5e4c8's `PageHash`) is in
+  `watch/stamps.rs` and `shadow.rs` (`by_parts`), with no switch.
 - CF test `no_mapping_is_lost_between_askers` not ported: it would hit our
   map-before-tell window, which exists without any switch (xmem maps with
   `MapViewOfFile3` before `title_memory_remapped`; an asking in between can

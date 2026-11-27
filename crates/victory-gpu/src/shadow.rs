@@ -73,6 +73,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// How the copy came to be what it is, for the frame budget only
+    /// ([`Origin`]).
+    origin: Origin,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -147,6 +150,52 @@ impl Hand {
     fn of(id: u32) -> Option<Hand> {
         Hand::ALL.into_iter().find(|&hand| hand as u32 == id)
     }
+}
+
+/// How a copy came to be what it is ([`Shadow::origin`]): what the frame
+/// budget's H2 classes are told apart by. Nothing reads it to decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// Made as copies are made: a home, a window, a buffer's copy with no
+    /// reason of the memory core's noted.
+    Made,
+    /// A buffer view's copy of its own bytes ([`exact`]), and what the copy
+    /// of the view's buffer (its base) was when it was made: a home of the
+    /// memory core, or a copy in the card's memory whose CPU side is one.
+    Exact {
+        base_is_home: bool,
+        base_is_card: bool,
+    },
+    /// A title buffer's copy (or a card copy's staging) made because the
+    /// memory core gave its bytes no home: why.
+    Kept(Kept),
+}
+
+/// Why a copy got no home ([`Origin::Kept`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The memory core's reason (`crate::home::classify`).
+    Why(crate::home::Why),
+    /// A copy in the card's memory that would start off a 16-byte step of
+    /// its home ([`card_side`]): it keeps its staging buffer.
+    Misaligned,
+}
+
+/// The words for a [`Shadow::budget_key`] on the frame budget's line.
+pub(crate) fn budget_name(key: u16) -> String {
+    let kind = match key >> 8 & 3 {
+        1 => "title memory in place",
+        2 => "window",
+        3 => "view copy",
+        _ => "buffer copy",
+    };
+    let card = if key >> 8 & 4 != 0 {
+        " on the card"
+    } else {
+        ""
+    };
+    let hand = Hand::of(u32::from(key & 0xff)).map_or("no way noted", Hand::name);
+    format!("{kind}{card}, last handed as {hand}")
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2501,11 +2550,75 @@ mod piece_tests {
 /// missing geometry with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
 fn stale_pages_in(taken: &Taken, a: usize, e: usize) -> Vec<usize> {
     let mut pages = Vec::new();
-    let _ = crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), taken, |page| {
+    let _ = crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), taken, |page, _| {
         pages.push(page);
         ControlFlow::Continue(())
     });
     pages
+}
+
+/// The byte runs to copy of `stale` (pages in order, each with the parts
+/// to take, a bit per 4 KiB), cut to `[from, to)`: next to it shaders may
+/// be writing the copy. Parts that follow each other, in a page or across
+/// two, are one run. Adapted from cool_fox's 3ead56e (`by_parts`,
+/// `PAGE_PARTS`; author `local`), as carried in Belobug/VIctory-Belobug-AMD
+/// (read at cd8dfc06), GPL-3.0-or-later.
+fn by_parts(stale: &[(usize, u16)], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(stale.len());
+    for &(page, parts) in stale {
+        for (a, b) in crate::watch::part_runs(parts) {
+            let (a, b) = ((page * PAGE + a).max(from), (page * PAGE + b).min(to));
+            if a >= b {
+                continue;
+            }
+            match out.last_mut() {
+                Some((_, end)) if *end == a => *end = b,
+                _ => out.push((a, b)),
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::{PAGE, by_parts};
+
+    /// Ported from cool_fox's `runs_are_cut_to_the_parts_written` (3ead56e).
+    #[test]
+    fn runs_are_cut_to_the_parts_written() {
+        const P: usize = PAGE / 16;
+        let at = |page: usize, part: usize| page * PAGE + part * P;
+        // Pages 10 and 11 again (the range from the middle of 10's part 1
+        // on), 12 never taken (whole), 14 again (the range to the middle of
+        // its part 9).
+        let (from, to) = (at(10, 1) + 100, at(14, 9) + 7);
+        let whole = [
+            (10, u16::MAX),
+            (11, u16::MAX),
+            (12, u16::MAX),
+            (14, u16::MAX),
+        ];
+        assert_eq!(
+            by_parts(&whole, from, to),
+            [(from, at(13, 0)), (at(14, 0), to)]
+        );
+        let parts = [
+            (10, 0b1000_0000_0000_0011),
+            (11, 0b11),
+            (12, u16::MAX),
+            (14, 0b10_0000_0000),
+        ];
+        assert_eq!(
+            by_parts(&parts, from, to),
+            [
+                (at(10, 1) + 100, at(10, 2)),
+                (at(10, 15), at(11, 2)),
+                (at(12, 0), at(13, 0)),
+                (at(14, 9), at(14, 9) + 7),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2541,6 +2654,7 @@ mod stale_tests {
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
+    use crate::watch::KERNEL_PAGE;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, ResetWriteWatch, VirtualAlloc,
     };
@@ -2603,7 +2717,8 @@ mod refresh_tests {
         assert_eq!(copy.taken.lock().unwrap().taken_pages(), 8);
     }
 
-    /// Bytes written in two pages: those two pages are taken, no more.
+    /// Bytes written in two pages: the 4 KiB part of each that holds them
+    /// is taken, no more.
     #[test]
     fn warp_refresh_copies_only_dirty_pages() {
         if host().is_none() {
@@ -2615,7 +2730,7 @@ mod refresh_tests {
         assert_eq!(copy.update(at, len), len);
         poke(at + 2 * PAGE + 100, 1);
         poke(at + 5 * PAGE + 7, 2);
-        assert_eq!(copy.update(at, len), 2 * PAGE);
+        assert_eq!(copy.update(at, len), 2 * KERNEL_PAGE);
         assert!(holds(&copy, at, at + len));
         assert_eq!(copy.update(at, len), 0);
     }
@@ -2647,6 +2762,39 @@ mod refresh_tests {
         assert_eq!(copy.update(at, len), 0);
     }
 
+    /// Writes in parts of pages: the parts written since the last refresh
+    /// are taken, a run of them across two pages as one, each page's other
+    /// parts not; the copy holds the title's bytes after each refresh.
+    #[test]
+    fn warp_refresh_copies_only_written_parts() {
+        if host().is_none() {
+            return;
+        }
+        let at = region(4);
+        let len = 4 * PAGE;
+        let copy = exact(at as u64, len as u64).expect("a copy");
+        assert_eq!(copy.update(at, len), len);
+        // Parts 2 and 9 of page 0; part 15 of page 1 and part 0 of page 2.
+        poke(at + 2 * KERNEL_PAGE + 1, 1);
+        poke(at + 9 * KERNEL_PAGE + 2, 2);
+        poke(at + 2 * PAGE - 1, 3);
+        poke(at + 2 * PAGE, 4);
+        assert_eq!(copy.update(at, len), 4 * KERNEL_PAGE);
+        assert!(holds(&copy, at, at + len));
+        // Written again, elsewhere: the parts of this asking alone.
+        poke(at + 3 * PAGE + 5 * KERNEL_PAGE, 5);
+        poke(at + 9 * KERNEL_PAGE + 3, 6);
+        assert_eq!(copy.update(at, len), 2 * KERNEL_PAGE);
+        assert!(holds(&copy, at, at + len));
+        assert_eq!(copy.update(at, len), 0);
+        // A refresh of part of a page copies the written parts inside it.
+        poke(at + 3 * PAGE + 7 * KERNEL_PAGE, 7);
+        poke(at + 3 * PAGE + 12 * KERNEL_PAGE, 8);
+        let from = at + 3 * PAGE + 6 * KERNEL_PAGE;
+        assert_eq!(copy.update(from, at + len - from), 2 * KERNEL_PAGE);
+        assert!(holds(&copy, at, at + len));
+    }
+
     /// A range shaders may be writing is left alone: the pages around it
     /// are refreshed, it is not, and no run spans it.
     #[test]
@@ -2663,7 +2811,11 @@ mod refresh_tests {
         for page in 2..5 {
             poke(at + page * PAGE + 9, 0xa0 + page as u8);
         }
-        assert_eq!(copy.update(at, len), 2 * PAGE, "pages 2 and 4");
+        assert_eq!(
+            copy.update(at, len),
+            2 * KERNEL_PAGE,
+            "pages 2 and 4, a part each"
+        );
         assert!(holds(&copy, at, at + 3 * PAGE));
         assert!(holds(&copy, at + 4 * PAGE, at + len));
         assert_eq!(
@@ -3015,6 +3167,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            origin: Origin::Made,
             place: None,
             core: None,
             hands: AtomicU32::new(0),
@@ -3040,6 +3193,28 @@ impl Shadow {
             self.root_at
                 .store(address.wrapping_sub(self.start), Ordering::Relaxed);
         }
+    }
+
+    /// For the frame budget's H2 table (`crate::frame_budget`): what kind of
+    /// copy this is, and the way it was last handed to the card, as one
+    /// number ([`budget_name`]).
+    pub(crate) fn budget_key(&self) -> u16 {
+        let kind = if self.place.is_some() {
+            1
+        } else if self.window {
+            2
+        } else if matches!(self.origin, Origin::Exact { .. }) {
+            3
+        } else {
+            0
+        };
+        let card = if self.card.is_some() { 4 } else { 0 };
+        (kind | card) << 8 | (self.last_hands.load(Ordering::Relaxed) & 0xff) as u16
+    }
+
+    /// How the copy came to be (the frame budget's H2 classes).
+    pub(crate) fn origin(&self) -> Origin {
+        self.origin
     }
 
     /// What kind of copy it is, by its own marks (`from`: what the table
@@ -3613,7 +3788,7 @@ impl Shadow {
         let taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| {
             crate::watch::asked_now(a, e).is_none()
-                || crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), &taken, |_| {
+                || crate::watch::stale_words(a / PAGE, e.div_ceil(PAGE), &taken, |_, _| {
                     ControlFlow::Break(())
                 })
                 .is_break()
@@ -3910,8 +4085,9 @@ impl Shadow {
     }
 
     /// Copies the pages of `[from, to)` (inside the buffer) the copy must
-    /// take after asking `now` ([`crate::watch::stale_words`]), one copy per
-    /// run of them, and notes the pages it took whole. The walk costs a look
+    /// take after asking `now` ([`crate::watch::stale_words`]), only the
+    /// 4 KiB parts of each written since the copy took it, one copy per run
+    /// of parts, and notes the pages it took whole. The walk costs a look
     /// per 64 pages of the range and one per page of the groups written
     /// since the copy took them; the first refresh of a range takes all of
     /// it, as one run.
@@ -3920,21 +4096,25 @@ impl Shadow {
         // copies are not (`crate::profile::journal_timer`).
         let _journal = crate::profile::journal_timer();
         let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        let _ = crate::watch::stale_words(from / PAGE, to.div_ceil(PAGE), &taken, |page| {
+        // Runs of stale pages, and each stale page with its parts to take.
+        let (mut runs, mut stale): (Vec<(usize, usize)>, Vec<(usize, u16)>) =
+            (Vec::new(), Vec::new());
+        let _ = crate::watch::stale_words(from / PAGE, to.div_ceil(PAGE), &taken, |page, parts| {
             match runs.last_mut() {
                 Some((_, end)) if *end == page => *end += 1,
                 _ => runs.push((page, page + 1)),
             }
+            stale.push((page, parts));
             ControlFlow::Continue(())
         });
+        let mut bytes = 0;
+        for (a, b) in by_parts(&stale, from, to) {
+            bytes += self.copy(a, b);
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let whole =
             |page: usize| (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
-        let mut bytes = 0;
         for (a, b) in runs {
-            // Cut to the range: next to it shaders may be writing the copy.
-            bytes += self.copy((a * PAGE).max(from), (b * PAGE).min(to));
             // A page only partly in the range is copied in part: it stays
             // stale for the rest.
             let first = if whole(a) { a } else { a + 1 };
@@ -4684,10 +4864,11 @@ pub(crate) static FOLDED: AtomicU64 = AtomicU64::new(0);
 /// title memory `[start, start + len)` (`crate::card_home`): the home that
 /// holds the bytes, or a new one, if the memory core gives them one
 /// (classified as a buffer not offered the card, so a later slice's homes
-/// come here the same way). `None`: the copy keeps a staging buffer.
-fn card_side(start: u64, len: u64) -> Option<Arc<Shadow>> {
+/// come here the same way). `Err`: the copy keeps a staging buffer, and why
+/// (`None`: the switch is off).
+fn card_side(start: u64, len: u64) -> Result<Arc<Shadow>, Option<Kept>> {
     if !crate::card_home::on() {
-        return None;
+        return Err(None);
     }
     // The merge on the card stores whole words of 16-byte steps of the copy
     // into the home: they must be steps of the home too. A private home's
@@ -4695,22 +4876,23 @@ fn card_side(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // a 64 KiB page's offset in its chunk's buffer, so asked before any opening.
     if !start.is_multiple_of(16) {
         crate::card_home::misaligned();
-        return None;
+        return Err(Some(Kept::Misaligned));
     }
     let home = match crate::home::resolve(start, len, false, false, &mut || false) {
         crate::home::Found::Home(home) => home,
         // Of either kind: a home in private memory or in a chunk of the pool.
         crate::home::Found::New(new) => new.home(start, len, false),
-        crate::home::Found::Card | crate::home::Found::Copy => return None,
+        crate::home::Found::Card => return Err(Some(Kept::Why(crate::home::Why::Off))),
+        crate::home::Found::Copy(why) => return Err(Some(Kept::Why(why))),
     };
     // (A home that holds it from further out, of a kind that does not. As
     // homes are made today the offset keeps `start`'s step, so this never
     // turns one down: a defence.)
     if !home.offset(start).is_multiple_of(16) {
         crate::card_home::misaligned();
-        return None;
+        return Err(Some(Kept::Misaligned));
     }
-    Some(home)
+    Ok(home)
 }
 
 /// A copy in the card's memory (`on_card`, `size` bytes) of title buffer
@@ -4863,6 +5045,9 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
     // copy made below. A home is found or made, and tabled, under one hold
     // of [`HOMING`].
     let mut card_asked: Option<Option<ID3D12Resource>> = None;
+    // Why the bytes got no home, if the core said (the copy made below
+    // notes it, [`Origin::Kept`]).
+    let mut kept = None;
     if crate::home::on() {
         let _homing = homing(true);
         let mut card = || {
@@ -4876,7 +5061,8 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
             crate::home::Found::New(new) => {
                 return publish(key, len, new.home(key.0, len, false), false).map(Some);
             }
-            crate::home::Found::Card | crate::home::Found::Copy => {}
+            crate::home::Found::Card => {}
+            crate::home::Found::Copy(why) => kept = Some(Kept::Why(why)),
         }
     }
     // Folded (`VICTORY_FOLD_BUFFERS=1`, off by default): a small buffer
@@ -4918,11 +5104,16 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
     // with that home ([`let_go_homes`]), so tabled under [`HOMING`] too.
     if let Some(Some(on_card)) = &card_asked {
         let _homing = homing(true);
-        if let Some(home) = card_side(key.0, len) {
-            let shadow = carded_home(on_card.clone(), home, key.0, len, size);
-            return publish(key, len, shadow, true).map(Some);
+        match card_side(key.0, len) {
+            Ok(home) => {
+                let shadow = carded_home(on_card.clone(), home, key.0, len, size);
+                return publish(key, len, shadow, true).map(Some);
+            }
+            Err(why) => {
+                crate::card_home::kept(why, len);
+                kept = why;
+            }
         }
-        crate::card_home::kept();
     }
     making();
     let Some((buffer, data)) = host().and_then(|host| host.shared_buffer(size)) else {
@@ -4976,6 +5167,9 @@ fn buffer_copy(key: (u64, usize), len: u64) -> Result<Option<Arc<Shadow>>, Gone>
     }
     let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
     shadow.card = card;
+    if let Some(kept) = kept {
+        shadow.origin = Origin::Kept(kept);
+    }
     publish(key, len, Arc::new(shadow), true).map(Some)
 }
 
@@ -5199,7 +5393,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let home = match crate::home::resolve(start, len, true, false, &mut || false) {
             crate::home::Found::Home(home) => Some(home),
             crate::home::Found::New(new) => Some(new.home(start, len, true)),
-            crate::home::Found::Card | crate::home::Found::Copy => None,
+            crate::home::Found::Card | crate::home::Found::Copy(_) => None,
         };
         if let Some(home) = home {
             let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
@@ -5341,7 +5535,7 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
-/// element of the copy its buffer has (`descriptor/host.rs` `own_bytes`).
+/// element of the copy its buffer has (`descriptor/buffer_views.rs` `own_bytes`).
 /// A host view counts its first element from its buffer's start; a console
 /// view starts at any address, and the title places views at ring
 /// positions inside its big GPU heap. Such a view was refused and its slot
@@ -5355,7 +5549,29 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
+///
+/// `base`: the copy of the view's buffer (which the copy made here notes,
+/// [`Origin::Exact`]; a copy found is as it was made).
+pub(crate) fn exact_of(address: u64, len: u64, base: &Shadow) -> Option<Arc<Shadow>> {
+    exact_with(address, len, Origin::Exact {
+        base_is_home: base.home_kind().is_some(),
+        base_is_card: base.card_home().is_some(),
+    })
+}
+
+/// [`exact_of`] for tests, whose views name no buffer: the base is the home
+/// that holds the view's first byte, if one does.
+#[cfg(test)]
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let base = home_of(address, 1);
+    exact_with(address, len, Origin::Exact {
+        base_is_home: base.as_ref().is_some_and(|b| b.home_kind().is_some()),
+        base_is_card: false,
+    })
+}
+
+/// [`exact_of`], the copy made noting `origin`.
+fn exact_with(address: u64, len: u64, origin: Origin) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
     const MANY: usize = 256;
@@ -5393,7 +5609,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let mut shadow = Shadow::new(buffer, data, gpu, address, len);
+    shadow.origin = origin;
+    let shadow = Arc::new(shadow);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let map = &mut guard.1;
     // Another thread's copy of the same bytes, made meanwhile: that one

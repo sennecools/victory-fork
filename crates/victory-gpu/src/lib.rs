@@ -34,6 +34,8 @@ pub mod fence;
 #[cfg(windows)]
 mod flip;
 pub mod frame;
+#[cfg(windows)]
+mod frame_budget;
 pub mod frametime;
 #[cfg(windows)]
 mod home;
@@ -72,6 +74,8 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+mod spans;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

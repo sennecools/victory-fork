@@ -437,8 +437,13 @@ fn sync_parted_heap(
                 continue;
             }
             part.pages += 1;
+            let looked = part.looked;
             let slots = changed_slots(from, to, start as usize, step, mirrored_count);
             host.sort_copied_page(slots, (start, step), from, &page_bytes, &mut part);
+            // (The frame budget: a page our own record writes changed.)
+            if crate::frame_budget::own_page_read(from as u64) {
+                part.own_looked += part.looked - looked;
+            }
         }
         *found[n].lock().unwrap_or_else(|e| e.into_inner()) = part;
     });
@@ -451,7 +456,12 @@ fn sync_parted_heap(
         all.read_ticks += part.read_ticks;
         all.make.append(&mut part.make);
         left.append(&mut part.left);
+        all.own_looked += part.own_looked;
+        all.pieces.append(&mut part.pieces);
     }
+    // For the frame budget, once a pass (no other pass runs: `SYNCING`).
+    crate::frame_budget::own_looked(all.own_looked);
+    crate::frame_budget::changed_pieces(crate::frame::current(), &all.pieces);
     // The slots left to tables before whose marks have aged: read again,
     // whether or not their pages were written since.
     host.retake_left(&left, (start, step), &mut all);
@@ -1247,12 +1257,24 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// For the frame budget's line (`crate::frame_budget`): the view table's
+/// entries in use and its length. Freed entries are used again before the
+/// table grows, so its length is the most entries ever in use at once.
+/// (Read from [`Views`] under its read lock, once a frame line: the reader
+/// table, [`table`], holds the same entries and keeps no free list.)
+#[cfg(windows)]
+pub(crate) fn views_in_use() -> [u64; 2] {
+    let views = views_read();
+    let len = views.list.len() as u64;
+    [len.saturating_sub(views.free.len() as u64), len]
+}
+
 /// For the memory line: the distinct views kept ([`Views`]), those of them
 /// free for reuse, and the bytes the table and its index hold for them (an
 /// estimate: an entry of the table, and one of the index with its share of
 /// a tree node; the shapes likewise; and the chunks of the tables readers
-/// read them from without the lock, [`table`], made so far); then the entries that are constant
-/// buffer views and views of placed memory (those that did not fit a
+/// read them from without the lock, [`table`], made so far); then the
+/// entries that are constant buffer views and views of placed memory (those that did not fit a
 /// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
 /// placed views kept, and the views named whole in their records since the
 /// start: constant buffer views, views of placed memory.
@@ -1414,7 +1436,10 @@ pub(crate) fn record(handle: u64, view: View) {
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     #[cfg(windows)]
-    mirror(handle, list_site::VIEW);
+    {
+        crate::frame_budget::own_wrote(handle, 12);
+        mirror(handle, list_site::VIEW);
+    }
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -1601,6 +1626,8 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         if !same {
             // SAFETY: as above.
             unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+            #[cfg(windows)]
+            crate::frame_budget::own_wrote(dst, len);
         }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
