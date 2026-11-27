@@ -887,6 +887,25 @@ pub(crate) fn mirrored(kind: Mirror, eligible: bool) {
     seen!(Seen::Mirror { kind, eligible });
 }
 
+/// A buffer view left for a draw again in a slot that shows it so already
+/// (`descriptor::host`'s mirror, `left_again`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeftAgain {
+    /// The same record as the slot was last left for a draw from.
+    Same,
+    /// A constant buffer view at another address, where one was left.
+    Constant,
+}
+
+/// Per [`LeftAgain`], buffer views left for a draw again.
+static LEFT_AGAIN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A buffer view was left for a draw again, `how`.
+pub(crate) fn left_again(how: LeftAgain) {
+    LEFT_AGAIN[how as usize].fetch_add(1, Ordering::Relaxed);
+    seen!(Seen::LeftAgain(how));
+}
+
 /// The write-watch pages (`crate::watch::PAGE`) our own writes of the
 /// title's records (`descriptor::record`, `descriptor::copy_simple`) last
 /// went to, by a hash of the page, each as its number plus one: the heap
@@ -1024,6 +1043,7 @@ pub(crate) enum Seen {
         kind: Mirror,
         eligible: bool,
     },
+    LeftAgain(LeftAgain),
 }
 
 #[cfg(test)]
@@ -1195,7 +1215,8 @@ pub(crate) fn wave1_line(frames: f64, levels: u64) {
     };
     tracing::info!(
         "frame budget for wave 1 per frame: H2 by class {}; card copies kept staging: {}; slots mirrored: {} \
-         ({:.0}% eligible for a pre-made descriptor); {:.0} records looked at on pages our own writes changed; \
+         ({:.0}% eligible for a pre-made descriptor); buffer views left for a draw again: {:.0} of the same \
+         record, {:.0} constant at another address; {:.0} records looked at on pages our own writes changed; \
          {:.0} distinct 4 KiB pieces with changed records; {:.2} texture level changes; directory numbers \
          {} of {}",
         none(classes),
@@ -1206,6 +1227,8 @@ pub(crate) fn wave1_line(frames: f64, levels: u64) {
         } else {
             0.0
         },
+        per(LEFT_AGAIN[LeftAgain::Same as usize].swap(0, Ordering::Relaxed)),
+        per(LEFT_AGAIN[LeftAgain::Constant as usize].swap(0, Ordering::Relaxed)),
         per(SYNC_SEEN[0].swap(0, Ordering::Relaxed)),
         per(SYNC_SEEN[1].swap(0, Ordering::Relaxed)),
         per(levels.saturating_sub(LEVELS_BEFORE.swap(levels, Ordering::Relaxed))),

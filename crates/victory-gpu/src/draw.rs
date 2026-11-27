@@ -5952,6 +5952,42 @@ void main() {
         assert_eq!(writes, 0);
     }
 
+    /// With `VICTORY_HEAP_PASS_TABLED=1` the heap buffer pass leaves a
+    /// buffer view left for a draw in a slot a table holds to the draws,
+    /// without making it: the same record left for a draw again (done with
+    /// before the claim) goes into the set of changes again, so a pass once
+    /// no table holds the slot makes it.
+    #[test]
+    fn warp_heap_pass_tabled_slot_left_again_is_changed_again() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        struct Tabled;
+        impl Drop for Tabled {
+            fn drop(&mut self) {
+                TABLED_HERE.with(|on| on.set(false));
+            }
+        }
+        TABLED_HERE.with(|on| on.set(true));
+        let _tabled = Tabled;
+        let heap = ViewHeap::new(true);
+        let slots = heap.host();
+        let handle = crate::descriptor::heap(heap.h).handle(0).unwrap();
+        crate::descriptor::record(handle, heap.view(1000));
+        let key = crate::descriptor::host::record_key(handle);
+        assert_eq!(slots.left_key(0), key, "left for a draw");
+        let frame = test_frame();
+        slots.buffer_tabled_in(0, frame);
+        let list = host.new_list().unwrap();
+        heap.pass(&list, frame);
+        assert!(!slots.made(0), "left to the table");
+        crate::descriptor::record(handle, heap.view(1000));
+        assert_eq!(slots.buffer_changes(), [0], "changed again");
+        assert_eq!(slots.left_key(0), key, "left again");
+        list.close();
+        list.reset();
+    }
+
     /// A range asked for twice in a list is one step, with the tag it got
     /// first; another range of the same copy is a step of its own.
     #[test]

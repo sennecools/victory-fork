@@ -224,19 +224,32 @@ fn mirror(handle: u64, site: u64) {
     let Some((heap, index)) = shader_slot(handle, site) else {
         return;
     };
+    let mirror = |host: &host::HostHeap| {
+        // The key of what is mirrored, read before the mirror: a record
+        // copied over it meanwhile is not taken as seen.
+        let key = host::record_key(handle);
+        host.mirror(index, handle, false);
+        // Seen as mirrored: the next pass leaves the record if the slot
+        // still shows it.
+        host.saw_key(index, key);
+    };
+    // A host heap that is there was published after the writes queued
+    // before it were replayed into it ([`Heap::host`]): no lock.
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            mirror(host);
+        }
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    // Asked again under the lock, which the heap's making holds until it
+    // is published.
     match heap.host.get() {
         None => pending.push(index),
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
-                // The key of what is mirrored, read before the mirror: a
-                // record copied over it meanwhile is not taken as seen.
-                let key = host::record_key(handle);
-                host.mirror(index, handle, false);
-                // Seen as mirrored: the next pass leaves the record if the
-                // slot still shows it.
-                host.saw_key(index, key);
+                mirror(host);
             }
         }
     }
