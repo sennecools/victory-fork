@@ -4744,26 +4744,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// end is looked at; it runs only for submissions whose reads would wait
 /// for flights (a few a frame).
 pub(crate) fn sole(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    sole_with(address, len, false)
-}
-
-/// As [`sole`], but a home of the memory core (`crate::home`) that holds the
-/// whole range is taken too (R5's lifts, `VICTORY_R5_LIFT=1`): a copy on the
-/// card from or into its placed buffer, at [`Shadow::offset`], is what every
-/// list of ours sees of those bytes. Two homes, or a home and a copy over
-/// some of the bytes, are still none.
-pub(crate) fn sole_or_home(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    sole_with(address, len, true)
-}
-
-/// Whether [`sole`] (with `homes`: [`sole_or_home`]) takes the one host copy
-/// that holds a range: `placed`, whether it is title memory in place; `home`,
-/// whether it is a home of the memory core.
-pub(crate) fn sole_takes(placed: bool, home: bool, homes: bool) -> bool {
-    !placed || homes && home
-}
-
-fn sole_with(address: u64, len: u64, homes: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut found: Option<Arc<Shadow>> = None;
     // False at a second copy.
@@ -4794,8 +4774,8 @@ fn sole_with(address: u64, len: u64, homes: bool) -> Option<Arc<Shadow>> {
         }
     }
     let shadow = found?;
-    let taken = sole_takes(shadow.place.is_some(), shadow.core.is_some(), homes);
-    (taken && shadow.start <= address && shadow.left(address) >= len).then_some(shadow)
+    (shadow.place.is_none() && shadow.start <= address && shadow.left(address) >= len)
+        .then_some(shadow)
 }
 
 /// The home of the memory core (`crate::home`) that holds the whole of

@@ -68,33 +68,6 @@ pub(crate) fn r5() -> bool {
     })
 }
 
-/// R5's S2 (`VICTORY_R5_LIFT=1`, off by default; only with [`r5`]): fills and
-/// title buffer copies that wait for flights are done on the card instead,
-/// behind the flights on the queue, also where the bytes are a home's
-/// (`lift_mode` in fills mode; the home's placed buffer is the source or
-/// destination). Refreshes over flights' homes are done on the card with [`r5`]
-/// alone (`late_lift::lift_refreshes`). Read once.
-pub(crate) fn r5_lift() -> bool {
-    #[cfg(test)]
-    if test_flights() {
-        return test_r5() && TEST_FLIGHTS.load(Ordering::Acquire) & TEST_LIFT != 0;
-    }
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let asked = std::env::var_os("VICTORY_R5_LIFT").is_some_and(|v| v == "1");
-        let on = asked && r5();
-        if on {
-            tracing::info!(
-                "R5 lifts on (VICTORY_R5_LIFT=1): reads of homes flights write are done on the card, \
-                 behind the flights"
-            );
-        } else if asked {
-            tracing::warn!("VICTORY_R5_LIFT=1 does nothing without VICTORY_R5=1");
-        }
-        on
-    })
-}
-
 /// Tests with flights in the air: the relay's second stage on, and R5 if
 /// asked, for the test's own thread and the relay's threads (named
 /// `victory-relay` and `victory-late-wait`) while [`TestFlights`] lives.
@@ -110,15 +83,13 @@ thread_local! {
 }
 
 /// Bits of [`TEST_FLIGHTS`]: flights on; R5 on; the memory core on (for the
-/// relay's threads; the test's own thread sets `crate::home`'s); R5's lifts.
+/// relay's threads; the test's own thread sets `crate::home`'s).
 #[cfg(test)]
 const TEST_FLYING: u8 = 1;
 #[cfg(test)]
 const TEST_R5: u8 = 2;
 #[cfg(test)]
 const TEST_CORE: u8 = 4;
-#[cfg(test)]
-const TEST_LIFT: u8 = 8;
 
 /// Whether this thread sees the test's flights ([`TEST_FLIGHTS`]).
 #[cfg(test)]
@@ -474,22 +445,10 @@ pub(crate) mod flights {
 
     impl TestFlights {
         pub(crate) fn on(r5: bool, core: bool) -> TestFlights {
-            Self::with(r5, core, false)
-        }
-
-        /// [`TestFlights::on`] with R5 and the memory core, and R5's lifts
-        /// ([`r5_lift`]) as asked.
-        pub(crate) fn r5_lifting(lift: bool) -> TestFlights {
-            Self::with(true, true, lift)
-        }
-
-        fn with(r5: bool, core: bool, lift: bool) -> TestFlights {
             static ONE: Mutex<()> = Mutex::new(());
             let one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-            let bits = TEST_FLYING
-                | if r5 { TEST_R5 } else { 0 }
-                | if core { TEST_CORE } else { 0 }
-                | if lift { TEST_LIFT } else { 0 };
+            let bits =
+                TEST_FLYING | if r5 { TEST_R5 } else { 0 } | if core { TEST_CORE } else { 0 };
             TEST_FLIGHTS.store(bits, Ordering::Release);
             TEST_FLIGHTS_HERE.with(|here| here.set(true));
             TestFlights(one)
@@ -669,13 +628,6 @@ pub(crate) mod flights {
     /// (`LIFT_STATS`), now.
     pub(crate) fn waits_left() -> u64 {
         LIFT_STATS[LIFT_WAITS_LEFT].load(Ordering::Relaxed)
-    }
-
-    /// Plans of lifted reads aborted because a texture reads what the card
-    /// writes, and because a copy over a lifted copy's home is refreshed.
-    pub(crate) fn aborted() -> (u64, u64) {
-        let at = |why: LiftAbort| LIFT_ABORTED[why as usize].load(Ordering::Relaxed);
-        (at(LiftAbort::TextureAfter), at(LiftAbort::Viewed))
     }
 
     /// What flights' shaders may write in homes ([`Line::homes_written`]).

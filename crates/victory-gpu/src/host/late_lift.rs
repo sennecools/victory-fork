@@ -1,32 +1,20 @@
-//! R5's reads of title memory that would wait for flights, done on the card
-//! instead where the bytes are a home's: refreshes over flights' homes with
-//! [`r5`], and fills and copies with `VICTORY_R5_LIFT=1` ([`r5_lift`]); and
-//! what the submitting thread's waits for flights say on the profile
-//! ([`wait_args`]).
+//! R5's refreshes over flights' homes, done on the card instead of waiting
+//! for those flights ([`lift_refreshes`]), and what the submitting thread's
+//! waits for flights say on the profile ([`wait_args`]).
 //!
 //! With R5 the submitting thread waits for flights before preparing for two
 //! reasons only, both "title memory read": a title buffer copy, a fill or a
 //! texture that reads (or a copy that writes) what a flight's shaders may
-//! write (H8, `blocked_by`), and a refresh of a copy that is no home over a
-//! home's bytes a flight's shaders may write (H2,
-//! [`refresh_over_flight_homes`]).
+//! write (H8, `blocked_by`; lifted only as `VICTORY_LIFT_READS` lifts it,
+//! never from or into a home), and a refresh of a copy that is no home over
+//! a home's bytes a flight's shaders may write (H2,
+//! [`refresh_over_flight_homes`]). H2 is lifted: the refresh is done on the
+//! CPU around the part over `homes_written`, and the card copies that part
+//! from the home's placed buffer into the copy at the head of the
+//! submission, behind the flights that write it.
 //!
-//! - H2 is lifted by [`lift_refreshes`]: the refresh is done on the CPU
-//!   around the part over `homes_written`, and the card copies that part
-//!   from the home's placed buffer into the copy at the head of the
-//!   submission, behind the flights that write it.
-//! - With the switch, H8 is lifted as `VICTORY_LIFT_READS=2` lifts it
-//!   (`lift_reads`), and a home that holds the whole range is a source or
-//!   destination like a sole copy (`crate::shadow::sole_or_home`): the copy
-//!   reads or writes the home's placed buffer at `Shadow::offset`, through a
-//!   bounce buffer within one buffer (two homes in one chunk of the pool
-//!   share it). A lifted copy into a home is declared as the list's shaders'
-//!   writes are (`Step::card_writes`): it is in the flight's `homes_written`
-//!   until the flight lands, and the landing tells the copies over those
-//!   bytes, as for a shader's write (`crate::home::after_wait`).
-//!
-//! What still waits is counted: `LiftAbort` for H8, [`R5_REFRESHES_REFUSED`]
-//! for H2 (with its reasons, `crate::frame_budget::h2_refused`).
+//! What still waits for H2 is counted in [`R5_REFRESHES_REFUSED`], with its
+//! reasons (`crate::frame_budget::h2_refused`).
 
 use super::*;
 
@@ -171,57 +159,6 @@ pub(super) fn wait_args(runs: &[&HostList], h2: bool) -> Vec<(&'static str, u64)
         ("back", back),
         ("homes_only", u64::from(youngest != 0 && homes_only)),
     ]
-}
-
-/// With [`r5_lift`], of a plan of lifted reads (`lift_reads`; `steps` as the
-/// plan saw them): whether a lifted copy writes a home and the submission
-/// refreshes another copy over those bytes (one that is not that home: an
-/// exact copy of a view, a buffer partly in the home, a card copy whose CPU
-/// side it is). The refresh takes them on the CPU, before the card's copy, so
-/// the plan is aborted (`LiftAbort::Viewed`) and the submission waits.
-pub(super) fn over_lifted_homes<C>(
-    lifts: &[Lift<std::sync::Arc<crate::shadow::Shadow>, C>],
-    steps: &[(usize, usize, Seen)],
-    runs: &[&HostList],
-) -> bool {
-    // Where each list's steps start in `steps`: they stand list by list,
-    // each step at its place in its list, so a lift's step is found at
-    // once (a plan can hold thousands of lifts over as many steps).
-    let mut starts: Vec<usize> = Vec::new();
-    for (i, &(list, _, _)) in steps.iter().enumerate() {
-        if starts.len() <= list {
-            starts.resize(list + 1, i);
-        }
-    }
-    let mut homes = Vec::new();
-    for lift in lifts {
-        let LiftTo::Copy { dst, .. } = &lift.to else {
-            continue;
-        };
-        if dst.home_kind().is_none() {
-            continue;
-        }
-        let at = |&&(list, step, _): &&(usize, usize, Seen)| list == lift.list && step == lift.step;
-        let seen = starts
-            .get(lift.list)
-            .and_then(|start| steps.get(start + lift.step))
-            .filter(at)
-            // (Steps not in that order are looked for one by one.)
-            .or_else(|| steps.iter().find(at));
-        if let Some(&(_, _, Seen::Copy(at, _, len))) = seen {
-            join_ranges(&mut homes, [(at, at + len)]);
-        }
-    }
-    if homes.is_empty() {
-        return false;
-    }
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| {
-            step.refreshes().any(|(shadow, at, len)| {
-                shadow.home_kind().is_none() && touches(&homes, at, at.saturating_add(len))
-            })
-        })
-    })
 }
 
 /// A piece of a refresh [`lift_refreshes`] gives the card: the list's place
@@ -409,9 +346,11 @@ fn homes_over(
 /// have changed them. Likewise when a flight in the air may write the copy
 /// over such a part (`Shadow::writes_pending_over`): the card's copy would go
 /// over what that flight's shaders wrote there, and its copy-back would take
-/// the home's bytes for theirs. And when such a part is a lifted read's, the
-/// copy's card side is in the card's memory (it goes up from the CPU side
-/// before the lists), no one home holds a part, or a list is named twice.
+/// the home's bytes for theirs. And when the copy's card side is in the
+/// card's memory (it goes up from the CPU side before the lists), no one
+/// home holds a part, or a list is named twice; and, as a guard only, when a
+/// step that reads such a part is no refresh (a lifted read takes a sole
+/// copy, never one over a home's bytes).
 /// Each refusal is counted with its reasons (`crate::frame_budget::h2_refused`).
 pub(super) fn lift_refreshes(plan: RefreshPlan, runs: &[&HostList]) -> Option<Vec<LiftedPiece>> {
     if let Some(first) = plan.refused {
@@ -460,117 +399,5 @@ mod tests {
         );
         assert_eq!(overlaps(&ranges, 20, 30).count(), 0);
         assert_eq!(overlaps(&ranges, 0, 100).count(), 3);
-    }
-
-    /// One holder of title memory as `crate::shadow::sole_or_home` sees it:
-    /// start, end, in place, a home, its buffer.
-    type Holder = (usize, usize, bool, bool, usize);
-
-    /// `crate::shadow::sole_or_home` over `holders` (with `homes`: else
-    /// `sole`): the one holder of every byte of the range, named (and known
-    /// to the plan) by its buffer, if `crate::shadow::sole_takes` takes it.
-    fn resolve(holders: &[Holder], homes: bool, at: usize, len: usize) -> Option<(usize, usize)> {
-        let mut over = holders.iter().filter(|h| h.0 < at + len && at < h.1);
-        let one = over.next()?;
-        if over.next().is_some() {
-            return None;
-        }
-        let taken = crate::shadow::sole_takes(one.2, one.3, homes);
-        (taken && one.0 <= at && at + len <= one.1).then_some((one.4, one.4))
-    }
-
-    /// The plan with R5's lifts takes a home holding the whole range as the
-    /// source and destination of a copy (between two buffers, or through a
-    /// bounce buffer within one chunk of the pool), and the source of a
-    /// fill; two homes over the range, a home and a view's copy over the
-    /// same bytes, or title memory in place that is no home are not one copy.
-    /// Without R5's lifts a home is not taken, as before.
-    #[test]
-    fn plan_lifts_takes_a_home_as_source_and_destination() {
-        // Two homes in one chunk of the pool (buffer 1), one of its own (2),
-        // a copy (3), a view's copy over the second home (4), memory in
-        // place that is no home (5).
-        let holders: [Holder; 6] = [
-            (0x1000, 0x2000, true, true, 1),
-            (0x2000, 0x3000, true, true, 1),
-            (0x5000, 0x6000, true, true, 2),
-            (0x8000, 0x9000, false, false, 3),
-            (0x2800, 0x2900, false, false, 4),
-            (0xa000, 0xb000, true, false, 5),
-        ];
-        // The flights write every byte here.
-        let written = [(0x1000, 0xc000)];
-        let plan = |homes: bool, seen: Seen| {
-            plan_lifts(
-                &written,
-                [(0, 0, seen)],
-                true,
-                |at, len| resolve(&holders, homes, at, len),
-                |_, at, _| Some(at),
-            )
-        };
-        let copy = |plan: Result<Vec<Lift<usize, usize>>, LiftAbort>| match plan {
-            Ok(lifts) => match lifts.as_slice() {
-                [
-                    Lift {
-                        src,
-                        to: LiftTo::Copy { dst, bounce },
-                        ..
-                    },
-                ] => Ok((*src, *dst, *bounce)),
-                other => panic!("one copy: {other:?}"),
-            },
-            Err(why) => Err(why),
-        };
-        assert_eq!(
-            copy(plan(true, Seen::Copy(0x5100, 0x1100, 0x100))),
-            Ok((1, 2, false)),
-            "two buffers"
-        );
-        assert_eq!(
-            copy(plan(true, Seen::Copy(0x2100, 0x1100, 0x100))),
-            Ok((1, 1, true)),
-            "one chunk"
-        );
-        assert_eq!(
-            copy(plan(true, Seen::Copy(0x8100, 0x5100, 0x100))),
-            Ok((2, 3, false)),
-            "into a copy"
-        );
-        assert_eq!(
-            plan(true, Seen::Copy(0x5100, 0x1f80, 0x100)),
-            Err(LiftAbort::NotSole),
-            "two homes over the source"
-        );
-        assert_eq!(
-            plan(true, Seen::Copy(0x5100, 0x2800, 0x80)),
-            Err(LiftAbort::NotSole),
-            "a home and a view's copy"
-        );
-        assert_eq!(
-            plan(true, Seen::Copy(0x5100, 0xa100, 0x80)),
-            Err(LiftAbort::NotSole),
-            "in place"
-        );
-        assert_eq!(
-            plan(false, Seen::Copy(0x5100, 0x1100, 0x100)),
-            Err(LiftAbort::NotSole),
-            "without R5's lifts"
-        );
-        assert_eq!(
-            plan(true, Seen::Copy(0x8100, 0x8180, 0x100)),
-            Err(LiftAbort::InPlace)
-        );
-        match plan(true, Seen::Fill(0x10_0000, 0x5100, 0x40)) {
-            Ok(lifts) => assert!(matches!(
-                lifts.as_slice(),
-                [Lift {
-                    src: 2,
-                    to: LiftTo::Fill(0x10_0000),
-                    ..
-                }]
-            )),
-            Err(why) => panic!("a fill from a home: {why:?}"),
-        }
     }
 }

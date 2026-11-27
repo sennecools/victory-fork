@@ -3196,7 +3196,7 @@ pub(crate) mod tests {
         list
     }
 
-    /// R5's reads of homes on the card (`VICTORY_R5_LIFT=1`).
+    /// R5's refreshes over flights' homes done on the card.
     mod r5_lift;
 
     /// A flight's shaders write a home's range; the next submission fills

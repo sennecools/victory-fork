@@ -39,8 +39,8 @@ pub(crate) use ending::{
 pub(crate) use ending::{refused_count, reset_for_test};
 /// R5 flush (`VICTORY_R5_FLUSH=1`): less work at submission, and its counters.
 pub(crate) mod r5_flush;
-/// R5's reads of homes on the card (`VICTORY_R5_LIFT=1`), and what its
-/// waits for flights say on the profile.
+/// R5's refreshes over flights' homes done on the card, and what its waits
+/// for flights say on the profile.
 mod late_lift;
 /// Lifted reads take along what depends on them (`VICTORY_LIFT_CLOSURE=1`).
 mod lift_closure;
@@ -52,7 +52,7 @@ pub(crate) use sweeper::{Budget, sweep_walk};
 pub(crate) use sweeper::{as_sweeper, bury_own_for_test, own_queue_for_test};
 
 use late_homes::{
-    R5_STATS, Writer, home_ranges, join_writers, r5_lift, refresh_over_flight_homes,
+    R5_STATS, Writer, home_ranges, join_writers, refresh_over_flight_homes,
     relay_card_homed, retake_flight_homes, value_unsure,
 };
 pub(crate) use late_homes::{Ring, finished, r5, settle_for_fence_at, wait_for_flights_now};
@@ -2552,12 +2552,11 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
-    // With lifted fills (`VICTORY_LIFT_READS=2`, or `VICTORY_R5_LIFT=1`) a
-    // copy on the card writes into chunks, which upload memory cannot take:
-    // shared memory instead (it starts in the common state and is read from
-    // there, as host copies are). The mode is fixed for the run, so kept
-    // chunks are of one kind; one of the other (tests switch the mode) is
-    // freed.
+    // With lifted fills (`VICTORY_LIFT_READS=2`) a copy on the card writes
+    // into chunks, which upload memory cannot take: shared memory instead (it
+    // starts in the common state and is read from there, as host copies are).
+    // The mode is fixed for the run, so kept chunks are of one kind; one of
+    // the other (tests switch the mode) is freed.
     let shared = lift_mode() == LiftMode::Fills;
     if scratch_pool()
         && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
@@ -4022,10 +4021,6 @@ impl LiftMode {
 }
 
 fn lift_mode() -> LiftMode {
-    // R5's lifts of homes' bytes (`VICTORY_R5_LIFT=1`) lift fills too.
-    if r5_lift() {
-        return LiftMode::Fills;
-    }
     static MODE: OnceLock<LiftMode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_LIFT_READS").as_deref() {
         Ok("count") => LiftMode::Count,
@@ -4038,10 +4033,9 @@ fn lift_mode() -> LiftMode {
 /// Whether the upload buffers of the title's buffer to texture copies lie
 /// in shared memory, so that a fill of one can be lifted to the card like a
 /// fill of a scratch chunk (`VICTORY_LIFT_UPLOADS=1`; off by default, and
-/// only where fills are lifted: `VICTORY_LIFT_READS=2` or
-/// `VICTORY_R5_LIFT=1`). Without it such a fill over what flights write
-/// aborts its plan ([`LiftAbort::BigScratch`]); with
-/// `VICTORY_LIFT_CLOSURE=1` so does one that reads what a lifted copy
+/// only where fills are lifted: `VICTORY_LIFT_READS=2`). Without it such a
+/// fill over what flights write aborts its plan ([`LiftAbort::BigScratch`]);
+/// with `VICTORY_LIFT_CLOSURE=1` so does one that reads what a lifted copy
 /// writes.
 ///
 /// Shared memory is the CPU's, cached: the copy into the texture reads it
@@ -4115,17 +4109,13 @@ enum LiftAbort {
     /// A planned step was no longer the copy or fill the plan saw when the
     /// steps were rewritten (counted after the rewrite, see [`lift_reads`]).
     Changed,
-    /// With `VICTORY_R5_LIFT=1`: a lifted copy writes a home, and the
-    /// submission refreshes another copy over those bytes, which would take
-    /// them on the CPU before the card's copy ([`late_lift::over_lifted_homes`]).
-    Viewed,
     /// With `VICTORY_LIFT_CLOSURE=1`: more steps to lift than
     /// [`lift_closure::CLOSURE_MOST`].
     TooMany,
 }
 
 impl LiftAbort {
-    const ALL: [LiftAbort; 12] = [
+    const ALL: [LiftAbort; 11] = [
         LiftAbort::NotSole,
         LiftAbort::SameBuffer,
         LiftAbort::NoBounce,
@@ -4136,7 +4126,6 @@ impl LiftAbort {
         LiftAbort::CpuWrites,
         LiftAbort::Twice,
         LiftAbort::Changed,
-        LiftAbort::Viewed,
         LiftAbort::TooMany,
     ];
 
@@ -4154,7 +4143,6 @@ impl LiftAbort {
             LiftAbort::CpuWrites => "a CPU copy writes it",
             LiftAbort::Twice => "a list named twice",
             LiftAbort::Changed => "a step changed",
-            LiftAbort::Viewed => "a copy over a home it writes is refreshed",
             LiftAbort::TooMany => "too many steps taken along",
         }
     }
@@ -4352,10 +4340,6 @@ fn lift_reads(runs: &[&HostList]) -> bool {
         .iter()
         .enumerate()
         .any(|(i, a)| runs[..i].iter().any(|b| std::ptr::eq(*a, *b)));
-    // With R5's lifts a home holding the whole range is taken too, named by
-    // its buffer: two homes in one chunk of the pool share it, and a copy
-    // between them goes through a bounce buffer.
-    let homes = r5_lift();
     // One list's lock at a time.
     let steps: Vec<(usize, usize, Seen)> = if twice {
         Vec::new()
@@ -4378,18 +4362,13 @@ fn lift_reads(runs: &[&HostList]) -> bool {
         Err(LiftAbort::Twice)
     } else {
         let sole = |at: usize, len: usize| {
-            if homes {
-                crate::shadow::sole_or_home(at as u64, len as u64)
-                    .map(|s| (s.buffer.as_raw() as usize, s))
-            } else {
-                crate::shadow::sole(at as u64, len as u64).map(|s| (Arc::as_ptr(&s) as usize, s))
-            }
+            crate::shadow::sole(at as u64, len as u64).map(|s| (Arc::as_ptr(&s) as usize, s))
         };
         let scratch = |l: usize, at: usize, len: usize| runs[l].scratch_chunk(at, len);
         let fills = mode != LiftMode::Copies;
         // With the closure, what is in the way is lifted too
         // (`VICTORY_LIFT_CLOSURE=1`); else such a plan aborts.
-        let planned = if lift_closure::lift_closure() {
+        if lift_closure::lift_closure() {
             let join = lift_closure::lift_join();
             lift_closure::plan_closure(&written, steps.iter().copied(), fills, join, sole, scratch)
                 .map(|(lifts, n)| {
@@ -4398,13 +4377,7 @@ fn lift_reads(runs: &[&HostList]) -> bool {
                 })
         } else {
             plan_lifts(&written, steps.iter().copied(), fills, sole, scratch)
-        };
-        planned.and_then(|lifts| {
-            if homes && late_lift::over_lifted_homes(&lifts, &steps, runs) {
-                return Err(LiftAbort::Viewed);
-            }
-            Ok(lifts)
-        })
+        }
     };
     let lifts = match plan {
         Ok(lifts) => lifts,
@@ -5348,9 +5321,8 @@ fn late_line(frames: f64) {
             "R5 per frame (VICTORY_R5=1): {:.2} submissions waited for flights before a copy's refresh over a home they write \
              (in \"title memory read\" above); {:.2} waits for a memory value and {:.2} blocking fence waits waited for the flights \
              concerned only; {:.2} protections of the title's waited for the flights in the air; of \"title memory read\": \
-             {:.2} waits by a buffer copy, fill or texture (H8) {:.1} ms, those refreshes (H2) {:.1} ms; with VICTORY_R5_LIFT={}: \
-             {:.2} submissions had such refreshes done on the card, {:.2} waited all the same (the copy is written there too, \
-             or no one home holds the bytes)",
+             {:.2} waits by a buffer copy, fill or texture (H8) {:.1} ms, those refreshes (H2) {:.1} ms; {:.2} submissions \
+             had such refreshes done on the card, {:.2} waited all the same (the reasons are on the frame budget's H2 line)",
             r[0],
             r[1],
             r[2],
@@ -5358,7 +5330,6 @@ fn late_line(frames: f64) {
             r[late_lift::R5_H8],
             r[late_lift::R5_H8_US] / 1000.0,
             r[late_lift::R5_H2_US] / 1000.0,
-            u8::from(r5_lift()),
             r[late_lift::R5_REFRESHES_LIFTED],
             r[late_lift::R5_REFRESHES_REFUSED],
         );
