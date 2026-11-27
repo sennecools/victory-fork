@@ -3439,21 +3439,27 @@ impl HostHeap {
             if let Some(hook) = BEFORE_NULL.take() {
                 hook(self);
             }
+            // What was read is noted as seen (0 for bytes of no view, the
+            // dead key for a released view), so that a live record copied
+            // back over it later does not look like the one the pass saw last
+            // ([`HostHeap::sort_copied_page`]).
+            let read = if tag == VIEW_TAG { key } else { 0 };
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             let Ok(mut claim) = self.claim(index, |made| made != 0 || for_draw) else {
+                // Refused: the slot shows nothing and this is no draw's
+                // mirror, so it stays as it is. The pass may have noted a live
+                // record it found here a moment ago, which these bytes
+                // replaced; noted as is, that record copied back would be
+                // left in a null slot.
+                self.saw_key(index, read);
                 return None;
             };
-            // What was read is seen (0 for bytes of no view, the dead key for
-            // a released view): a draw that makes the slot null here changes
-            // what the slot shows without the pass, and a live record copied
-            // back over it must then not look like the one the pass saw last
-            // ([`HostHeap::sort_copied_page`]). Noted under the claim: a pass
-            // that made the slot from a live record between this read and
-            // the claim noted that record as seen, and this null must not
-            // leave it so. With the claim refused, the slot is left as it is,
-            // and so is what was seen.
-            self.saw_key(index, if tag == VIEW_TAG { key } else { 0 });
+            // Noted under the claim when it changes the slot: a pass that
+            // made the slot from a live record between this read and the
+            // claim noted that record as seen, and the null made here must
+            // not leave it so.
+            self.saw_key(index, read);
             if claim.old != 0 {
                 claim.value = 0;
                 self.write_word(index, 0);

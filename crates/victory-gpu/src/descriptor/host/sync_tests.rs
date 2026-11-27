@@ -2040,3 +2040,46 @@ fn a_pass_between_a_viewless_draw_s_read_and_its_claim_is_undone() {
     );
     assert_eq!(key(&heap, slot), live_key);
 }
+
+/// A pass finds a live record in a slot made from nothing and notes it as
+/// seen; before it mirrors the slot, the title writes bytes of no view
+/// there, so the mirror, no draw's, is refused its claim; then the title
+/// copies the record back. The refused mirror noted what it read, so the
+/// next pass hands the slot on and makes it.
+#[test]
+fn a_refused_viewless_mirror_notes_what_it_read() {
+    let Some(heap) = HostHeap::new(false, SLOTS) else {
+        return; // no host GPU
+    };
+    let (views, _hosts) = object_views();
+    let mut records = vec![[0u32; 8]; SLOTS as usize];
+    let base = records.as_mut_ptr() as u64;
+    let slot = 8u32;
+    let at = base + u64::from(slot) * 32;
+    assert_eq!(pass_over(&heap, base), [], "nothing there");
+    write(at, &views[0]);
+    let live = records[slot as usize];
+    let live_key = record_key(at);
+    // The pass's sort: the live record seen, the slot handed on.
+    let len = SLOTS as usize * 32;
+    // SAFETY: the test's records.
+    let page = unsafe { std::slice::from_raw_parts(base as *const u8, len) }.to_vec();
+    let mut part = SyncPart::default();
+    heap.sort_copied_page(
+        0..u64::from(SLOTS),
+        (base, 32),
+        base as usize,
+        &page,
+        &mut part,
+    );
+    assert_eq!(part.make, [slot]);
+    assert_eq!(heap.seen_key(slot), Some(live_key));
+    // Bytes of no view before the pass's mirror, which is refused.
+    records[slot as usize] = [0x7e57_0008; 8];
+    heap.mirror_synced(slot, at);
+    assert_eq!(key(&heap, slot), 0, "left null");
+    // The record back: the next pass makes the slot from it.
+    records[slot as usize] = live;
+    assert_eq!(pass_over(&heap, base), [slot]);
+    assert_eq!(key(&heap, slot), live_key);
+}
