@@ -7,6 +7,13 @@ planning and our `Host`. No cool_fox history is merged or cherry-picked.
 Nothing here is XCL-derived. Every new behaviour is behind its own switch,
 off by default; with every switch unset, behaviour is as on the base.
 
+> **2026-11-27:** `VICTORY_R5_LIFT`, `crate::shadow::sole_or_home` and
+> `over_lifted_homes` were removed. With `VICTORY_R5=1` a refresh over a
+> home a flight writes is taken on the card (H2) unless the lift is
+> refused, and then waits as before; a lifted copy or fill (H8,
+> `VICTORY_LIFT_READS`) never reads from or writes into a home. What this
+> file says about them is history.
+
 ## What the lane ports
 
 All cool_fox commits named here have the author `local`.

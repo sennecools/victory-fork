@@ -569,6 +569,213 @@ pub(crate) fn first_overlap(ranges: &[(usize, usize)], from: usize, to: usize) -
     ranges.get(at).filter(|r| r.0 < to).map(|r| r.0.max(from))
 }
 
+/// Where a refresh of a host copy was asked for: the tag a refresh step
+/// carries (`crate::host`'s `Step::Refresh`), so that what is left of H2 can
+/// be split by the binding that asked for it. A step asked for twice keeps
+/// the first tag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Source {
+    /// Any site with no tag of its own.
+    #[default]
+    Other,
+    /// A root constant or shader resource view bound at its host address
+    /// (`crate::draw::root_view`), or a root constant view in a table.
+    RootView,
+    Vertex,
+    Index,
+    /// A root unordered access view bound as a table.
+    RootUav,
+    /// A root shader resource view bound as a table.
+    RootSrv,
+    /// A root constant view bound as a table, bound again in the list.
+    RootCbv,
+    /// The heap buffer pass (`State::heap_buffers`): the views a shader
+    /// may pick from the heap.
+    HeapPass,
+    /// Indirect arguments and their count.
+    Indirect,
+    /// A buffer view in a table a draw binds (`crate::draw`'s `readable`).
+    Table,
+}
+
+impl Source {
+    const ALL: [Source; 10] = [
+        Source::Other,
+        Source::RootView,
+        Source::Vertex,
+        Source::Index,
+        Source::RootUav,
+        Source::RootSrv,
+        Source::RootCbv,
+        Source::HeapPass,
+        Source::Indirect,
+        Source::Table,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Source::Other => "other",
+            Source::RootView => "root view",
+            Source::Vertex => "vertex",
+            Source::Index => "index",
+            Source::RootUav => "root UAV",
+            Source::RootSrv => "root SRV",
+            Source::RootCbv => "root CBV",
+            Source::HeapPass => "heap pass",
+            Source::Indirect => "indirect",
+            Source::Table => "table",
+        }
+    }
+}
+
+/// What became of a submission with a refresh over flights' homes (H2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H2Outcome {
+    /// It waited for the flights.
+    Waited,
+    /// Its refreshes' bytes over those homes were taken on the card.
+    Lifted,
+    /// The card was asked to take them and refused ([`Refusal`]); it then
+    /// waits, if the flights are still in the air.
+    Refused,
+}
+
+/// Per [`Source`] of the first refresh that made a submission meet H2:
+/// waits and their microseconds, submissions lifted, submissions refused.
+static H2_SOURCES: [[AtomicU64; 4]; Source::ALL.len()] =
+    [const { [const { AtomicU64::new(0) }; 4] }; Source::ALL.len()];
+
+/// A submission met H2, its first refresh from `source`, of `class`; it
+/// came to `outcome` (`us`: the microseconds it waited, for a wait).
+// (`class` is noted for tests only.)
+#[cfg_attr(not(test), allow(unused_variables))]
+pub(crate) fn h2_source(source: Source, class: H2Class, outcome: H2Outcome, us: u64) {
+    let counts = &H2_SOURCES[source as usize];
+    match outcome {
+        H2Outcome::Waited => {
+            counts[0].fetch_add(1, Ordering::Relaxed);
+            counts[1].fetch_add(us, Ordering::Relaxed);
+        }
+        H2Outcome::Lifted => {
+            counts[2].fetch_add(1, Ordering::Relaxed);
+        }
+        H2Outcome::Refused => {
+            counts[3].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    seen!(Seen::H2Source {
+        source,
+        class,
+        outcome
+    });
+}
+
+/// Why the bytes of a refresh over flights' homes are not taken on the card
+/// (`crate::host`'s `late_lift::lift_refreshes`): the submission waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// A list is named twice in the submission.
+    Twice,
+    /// A step reads the bytes that is no refresh (a lifted read's source).
+    NotRefresh,
+    /// The copy is in the card's memory (its CPU side goes up before the
+    /// lists, over the piece).
+    Carded,
+    /// A flight in the air may write the copy over the piece.
+    Pending,
+    /// No home holds a part of the piece's bytes (a piece over two homes
+    /// side by side is split, one part per home).
+    NoHome,
+    /// The submission's shaders write the copy over the piece.
+    Written,
+}
+
+impl Refusal {
+    pub(crate) const ALL: [Refusal; 6] = [
+        Refusal::Twice,
+        Refusal::NotRefresh,
+        Refusal::Carded,
+        Refusal::Pending,
+        Refusal::NoHome,
+        Refusal::Written,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Refusal::Twice => "a list twice",
+            Refusal::NotRefresh => "not a refresh",
+            Refusal::Carded => "on the card",
+            Refusal::Pending => "a pending write",
+            Refusal::NoHome => "no home",
+            Refusal::Written => "written",
+        }
+    }
+}
+
+/// Per [`Refusal`]: submissions it was the first reason of, and pieces it
+/// refused.
+static H2_REFUSALS: [[AtomicU64; 2]; Refusal::ALL.len()] =
+    [const { [const { AtomicU64::new(0) }; 2] }; Refusal::ALL.len()];
+
+/// A submission's refreshes over flights' homes were refused, first for
+/// `first`; `pieces`: per [`Refusal`], the pieces it refused.
+pub(crate) fn h2_refused(first: Refusal, pieces: [u32; Refusal::ALL.len()]) {
+    H2_REFUSALS[first as usize][0].fetch_add(1, Ordering::Relaxed);
+    for (counts, n) in H2_REFUSALS.iter().zip(pieces) {
+        counts[1].fetch_add(u64::from(n), Ordering::Relaxed);
+    }
+    seen!(Seen::H2Refused { first, pieces });
+}
+
+/// The frame budget's H2 split, beside [`wave1_line`], per frame over
+/// `frames`: what met H2 by the binding that asked for its first refresh,
+/// and why the card did not take those bytes.
+pub(crate) fn h2_line(frames: f64) {
+    let per = |n: u64| n as f64 / frames;
+    let sources: Vec<String> = Source::ALL
+        .iter()
+        .filter_map(|&source| {
+            let s: [u64; 4] =
+                std::array::from_fn(|i| H2_SOURCES[source as usize][i].swap(0, Ordering::Relaxed));
+            (s.iter().any(|&n| n > 0)).then(|| {
+                format!(
+                    "{} {:.2} waits {:.1} ms, {:.2} lifted, {:.2} refused",
+                    source.name(),
+                    per(s[0]),
+                    s[1] as f64 / 1000.0 / frames,
+                    per(s[2]),
+                    per(s[3])
+                )
+            })
+        })
+        .collect();
+    let refusals: Vec<String> = Refusal::ALL
+        .iter()
+        .filter_map(|&why| {
+            let r: [u64; 2] =
+                std::array::from_fn(|i| H2_REFUSALS[why as usize][i].swap(0, Ordering::Relaxed));
+            (r[0] > 0 || r[1] > 0)
+                .then(|| format!("{} {:.2} ({:.2} pieces)", why.name(), per(r[0]), per(r[1])))
+        })
+        .collect();
+    if sources.is_empty() && refusals.is_empty() {
+        return;
+    }
+    let none = |v: Vec<String>| {
+        if v.is_empty() {
+            "none".to_owned()
+        } else {
+            v.join(", ")
+        }
+    };
+    tracing::info!(
+        "frame budget H2 per frame: by first refresh's source {}; refused first by {}",
+        none(sources),
+        none(refusals),
+    );
+}
+
 /// Why a card copy kept its staging buffer (`crate::card_home::kept`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Staging {
@@ -799,6 +1006,15 @@ pub(crate) enum Seen {
         class: H2Class,
         bytes: u64,
         us: u64,
+    },
+    H2Source {
+        source: Source,
+        class: H2Class,
+        outcome: H2Outcome,
+    },
+    H2Refused {
+        first: Refusal,
+        pieces: [u32; Refusal::ALL.len()],
     },
     Kept {
         reason: Staging,

@@ -21,15 +21,15 @@
 //! list of ours with its own buffer between reading and writing is not
 //! taken: our lift list copies from host copy to host copy (through a
 //! bounce buffer within one) and fills into the lists' shared scratch, as
-//! `VICTORY_LIFT_READS=2` does, and homes stay what `VICTORY_R5_LIFT` makes
-//! of them (`crate::shadow::sole_or_home`).
+//! `VICTORY_LIFT_READS=2` does, and a home is never a source or destination
+//! (`crate::shadow::sole`).
 
 use super::*;
 
 /// Whether lifted reads take along the copies and fills that depend on
 /// them, or they on them, instead of aborting the plan
 /// (`VICTORY_LIFT_CLOSURE=1`; off by default, and only where lifts are made:
-/// `VICTORY_LIFT_READS` at `1` or `2`, or `VICTORY_R5_LIFT=1`).
+/// `VICTORY_LIFT_READS` at `1` or `2`).
 ///
 /// Taken along: every title buffer copy or fill of the submission that
 /// writes what a lifted step reads or writes, or reads what one writes,

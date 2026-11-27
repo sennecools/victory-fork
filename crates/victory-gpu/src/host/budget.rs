@@ -18,12 +18,15 @@ pub(super) fn measured<T>(kind: Wait, wait: impl FnOnce() -> T) -> T {
 /// H2: the wait of a submission for the flights that write home bytes
 /// (`homes`, in order and joined, as it was before the wait) under refreshes
 /// of copies that are no home ([`refresh_over_flight_homes`]), measured, and
-/// the refreshes that made it wait sent to the H2 table. The microseconds
-/// waited, if it waited (as [`relay_wait_with`] says them).
+/// the refreshes that made it wait sent to the H2 table; `first`: the first
+/// such refresh ([`h2_class`]), whose class and source the wait is counted
+/// under. The microseconds waited, if it waited (as [`relay_wait_with`] says
+/// them).
 pub(super) fn h2_wait(
     args: &[(&'static str, u64)],
     homes: &[(usize, usize)],
     runs: &[&HostList],
+    first: Option<H2First>,
 ) -> Option<u64> {
     let measure = crate::frame_budget::Measure::start();
     let waited = relay_wait_with(WHY_READ, args, |line| {
@@ -31,42 +34,52 @@ pub(super) fn h2_wait(
     });
     if let Some(us) = measure.end(Wait::H2, true) {
         h2_waited(us, homes, runs);
-        if let Some((class, bytes)) = h2_class(homes, runs) {
-            crate::frame_budget::h2_class(class, bytes, us);
+        if let Some(first) = first {
+            crate::frame_budget::h2_class(first.class, first.bytes, us);
+            h2_outcome(Some(first), crate::frame_budget::H2Outcome::Waited, us);
         }
     }
     waited
 }
 
-/// The class of an H2 wait: that of the first refresh in `runs` of a copy
-/// that is no home over `homes` (as [`refresh_over_flight_homes`] finds
-/// it, but counting nothing: that one is also the wait's predicate, asked
-/// at every landing), and that refresh's bytes over `homes`.
-fn h2_class(
-    homes: &[(usize, usize)],
-    runs: &[&HostList],
-) -> Option<(crate::frame_budget::H2Class, u64)> {
-    for list in runs {
-        for step in &list.deferred().copies {
-            for (shadow, at, len) in step.refreshes() {
-                let end = at.saturating_add(len);
-                if shadow.is_home() {
-                    continue;
-                }
-                let Some(first) = crate::frame_budget::first_overlap(homes, at, end) else {
-                    continue;
-                };
-                let bytes = crate::frame_budget::overlap_bytes(homes, at, end);
-                let class = crate::frame_budget::H2Class::of(
-                    shadow.origin(),
-                    shadow.carded(),
-                    in_home_pages(first, at, end),
-                );
-                return Some((class, bytes));
-            }
-        }
+/// The first refresh in a submission of a copy that is no home over the
+/// home bytes flights write ([`h2_class`]).
+#[derive(Clone, Copy)]
+pub(super) struct H2First {
+    class: crate::frame_budget::H2Class,
+    /// Its bytes over those homes.
+    bytes: u64,
+    source: crate::frame_budget::Source,
+}
+
+/// A submission that met H2 (its first refresh `first`) came to `outcome`.
+pub(super) fn h2_outcome(first: Option<H2First>, outcome: crate::frame_budget::H2Outcome, us: u64) {
+    if let Some(first) = first {
+        crate::frame_budget::h2_source(first.source, first.class, outcome, us);
     }
-    None
+}
+
+/// Of the first refresh of a submission that met H2 (`first`, as
+/// `late_lift::plan_refresh_lifts` found it in its walk over the lists): its
+/// class, its bytes over `homes`, and where it was asked for. Called with no
+/// list's lock held: the class looks at the homes' table.
+pub(super) fn h2_class(
+    homes: &[(usize, usize)],
+    first: Option<&late_lift::FirstRefresh>,
+) -> Option<H2First> {
+    let (shadow, at, end, source) = first?;
+    let (at, end) = (*at, *end);
+    let over = crate::frame_budget::first_overlap(homes, at, end)?;
+    let class = crate::frame_budget::H2Class::of(
+        shadow.origin(),
+        shadow.carded(),
+        in_home_pages(over, at, end),
+    );
+    Some(H2First {
+        class,
+        bytes: crate::frame_budget::overlap_bytes(homes, at, end),
+        source: *source,
+    })
 }
 
 /// Whether `[at, end)` lies inside the 64 KiB pages of the home that holds
@@ -118,4 +131,5 @@ pub(super) fn line(frames: f64) {
         u64::from(victory_shader::emit::view_heap_limit()) + 1,
     );
     crate::frame_budget::wave1_line(frames, crate::descriptor::host::levels_seen());
+    crate::frame_budget::h2_line(frames);
 }
