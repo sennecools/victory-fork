@@ -945,6 +945,9 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Title bytes under flights' shader writes.
+    mod stale;
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -3112,8 +3115,14 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy,
+    /// declared at a site of the frame budget's.
+    GpuWrite(
+        std::sync::Arc<crate::shadow::Shadow>,
+        usize,
+        usize,
+        crate::frame_budget::Declarer,
+    ),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture {
@@ -3201,7 +3210,7 @@ impl Step {
     /// declared writes, or a lifted copy's destination.
     fn card_writes(&self) -> Option<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
         match self {
-            Step::GpuWrite(shadow, address, len) => Some((shadow, *address, *len)),
+            Step::GpuWrite(shadow, address, len, _) => Some((shadow, *address, *len)),
             Step::Lifted(lift) => match &lift.to {
                 LiftedTo::Copy(dst, at, _) => Some((dst, *at, lift.len)),
                 LiftedTo::Fill(..) | LiftedTo::Refresh(_) => None,
@@ -4549,9 +4558,12 @@ unsafe fn record_lifts(list: &ID3D12GraphicsCommandList, lifts: &[LiftCopy]) {
 /// the title's bytes there would reach the card a submission late.
 ///
 /// The spans found so (copy, from, to): the first only, or with
-/// [`lift_stale`] all of them.
+/// [`lift_stale`] all of them. Each refusal is counted
+/// (`crate::frame_budget::stale_refused`); `first`: this is the
+/// submission's first look.
 fn stale_under_flights(
     runs: &[&HostList],
+    first: bool,
 ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
     // (Only with the relay's second stage, as the switch says: with
@@ -4561,8 +4573,9 @@ fn stale_under_flights(
     // and whether a settle is due.
     let mut span = crate::profile::span("stale under flights");
     // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    // up to date at most), and the refreshed ranges.
+    type Spans = Vec<(Arc<crate::shadow::Shadow>, usize, usize, Vec<(usize, usize)>)>;
+    let mut spans: Spans = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             // (A lifted read's ranges are refreshed too.)
@@ -4570,13 +4583,30 @@ fn stale_under_flights(
                 if !shadow.writes_pending() {
                     continue;
                 }
+                let range = (address, address + len);
                 match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(address), s.2.max(address + len)),
-                    None => spans.push((shadow.clone(), address, address + len)),
+                    Some(s) => {
+                        (s.1, s.2) = (s.1.min(address), s.2.max(address + len));
+                        s.3.push(range);
+                    }
+                    None => spans.push((shadow.clone(), address, address + len, vec![range])),
                 }
             }
         }
     }
+    // On the first look: how much of what flights may write the hulls
+    // hold, and how much the refreshed ranges themselves (the looks after a
+    // wait, under the submission lock, need not pay for it again).
+    if first {
+        let (mut hull, mut exact) = (0, 0);
+        for (shadow, from, to, ranges) in &mut spans {
+            hull += shadow.pending_bytes(*from, *to);
+            join_ranges(ranges, []);
+            exact += ranges.iter().map(|&(a, e)| shadow.pending_bytes(a, e)).sum::<u64>();
+        }
+        crate::frame_budget::stale_bytes(hull, exact);
+    }
+    let spans: Vec<_> = spans.into_iter().map(|(shadow, from, to, _)| (shadow, from, to)).collect();
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -4586,20 +4616,26 @@ fn stale_under_flights(
         let budget = if all { 4096 } else { 512 };
         let mut runs_left = budget;
         let copies = spans.len() as u64;
+        let mut refused = Vec::new();
+        let mut merge = |shadow: &crate::shadow::Shadow, from: usize, to: usize| {
+            match shadow.merge_under_writes(from, to - from, &mut runs_left) {
+                Ok(()) => false,
+                Err(why) => {
+                    refused.push(why);
+                    true
+                }
+            }
+        };
         let stale: Vec<_> = if all {
-            spans.retain(|(shadow, from, to)| {
-                shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
-            });
-            spans
+            spans.into_iter().filter(|(shadow, from, to)| merge(shadow, *from, *to)).collect()
         } else {
             spans
                 .into_iter()
-                .find(|(shadow, from, to)| {
-                    shadow.merge_under_writes(*from, *to - *from, &mut runs_left)
-                })
+                .find(|(shadow, from, to)| merge(shadow, *from, *to))
                 .into_iter()
                 .collect()
         };
+        crate::frame_budget::stale_refused(&refused, first);
         if let Some(span) = span.as_mut() {
             span.arg("copies", copies);
             span.arg("merged", budget.saturating_sub(runs_left) as u64);
@@ -4609,8 +4645,10 @@ fn stale_under_flights(
     }
     let copies = spans.len() as u64;
     let stale: Vec<_> = if all {
-        spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
         spans
+            .into_iter()
+            .filter(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+            .collect()
     } else {
         spans
             .into_iter()
@@ -7445,7 +7483,7 @@ impl Host {
                     })
                 });
                 ask_again();
-                stale = stale_under_flights(runs);
+                stale = stale_under_flights(runs, false);
                 if stale.is_empty() {
                     return;
                 }
@@ -7847,13 +7885,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = if behind { stale_under_flights(runs, true) } else { Vec::new() };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, runs, stale, &ranges);
                 settled += settling.elapsed();
             }
-        } else if behind && !stale_under_flights(runs).is_empty() {
+        } else if behind && !stale_under_flights(runs, true).is_empty() {
             let settling = std::time::Instant::now();
             measured(Wait::Stale, || self.settle(&mut submitted, WHY_STALE));
             settled += settling.elapsed();
@@ -9255,16 +9293,18 @@ impl HostList {
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
-    /// host copy: copied back into title memory once the list has run.
+    /// host copy: copied back into title memory once the list has run. The
+    /// step keeps where it was declared (`crate::frame_budget::declaring`).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
+        let by = crate::frame_budget::declarer();
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, by));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -9855,7 +9895,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, by) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -9864,7 +9904,7 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
+                    shadow.writing_by(*address, *len, *by);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
@@ -9903,7 +9943,7 @@ impl HostList {
                             // the landing finds every byte the copy changed.
                             batch.add(dst, *at, lift.len);
                             batch.flush_one(dst);
-                            dst.writing(*at, lift.len);
+                            dst.writing_by(*at, lift.len, crate::frame_budget::Declarer::Lifted);
                             (dst.buffer.clone(), dst.offset(*at as u64), bounce.clone())
                         }
                         LiftedTo::Fill(buffer, offset, _) => (buffer.clone(), *offset, None),

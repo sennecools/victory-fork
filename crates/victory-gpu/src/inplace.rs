@@ -84,7 +84,7 @@ pub(crate) fn probe_level() -> u8 {
 ///
 /// Stage 1 was exempt from that rule on the argument that a window outside
 /// buffers is a copy. It is not: a placed window is a `Shadow` with `place`
-/// set, and `gpu_writes`, `writing` and `copy_back_with` all return early on
+/// set, and `gpu_writes`, `writing_by` and `copy_back_with` all return early on
 /// that, so nothing declares its writes to the flights either. Whether a
 /// shader ever writes one (the placed buffer carries
 /// `ALLOW_UNORDERED_ACCESS`, and the root-UAV path takes any such buffer) is

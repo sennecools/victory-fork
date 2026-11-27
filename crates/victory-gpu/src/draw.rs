@@ -1498,7 +1498,7 @@ impl State {
             s.refresh_from(list, a, len, Source::RootUav);
             list.buffer_uav(&s.buffer);
             if writes {
-                s.gpu_writes(list, a, len);
+                s.gpu_writes_from(list, a, len, crate::frame_budget::Declarer::RootTail);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -4055,7 +4055,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
+                shadow.gpu_writes_from(
+                    list,
+                    address,
+                    len,
+                    crate::frame_budget::Declarer::TableUav,
+                );
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

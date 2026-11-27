@@ -776,6 +776,217 @@ pub(crate) fn h2_line(frames: f64) {
     );
 }
 
+/// Where a range that shaders may write was declared (`Shadow::writing_by`):
+/// which binding made the stale spans that title bytes could not go in
+/// under ([`stale_refused`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Declarer {
+    /// Any other site (and every declaration without the relay, which keeps
+    /// no per-flight record).
+    #[default]
+    Other,
+    /// A buffer view in a descriptor table bound for unordered access.
+    TableUav,
+    /// A root UAV, declared from its address to the end of its buffer.
+    RootTail,
+    /// The memory directory's copies a shader may write.
+    Directory,
+    /// The destination of a title buffer copy done on the card (a lifted
+    /// step).
+    Lifted,
+}
+
+impl Declarer {
+    pub(crate) const ALL: [Declarer; 5] = [
+        Declarer::Other,
+        Declarer::TableUav,
+        Declarer::RootTail,
+        Declarer::Directory,
+        Declarer::Lifted,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Declarer::Other => "other",
+            Declarer::TableUav => "table UAV",
+            Declarer::RootTail => "root tail",
+            Declarer::Directory => "directory",
+            Declarer::Lifted => "lifted",
+        }
+    }
+}
+
+thread_local! {
+    /// The site declaring shaders' writes on this thread now ([`declaring`]).
+    static DECLARING: Cell<Declarer> = const { Cell::new(Declarer::Other) };
+}
+
+/// Runs `f`, whose shader-write declarations are `by`'s: the lists' steps
+/// take it along (`HostList::defer_gpu_write`).
+pub(crate) fn declaring<R>(by: Declarer, f: impl FnOnce() -> R) -> R {
+    let was = DECLARING.replace(by);
+    let done = f();
+    DECLARING.set(was);
+    done
+}
+
+/// The site declaring shaders' writes on this thread ([`declaring`]).
+pub(crate) fn declarer() -> Declarer {
+    DECLARING.get()
+}
+
+/// Why the title's bytes under a flight's shader writes were not put in
+/// beside them (`Shadow::merge_under_writes`): the submission waits for the
+/// flights. Adapted from cool_fox 007fe55 (`note_stale`, `STALE_WHY`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StaleRefusal {
+    /// The memory is not write-watched.
+    NotWatched,
+    /// Neither the journal nor the kernel says which pages were written.
+    JournalSilent,
+    /// A copy whose CPU side is a home ran out of changed runs.
+    HomeRunsOut,
+    /// A card copy ran out of changed runs on the first page it looked at:
+    /// nothing was put in.
+    CardRunsOutFirst,
+    /// A card copy ran out of changed runs on a later page.
+    CardRunsOutLater,
+    /// The copy has no snapshot to compare with.
+    NoSnapshot,
+}
+
+impl StaleRefusal {
+    pub(crate) const ALL: [StaleRefusal; 6] = [
+        StaleRefusal::NotWatched,
+        StaleRefusal::JournalSilent,
+        StaleRefusal::HomeRunsOut,
+        StaleRefusal::CardRunsOutFirst,
+        StaleRefusal::CardRunsOutLater,
+        StaleRefusal::NoSnapshot,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            StaleRefusal::NotWatched => "not watched",
+            StaleRefusal::JournalSilent => "journal silent",
+            StaleRefusal::HomeRunsOut => "home runs out",
+            StaleRefusal::CardRunsOutFirst => "card runs out on the first page",
+            StaleRefusal::CardRunsOutLater => "card runs out on a later page",
+            StaleRefusal::NoSnapshot => "no snapshot",
+        }
+    }
+}
+
+/// A stale span's refusal: why, who declared the first range shaders may
+/// write that it met, and whether the last submission declaring that range
+/// is the newest one sent before this (then a wait for it alone is about a
+/// whole settle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Refused {
+    pub(crate) why: StaleRefusal,
+    pub(crate) by: Declarer,
+    pub(crate) newest: bool,
+}
+
+/// Per [`StaleRefusal`]: submissions it was the first reason of, and spans
+/// it refused.
+static STALE_REFUSALS: [[AtomicU64; 2]; StaleRefusal::ALL.len()] =
+    [const { [const { AtomicU64::new(0) }; 2] }; StaleRefusal::ALL.len()];
+
+/// Per [`Declarer`]: refused spans whose first range met was its.
+static STALE_BY: [AtomicU64; Declarer::ALL.len()] =
+    [const { AtomicU64::new(0) }; Declarer::ALL.len()];
+
+/// Refused spans whose declaring submission is the newest sent.
+static STALE_NEWEST: AtomicU64 = AtomicU64::new(0);
+
+/// A look for stale spans refused `refused` (each span once); `first`: it
+/// is the submission's first look, whose first refusal counts the
+/// submission.
+pub(crate) fn stale_refused(refused: &[Refused], first: bool) {
+    if first && let Some(r) = refused.first() {
+        STALE_REFUSALS[r.why as usize][0].fetch_add(1, Ordering::Relaxed);
+    }
+    for r in refused {
+        STALE_REFUSALS[r.why as usize][1].fetch_add(1, Ordering::Relaxed);
+        STALE_BY[r.by as usize].fetch_add(1, Ordering::Relaxed);
+        if r.newest {
+            STALE_NEWEST.fetch_add(1, Ordering::Relaxed);
+        }
+        seen!(Seen::StaleRefused(*r));
+    }
+}
+
+/// Bytes the flights may write in what submissions refresh: over the span
+/// of each copy's refreshed ranges, and over those ranges themselves.
+static STALE_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A submission's look for stale spans: of the ranges flights may write,
+/// `hull` bytes lie in the span of a copy's refreshed ranges and `exact` in
+/// those ranges.
+pub(crate) fn stale_bytes(hull: u64, exact: u64) {
+    STALE_BYTES[0].fetch_add(hull, Ordering::Relaxed);
+    STALE_BYTES[1].fetch_add(exact, Ordering::Relaxed);
+    seen!(Seen::StaleBytes { hull, exact });
+}
+
+/// Of `Shadow::copy`: copies, bytes, and copies of part of a 64 KiB page.
+static COPIED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `Shadow::copy` copied `bytes`; `part`: not whole 64 KiB pages.
+pub(crate) fn copied(bytes: u64, part: bool) {
+    COPIED[0].fetch_add(1, Ordering::Relaxed);
+    COPIED[1].fetch_add(bytes, Ordering::Relaxed);
+    COPIED[2].fetch_add(u64::from(part), Ordering::Relaxed);
+}
+
+/// The stale split, beside [`h2_line`], per frame over `frames`: why title
+/// bytes under flights' writes waited, who declared those writes, and how
+/// much of what flights write the refreshes cover.
+pub(crate) fn stale_line(frames: f64) {
+    let per = |n: u64| n as f64 / frames;
+    let mb = |b: u64| b as f64 / f64::from(1 << 20) / frames;
+    let refusals: Vec<String> = StaleRefusal::ALL
+        .iter()
+        .filter_map(|&why| {
+            let r: [u64; 2] =
+                std::array::from_fn(|i| STALE_REFUSALS[why as usize][i].swap(0, Ordering::Relaxed));
+            (r[0] > 0 || r[1] > 0)
+                .then(|| format!("{} {:.2} ({:.2} spans)", why.name(), per(r[0]), per(r[1])))
+        })
+        .collect();
+    let by: Vec<String> = Declarer::ALL
+        .iter()
+        .filter_map(|&by| {
+            let n = STALE_BY[by as usize].swap(0, Ordering::Relaxed);
+            (n > 0).then(|| format!("{} {:.2}", by.name(), per(n)))
+        })
+        .collect();
+    let newest = STALE_NEWEST.swap(0, Ordering::Relaxed);
+    let bytes: [u64; 2] = std::array::from_fn(|i| STALE_BYTES[i].swap(0, Ordering::Relaxed));
+    let copied: [u64; 3] = std::array::from_fn(|i| COPIED[i].swap(0, Ordering::Relaxed));
+    let none = |v: Vec<String>| {
+        if v.is_empty() {
+            "none".to_owned()
+        } else {
+            v.join(", ")
+        }
+    };
+    tracing::info!(
+        "frame budget stale per frame: refused first by {}; refused spans declared by {}, {:.2} by the newest \
+         submission; flights' writes {:.2} MB over refreshed spans, {:.2} MB over refreshed ranges; host copies \
+         {:.0} ({:.2} MB, {:.0} of part pages)",
+        none(refusals),
+        none(by),
+        per(newest),
+        mb(bytes[0]),
+        mb(bytes[1]),
+        per(copied[0]),
+        mb(copied[1]),
+        per(copied[2]),
+    );
+}
+
 /// Why a card copy kept its staging buffer (`crate::card_home::kept`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Staging {
@@ -1015,6 +1226,11 @@ pub(crate) enum Seen {
     H2Refused {
         first: Refusal,
         pieces: [u32; Refusal::ALL.len()],
+    },
+    StaleRefused(Refused),
+    StaleBytes {
+        hull: u64,
+        exact: u64,
     },
     Kept {
         reason: Staging,
