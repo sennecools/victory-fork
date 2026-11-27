@@ -4551,62 +4551,91 @@ unsafe fn record_lifts(list: &ID3D12GraphicsCommandList, lifts: &[LiftCopy]) {
     }
 }
 
+/// The host copies a submission refreshes, each found by its address: the
+/// copy and the ranges its steps refresh (a lifted read's too), in order and
+/// joined where they overlap or touch ([`join_ranges`]). One walk over the
+/// lists' steps serves the write-watch asking ([`asked_spans`]) and every
+/// look for stale spans ([`stale_under_flights`]); it is not filtered, so
+/// that each look sees the copies' pending writes as they are then.
+type Refreshed = std::collections::HashMap<
+    usize,
+    (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>),
+>;
+
+/// [`Refreshed`] of `runs`.
+fn refreshed_ranges(runs: &[&HostList]) -> Refreshed {
+    let mut refreshed = Refreshed::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            for (shadow, address, len) in step.refreshes() {
+                refreshed
+                    .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                    .or_insert_with(|| (shadow.clone(), Vec::new()))
+                    .1
+                    .push((address, address + len));
+            }
+        }
+    }
+    for (_, ranges) in refreshed.values_mut() {
+        join_ranges(ranges, []);
+    }
+    refreshed
+}
+
+/// What the submission's one write-watch asking covers: per copy that is
+/// write-watched (or not known yet), the span of its refreshed ranges.
+/// Asking about more than is refreshed costs nothing that matters.
+fn asked_spans(refreshed: &Refreshed) -> Vec<(usize, usize)> {
+    refreshed
+        .values()
+        .filter(|(shadow, ranges)| !shadow.unwatched() && !ranges.is_empty())
+        .map(|(_, ranges)| (ranges[0].0, ranges[ranges.len() - 1].1))
+        .collect()
+}
+
 /// With flights in the air, after the submission's write-watch asking:
-/// whether `runs` refresh a range of a host copy that a flight's shaders
-/// may write and that the title wrote since it was last copied. The
-/// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
-/// the title's bytes there would reach the card a submission late.
+/// whether the submission refreshes a range of a host copy that a flight's
+/// shaders may write and that the title wrote since it was last copied.
+/// The refresh leaves ranges shaders are writing alone (`Shadow::update`),
+/// so the title's bytes there would reach the card a submission late.
+/// Only the refreshed ranges count (`refreshed`, [`refreshed_ranges`]): a
+/// title write between two of them is no refresh's, and the next
+/// submission that refreshes it takes it.
 ///
 /// The spans found so (copy, from, to): the first only, or with
 /// [`lift_stale`] all of them. Each refusal is counted
 /// (`crate::frame_budget::stale_refused`); `first`: this is the
 /// submission's first look.
 fn stale_under_flights(
-    runs: &[&HostList],
+    refreshed: &Refreshed,
     first: bool,
 ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
-    use std::sync::Arc;
     // (Only with the relay's second stage, as the switch says: with
     // `VICTORY_LATE_WAIT=2` alone the first span and 512 runs, as before.)
     let all = lift_stale() && relay_exact();
     // On the profile: host copies looked at, runs merged (`late_exact`),
     // and whether a settle is due.
     let mut span = crate::profile::span("stale under flights");
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most), and the refreshed ranges.
-    type Spans = Vec<(Arc<crate::shadow::Shadow>, usize, usize, Vec<(usize, usize)>)>;
-    let mut spans: Spans = Vec::new();
-    for list in runs {
-        for step in &list.deferred().copies {
-            // (A lifted read's ranges are refreshed too.)
-            for (shadow, address, len) in step.refreshes() {
-                if !shadow.writes_pending() {
-                    continue;
-                }
-                let range = (address, address + len);
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => {
-                        (s.1, s.2) = (s.1.min(address), s.2.max(address + len));
-                        s.3.push(range);
-                    }
-                    None => spans.push((shadow.clone(), address, address + len, vec![range])),
-                }
-            }
+    // Each refreshed range of a copy flights may be writing.
+    let (mut spans, mut copies) = (Vec::new(), 0u64);
+    let (mut hull, mut exact) = (0, 0);
+    for (shadow, ranges) in refreshed.values() {
+        if ranges.is_empty() || !shadow.writes_pending() {
+            continue;
         }
-    }
-    // On the first look: how much of what flights may write the hulls
-    // hold, and how much the refreshed ranges themselves (the looks after a
-    // wait, under the submission lock, need not pay for it again).
-    if first {
-        let (mut hull, mut exact) = (0, 0);
-        for (shadow, from, to, ranges) in &mut spans {
-            hull += shadow.pending_bytes(*from, *to);
-            join_ranges(ranges, []);
+        copies += 1;
+        // On the first look: how much of what flights may write those
+        // ranges hold, and their copy's hull (the looks after a wait,
+        // under the submission lock, need not pay for it again).
+        if first {
+            hull += shadow.pending_bytes(ranges[0].0, ranges[ranges.len() - 1].1);
             exact += ranges.iter().map(|&(a, e)| shadow.pending_bytes(a, e)).sum::<u64>();
         }
+        spans.extend(ranges.iter().map(|&(a, e)| (shadow.clone(), a, e)));
+    }
+    if first {
         crate::frame_budget::stale_bytes(hull, exact);
     }
-    let spans: Vec<_> = spans.into_iter().map(|(shadow, from, to, _)| (shadow, from, to)).collect();
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -4615,7 +4644,6 @@ fn stale_under_flights(
         // span is merged).
         let budget = if all { 4096 } else { 512 };
         let mut runs_left = budget;
-        let copies = spans.len() as u64;
         let mut refused = Vec::new();
         let mut merge = |shadow: &crate::shadow::Shadow, from: usize, to: usize| {
             match shadow.merge_under_writes(from, to - from, &mut runs_left) {
@@ -4643,7 +4671,6 @@ fn stale_under_flights(
         }
         return stale;
     }
-    let copies = spans.len() as u64;
     let stale: Vec<_> = if all {
         spans
             .into_iter()
@@ -7448,9 +7475,9 @@ impl Host {
     /// signals behind them. `submitted` is the submission lock's value;
     /// `why` one of the `WHY_` places. Nothing happens if nothing flies.
     ///
-    /// For a submission of `runs` that refreshes the spans `stale` of host
-    /// copies, which flights may be writing and the title wrote too
-    /// ([`stale_under_flights`]): the flights land first, and the write
+    /// For a submission that refreshes `refreshed` ([`refreshed_ranges`]),
+    /// the spans `stale` of which flights may be writing and the title wrote
+    /// too ([`stale_under_flights`]): the flights land first, and the write
     /// watch is asked again for `ranges`, the submission's one asking (what
     /// they landed is title memory written).
     ///
@@ -7461,7 +7488,7 @@ impl Host {
     fn settle_stale(
         &self,
         submitted: &mut u64,
-        runs: &[&HostList],
+        refreshed: &Refreshed,
         mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         ranges: &[(usize, usize)],
     ) {
@@ -7483,7 +7510,7 @@ impl Host {
                     })
                 });
                 ask_again();
-                stale = stale_under_flights(runs, false);
+                stale = stale_under_flights(refreshed, false);
                 if stale.is_empty() {
                     return;
                 }
@@ -7847,26 +7874,15 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // The copies the submission refreshes and their ranges, for the
+        // asking and the looks for stale spans.
+        let once = crate::watch::once();
+        let refreshed = if once || behind { refreshed_ranges(runs) } else { Refreshed::new() };
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        if crate::watch::once() {
+        if once {
             let mut asking = crate::profile::span("ask once");
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    // (A lifted read's ranges are refreshed too.)
-                    for (shadow, address, len) in step.refreshes() {
-                        if shadow.unwatched() {
-                            continue;
-                        }
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((address, address + len));
-                        *span = (span.0.min(address), span.1.max(address + len));
-                    }
-                }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges = asked_spans(&refreshed);
             let split = asking.as_ref().map(|_| crate::profile::refresh_split());
             {
                 let _refresh = crate::profile::refresh_scope();
@@ -7885,13 +7901,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            let stale = if behind { stale_under_flights(runs, true) } else { Vec::new() };
+            let stale = if behind { stale_under_flights(&refreshed, true) } else { Vec::new() };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle_stale(&mut submitted, runs, stale, &ranges);
+                self.settle_stale(&mut submitted, &refreshed, stale, &ranges);
                 settled += settling.elapsed();
             }
-        } else if behind && !stale_under_flights(runs, true).is_empty() {
+        } else if behind && !stale_under_flights(&refreshed, true).is_empty() {
             let settling = std::time::Instant::now();
             measured(Wait::Stale, || self.settle(&mut submitted, WHY_STALE));
             settled += settling.elapsed();

@@ -37,6 +37,11 @@ fn put(at: usize, bytes: &[u8]) {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
 }
 
+fn get(at: usize, len: usize) -> Vec<u8> {
+    // SAFETY: committed memory of the test's own.
+    unsafe { std::slice::from_raw_parts(at as *const u8, len).to_vec() }
+}
+
 /// The host copy of a title buffer `[at, at + len)`, registered as `id`.
 fn copy_of(id: usize, at: usize, len: usize) -> Arc<Shadow> {
     register(id, at as u64, len as u64);
@@ -180,4 +185,193 @@ fn warp_stale_pending_source_root_tail() {
     flights.land_all();
     list.reset();
     unregister(0x57a1_e005, at as u64);
+}
+
+/// Whether the thread's counters saw a wait for stale spans or a refusal
+/// since the last look (`crate::frame_budget::take_seen`).
+fn stale_seen() -> (bool, usize) {
+    use crate::frame_budget::{Seen, Wait};
+    let seen = crate::frame_budget::take_seen();
+    let waited = seen.iter().any(|s| {
+        matches!(
+            s,
+            Seen::Wait {
+                kind: Wait::Stale,
+                ..
+            }
+        )
+    });
+    let refused = seen
+        .iter()
+        .filter(|s| matches!(s, Seen::StaleRefused(_)))
+        .count();
+    (waited, refused)
+}
+
+/// A flight whose shaders may write `[at, at + len)` of `copy` (declared,
+/// nothing written), sent behind a hold on the queue: it stays in the air
+/// until the hold goes.
+fn held_flight(
+    host: &Host,
+    copy: &Arc<Shadow>,
+    at: usize,
+    len: usize,
+) -> (flights::QueueHold, HostList) {
+    let hold = flights::QueueHold::new(host);
+    let list = host.new_list().unwrap();
+    copy.refresh(&list, at as u64, len as u64);
+    copy.gpu_writes(&list, at as u64, len as u64);
+    list.close();
+    host.send_for_test(&list);
+    (hold, list)
+}
+
+/// A list that refreshes `ranges` of `copy`, closed.
+fn refresher(host: &Host, copy: &Arc<Shadow>, ranges: &[(usize, usize)]) -> HostList {
+    let list = host.new_list().unwrap();
+    for &(a, e) in ranges {
+        copy.refresh(&list, a as u64, (e - a) as u64);
+    }
+    list.close();
+    list
+}
+
+/// The title writes the page a flight may write, between two pages a
+/// submission refreshes. No refresh of it writes that page, so nothing is
+/// stale: the submission goes with no wait (the memory is not watched, so a
+/// look at the page would refuse and wait). The next submission that
+/// refreshes the page, with nothing in the air, takes the title's bytes.
+#[test]
+fn warp_stale_pending_between_refreshed_ranges_no_settle() {
+    let Some(host) = host() else { return };
+    let flights = flights::TestFlights::on(false, false);
+    let at = title_memory(3 * K64, false);
+    let copy = copy_of(0x57a1_e011, at, 3 * K64);
+    copy.update(at, 3 * K64);
+    let (hold, one) = held_flight(host, &copy, at + K64, K64);
+    put(at + K64 + 0x40, &[0x77; 32]);
+    let _ = stale_seen();
+    let two = refresher(host, &copy, &[(at, at + K64), (at + 2 * K64, at + 3 * K64)]);
+    // Were it to wait, the hold goes after a while.
+    let released = hold.released().after(2000);
+    host.send_for_test(&two);
+    let sent_with_no_wait = flights::in_air() == 2;
+    let (waited, refused) = stale_seen();
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    assert!(sent_with_no_wait, "no wait");
+    assert!(!waited && refused == 0, "nothing stale");
+    let three = refresher(host, &copy, &[(at + K64, at + 2 * K64)]);
+    host.send_for_test(&three);
+    flights.land_all();
+    assert_eq!(
+        &crate::shadow::copy_bytes(&copy)[K64 + 0x40..K64 + 0x60],
+        &[0x77; 32],
+        "the next refresh of the page takes the title's bytes"
+    );
+    for list in [one, two, three] {
+        list.reset();
+    }
+    unregister(0x57a1_e011, at as u64);
+}
+
+/// The title writes inside a range a flight may write and the submission
+/// refreshes: still merged beside the flight's writes, with no wait, and the
+/// landing keeps the title's bytes.
+#[test]
+fn warp_stale_pending_inside_refreshed_range_still_merged() {
+    let Some(host) = host() else { return };
+    let flights = flights::TestFlights::on(false, false);
+    let at = title_memory(2 * K64, true);
+    let copy = copy_of(0x57a1_e012, at, 2 * K64);
+    copy.update(at, 2 * K64);
+    let (hold, one) = held_flight(host, &copy, at + 0x1000, 0x1000);
+    put(at + 0x1100, &[0x3c; 8]);
+    let _ = stale_seen();
+    let two = refresher(host, &copy, &[(at, at + K64)]);
+    let released = hold.released().after(2000);
+    host.send_for_test(&two);
+    let sent_with_no_wait = flights::in_air() == 2;
+    let (waited, refused) = stale_seen();
+    let held = crate::shadow::copy_bytes(&copy)[0x1100..0x1108].to_vec();
+    hold.release();
+    flights.land_all();
+    released.join().unwrap();
+    assert!(sent_with_no_wait, "no wait");
+    assert!(!waited && refused == 0, "merged, not refused");
+    assert_eq!(held, [0x3c; 8], "the title's bytes went into the copy");
+    assert_eq!(
+        get(at + 0x1100, 8),
+        [0x3c; 8],
+        "and stay the title's after the landing"
+    );
+    for list in [one, two] {
+        list.reset();
+    }
+    unregister(0x57a1_e012, at as u64);
+}
+
+/// A look for stale spans sees the copies' pending writes as they are when
+/// it looks, not as they were when the submission's ranges were gathered:
+/// once the flight that declared the range is done, the same ranges are not
+/// stale any more.
+#[test]
+fn warp_stale_relook_after_narrowed_wait_uses_current_pending() {
+    let Some(host) = host() else { return };
+    let _flights = flights::TestFlights::on(false, false);
+    let at = title_memory(K64, false);
+    let copy = copy_of(0x57a1_e013, at, K64);
+    copy.update(at, K64);
+    let range = (at + 0x200, at + 0x400);
+    copy.writing(range.0, range.1 - range.0);
+    let list = refresher(host, &copy, &[(at, at + K64)]);
+    let refreshed = refreshed_ranges(&[&list]);
+    let stale = stale_under_flights(&refreshed, true);
+    assert_eq!(stale.len(), 1, "not watched: refused");
+    copy.copy_back_done(&[range]);
+    assert!(
+        stale_under_flights(&refreshed, false).is_empty(),
+        "nothing pending now"
+    );
+    list.reset();
+    unregister(0x57a1_e013, at as u64);
+}
+
+/// One walk gathers every refreshed copy (unwatched ones too, for the looks
+/// for stale spans); the asking covers only those that may be watched, each
+/// by the span of its ranges.
+#[test]
+fn warp_ask_once_skips_unwatched_from_shared_walk() {
+    let Some(host) = host() else { return };
+    let (plain, watched) = (title_memory(2 * K64, false), title_memory(2 * K64, true));
+    let a = copy_of(0x57a1_e014, plain, 2 * K64);
+    let b = copy_of(0x57a1_e015, watched, 2 * K64);
+    a.update(plain, 2 * K64);
+    b.update(watched, 2 * K64);
+    assert!(a.unwatched() && !b.unwatched());
+    let list = host.new_list().unwrap();
+    for (copy, base) in [(&a, plain), (&b, watched)] {
+        copy.refresh(&list, (base + 0x100) as u64, 0x100);
+        copy.refresh(&list, (base + K64) as u64, 0x100);
+        copy.refresh(&list, (base + 0x180) as u64, 0x100);
+    }
+    list.close();
+    let refreshed = refreshed_ranges(&[&list]);
+    assert_eq!(refreshed.len(), 2, "both copies, unfiltered");
+    let ranges_of = |copy: &Arc<Shadow>| refreshed[&(Arc::as_ptr(copy) as usize)].1.clone();
+    assert_eq!(
+        ranges_of(&a),
+        [
+            (plain + 0x100, plain + 0x280),
+            (plain + K64, plain + K64 + 0x100)
+        ]
+    );
+    assert_eq!(
+        asked_spans(&refreshed),
+        [(watched + 0x100, watched + K64 + 0x100)]
+    );
+    list.reset();
+    unregister(0x57a1_e014, plain as u64);
+    unregister(0x57a1_e015, watched as u64);
 }
